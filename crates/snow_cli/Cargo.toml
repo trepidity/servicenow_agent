@@ -1,0 +1,33 @@
+[package]
+name = "snow_cli"
+version.workspace = true
+edition.workspace = true
+default-run = "snow"
+
+[[bin]]
+name = "snow"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+colored.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+dotenvy.workspace = true
+open.workspace = true
+ratatui.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+servicenow_rs.workspace = true
+snow_core = { path = "../snow_core" }
+snow_daemon = { path = "../snow_daemon" }
+nix = { version = "0.31.3", features = ["process", "signal", "fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

@@ -1,0 +1,386 @@
+use colored::Colorize;
+use servicenow_rs::prelude::{CatalogVariable, JournalEntry, Record};
+use std::io::Write;
+use std::process::Command;
+
+use crate::auth::strip_secret_env;
+
+pub fn print_change_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Category", record.get_str("category"));
+    print_field("Start", record.get_str("start_date"));
+    print_field("End", record.get_str("end_date"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    if let Some(desc) = record.get_str("description") {
+        let clean = strip_html(desc);
+        let truncated = if clean.chars().count() > 200 {
+            format!("{}...", clean.chars().take(200).collect::<String>())
+        } else {
+            clean
+        };
+        // Collapse to single line for inline display
+        let oneline = truncated.lines().collect::<Vec<_>>().join(" ");
+        println!("{:>13} {}", "Description:".dimmed(), oneline);
+    }
+    print_multiline_field("Change Plan", record.get_str("change_plan"));
+    print_multiline_field("Implementation", record.get_str("implementation_plan"));
+    print_multiline_field("Backout Plan", record.get_str("backout_plan"));
+}
+
+pub fn print_project_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("Name", record.get_str("name"));
+    print_field("State", record.get_str("state"));
+    print_field("Demand", record.get_str("demand"));
+    print_field("Manager", record.get_str("project_manager"));
+    print_field("Start", record.get_str("start_date"));
+    print_field("End", record.get_str("end_date"));
+    print_field("Complete", record.get_str("percent_complete"));
+    print_multiline_field("Description", record.get_str("description"));
+    print_multiline_field("Goals", record.get_str("goals"));
+    print_multiline_field("Business Case", record.get_str("business_case"));
+}
+
+pub fn print_demand_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Requested by", record.get_str("requested_by"));
+    print_field("Start", record.get_str("start_date"));
+    print_field("End", record.get_str("end_date"));
+    print_multiline_field("Description", record.get_str("description"));
+    print_multiline_field("Business Case", record.get_str("business_case"));
+}
+
+pub fn print_incident_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Severity", record.get_str("severity"));
+    print_field("Category", record.get_str("category"));
+    print_field("Subcategory", record.get_str("subcategory"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    print_field("Group", record.get_str("assignment_group"));
+    print_field("Caller", record.get_str("caller_id"));
+    print_field("Opened", record.get_str("opened_at"));
+    print_field("Resolved", record.get_str("resolved_at"));
+    print_field("Close code", record.get_str("close_code"));
+    print_multiline_field("Description", record.get_str("description"));
+}
+
+pub fn print_request_item_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Catalog Item", record.get_str("cat_item"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    print_field("Group", record.get_str("assignment_group"));
+    print_field("Request", record.get_str("request"));
+    print_field("Requested for", record.get_str("requested_for"));
+    print_field("Opened", record.get_str("opened_at"));
+    print_field("Due", record.get_str("due_date"));
+    print_field("Stage", record.get_str("stage"));
+    print_field("Approval", record.get_str("approval"));
+    print_multiline_field("Description", record.get_str("description"));
+}
+
+pub fn print_story_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    print_field("Story Points", record.get_str("story_points"));
+    print_field("Blocked", record.get_str("blocked"));
+    print_field("Sprint", record.get_str("sprint"));
+    print_field("Product", record.get_str("product"));
+    print_field("Epic", record.get_str("epic"));
+    print_multiline_field("Acceptance Criteria", record.get_str("acceptance_criteria"));
+    print_multiline_field("Description", record.get_str("description"));
+}
+
+pub fn print_story_tasks(tasks: &[(Record, Vec<JournalEntry>)]) {
+    println!("\n{}", "Story Tasks:".bold().underline());
+    for (task, notes) in tasks {
+        let number = task.get_str("number").unwrap_or("-");
+        let title = task
+            .get_str("short_description")
+            .unwrap_or("(no description)");
+        let state = task.get_str("state").unwrap_or("-");
+        let assigned = task.get_str("assigned_to").unwrap_or("Unassigned");
+        println!("  {} — {}", number.bold(), title);
+        println!(
+            "    {:>10} {}  {:>8} {}",
+            "State:".dimmed(),
+            state,
+            "Assigned:".dimmed(),
+            assigned
+        );
+        if !notes.is_empty() {
+            println!("    {}", "Work Notes:".dimmed());
+            for entry in notes {
+                println!(
+                    "      {} — {}",
+                    entry.timestamp.green(),
+                    entry.author.cyan().bold()
+                );
+                for line in entry.body.lines() {
+                    println!("        {line}");
+                }
+            }
+        }
+    }
+}
+
+pub fn print_task_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    print_field("Group", record.get_str("assignment_group"));
+    print_field("Request Item", record.get_str("request_item"));
+    print_field("Opened", record.get_str("opened_at"));
+    print_field("Due", record.get_str("due_date"));
+    print_multiline_field("Description", record.get_str("description"));
+}
+
+pub fn print_variables(variables: &[CatalogVariable]) {
+    if variables.is_empty() {
+        return;
+    }
+    println!("\n{}", "Variables:".bold().underline());
+    for var in variables {
+        if var.value.is_empty() {
+            continue;
+        }
+        if var.value.contains('\n') || var.value.len() > 80 {
+            println!("  {}:", var.name.dimmed());
+            for line in var.value.lines() {
+                println!("    {line}");
+            }
+        } else {
+            println!("  {:>30}  {}", format!("{}:", var.name).dimmed(), var.value);
+        }
+    }
+}
+
+pub fn print_activity(entries: &[JournalEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("\n{}", "Recent Activity:".bold().underline());
+    for entry in entries {
+        println!(
+            "  {} — {}",
+            entry.timestamp.green(),
+            entry.author.cyan().bold()
+        );
+        for line in entry.body.lines() {
+            println!("    {line}");
+        }
+    }
+}
+
+pub fn print_tasks(records: &[Record]) {
+    if records.is_empty() {
+        println!("No tasks found.");
+        return;
+    }
+    println!(
+        "{:<4} {:<16} {:<14} {:<20} {}",
+        "#".bold(),
+        "Task Number".bold(),
+        "State".bold(),
+        "Assigned To".bold(),
+        "Short Description".bold()
+    );
+    for (i, record) in records.iter().enumerate() {
+        println!(
+            "{:<4} {:<16} {:<14} {:<20} {}",
+            i + 1,
+            record.get_str("number").unwrap_or("-"),
+            record.get_str("state").unwrap_or("-"),
+            record.get_str("assigned_to").unwrap_or("-"),
+            record.get_str("short_description").unwrap_or("-"),
+        );
+    }
+}
+
+pub fn print_approval_records(records: &[Record]) {
+    if records.is_empty() {
+        return;
+    }
+    println!("\n{}", "Your Approvals:".bold().underline());
+    for record in records {
+        let state = record.get_str("state").unwrap_or("unknown");
+        let colored_state = match state {
+            "approved" => state.green().to_string(),
+            "rejected" => state.red().to_string(),
+            "requested" => state.yellow().to_string(),
+            _ => state.to_string(),
+        };
+        println!("  {} ({})", record.sys_id, colored_state);
+    }
+}
+
+pub fn record_to_json(record: &Record) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("sys_id".to_string(), serde_json::json!(record.sys_id));
+    for (name, fv) in record.fields() {
+        let val = if let Some(s) = fv.as_str() {
+            serde_json::json!(s)
+        } else if let Some(v) = &fv.value {
+            v.clone()
+        } else {
+            serde_json::Value::Null
+        };
+        map.insert(name.clone(), val);
+    }
+    serde_json::Value::Object(map)
+}
+
+pub fn print_multiline_field_pub(label: &str, value: Option<&str>) {
+    print_multiline_field(label, value);
+}
+
+pub fn print_full_dump(value: &serde_json::Value) {
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+
+    // Try to pipe through pager
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+    let mut command = Command::new(&pager);
+    strip_secret_env(command.stdin(std::process::Stdio::piped()));
+    if let Ok(mut child) = command.spawn() {
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(pretty.as_bytes());
+        }
+        let _ = child.wait();
+    } else {
+        // Fallback: just print
+        println!("{pretty}");
+    }
+}
+
+fn print_field(label: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        println!("{:>13} {}", format!("{label}:").dimmed(), v);
+    }
+}
+
+fn print_multiline_field(label: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
+        println!("\n{}", format!("{label}:").bold().underline());
+        println!("{}", strip_html(v));
+    }
+}
+
+/// Convert simple HTML (as returned by ServiceNow rich-text fields) to plain text.
+pub fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag_name = String::new();
+    let mut collecting_tag = false;
+
+    for ch in html.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_name.clear();
+            collecting_tag = true;
+            continue;
+        }
+        if in_tag {
+            if collecting_tag {
+                if ch.is_ascii_alphanumeric() || ch == '/' {
+                    tag_name.push(ch.to_ascii_lowercase());
+                } else {
+                    collecting_tag = false;
+                }
+            }
+            if ch == '>' {
+                in_tag = false;
+                let name = tag_name.trim_start_matches('/');
+                match name {
+                    "br" => out.push('\n'),
+                    "p" | "div" if !tag_name.starts_with('/') && !out.ends_with('\n') => {
+                        // Add blank line before block elements (but avoid double blanks)
+                        out.push('\n');
+                    }
+                    "li" if !tag_name.starts_with('/') => {
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str("  • ");
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // Decode common HTML entities
+        if ch == '&' {
+            // Peek-ahead not available char-by-char, so we handle entities in a post-pass below
+        }
+        out.push(ch);
+    }
+
+    // Decode HTML entities
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+
+    // Collapse runs of blank lines into at most one
+    let mut result = String::with_capacity(out.len());
+    let mut blank_count = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                result.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+        }
+    }
+
+    result.trim().to_string()
+}

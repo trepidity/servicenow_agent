@@ -1,0 +1,1150 @@
+use std::future::Future;
+use std::sync::Arc;
+
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use snow_core::query::filter::ListQuery;
+use snow_core::vault::markdown::{
+    render_approval_record, render_knowledge_article, render_snow_record,
+};
+use snow_core::{
+    CacheSource, FieldValue, JournalEntry, KnowledgeArticle, KnowledgeEmbeddingCoverage,
+    KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
+    KnowledgeSemanticSearchFilters, KnowledgeTagLayer, RecordRef, Reference, ResourceType,
+    SearchScope, SnowCore, SnowRecord,
+};
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
+use tokio::signal;
+
+use crate::config::McpConfig;
+use crate::domain::policy::is_write_tool;
+use crate::planner::is_governed_story_tool;
+use crate::planner::knowledge_grounding::{KbGroundedPlanner, content_hash};
+use crate::protocol::schema::{
+    JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport,
+};
+use crate::tools::ToolRegistry;
+use crate::transport::McpTransport;
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions;
+
+#[derive(Clone)]
+pub struct McpServer {
+    core: Arc<SnowCore>,
+    config: McpConfig,
+    transport: McpTransport,
+    registry: ToolRegistry,
+}
+
+impl McpServer {
+    pub fn new(core: Arc<SnowCore>) -> Self {
+        Self::with_config(core, McpConfig::default(), McpTransport::Stdio)
+    }
+
+    pub fn with_transport(core: Arc<SnowCore>, transport: McpTransport) -> Self {
+        Self::with_config(core, McpConfig::default(), transport)
+    }
+
+    pub fn with_config(core: Arc<SnowCore>, config: McpConfig, transport: McpTransport) -> Self {
+        Self {
+            core,
+            config,
+            transport,
+            registry: ToolRegistry::new(),
+        }
+    }
+
+    pub fn builder(core: Arc<SnowCore>) -> McpServerBuilder {
+        McpServerBuilder {
+            core,
+            config: McpConfig::default(),
+            transport: McpTransport::Stdio,
+        }
+    }
+
+    pub async fn serve(self) -> Result<()> {
+        match self.transport {
+            McpTransport::Stdio => self.serve_stdio().await,
+            McpTransport::Http | McpTransport::Sse => {
+                signal::ctrl_c().await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn serve_stdio(self) -> Result<()> {
+        self.serve_streams(
+            BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+            signal::ctrl_c(),
+        )
+        .await
+    }
+
+    pub async fn serve_streams<R, W, F>(&self, reader: R, writer: W, shutdown: F) -> Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+        F: Future<Output = std::result::Result<(), std::io::Error>>,
+    {
+        crate::transport::stdio::StdioTransport::serve_streams(self, reader, writer, shutdown).await
+    }
+
+    pub async fn dispatch(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+        let id = request.id.clone();
+        match request.method.as_str() {
+            "initialize" => JsonRpcResponse::ok(
+                id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": { "name": "snow_mcp", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": {
+                        "tools": { "listChanged": false },
+                        "resources": { "subscribe": false, "listChanged": false }
+                    }
+                }),
+            ),
+            "tools/list" => {
+                JsonRpcResponse::ok(id, json!({ "tools": self.registry.descriptors() }))
+            }
+            "resources/list" => {
+                JsonRpcResponse::ok(id, json!({ "resources": self.registry.resources() }))
+            }
+            "tools/call" => self.call_tool(id, &request.params).await,
+            "resources/read" => self.read_resource(id, &request.params).await,
+            "tool_capabilities" => self.tool_capabilities_response(id),
+            "policy_describe" => self.policy_describe_response(id),
+            "redaction_rules_describe" => JsonRpcResponse::ok(
+                id,
+                json!({"rules_version": self.config.redaction.rules_version, "mode": self.config.redaction.phi_in_work_notes}),
+            ),
+            _ => JsonRpcResponse::error(id, -32601, "method not found", None),
+        }
+    }
+
+    async fn call_tool(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return invalid_params(id, "missing tool name");
+        };
+        if is_governed_story_tool(name) {
+            return daemon_required_for_write(id, name, "daemon required for governed write");
+        }
+        if name == "plan_get" {
+            return daemon_required_for_write(id, name, "daemon required for plan persistence");
+        }
+        if is_write_tool(name) && !self.config.policy.is_tool_enabled(name) {
+            return JsonRpcResponse::error(
+                id,
+                -32040,
+                "policy denied",
+                Some(
+                    json!({ "details": "write tool is disabled by current MCP policy", "tool": name }),
+                ),
+            );
+        }
+
+        match name {
+            "get_record" => self.call_get_record(id, params).await,
+            "get_approval" => self.call_get_approval(id, params).await,
+            "list_my_tasks" => self.call_list_my_tasks(id).await,
+            "list_my_approvals" => self.call_list_my_approvals(id).await,
+            "list_my_projects" => self.call_list_my_projects(id).await,
+            "get_children" => self.call_get_children(id, params).await,
+            "search_records" => self.call_search(id, params, SearchScope::All).await,
+            "search_knowledge" | "knowledge_search" => self.call_search_knowledge(id, params).await,
+            "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
+            "get_article" | "knowledge_fetch" => self.call_get_article(id, params).await,
+            "knowledge_answer" => self.call_knowledge_answer(id, params).await,
+            "knowledge_grounded_plan" => self.call_knowledge_grounded_plan(id, params).await,
+            "list_records" => self.call_list_records(id, params).await,
+            "list_knowledge_bases" => self.call_list_knowledge_bases(id),
+            "list_categories" => self.call_list_categories(id, params),
+            "list_knowledge_articles" => self.call_list_knowledge_articles(id, params).await,
+            "vault_path" => JsonRpcResponse::ok(id, json!({ "path": self.core.vault_path() })),
+            "kb_sync" => self.call_kb_sync(id, params).await,
+            "kb_list_tags" => self.call_kb_list_tags(id, params),
+            "kb_status" => self.call_kb_status(id),
+            "kb_semantic_status" => self.call_kb_semantic_status(id).await,
+            "kb_semantic_rebuild" => self.call_kb_semantic_rebuild(id, params).await,
+            "repair_vault" => self.call_repair_vault(id).await,
+            "rebuild_cache" => self.call_rebuild_cache(id),
+            "verify_vault" => self.call_verify_vault(id),
+            "get_work_notes" => self.call_get_work_notes(id, params).await,
+            "resource_plan_get" | "story_get" => self.call_get_record(id, params).await,
+            "story_tasks_list" => self.call_get_children(id, params).await,
+            "work_note_plan_add" => self.call_work_note_plan_add(id, params).await,
+            "catalog_items_search" => self.call_catalog_items_search(id, params).await,
+            "catalog_item_get" => self.call_get_record(id, params).await,
+            "catalog_plan_request" | "change_plan_request" | "change_task_plan_assignment" => self
+                .not_implemented(
+                    id,
+                    name,
+                    "planning scaffold is registered but not implemented",
+                ),
+            "plan_get" => self.not_implemented(id, name, "plan persistence is not enabled"),
+            "audit_event_get" | "audit_events_search" | "audit_chain_verify" => self
+                .not_implemented(
+                    id,
+                    name,
+                    "audit read tools require an audit store configured",
+                ),
+            "policy_describe" => self.policy_describe_response(id),
+            "tool_capabilities" => self.tool_capabilities_response(id),
+            "redaction_rules_describe" => JsonRpcResponse::ok(
+                id,
+                json!({"rules_version": self.config.redaction.rules_version, "phi_in_work_notes": self.config.redaction.phi_in_work_notes}),
+            ),
+            _ => JsonRpcResponse::error(id, -32601, "tool not found", None),
+        }
+    }
+
+    async fn read_resource(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+            return invalid_params(id, "missing uri");
+        };
+
+        match uri {
+            u if u.starts_with("snow://records/") => {
+                let number = u.trim_start_matches("snow://records/");
+                match get_record_cached_or_fresh(self.core.as_ref(), number).await {
+                    Ok(Some(record)) => JsonRpcResponse::ok(
+                        id,
+                        json!({"uri": uri, "mimeType": "text/markdown", "text": render_snow_record(&record)}),
+                    ),
+                    Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+                    Err(err) => service_failure(id, err),
+                }
+            }
+            u if u.starts_with("snow://knowledge/") => {
+                let number = u.trim_start_matches("snow://knowledge/");
+                match self.core.get_knowledge_article(number).await {
+                    Ok(Some(article)) => JsonRpcResponse::ok(
+                        id,
+                        json!({"uri": uri, "mimeType": "text/markdown", "text": render_knowledge_article(&article)}),
+                    ),
+                    Ok(None) => {
+                        JsonRpcResponse::error(id, -32004, "knowledge article not found", None)
+                    }
+                    Err(err) => service_failure(id, err),
+                }
+            }
+            "snow://dashboard" => {
+                let tasks = match self.core.my_tasks().await {
+                    Ok(records) => records,
+                    Err(err) => return service_failure(id, err),
+                };
+                let approvals = match self.core.my_approvals().await {
+                    Ok(records) => records,
+                    Err(err) => return service_failure(id, err),
+                };
+                JsonRpcResponse::ok(
+                    id,
+                    json!({"uri": uri, "mimeType": "application/json", "json": {"tasks": tasks, "approvals": approvals}}),
+                )
+            }
+            _ => JsonRpcResponse::error(id, -32601, "resource not found", None),
+        }
+    }
+
+    async fn call_get_record(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        match get_record_cached_or_fresh(self.core.as_ref(), &number).await {
+            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "record": record })),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_get_approval(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        match self.core.get_approval(&number).await {
+            Ok(Some(approval)) => JsonRpcResponse::ok(
+                id,
+                json!({"approval": approval, "markdown": render_approval_record(&approval)}),
+            ),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "approval not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_get_children(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        match self.core.get_children(&number).await {
+            Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records, "parent": number })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_list_my_tasks(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.my_tasks().await {
+            Ok(records) if !records.is_empty() => {
+                JsonRpcResponse::ok(id, json!({ "records": records }))
+            }
+            Ok(_) | Err(_) => match self.core.my_tasks_fresh().await {
+                Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
+                Err(err) => service_failure(id, err),
+            },
+        }
+    }
+
+    async fn call_list_my_approvals(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.my_approvals().await {
+            Ok(records) if !records.is_empty() => {
+                JsonRpcResponse::ok(id, json!({ "records": records }))
+            }
+            Ok(_) | Err(_) => match self.core.my_approvals_fresh().await {
+                Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
+                Err(err) => service_failure(id, err),
+            },
+        }
+    }
+
+    async fn call_list_my_projects(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.my_projects().await {
+            Ok(records) if !records.is_empty() => {
+                JsonRpcResponse::ok(id, json!({ "records": records }))
+            }
+            Ok(_) | Err(_) => match self.core.my_projects_fresh().await {
+                Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
+                Err(err) => service_failure(id, err),
+            },
+        }
+    }
+
+    async fn call_search(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+        scope: SearchScope,
+    ) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        let effective_scope = arguments
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(parse_search_scope)
+            .unwrap_or(scope);
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(20);
+
+        match self.core.search_enriched(query, effective_scope).await {
+            Ok(results) => JsonRpcResponse::ok(
+                id,
+                json!({ "results": results.into_iter().take(limit).collect::<Vec<_>>() }),
+            ),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_search_knowledge(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        if arguments
+            .get("mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "lexical")
+        {
+            return self.call_kb_semantic_search(id, params).await;
+        }
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        let filters = KnowledgeSearchFilters {
+            knowledge_base: arguments
+                .get("knowledge_base")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            category: arguments
+                .get("category")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        };
+        match self.core.search_knowledge(query, filters).await {
+            Ok(articles) => JsonRpcResponse::ok(id, json!({ "articles": articles })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_get_article(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        let fresh = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("fresh"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let article = if fresh {
+            self.core.get_knowledge_article_fresh(&number).await
+        } else {
+            self.core.get_knowledge_article(&number).await
+        };
+        match article {
+            Ok(Some(article)) => JsonRpcResponse::ok(
+                id,
+                json!({"article": article, "markdown": render_knowledge_article(&article), "content_hash": content_hash(&article.content)}),
+            ),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "knowledge article not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_kb_semantic_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        let mut filters =
+            match serde_json::from_value::<KnowledgeSemanticSearchFilters>(arguments.clone()) {
+                Ok(filters) => filters,
+                Err(err) => return invalid_params(id, err),
+            };
+        if filters.mode == KnowledgeSearchMode::Hybrid
+            && arguments.get("mode").and_then(Value::as_str).is_none()
+        {
+            filters.mode = KnowledgeSearchMode::Lexical;
+        }
+        match self.core.search_knowledge_semantic(query, filters).await {
+            Ok(hits) => {
+                let mut wrapped_hits = Vec::with_capacity(hits.len());
+                for hit in hits {
+                    match self.knowledge_search_hit_json(&hit) {
+                        Ok(hit) => wrapped_hits.push(hit),
+                        Err(err) => return service_failure(id, err),
+                    }
+                }
+                JsonRpcResponse::ok(id, json!({ "hits": wrapped_hits }))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_knowledge_answer(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(5);
+        let filters = KnowledgeSearchFilters {
+            limit: Some(limit),
+            ..Default::default()
+        };
+        match self.core.search_knowledge(query, filters).await {
+            Ok(articles) => {
+                let citations = articles
+                    .iter()
+                    .map(|article| {
+                        json!({
+                            "article_number": article.record.number,
+                            "sys_id": article.record.sys_id,
+                            "title": article.record.short_description,
+                            "knowledge_base": article.knowledge_base.display_name,
+                            "content_hash": content_hash(&article.content),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                JsonRpcResponse::ok(id, json!({ "articles": articles, "citations": citations }))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_knowledge_grounded_plan(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        let filters = KnowledgeSearchFilters {
+            limit: Some(5),
+            ..Default::default()
+        };
+        match self.core.search_knowledge(query, filters).await {
+            Ok(articles) => {
+                let bodies = articles
+                    .iter()
+                    .map(|article| article.content.clone())
+                    .collect::<Vec<_>>();
+                let verdict = KbGroundedPlanner {
+                    freshness_days: self.config.policy.kb_freshness_days,
+                }
+                .evaluate(Vec::new(), &bodies);
+                JsonRpcResponse::ok(
+                    id,
+                    json!({"status": "needs_review", "evidence_verdict": verdict, "articles": articles}),
+                )
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_list_records(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: ListRecordsArguments = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+
+        let mut query = ListQuery::new();
+        if let Some(resource_type) = parsed.resource_type.as_deref() {
+            match parse_resource_type(resource_type) {
+                Ok(resource_type) => query = query.resource_type(resource_type),
+                Err(err) => return invalid_params(id, err),
+            }
+        }
+        if let Some(assigned_to) = parsed.assigned_to {
+            query = query.assigned_to(assigned_to);
+        }
+        if let Some(limit) = parsed.limit {
+            query = query.limit(limit);
+        }
+        if let Some(parent_number) = parsed.parent_number {
+            match self.core.get_record(&parent_number).await {
+                Ok(Some(parent)) => query = query.parent_sys_id(parent.sys_id),
+                Ok(None) => {
+                    return JsonRpcResponse::error(id, -32004, "parent record not found", None);
+                }
+                Err(err) => return service_failure(id, err),
+            }
+        }
+        match self.core.list_records_query(query).await {
+            Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_list_knowledge_bases(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.list_knowledge_bases() {
+            Ok(bases) => JsonRpcResponse::ok(id, json!({ "bases": bases })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_list_categories(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(knowledge_base_sys_id) = extract_argument_string(params, "knowledge_base_sys_id")
+        else {
+            return invalid_params(id, "missing knowledge_base_sys_id");
+        };
+        match self.core.list_categories(&knowledge_base_sys_id) {
+            Ok(categories) => JsonRpcResponse::ok(id, json!({ "categories": categories })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_list_knowledge_articles(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: ListKnowledgeArticlesArguments = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        match self
+            .core
+            .list_knowledge_articles(
+                parsed.knowledge_base_sys_id.as_deref(),
+                parsed.category_sys_id.as_deref(),
+                parsed.limit,
+            )
+            .await
+        {
+            Ok(articles) => JsonRpcResponse::ok(id, json!({ "articles": articles })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_kb_sync(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let full = arguments
+            .get("full")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let with_bodies = arguments
+            .get("with_bodies")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self.core.sync_knowledge(full, with_bodies).await {
+            Ok(sync) => JsonRpcResponse::ok(id, json!({ "sync": sync })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_kb_list_tags(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let layer = match arguments.get("layer").and_then(Value::as_str) {
+            Some("all") | None => None,
+            Some("sn") => Some(KnowledgeTagLayer::Sn),
+            Some("auto") => Some(KnowledgeTagLayer::Auto),
+            Some("user") => Some(KnowledgeTagLayer::User),
+            Some(other) => return invalid_params(id, format!("unsupported tag layer `{other}`")),
+        };
+        let min_count = arguments
+            .get("min_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(1);
+        match self.core.list_knowledge_tags(layer, min_count) {
+            Ok(tags) => JsonRpcResponse::ok(id, json!({ "tags": tags })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_kb_status(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.knowledge_status() {
+            Ok(status) => JsonRpcResponse::ok(id, json!({ "status": status })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_kb_semantic_status(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.knowledge_semantic_status().await {
+            Ok(status) => JsonRpcResponse::ok(id, json!({ "status": status })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_kb_semantic_rebuild(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let full = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("full"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self.core.rebuild_knowledge_semantic_index(full).await {
+            Ok(summary) => JsonRpcResponse::ok(id, json!({ "summary": summary })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_repair_vault(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.repair_vault().await {
+            Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_rebuild_cache(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.rebuild_cache() {
+            Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn call_verify_vault(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.verify_vault() {
+            Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_get_work_notes(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        match get_record_cached_or_fresh(self.core.as_ref(), &number).await {
+            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes })),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_work_note_plan_add(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Ok(number) = extract_argument_string(params, "number") else {
+            return invalid_params(id, "missing number");
+        };
+        let note = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match get_record_cached_or_fresh(self.core.as_ref(), &number).await {
+            Ok(Some(record)) => JsonRpcResponse::ok(
+                id,
+                json!({
+                    "target": {"sys_id": record.sys_id, "number": record.number, "table": record.table},
+                    "recent_work_note_count": record.work_notes.len(),
+                    "field": "work_notes",
+                    "preview": note,
+                    "requires_confirmation": true
+                }),
+            ),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_catalog_items_search(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+            return invalid_params(id, "missing query");
+        };
+        match self.core.search_enriched(query, SearchScope::All).await {
+            Ok(results) => JsonRpcResponse::ok(
+                id,
+                json!({ "candidates": results.into_iter().take(10).collect::<Vec<_>>() }),
+            ),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    fn tool_capabilities_response(&self, id: Option<Value>) -> JsonRpcResponse {
+        let tools = self
+            .registry
+            .metadata()
+            .iter()
+            .map(|metadata| metadata.capability(self.config.policy.is_tool_enabled(&metadata.name)))
+            .collect::<Vec<_>>();
+        JsonRpcResponse::ok(
+            id,
+            json!(ToolCapabilitiesReport {
+                environment: self.config.environment.label.clone(),
+                default_mode: self.config.policy.default_mode.clone(),
+                tools,
+            }),
+        )
+    }
+
+    fn policy_describe_response(&self, id: Option<Value>) -> JsonRpcResponse {
+        JsonRpcResponse::ok(
+            id,
+            json!(PolicyDescribeReport {
+                environment: self.config.environment.label.clone(),
+                default_mode: self.config.policy.default_mode.clone(),
+                roles: self.config.policy.roles.keys().cloned().collect(),
+                write_tools_enabled: self
+                    .registry
+                    .metadata()
+                    .iter()
+                    .filter(|metadata| {
+                        is_write_tool(&metadata.name)
+                            && self.config.policy.is_tool_enabled(&metadata.name)
+                    })
+                    .map(|metadata| metadata.name.clone())
+                    .collect(),
+                kb_freshness_days: self.config.policy.kb_freshness_days,
+                idempotency_window_seconds: self.config.policy.idempotency_window_seconds,
+                phi_in_work_notes: self.config.policy.phi_in_work_notes.clone(),
+                evaluation_order: crate::domain::policy::PolicyGate::evaluation_order()
+                    .into_iter()
+                    .map(|gate| gate.as_name().to_string())
+                    .collect(),
+            }),
+        )
+    }
+
+    fn knowledge_search_hit_json(&self, hit: &KnowledgeSearchHit) -> Result<Value> {
+        let mut hit_json = Map::new();
+        hit_json.insert(
+            "article".to_string(),
+            self.knowledge_article_json(&hit.article)?,
+        );
+        hit_json.insert(
+            "mode".to_string(),
+            Value::String(knowledge_search_mode_json(hit.mode).to_string()),
+        );
+        hit_json.insert("score".to_string(), json!(hit.score));
+        if let Some(semantic_score) = hit.semantic_score {
+            hit_json.insert("semantic_score".to_string(), json!(semantic_score));
+        }
+        if let Some(lexical_score) = hit.lexical_score {
+            hit_json.insert("lexical_score".to_string(), json!(lexical_score));
+        }
+        hit_json.insert(
+            "coverage".to_string(),
+            Value::String(knowledge_coverage_json(hit.coverage).to_string()),
+        );
+        Ok(Value::Object(hit_json))
+    }
+
+    fn knowledge_article_json(&self, article: &KnowledgeArticle) -> Result<Value> {
+        let record = self.record_json(&article.record)?;
+        let browser_url = record.get("browser_url").cloned().unwrap_or(Value::Null);
+        let vault_relative_path = record
+            .get("vault_relative_path")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut article_json = Map::new();
+        if !browser_url.is_null() {
+            article_json.insert("browser_url".to_string(), browser_url);
+        }
+        if !vault_relative_path.is_null() {
+            article_json.insert("vault_relative_path".to_string(), vault_relative_path);
+        }
+        article_json.insert("record".to_string(), record);
+        article_json.insert(
+            "knowledge_base".to_string(),
+            reference_json(&article.knowledge_base),
+        );
+        article_json.insert("category".to_string(), reference_json(&article.category));
+        article_json.insert(
+            "article_type".to_string(),
+            Value::String(article.article_type.clone()),
+        );
+        article_json.insert(
+            "content".to_string(),
+            Value::String(article.content.clone()),
+        );
+        article_json.insert("sn_tags".to_string(), json!(article.sn_tags));
+        article_json.insert("auto_tags".to_string(), json!(article.auto_tags));
+        article_json.insert("user_tags".to_string(), json!(article.user_tags));
+        article_json.insert("body_cached".to_string(), Value::Bool(article.body_cached));
+        if let Some(published_at) = article.published_at {
+            article_json.insert("published_at".to_string(), json!(published_at));
+        }
+        if let Some(author) = &article.author {
+            article_json.insert("author".to_string(), reference_json(author));
+        }
+        if let Some(valid_to) = article.valid_to {
+            article_json.insert("valid_to".to_string(), json!(valid_to));
+        }
+        Ok(Value::Object(article_json))
+    }
+
+    fn record_json(&self, record: &SnowRecord) -> Result<Value> {
+        let mut record_json = Map::new();
+        record_json.insert("sys_id".to_string(), Value::String(record.sys_id.clone()));
+        record_json.insert("number".to_string(), Value::String(record.number.clone()));
+        record_json.insert("table".to_string(), Value::String(record.table.clone()));
+        record_json.insert(
+            "resource_type".to_string(),
+            Value::String(resource_type_json(&record.resource_type).to_string()),
+        );
+        record_json.insert("state".to_string(), Value::String(record.state.clone()));
+        record_json.insert(
+            "short_description".to_string(),
+            Value::String(record.short_description.clone()),
+        );
+        record_json.insert(
+            "description".to_string(),
+            Value::String(record.description.clone()),
+        );
+        record_json.insert(
+            "fields".to_string(),
+            Value::Object(
+                record
+                    .fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), field_value_json(value)))
+                    .collect(),
+            ),
+        );
+        record_json.insert(
+            "work_notes".to_string(),
+            Value::Array(record.work_notes.iter().map(journal_entry_json).collect()),
+        );
+        record_json.insert(
+            "comments".to_string(),
+            Value::Array(record.comments.iter().map(journal_entry_json).collect()),
+        );
+        if let Some(parent) = &record.parent {
+            record_json.insert("parent".to_string(), record_ref_json(parent));
+        }
+        record_json.insert(
+            "children".to_string(),
+            Value::Array(record.children.iter().map(record_ref_json).collect()),
+        );
+        record_json.insert(
+            "references".to_string(),
+            Value::Object(
+                record
+                    .references
+                    .iter()
+                    .map(|(key, reference)| (key.clone(), reference_json(reference)))
+                    .collect(),
+            ),
+        );
+        record_json.insert("synced_at".to_string(), json!(record.synced_at));
+        record_json.insert(
+            "source".to_string(),
+            Value::String(cache_source_json(&record.source).to_string()),
+        );
+        if let Some(browser_url) = self.browser_url(&record.table, &record.sys_id) {
+            record_json.insert("browser_url".to_string(), Value::String(browser_url));
+        }
+        if let Some(path) = self.core.vault_relative_path_for_sys_id(&record.sys_id)? {
+            record_json.insert("vault_relative_path".to_string(), Value::String(path));
+        }
+        Ok(Value::Object(record_json))
+    }
+
+    fn browser_url(&self, table: &str, sys_id: &str) -> Option<String> {
+        let base = normalize_instance_url(&self.core.config().instance.url)?;
+        Some(format!("{base}/nav_to.do?uri={table}.do?sys_id={sys_id}"))
+    }
+
+    fn not_implemented(&self, id: Option<Value>, tool: &str, details: &str) -> JsonRpcResponse {
+        JsonRpcResponse::error(
+            id,
+            -32000,
+            "not implemented",
+            Some(json!({ "tool": tool, "details": details })),
+        )
+    }
+}
+
+pub struct McpServerBuilder {
+    core: Arc<SnowCore>,
+    config: McpConfig,
+    transport: McpTransport,
+}
+
+impl McpServerBuilder {
+    pub fn config(mut self, config: McpConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn transport(mut self, transport: McpTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    pub fn build(self) -> McpServer {
+        McpServer::with_config(self.core, self.config, self.transport)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ListRecordsArguments {
+    #[serde(default)]
+    resource_type: Option<String>,
+    #[serde(default)]
+    parent_number: Option<String>,
+    #[serde(default)]
+    assigned_to: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ListKnowledgeArticlesArguments {
+    #[serde(default)]
+    knowledge_base_sys_id: Option<String>,
+    #[serde(default)]
+    category_sys_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
+    let normalized = resource_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "task" => Ok(ResourceType::Task),
+        "incident" => Ok(ResourceType::Incident),
+        "change" | "change_request" => Ok(ResourceType::Change),
+        "change_task" => Ok(ResourceType::ChangeTask),
+        "request" | "sc_req_item" | "request_item" => Ok(ResourceType::Request),
+        "request_task" | "sc_task" => Ok(ResourceType::RequestTask),
+        "project" | "pm_project" => Ok(ResourceType::Project),
+        "demand" | "dmn_demand" => Ok(ResourceType::Demand),
+        "resource_plan" | "resourceplan" | "rpln" => Ok(ResourceType::ResourcePlan),
+        "story" | "rm_story" => Ok(ResourceType::Story),
+        "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),
+        "knowledge" | "kb_knowledge" => Ok(ResourceType::Knowledge),
+        "approval" | "sysapproval_approver" => Ok(ResourceType::Approval),
+        _ => Err(Error::InvalidParams(format!(
+            "unsupported resource_type `{resource_type}`"
+        ))),
+    }
+}
+
+fn parse_search_scope(scope: &str) -> SearchScope {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "knowledge" => SearchScope::Knowledge,
+        "work_notes" => SearchScope::WorkNotes,
+        _ => SearchScope::All,
+    }
+}
+
+async fn get_record_cached_or_fresh(
+    core: &SnowCore,
+    number: &str,
+) -> anyhow::Result<Option<SnowRecord>> {
+    match core.get_record(number).await? {
+        Some(record) => Ok(Some(record)),
+        None => core.get_record_fresh(number).await,
+    }
+}
+
+fn field_value_json(value: &FieldValue) -> Value {
+    let mut field = Map::new();
+    field.insert("value".to_string(), Value::String(value.value.clone()));
+    if let Some(display_value) = &value.display_value {
+        field.insert(
+            "display_value".to_string(),
+            Value::String(display_value.clone()),
+        );
+    }
+    Value::Object(field)
+}
+
+fn journal_entry_json(entry: &JournalEntry) -> Value {
+    json!({
+        "timestamp": entry.timestamp,
+        "author": entry.author,
+        "body": entry.body,
+    })
+}
+
+fn reference_json(reference: &Reference) -> Value {
+    json!({
+        "sys_id": reference.sys_id,
+        "table": reference.table,
+        "display_name": reference.display_name,
+        "extra": reference.extra,
+    })
+}
+
+fn record_ref_json(reference: &RecordRef) -> Value {
+    json!({
+        "sys_id": reference.sys_id,
+        "number": reference.number,
+        "table": reference.table,
+    })
+}
+
+fn knowledge_search_mode_json(mode: KnowledgeSearchMode) -> &'static str {
+    match mode {
+        KnowledgeSearchMode::Lexical => "lexical",
+        KnowledgeSearchMode::Semantic => "semantic",
+        KnowledgeSearchMode::Hybrid => "hybrid",
+    }
+}
+
+fn knowledge_coverage_json(coverage: KnowledgeEmbeddingCoverage) -> &'static str {
+    match coverage {
+        KnowledgeEmbeddingCoverage::Metadata => "metadata",
+        KnowledgeEmbeddingCoverage::FullText => "full_text",
+    }
+}
+
+fn resource_type_json(resource_type: &ResourceType) -> &'static str {
+    match resource_type {
+        ResourceType::Task => "task",
+        ResourceType::Incident => "incident",
+        ResourceType::Change => "change",
+        ResourceType::ChangeTask => "change_task",
+        ResourceType::Request => "request",
+        ResourceType::RequestTask => "request_task",
+        ResourceType::Project => "project",
+        ResourceType::Demand => "demand",
+        ResourceType::ResourcePlan => "resource_plan",
+        ResourceType::Story => "story",
+        ResourceType::ScrumTask => "scrum_task",
+        ResourceType::Knowledge => "knowledge",
+        ResourceType::Approval => "approval",
+    }
+}
+
+fn cache_source_json(source: &CacheSource) -> &'static str {
+    match source {
+        CacheSource::Memory => "memory",
+        CacheSource::Disk => "disk",
+        CacheSource::Api => "api",
+    }
+}
+
+fn normalize_instance_url(instance_url: &str) -> Option<String> {
+    let trimmed = instance_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("https://{trimmed}"))
+    }
+}
+
+fn extract_argument_string(params: &Value, key: &str) -> Result<String> {
+    params
+        .get("arguments")
+        .and_then(|arguments| arguments.get(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| Error::InvalidParams(format!("missing {key}")))
+}
+
+fn invalid_params(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32602,
+        "invalid params",
+        Some(json!({ "details": err.to_string() })),
+    )
+}
+
+fn daemon_required_for_write(id: Option<Value>, tool: &str, details: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32044,
+        "DAEMON_REQUIRED_FOR_WRITE",
+        Some(json!({
+            "tool_name": tool,
+            "reason": "daemon_not_attached",
+            "details": details,
+        })),
+    )
+}
+
+fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32000,
+        "service failure",
+        Some(json!({ "details": err.to_string() })),
+    )
+}
