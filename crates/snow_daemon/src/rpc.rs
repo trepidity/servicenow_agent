@@ -1649,11 +1649,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn story_plan_create_persists_plan_for_get() {
         let fixture = build_fixture_state().await.expect("fixture");
-        let mut mcp_config = snow_mcp::McpConfig::default();
-        mcp_config.environment =
-            snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago");
-        mcp_config.policy = snow_mcp::domain::policy::PolicyConfig::from_toml_str(
-            r#"
+        let mcp_config = snow_mcp::McpConfig {
+            environment: snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago"),
+            policy: snow_mcp::domain::policy::PolicyConfig::from_toml_str(
+                r#"
 [mcp.boards."board-sys"]
 name = "training-board"
 instance_host = "https://example.service-now.com"
@@ -1669,8 +1668,10 @@ enabled = true
 requires_confirmation = false
 story_board_id = "board-sys"
 "#,
-        )
-        .expect("policy");
+            )
+            .expect("policy"),
+            ..Default::default()
+        };
         let state = std::sync::Arc::new(crate::DaemonState::with_data_dir_and_mcp_config(
             std::sync::Arc::clone(&fixture.state.core),
             fixture.tempdir.path().join("story-write"),

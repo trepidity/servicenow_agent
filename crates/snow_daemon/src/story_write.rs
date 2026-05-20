@@ -53,7 +53,7 @@ pub async fn handle_plan_get(
         );
     };
 
-    match stores(state).and_then(|stores| Ok((stores.plan_store, plan_id))) {
+    match stores(state).map(|stores| (stores.plan_store, plan_id)) {
         Ok((plan_store, plan_id)) => match plan_store.get(&plan_id).await {
             Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "plan": record })),
             Ok(None) => story_error(
@@ -1798,6 +1798,9 @@ async fn apply_plan(
     }
 }
 
+// Short-lived control-flow result, never stored in bulk; the size difference
+// between variants is harmless here.
+#[allow(clippy::large_enum_variant)]
 enum PendingResolution {
     Recovered(OperationReceipt),
     Proceed,
@@ -1852,6 +1855,9 @@ async fn resolve_pending_response(
     }
 }
 
+// Short-lived control-flow result, never stored in bulk; the size difference
+// between variants is harmless here.
+#[allow(clippy::large_enum_variant)]
 enum PendingRecovery {
     Recovered(OperationReceipt),
     Proceed,
@@ -1981,6 +1987,9 @@ async fn append_confirmation_consume_audit(
     Ok(())
 }
 
+// Short-lived control-flow result, never stored in bulk; the size difference
+// between variants is harmless here.
+#[allow(clippy::large_enum_variant)]
 enum CreateRecoveryLookup {
     Found(SnowRecord),
     NoMatch,
@@ -2191,6 +2200,7 @@ async fn enforce_apply_guard(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt_for_write(
     plan: &OperationPlan,
     tool: &str,
@@ -2864,6 +2874,7 @@ fn policy_decisions_for(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_audit_event(
     state: &DaemonState,
     audit_id: &str,

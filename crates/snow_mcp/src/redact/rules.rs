@@ -34,17 +34,9 @@ impl Default for RedactionRuleSet {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuleBasedRedactor {
     rules: RedactionRuleSet,
-}
-
-impl Default for RuleBasedRedactor {
-    fn default() -> Self {
-        Self {
-            rules: RedactionRuleSet::default(),
-        }
-    }
 }
 
 impl PhiRedactor for RuleBasedRedactor {

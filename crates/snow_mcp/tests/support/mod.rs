@@ -57,6 +57,8 @@ pub async fn build_fixture_state() -> Result<FixtureState> {
 
     Ok(FixtureState {
         _tempdir: tempdir,
+        // SnowCore is single-threaded; Arc here matches the server's API shape.
+        #[allow(clippy::arc_with_non_send_sync)]
         core: Arc::new(core),
     })
 }

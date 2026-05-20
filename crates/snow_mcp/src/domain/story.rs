@@ -741,10 +741,7 @@ pub const WARNING_ASSIGNEE_AMBIGUOUS: &str = "ASSIGNEE_AMBIGUOUS";
 pub const WARNING_PRIORITY_VALUE_UNMAPPED: &str = "PRIORITY_VALUE_UNMAPPED";
 
 pub fn mask_email_for_receipt(email: &str) -> PiiEmailMask {
-    let (local, domain) = email
-        .split_once('@')
-        .map(|(local, domain)| (local, domain))
-        .unwrap_or((email, ""));
+    let (local, domain) = email.split_once('@').unwrap_or((email, ""));
     let domain = domain.trim().to_ascii_lowercase();
     let digest = Sha256::digest(domain.as_bytes());
 

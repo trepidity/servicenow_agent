@@ -382,7 +382,7 @@ fn render_child_summary(
         model
             .columns
             .iter()
-            .map(|column| detail_column_constraint(column))
+            .map(detail_column_constraint)
             .collect::<Vec<_>>(),
     )
     .header(

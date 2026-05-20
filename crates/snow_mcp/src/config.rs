@@ -53,25 +53,15 @@ impl McpEnvironment {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// `PolicyConfig::default()` resolves to `read_only_default()`, so a derived
+// `Default` is behavior-preserving here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpConfig {
     pub environment: McpEnvironment,
     pub policy: crate::domain::policy::PolicyConfig,
     pub audit: McpAuditConfig,
     pub redaction: McpRedactionConfig,
     pub rate_limit: McpRateLimitConfig,
-}
-
-impl Default for McpConfig {
-    fn default() -> Self {
-        Self {
-            environment: McpEnvironment::default(),
-            policy: crate::domain::policy::PolicyConfig::read_only_default(),
-            audit: McpAuditConfig::default(),
-            redaction: McpRedactionConfig::default(),
-            rate_limit: McpRateLimitConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

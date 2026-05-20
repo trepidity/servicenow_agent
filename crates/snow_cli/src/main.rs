@@ -1297,6 +1297,7 @@ fn print_approval_record(approval: &ApprovalRecord) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_show(
     core: &SnowCore,
     client: &ServiceNowClient,

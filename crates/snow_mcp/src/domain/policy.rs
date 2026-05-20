@@ -468,7 +468,7 @@ fn normalize_instance_hostname(input: &str) -> Option<String> {
     }
 }
 
-pub fn resolve_role_allowlist<'a, I, S>(cfg: &'a PolicyConfig, roles: I) -> HashSet<&'a str>
+pub fn resolve_role_allowlist<I, S>(cfg: &PolicyConfig, roles: I) -> HashSet<&str>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,

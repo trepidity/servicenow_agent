@@ -584,13 +584,14 @@ fn daemon_params_for(method: &str, args: Value) -> Value {
         _ => return json!({}),
     };
 
-    if method == "get_record" && !object.contains_key("number") {
-        if let Some(record_number) = object.get("record_number").and_then(Value::as_str) {
-            object.insert(
-                "number".to_string(),
-                Value::String(record_number.to_string()),
-            );
-        }
+    if method == "get_record"
+        && !object.contains_key("number")
+        && let Some(record_number) = object.get("record_number").and_then(Value::as_str)
+    {
+        object.insert(
+            "number".to_string(),
+            Value::String(record_number.to_string()),
+        );
     }
     if method == "get_children" && !object.contains_key("number") {
         let parent = object

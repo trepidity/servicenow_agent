@@ -45,7 +45,7 @@ impl Args {
                     let Some(value) = iter.next() else {
                         bail!("{arg} requires a path");
                     };
-                    daemon_socket = Some(PathBuf::from(expand_home(&value)));
+                    daemon_socket = Some(expand_home(&value));
                 }
                 "--require-contract" => {
                     let Some(value) = iter.next() else {
@@ -83,10 +83,10 @@ fn expand_home(value: &str) -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(value));
     }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(value)
 }

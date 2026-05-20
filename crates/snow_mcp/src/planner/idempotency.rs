@@ -23,7 +23,9 @@ pub struct IdempotencyRecord {
 pub enum IdempotencyOutcome {
     NewKey,
     Pending { retryable: bool, transient: bool },
-    Replay(OperationReceipt),
+    // Boxed: `OperationReceipt` is far larger than the other variants, so
+    // indirection keeps `IdempotencyOutcome` small (clippy::large_enum_variant).
+    Replay(Box<OperationReceipt>),
     Conflict { reason: String },
 }
 
@@ -188,7 +190,7 @@ impl IdempotencyStore for SqliteIdempotencyStore {
                 });
             } else if let Some(mut receipt) = record.receipt {
                 receipt.idempotency_replay = true;
-                return Ok(IdempotencyOutcome::Replay(receipt));
+                return Ok(IdempotencyOutcome::Replay(Box::new(receipt)));
             } else {
                 return Ok(IdempotencyOutcome::Pending {
                     retryable: true,

@@ -22,10 +22,11 @@ const SECRET_ENV_VARS: &[&str] = &[
 ];
 
 /// Where the ServiceNow password is resolved from at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum CredentialProvider {
     /// Read SNOW_PASSWORD, then SERVICENOW_PASSWORD, from the environment.
+    #[default]
     Env,
     /// Fetch from 1Password via the `op` CLI.
     OnePassword {
@@ -33,12 +34,6 @@ pub enum CredentialProvider {
         #[serde(default = "default_op_field")]
         field: String,
     },
-}
-
-impl Default for CredentialProvider {
-    fn default() -> Self {
-        Self::Env
-    }
 }
 
 impl CredentialProvider {
