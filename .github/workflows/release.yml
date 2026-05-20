@@ -5,8 +5,9 @@
 # far simpler against a host toolchain than under a cross linker.
 #
 # Produced binaries (per target):
-#   - snow         (the CLI, from crates/snow_cli)
-#   - snow_daemon  (the daemon, from crates/snow_daemon)
+#   - snow             (the CLI, from crates/snow_cli)
+#   - snow_daemon      (the daemon, from crates/snow_daemon)
+#   - snow_mcp_bridge  (the MCP bridge, from crates/snow_mcp)
 name: release
 
 on:
@@ -47,7 +48,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} --bin snow --bin snow_daemon
+        run: cargo build --release --target ${{ matrix.target }} --bin snow --bin snow_daemon --bin snow_mcp_bridge
 
       # Collect the binaries into a single archive named after the tag and target.
       - name: Package (Linux)
@@ -58,6 +59,7 @@ jobs:
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/snow" "$staging/"
           cp "target/${{ matrix.target }}/release/snow_daemon" "$staging/"
+          cp "target/${{ matrix.target }}/release/snow_mcp_bridge" "$staging/"
           cp README.md "$staging/" 2>/dev/null || true
           tar czf "${staging}.tar.gz" "$staging"
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
@@ -70,6 +72,7 @@ jobs:
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/snow.exe" "$staging/"
           cp "target/${{ matrix.target }}/release/snow_daemon.exe" "$staging/"
+          cp "target/${{ matrix.target }}/release/snow_mcp_bridge.exe" "$staging/"
           cp README.md "$staging/" 2>/dev/null || true
           7z a "${staging}.zip" "$staging"
           echo "ASSET=${staging}.zip" >> "$GITHUB_ENV"
