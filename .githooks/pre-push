@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — block pushing any commit that contains forbidden,
+# organization-specific identifiers. The denylist lives outside the repo; see
+# scripts/sensitive_scan.sh (loaded from $SENSITIVE_PATTERNS_FILE).
+#
+# Active when core.hooksPath is set to .githooks:
+#     git config core.hooksPath .githooks
+#
+# git feeds lines on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>
+# We scan every commit a push would NEWLY add to the remote (not just the tip),
+# so nothing forbidden ships even if it was introduced in an intermediate commit
+# and removed later.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SCANNER="$REPO_ROOT/scripts/sensitive_scan.sh"
+
+if [[ ! -x "$SCANNER" ]]; then
+  echo "pre-push: $SCANNER missing or not executable; refusing to push." >&2
+  exit 1
+fi
+
+ZERO='0000000000000000000000000000000000000000'
+status=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  # Skip branch deletions (local sha all zeros).
+  [[ "$local_sha" == "$ZERO" ]] && continue
+
+  # Determine which commits this push would newly add to the remote, so we scan
+  # every new commit without re-flagging history already on the remote. New
+  # branch (remote sha zero): everything not already on a remote.
+  # (SHAs are whitespace-free, so word-splitting the list is safe — and this
+  # stays compatible with the bash 3.2 shipped on macOS, which lacks mapfile.)
+  if [[ "$remote_sha" == "$ZERO" ]]; then
+    commits="$(git rev-list "$local_sha" --not --remotes)"
+  else
+    commits="$(git rev-list "$remote_sha..$local_sha")"
+  fi
+  # Always scan the tip too (covers the case where the range is empty).
+  for c in $commits "$local_sha"; do
+    if ! "$SCANNER" "$c"; then
+      status=1
+    fi
+  done
+done
+
+if [[ "$status" -ne 0 ]]; then
+  echo "pre-push: blocked — see matches above." >&2
+fi
+exit "$status"

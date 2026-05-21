@@ -1,0 +1,17 @@
+# Sensitive-pattern denylist — TEMPLATE. Contains NO real values.
+#
+# One POSIX extended-regex per line, matched case-insensitively.
+# Blank lines and lines starting with # are ignored.
+#
+# Local use: copy to the path the scanner reads (default
+#   ~/.config/snow/sensitive_patterns.txt
+# or set SENSITIVE_PATTERNS_FILE) and fill in your org's REAL values.
+# NEVER commit the filled-in file. CI loads the same values from the
+# SENSITIVE_PATTERNS GitHub Actions secret instead.
+#
+# Replace the placeholders below with your real identifiers:
+# acmecorp
+# acme-prod
+# acme ?(&|and) ?co
+# jdoe123
+# 0123456789abcdef0123456789abcdef

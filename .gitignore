@@ -9,3 +9,7 @@ output/
 docs/**
 .claude/**
 .claude/settings.local.json
+
+# Sensitive denylist — never commit real values (use the .example template)
+sensitive_patterns.txt
+.sensitive_patterns
