@@ -3,6 +3,9 @@
 //! `HOME` is overridden to a tempdir so [`DaemonPaths::resolve`] reports
 //! `~tmp/.config/snow/daemon.pid` (which doesn't exist) and the status
 //! probe takes the `(None, false)` branch and prints `stopped`.
+//!
+//! Daemon mode is Unix-only, so this test does not apply on Windows.
+#![cfg(unix)]
 
 #[test]
 fn status_reports_stopped_when_no_pidfile() {

@@ -5,8 +5,11 @@ use anyhow::{Context, Result};
 pub struct DaemonPaths {
     pub config_dir: PathBuf,
     pub pidfile: PathBuf,
+    // Only the Unix daemon lifecycle modules read these; unused on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub statusfile: PathBuf,
     pub logfile: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub logfile_rotated: PathBuf,
     pub socket: PathBuf,
 }

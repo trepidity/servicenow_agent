@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+// `Ordering` is only used by the Unix daemon `send_request`.
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -16,7 +17,9 @@ use snow_core::{
     ResourceType, SearchMatchReason, SemanticIndexSummary, SnowCore, SnowRecord, TaskSlaParentRef,
     TaskSlaStatus,
 };
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::error::SnowError;
@@ -344,6 +347,9 @@ impl TuiClient {
 }
 
 #[derive(Clone)]
+// On non-Unix targets the socket fields are never read (daemon mode is
+// stubbed out), but the struct is still constructed by the Remote variant.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct DaemonRpcClient {
     socket_path: PathBuf,
     instance_url: Option<String>,
@@ -675,6 +681,21 @@ impl DaemonRpcClient {
         }
     }
 
+    // Daemon mode talks to the daemon over a Unix domain socket, which Windows
+    // lacks. The non-Unix stub keeps `DaemonRpcClient` (and the `Remote` TUI
+    // variant) compiling while making any daemon call fail with a clear error.
+    #[cfg(not(unix))]
+    async fn send_request(
+        &self,
+        _method: &str,
+        _params: Option<Value>,
+    ) -> Result<RpcResponse, SnowError> {
+        Err(SnowError::Api(
+            "daemon mode is not supported on this platform (Windows)".to_string(),
+        ))
+    }
+
+    #[cfg(unix)]
     async fn send_request(
         &self,
         method: &str,
@@ -1134,7 +1155,10 @@ impl From<DaemonCacheSource> for CacheSource {
     }
 }
 
+// The JSON-RPC wire types are only exercised by the Unix `send_request`; on
+// non-Unix targets daemon mode is stubbed out, so they read as dead code.
 #[derive(serde::Serialize)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct RpcRequest {
     jsonrpc: &'static str,
     method: String,
@@ -1145,10 +1169,12 @@ struct RpcRequest {
 #[derive(serde::Deserialize)]
 struct RpcResponse {
     result: Option<Value>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     error: Option<RpcError>,
 }
 
 #[derive(serde::Deserialize)]
+#[cfg_attr(not(unix), allow(dead_code))]
 struct RpcError {
     code: i64,
     message: String,

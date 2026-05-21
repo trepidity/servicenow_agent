@@ -85,8 +85,20 @@ fn run_entry(cli: Cli) -> Result<(), SnowError> {
         let Command::Daemon { action } = cli.command else {
             unreachable!()
         };
-        let env_name = daemon_cmd::paths::selected_env(cli.env.as_deref());
-        return daemon_cmd::dispatch(action, &env_name).map_err(SnowError::from);
+        #[cfg(unix)]
+        {
+            let env_name = daemon_cmd::paths::selected_env(cli.env.as_deref());
+            return daemon_cmd::dispatch(action, &env_name).map_err(SnowError::from);
+        }
+        // Daemon mode requires Unix domain sockets and is not available on
+        // Windows; surface a clear error instead of a confusing failure later.
+        #[cfg(not(unix))]
+        {
+            let _ = action;
+            return Err(SnowError::Api(
+                "daemon mode is not supported on this platform (Windows)".to_string(),
+            ));
+        }
     }
 
     if matches!(cli.command, Command::CacheInfo) {
