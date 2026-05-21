@@ -34,30 +34,30 @@ fn policy_describe_exposes_read_only_defaults() {
 fn boards_section_parses() {
     let cfg = PolicyConfig::from_toml_str(
         r#"
-[mcp.boards."5440db79c38832d41b7255af0501314a"]
+[mcp.boards."0123456789abcdef0123456789abcdef"]
 name = "training-board"
 instance_host = "https://example.service-now.com"
 story_table = "rm_story"
 task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
-assignment_group = "17982e3993c0fe549d26b7847aba104f"
-allowed_sprints = ["536d0000473d7a54991e4d69736d4368"]
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["11112222333344445555666677778888"]
 
 [mcp.tools.story_apply_create]
 enabled = true
 requires_confirmation = true
-story_board_id = "5440db79c38832d41b7255af0501314a"
+story_board_id = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("policy TOML should parse");
 
     let binding = cfg
         .boards
-        .get("5440db79c38832d41b7255af0501314a")
+        .get("0123456789abcdef0123456789abcdef")
         .expect("board binding should be present");
     assert_eq!(binding.name, "training-board");
-    assert_eq!(binding.board_sys_id, "5440db79c38832d41b7255af0501314a");
+    assert_eq!(binding.board_sys_id, "0123456789abcdef0123456789abcdef");
     assert!(!binding.allow_production);
     assert!(binding.allowed_story_states.is_empty());
     assert!(binding.allowed_task_states.is_empty());
@@ -66,7 +66,7 @@ story_board_id = "5440db79c38832d41b7255af0501314a"
         cfg.tools
             .get("story_apply_create")
             .and_then(|policy| policy.story_board_id.as_deref()),
-        Some("5440db79c38832d41b7255af0501314a")
+        Some("0123456789abcdef0123456789abcdef")
     );
 }
 
@@ -74,21 +74,21 @@ story_board_id = "5440db79c38832d41b7255af0501314a"
 fn production_label_refuses_without_override() {
     let cfg = PolicyConfig::from_toml_str(
         r#"
-[mcp.boards."5440db79c38832d41b7255af0501314a"]
+[mcp.boards."0123456789abcdef0123456789abcdef"]
 name = "training-board"
 instance_host = "https://example.service-now.com"
 story_table = "rm_story"
 task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
-assignment_group = "17982e3993c0fe549d26b7847aba104f"
-allowed_sprints = ["536d0000473d7a54991e4d69736d4368"]
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["11112222333344445555666677778888"]
 
 [mcp.tools.story_apply_create]
 enabled = true
 requires_confirmation = true
 environments = ["test", "training", "production"]
-story_board_id = "5440db79c38832d41b7255af0501314a"
+story_board_id = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("policy TOML should parse");
@@ -102,7 +102,7 @@ story_board_id = "5440db79c38832d41b7255af0501314a"
         error,
         BoardPolicyError::ProductionBoardNotAllowed {
             tool: "story_apply_create".to_string(),
-            board_id: "5440db79c38832d41b7255af0501314a".to_string(),
+            board_id: "0123456789abcdef0123456789abcdef".to_string(),
         }
     );
 }
@@ -114,21 +114,21 @@ fn configured_production_host_refuses_without_override() {
 [mcp]
 production_hosts = ["EXAMPLE.service-now.com"]
 
-[mcp.boards."5440db79c38832d41b7255af0501314a"]
+[mcp.boards."0123456789abcdef0123456789abcdef"]
 name = "training-board"
 instance_host = "https://example.service-now.com/"
 story_table = "rm_story"
 task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
-assignment_group = "17982e3993c0fe549d26b7847aba104f"
-allowed_sprints = ["536d0000473d7a54991e4d69736d4368"]
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["11112222333344445555666677778888"]
 
 [mcp.tools.story_apply_create]
 enabled = true
 requires_confirmation = true
 environments = ["test", "training"]
-story_board_id = "5440db79c38832d41b7255af0501314a"
+story_board_id = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("policy TOML should parse");
@@ -142,7 +142,7 @@ story_board_id = "5440db79c38832d41b7255af0501314a"
         error,
         BoardPolicyError::ProductionBoardNotAllowed {
             tool: "story_apply_create".to_string(),
-            board_id: "5440db79c38832d41b7255af0501314a".to_string(),
+            board_id: "0123456789abcdef0123456789abcdef".to_string(),
         }
     );
 }
@@ -151,21 +151,21 @@ story_board_id = "5440db79c38832d41b7255af0501314a"
 fn empty_production_hosts_means_label_only_detection() {
     let cfg = PolicyConfig::from_toml_str(
         r#"
-[mcp.boards."5440db79c38832d41b7255af0501314a"]
+[mcp.boards."0123456789abcdef0123456789abcdef"]
 name = "training-board"
 instance_host = "https://example.service-now.com"
 story_table = "rm_story"
 task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
-assignment_group = "17982e3993c0fe549d26b7847aba104f"
-allowed_sprints = ["536d0000473d7a54991e4d69736d4368"]
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["11112222333344445555666677778888"]
 
 [mcp.tools.story_apply_create]
 enabled = true
 requires_confirmation = true
 environments = ["test", "training"]
-story_board_id = "5440db79c38832d41b7255af0501314a"
+story_board_id = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("policy TOML should parse");
@@ -186,21 +186,21 @@ fn substring_only_production_host_does_not_match() {
 [mcp]
 production_hosts = ["example.service-now.com"]
 
-[mcp.boards."5440db79c38832d41b7255af0501314a"]
+[mcp.boards."0123456789abcdef0123456789abcdef"]
 name = "training-board"
 instance_host = "https://example.service-now.com.attacker.invalid"
 story_table = "rm_story"
 task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
-assignment_group = "17982e3993c0fe549d26b7847aba104f"
-allowed_sprints = ["536d0000473d7a54991e4d69736d4368"]
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["11112222333344445555666677778888"]
 
 [mcp.tools.story_apply_create]
 enabled = true
 requires_confirmation = true
 environments = ["test", "training"]
-story_board_id = "5440db79c38832d41b7255af0501314a"
+story_board_id = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("policy TOML should parse");

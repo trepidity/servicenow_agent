@@ -1,0 +1,33 @@
+name: sensitive-scan
+
+# Block organization-specific identifiers from reaching the repo. The denylist
+# is supplied entirely via the SENSITIVE_PATTERNS secret (one regex per line);
+# no patterns are stored in the repository.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load denylist from secret
+        env:
+          SENSITIVE_PATTERNS: ${{ secrets.SENSITIVE_PATTERNS }}
+        run: |
+          if [ -z "${SENSITIVE_PATTERNS}" ]; then
+            echo "::error::SENSITIVE_PATTERNS secret is not set; failing closed."
+            exit 1
+          fi
+          # Write to a temp file; GitHub masks the secret value in logs.
+          printf '%s\n' "${SENSITIVE_PATTERNS}" > "${RUNNER_TEMP}/patterns.txt"
+
+      - name: Scan checked-out tree
+        env:
+          SENSITIVE_PATTERNS_FILE: ${{ runner.temp }}/patterns.txt
+        run: bash scripts/sensitive_scan.sh HEAD

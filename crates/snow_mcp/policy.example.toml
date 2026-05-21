@@ -1,0 +1,158 @@
+# snow_mcp policy — example/template
+#
+# Point the daemon at this file to override the compiled-in defaults WITHOUT
+# recompiling:
+#
+#     export SNOW_MCP_POLICY_PATH=/etc/snow/policy.toml
+#     export SNOW_ENV=test          # environment label this deployment runs as
+#     snow_daemon
+#
+# Loader:  snow_daemon/src/lib.rs::mcp_config_from_env  ->  PolicyConfig::from_toml_str
+# Schema:  every key below maps to a field in crates/snow_mcp/src/domain/policy.rs
+#          (PolicyConfig / ToolPolicy / RoleAllowList / BoardBinding).
+# Note:    the whole document is namespaced under [mcp].
+#
+# Tool-enablement rule (see PolicyConfig::is_tool_enabled):
+#   * If a [mcp.tools.<name>] entry exists, its `enabled` flag is authoritative.
+#   * If NO entry exists: read tools default enabled, write tools default DISABLED.
+#     ("write tool" = name contains _apply_/_submit_ or is in is_write_tool()).
+# Environment gate (tool_enabled_in_environment):
+#   a tool is callable only if enabled AND (environments empty OR contains SNOW_ENV).
+
+[mcp]
+environment = "test"                       # default label if SNOW_ENV unset
+instance_timezone = "America/Chicago"
+default_mode = "read_only"                 # read_only is the safe default posture
+kb_freshness_days = 365
+idempotency_window_seconds = 86400         # 24h dedupe window for writes
+phi_in_work_notes = "warn"                 # warn | block | allow
+confirmation_ttl_seconds_default = 600     # how long a confirm token stays valid
+production_hosts = ["myinstance.service-now.com"]  # hosts treated as production
+
+# ---------------------------------------------------------------------------
+# Per-tool overrides. Only list a tool here when you want to change its default.
+# ---------------------------------------------------------------------------
+
+# Enable a write tool that ships DISABLED by default:
+[mcp.tools.story_apply_create]
+enabled = true
+requires_confirmation = true               # require a confirm token before applying
+requires_kb_evidence = false
+environments = ["test", "training"]        # never callable in production
+confirmation_ttl_seconds = 600
+field_allowlist = [                        # only these fields may be written
+    "short_description",
+    "description",
+    "acceptance_criteria",
+    "priority",
+    "epic",
+    "story_points",
+    "assigned_to",
+]
+story_board_id = "0123456789abcdef0123456789abcdef"
+
+# Tighten a tool that is enabled by default (e.g. forbid it in prod, cap bulk):
+[mcp.tools.work_note_apply_add]
+enabled = true
+requires_confirmation = true
+field_allowlist = ["work_notes"]
+environments = ["test", "training"]
+confirmation_ttl_seconds = 300
+
+# Explicitly DISABLE a tool regardless of its default:
+[mcp.tools.catalog_submit_request]
+enabled = false
+
+# Enable a scaffold/bulk write tool with a record cap:
+[mcp.tools.change_task_apply_assignment]
+enabled = false                            # flip to true to allow
+requires_confirmation = true
+field_allowlist = ["assigned_to", "start_date", "end_date"]
+environments = ["test", "training"]
+max_records = 20                           # reject bulk ops above this size
+skip_terminal_records = true               # ignore closed/cancelled records
+
+# --- Remaining write tools (all ship DISABLED by default) ---
+# The complete set of write tools you may toggle (is_write_tool):
+#   catalog_submit_request, catalog_cancel_request, work_note_apply_add,
+#   story_apply_create, story_apply_update,
+#   story_task_apply_create, story_task_apply_update,
+#   change_submit_request, change_task_apply_assignment, plan_cancel
+# Read tools are enabled by default and never need an entry here.
+
+[mcp.tools.story_apply_update]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+story_board_id = "0123456789abcdef0123456789abcdef"
+field_allowlist = [
+    "short_description", "description", "acceptance_criteria",
+    "priority", "epic", "story_points", "assigned_to", "state",
+]
+
+[mcp.tools.story_task_apply_create]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+story_board_id = "0123456789abcdef0123456789abcdef"
+field_allowlist = [
+    "short_description", "description", "assigned_to", "priority",
+    "due_date", "state", "planned_hours", "actual_hours",
+]
+
+[mcp.tools.story_task_apply_update]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+story_board_id = "0123456789abcdef0123456789abcdef"
+field_allowlist = [
+    "short_description", "description", "assigned_to", "priority",
+    "due_date", "state", "planned_hours", "actual_hours",
+]
+
+# Cancel a cancellable catalog request (sc_req_item).
+[mcp.tools.catalog_cancel_request]
+enabled = false
+requires_confirmation = true
+
+# Scaffold — not yet implemented; listed so the full write surface is visible.
+[mcp.tools.change_submit_request]
+enabled = false
+requires_confirmation = true
+
+# Cancel a pending MCP operation plan (not a ServiceNow record). No board needed.
+[mcp.tools.plan_cancel]
+enabled = false
+requires_confirmation = true
+
+# ---------------------------------------------------------------------------
+# Optional: per-role allow-lists. A caller's role further restricts which tools
+# it may invoke, intersected with the per-tool policy above.
+# ---------------------------------------------------------------------------
+
+# Role tool names MUST match the registered tool names in src/tools/* exactly
+# (e.g. `get_record`/`search_records`, not `record_get`); an unknown name is a
+# silent no-op in the allow-list.
+[mcp.roles.read_only_agent]
+read_tools = ["get_record", "search_records", "knowledge_search", "story_get"]
+write_tools = []
+
+[mcp.roles.story_writer]
+read_tools = ["story_get", "story_tasks_list", "story_plan_create", "story_plan_update"]
+write_tools = ["story_apply_create", "story_apply_update"]
+
+# ---------------------------------------------------------------------------
+# Optional: story-board bindings, required for governed story_* write tools.
+# Keyed by board sys_id.
+# ---------------------------------------------------------------------------
+
+[mcp.boards."0123456789abcdef0123456789abcdef"]
+name = "training-board"
+instance_host = "https://myinstance.service-now.com"
+story_table = "rm_story"
+task_table = "rm_scrum_task"
+column_field = "sprint"
+swim_lane_field = "epic"
+assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_sprints = ["00000000000000000000000000000000"]
+allow_production = false
