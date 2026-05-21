@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use snow_core::ipc::IpcEndpoint;
 
 pub struct DaemonPaths {
     pub config_dir: PathBuf,
@@ -12,6 +13,7 @@ pub struct DaemonPaths {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub logfile_rotated: PathBuf,
     pub socket: PathBuf,
+    pub endpoint: IpcEndpoint,
 }
 
 impl DaemonPaths {
@@ -19,24 +21,36 @@ impl DaemonPaths {
         let config_dir = resolve_config_dir().context("resolving snow config dir")?;
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("creating {}", config_dir.display()))?;
+        let endpoint = IpcEndpoint::for_config_dir(&config_dir);
+        let socket = endpoint
+            .filesystem_path()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_dir.join("daemon.sock"));
         Ok(Self {
             pidfile: config_dir.join("daemon.pid"),
             statusfile: config_dir.join("daemon.status"),
             logfile: config_dir.join("daemon.log"),
             logfile_rotated: config_dir.join("daemon.log.1"),
-            socket: config_dir.join("daemon.sock"),
+            socket,
+            endpoint,
             config_dir,
         })
     }
 
     #[cfg(test)]
     pub fn under(root: PathBuf) -> Self {
+        let endpoint = IpcEndpoint::for_config_dir(&root);
+        let socket = endpoint
+            .filesystem_path()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("daemon.sock"));
         Self {
             pidfile: root.join("daemon.pid"),
             statusfile: root.join("daemon.status"),
             logfile: root.join("daemon.log"),
             logfile_rotated: root.join("daemon.log.1"),
-            socket: root.join("daemon.sock"),
+            socket,
+            endpoint,
             config_dir: root,
         }
     }
@@ -65,8 +79,8 @@ pub fn config_path(filename: &str) -> PathBuf {
         return p;
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join(".config").join("snow").join(filename);
+    if let Ok(config_dir) = resolve_config_dir() {
+        let p = config_dir.join(filename);
         if p.exists() {
             return p;
         }
@@ -75,22 +89,14 @@ pub fn config_path(filename: &str) -> PathBuf {
     PathBuf::from(filename)
 }
 
-fn resolve_config_dir() -> Result<PathBuf> {
-    // Match the existing snow config-dir pattern documented in
-    // memory/reference_config_dir_pattern.md: exe -> ~/.config/snow -> cwd.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join("snow_config");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        let candidate = home.join(".config").join("snow");
-        return Ok(candidate);
-    }
-    Ok(std::env::current_dir()?.join(".snow"))
+pub fn config_dir_hint() -> String {
+    resolve_config_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".snow".to_string())
+}
+
+pub fn resolve_config_dir() -> Result<PathBuf> {
+    snow_core::ipc::resolve_config_dir().context("resolving shared snow config dir")
 }
 
 #[cfg(test)]

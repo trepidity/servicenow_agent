@@ -1,15 +1,19 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use snow_core::ipc::{IpcEndpoint, IpcStream, default_endpoint_from_env};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::process::Command;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::config::McpConfig;
 use crate::domain::policy::is_write_tool;
@@ -22,6 +26,8 @@ use crate::{Error, Result};
 
 const JSON_RPC_VERSION: &str = "2.0";
 const DEFAULT_CONTRACT_VERSION: &str = "daemon-json-rpc-v1";
+const DEFAULT_AUTOSPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+const AUTOSPAWN_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("get_record", "get_record"),
@@ -67,27 +73,200 @@ pub trait DaemonJsonRpcClient: Send + Sync {
     async fn request(&self, method: &str, params: Value) -> Result<Value>;
 }
 
+pub type DaemonEndpoint = IpcEndpoint;
+
 #[derive(Debug)]
-pub struct UnixDaemonJsonRpcClient {
-    socket_path: PathBuf,
-    next_id: AtomicU64,
+pub struct ProcessDaemonAutoSpawn {
+    snow_bin: PathBuf,
+    start_timeout: Duration,
+    retry_timeout: Duration,
+    retry_interval: Duration,
+    spawn_lock: Mutex<()>,
 }
 
-impl UnixDaemonJsonRpcClient {
-    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+impl ProcessDaemonAutoSpawn {
+    pub fn new(snow_bin: impl Into<PathBuf>) -> Self {
         Self {
-            socket_path: socket_path.into(),
-            next_id: AtomicU64::new(1),
+            snow_bin: snow_bin.into(),
+            start_timeout: DEFAULT_AUTOSPAWN_TIMEOUT,
+            retry_timeout: DEFAULT_AUTOSPAWN_TIMEOUT,
+            retry_interval: AUTOSPAWN_RETRY_INTERVAL,
+            spawn_lock: Mutex::new(()),
         }
     }
 
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn with_timeouts(
+        snow_bin: impl Into<PathBuf>,
+        start_timeout: Duration,
+        retry_timeout: Duration,
+        retry_interval: Duration,
+    ) -> Self {
+        Self {
+            snow_bin: snow_bin.into(),
+            start_timeout,
+            retry_timeout,
+            retry_interval,
+            spawn_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn snow_bin(&self) -> &Path {
+        &self.snow_bin
+    }
+
+    async fn start(&self) -> Result<()> {
+        let _guard = self.spawn_lock.lock().await;
+        let output = timeout(self.start_timeout, {
+            let mut command = Command::new(&self.snow_bin);
+            command.arg("daemon").arg("start").stdin(Stdio::null());
+            command.output()
+        })
+        .await
+        .map_err(|_| {
+            Error::InvalidParams(format!(
+                "daemon unavailable and auto-spawn timed out running {} daemon start",
+                self.snow_bin.display()
+            ))
+        })?
+        .map_err(|err| {
+            Error::InvalidParams(format!(
+                "daemon unavailable and auto-spawn failed to execute {} daemon start: {err}",
+                self.snow_bin.display()
+            ))
+        })?;
+
+        if !output.status.success() {
+            return Err(Error::InvalidParams(format!(
+                "daemon unavailable and auto-spawn command failed: {} daemon start exited with {}{}",
+                self.snow_bin.display(),
+                output.status,
+                command_output_summary(&output.stdout, &output.stderr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum AutoSpawnMode {
+    Process(ProcessDaemonAutoSpawn),
+    Unavailable(String),
+}
+
+#[derive(Debug)]
+pub struct LocalSocketDaemonJsonRpcClient {
+    endpoint: DaemonEndpoint,
+    next_id: AtomicU64,
+    auto_spawn: Option<AutoSpawnMode>,
+}
+
+pub type UnixDaemonJsonRpcClient = LocalSocketDaemonJsonRpcClient;
+
+impl LocalSocketDaemonJsonRpcClient {
+    pub fn new(endpoint: impl Into<DaemonEndpoint>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            next_id: AtomicU64::new(1),
+            auto_spawn: None,
+        }
+    }
+
+    pub fn with_auto_spawn(
+        endpoint: impl Into<DaemonEndpoint>,
+        auto_spawn: ProcessDaemonAutoSpawn,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            next_id: AtomicU64::new(1),
+            auto_spawn: Some(AutoSpawnMode::Process(auto_spawn)),
+        }
+    }
+
+    pub fn with_unavailable_auto_spawn(
+        endpoint: impl Into<DaemonEndpoint>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            next_id: AtomicU64::new(1),
+            auto_spawn: Some(AutoSpawnMode::Unavailable(reason.into())),
+        }
+    }
+
+    pub fn from_socket_path(socket_path: impl Into<PathBuf>) -> Self {
+        Self::new(DaemonEndpoint::from_socket_path(socket_path))
+    }
+
+    pub fn endpoint(&self) -> &DaemonEndpoint {
+        &self.endpoint
+    }
+
+    pub fn socket_path(&self) -> Option<&Path> {
+        self.endpoint.socket_path()
+    }
+
+    async fn connect(&self) -> Result<IpcStream> {
+        let first_error = match self.try_connect().await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => err,
+        };
+
+        match &self.auto_spawn {
+            Some(AutoSpawnMode::Process(auto_spawn)) => {
+                auto_spawn.start().await?;
+                self.wait_for_connect(
+                    first_error,
+                    auto_spawn.retry_timeout,
+                    auto_spawn.retry_interval,
+                )
+                .await
+            }
+            Some(AutoSpawnMode::Unavailable(reason)) => Err(Error::InvalidParams(format!(
+                "daemon unavailable and auto-spawn could not locate snow ({reason}); endpoint: {}; connect error: {first_error}",
+                self.endpoint
+            ))),
+            None => Err(Error::Io(first_error)),
+        }
+    }
+
+    async fn wait_for_connect(
+        &self,
+        first_error: std::io::Error,
+        retry_timeout: Duration,
+        retry_interval: Duration,
+    ) -> Result<IpcStream> {
+        let first_error = first_error.to_string();
+        let deadline = Instant::now() + retry_timeout;
+        let mut last_error: String;
+
+        loop {
+            match self.try_connect().await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => last_error = err.to_string(),
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline - now;
+            sleep(retry_interval.min(remaining)).await;
+        }
+
+        Err(Error::InvalidParams(format!(
+            "daemon unavailable after auto-spawn retry window; endpoint: {}; first connect error: {first_error}; last connect error: {last_error}",
+            self.endpoint
+        )))
+    }
+
+    async fn try_connect(&self) -> std::io::Result<IpcStream> {
+        self.endpoint.connect().await
     }
 }
 
 #[async_trait]
-impl DaemonJsonRpcClient for UnixDaemonJsonRpcClient {
+impl DaemonJsonRpcClient for LocalSocketDaemonJsonRpcClient {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
@@ -97,8 +276,8 @@ impl DaemonJsonRpcClient for UnixDaemonJsonRpcClient {
             "params": params,
         });
 
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let (reader, mut writer) = stream.into_split();
+        let stream = self.connect().await?;
+        let (reader, mut writer) = tokio::io::split(stream);
         writer
             .write_all(serde_json::to_string(&payload)?.as_bytes())
             .await?;
@@ -139,6 +318,28 @@ impl DaemonJsonRpcClient for UnixDaemonJsonRpcClient {
     }
 }
 
+pub fn default_daemon_endpoint() -> DaemonEndpoint {
+    default_endpoint_from_env()
+        .unwrap_or_else(|_| DaemonEndpoint::filesystem(PathBuf::from(".snow").join("daemon.sock")))
+}
+
+fn command_output_summary(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    if stderr.is_empty() && stdout.is_empty() {
+        return String::new();
+    }
+
+    let details = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("stderr: {stderr}; stdout: {stdout}")
+    };
+    format!(": {}", details.chars().take(500).collect::<String>())
+}
+
 #[derive(Debug, Clone)]
 struct DaemonContract {
     environment: String,
@@ -172,7 +373,9 @@ impl DaemonBackedMcpBridge {
 
     pub fn from_socket(socket_path: impl Into<PathBuf>) -> Self {
         Self::new(
-            Arc::new(UnixDaemonJsonRpcClient::new(socket_path)),
+            Arc::new(LocalSocketDaemonJsonRpcClient::from_socket_path(
+                socket_path,
+            )),
             McpConfig::default(),
             DEFAULT_CONTRACT_VERSION,
         )

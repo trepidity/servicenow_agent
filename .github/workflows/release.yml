@@ -34,9 +34,8 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-            # Daemon mode (snow_daemon, snow_mcp_bridge) relies on Unix domain
-            # sockets and is unsupported on Windows, so only the CLI is built.
-            bins: --bin snow
+            # All three binaries build on Windows through interprocess local sockets.
+            bins: --bin snow --bin snow_daemon --bin snow_mcp_bridge
 
     steps:
       - name: Checkout
@@ -75,8 +74,9 @@ jobs:
         run: |
           staging="snow-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$staging"
-          # Only the CLI ships on Windows; daemon mode is Unix-only.
           cp "target/${{ matrix.target }}/release/snow.exe" "$staging/"
+          cp "target/${{ matrix.target }}/release/snow_daemon.exe" "$staging/"
+          cp "target/${{ matrix.target }}/release/snow_mcp_bridge.exe" "$staging/"
           cp README.md "$staging/" 2>/dev/null || true
           7z a "${staging}.zip" "$staging"
           echo "ASSET=${staging}.zip" >> "$GITHUB_ENV"

@@ -23,7 +23,7 @@ pub struct AdminApp {
     pub current: Tab,
     /// Daemon RPC handle (heartbeat + job dispatch).
     pub rpc: AdminRpc,
-    /// Last-known reachability of the daemon socket.
+    /// Last-known reachability of the daemon endpoint.
     pub daemon_reachable: bool,
     /// Whether the jobs overlay is currently open.
     pub jobs_overlay_open: bool,
@@ -227,7 +227,7 @@ impl AdminApp {
             KeyCode::Char('x') => {
                 self.pending_confirm = Some(PendingConfirm {
                     title: "Confirm: stop daemon".into(),
-                    action_label: "Send SIGTERM to daemon".into(),
+                    action_label: "Request daemon shutdown".into(),
                     impact: "All in-flight RPC calls will fail. Running jobs will be cancelled."
                         .into(),
                     confirm: ConfirmAction::DaemonStop,
@@ -435,7 +435,7 @@ impl AdminApp {
             }
             ConfirmAction::DaemonStop => {
                 // Spawn `snow daemon stop` so the TUI itself doesn't have to
-                // manage signals or fork bookkeeping.
+                // manage shutdown RPCs or platform fallback details.
                 std::process::Command::new(std::env::current_exe()?)
                     .args(["daemon", "stop"])
                     .spawn()?;

@@ -33,3 +33,26 @@ jobs:
 
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  windows-daemon-tests:
+    name: windows daemon tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace builds on Windows
+        run: cargo check --workspace
+
+      - name: Run cross-platform daemon tests
+        run: |
+          cargo test -p snow_core ipc -- --test-threads=1
+          cargo test -p snow_daemon shutdown -- --test-threads=1
+          cargo test -p snow_cli --test daemon_status
+          cargo test -p snow_mcp --bin snow_mcp_bridge

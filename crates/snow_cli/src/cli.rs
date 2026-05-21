@@ -27,7 +27,7 @@ pub enum Command {
         /// Use the JSON-RPC daemon instead of embedding snow_core locally
         #[arg(long)]
         daemon: bool,
-        /// Override the daemon Unix socket path. Implies --daemon.
+        /// Override the daemon filesystem socket path. Implies --daemon.
         #[arg(long, value_name = "PATH")]
         socket_path: Option<PathBuf>,
     },
@@ -143,6 +143,13 @@ pub enum DaemonCommand {
         /// Print only the last N lines and exit
         #[arg(long)]
         lines: Option<usize>,
+    },
+    /// Internal daemon entrypoint used by `snow daemon start`.
+    #[command(name = "__serve", hide = true)]
+    Serve {
+        /// Environment label passed by the launcher.
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 
@@ -463,6 +470,17 @@ mod tests {
             Command::Daemon {
                 action: DaemonCommand::Start
             }
+        ));
+    }
+
+    #[test]
+    fn parses_hidden_daemon_serve() {
+        let cli = Cli::parse_from(["snow", "daemon", "__serve", "--env", "prd"]);
+        assert!(matches!(
+            cli.command,
+            Command::Daemon {
+                action: DaemonCommand::Serve { env: Some(env) }
+            } if env == "prd"
         ));
     }
 

@@ -9,6 +9,7 @@ pub mod credential;
 pub mod display;
 pub mod enrich;
 pub(crate) mod helpers;
+pub mod ipc;
 pub mod kb;
 pub mod query;
 pub(crate) mod reference;

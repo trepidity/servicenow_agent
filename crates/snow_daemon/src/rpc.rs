@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use interprocess::local_socket::tokio::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use snow_core::ipc::IpcEndpoint;
 use snow_core::{
     KnowledgeSemanticSearchFilters, ResourceType, SearchScope, SnowCore, SnowRecord,
     TaskSlaParentRef, cache::store::Store, query::filter::ListQuery,
@@ -9,10 +11,12 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::signal;
+use tokio::sync::Notify;
+use tokio_util::task::TaskTracker;
 
 use crate::transport::{
     DaemonKnowledgeSemanticStatus, DaemonKnowledgeStatus, DaemonKnowledgeSyncOutcome,
@@ -120,6 +124,7 @@ pub enum RpcMethod {
     StoryTaskApplyCreate,
     StoryTaskPlanUpdate,
     StoryTaskApplyUpdate,
+    Shutdown,
     Ping,
     Unknown,
 }
@@ -192,6 +197,7 @@ impl RpcMethod {
             "story_task_apply_create" => Self::StoryTaskApplyCreate,
             "story_task_plan_update" => Self::StoryTaskPlanUpdate,
             "story_task_apply_update" => Self::StoryTaskApplyUpdate,
+            "shutdown" => Self::Shutdown,
             "ping" => Self::Ping,
             _ => Self::Unknown,
         }
@@ -201,12 +207,27 @@ impl RpcMethod {
 #[derive(Clone)]
 pub struct JsonRpcServer {
     state: Arc<DaemonState>,
-    socket_path: PathBuf,
+    endpoint: IpcEndpoint,
+    shutdown: Arc<Notify>,
+    drain_timeout: Duration,
 }
 
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl JsonRpcServer {
-    pub fn new(state: Arc<DaemonState>, socket_path: PathBuf) -> Self {
-        Self { state, socket_path }
+    pub fn new(state: Arc<DaemonState>, endpoint: impl Into<IpcEndpoint>) -> Self {
+        Self {
+            state,
+            endpoint: endpoint.into(),
+            shutdown: Arc::new(Notify::new()),
+            drain_timeout: CONNECTION_DRAIN_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
+        self.drain_timeout = drain_timeout;
+        self
     }
 
     pub async fn serve(self) -> Result<()> {
@@ -217,39 +238,61 @@ impl JsonRpcServer {
     where
         F: Future<Output = Result<(), std::io::Error>>,
     {
-        if let Some(parent) = self.socket_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let _ = fs::remove_file(&self.socket_path).await;
-
-        let listener = UnixListener::bind(&self.socket_path)
-            .with_context(|| format!("failed to bind {}", self.socket_path.display()))?;
-        eprintln!(
-            "snow_daemon: json-rpc listening on {}",
-            self.socket_path.display()
-        );
+        prepare_listener(&self.endpoint).await?;
+        let listener = self
+            .endpoint
+            .listen()
+            .with_context(|| format!("failed to bind {}", self.endpoint))?;
+        eprintln!("snow_daemon: json-rpc listening on {}", self.endpoint);
+        let tracker = TaskTracker::new();
         tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
                 accept = listener.accept() => {
-                    let (stream, _) = accept?;
+                    let stream = accept?;
                     let state = Arc::clone(&self.state);
-                    tokio::task::spawn_local(async move {
-                        if let Err(err) = handle_connection(stream, state).await {
+                    let shutdown = Arc::clone(&self.shutdown);
+                    tracker.spawn_local(async move {
+                        if let Err(err) = handle_connection(stream, state, shutdown).await {
                             eprintln!("json-rpc connection error: {err:#}");
                         }
                     });
                 }
                 _ = &mut shutdown => {
-                    let _ = fs::remove_file(&self.socket_path).await;
+                    break;
+                }
+                _ = self.shutdown.notified() => {
                     break;
                 }
             }
         }
 
+        tracker.close();
+        let _ = cleanup_listener(&self.endpoint).await;
+        let _ = tokio::time::timeout(self.drain_timeout, tracker.wait()).await;
+
         Ok(())
     }
+}
+
+async fn prepare_listener(endpoint: &IpcEndpoint) -> std::io::Result<()> {
+    if let Some(path) = endpoint.filesystem_path() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).await?;
+        }
+        let _ = fs::remove_file(path).await;
+    }
+    Ok(())
+}
+
+async fn cleanup_listener(endpoint: &IpcEndpoint) -> std::io::Result<()> {
+    if let Some(path) = endpoint.filesystem_path() {
+        let _ = fs::remove_file(path).await;
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() -> Result<(), std::io::Error> {
@@ -268,8 +311,15 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
     }
 }
 
-async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn handle_connection<S>(
+    stream: S,
+    state: Arc<DaemonState>,
+    shutdown: Arc<Notify>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
@@ -284,8 +334,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
             break;
         }
 
+        let mut should_shutdown = false;
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => dispatch(request, &state).await,
+            Ok(request) => {
+                should_shutdown = RpcMethod::from_method(&request.method) == RpcMethod::Shutdown;
+                dispatch(request, &state).await
+            }
             Err(err) => JsonRpcResponse::error(
                 None,
                 -32700,
@@ -306,6 +360,12 @@ async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) -> Resul
                 break;
             }
             return Err(err.into());
+        }
+        writer.flush().await?;
+
+        if should_shutdown {
+            shutdown.notify_one();
+            break;
         }
     }
 
@@ -328,6 +388,7 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
     match RpcMethod::from_method(&request.method) {
         RpcMethod::ContractInfo => JsonRpcResponse::ok(id, contract_info(state.as_ref())),
         RpcMethod::Ping => JsonRpcResponse::ok(id, json!({ "ok": true })),
+        RpcMethod::Shutdown => JsonRpcResponse::ok(id, json!({ "status": "shutting_down" })),
         RpcMethod::VaultPath => JsonRpcResponse::ok(id, json!({ "path": transport.vault_path() })),
         RpcMethod::GetRecord => match extract_number(&request.params) {
             Ok(number) => match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
@@ -1000,6 +1061,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "story_task_apply_create",
     "story_task_plan_update",
     "story_task_apply_update",
+    "shutdown",
 ];
 
 const DEPRECATED_RPC_ALIASES: &[(&str, &str)] = &[
@@ -1432,6 +1494,7 @@ mod tests {
         build_fixture_state, build_fixture_state_at_instance,
         build_fixture_state_without_instance_config, socket_path, spawn_json_http_server,
     };
+    use interprocess::local_socket::tokio::Stream as LocalSocketStream;
     use rusqlite::Connection;
     use serde_json::json;
     use snow_mcp::McpServer;
@@ -1439,9 +1502,27 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::io::{duplex, split};
     use tokio::net::TcpListener;
-    use tokio::net::UnixStream;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
+
+    async fn connect_endpoint(endpoint: &IpcEndpoint) -> std::io::Result<LocalSocketStream> {
+        endpoint.connect().await
+    }
+
+    fn test_endpoint_for_socket(socket: &std::path::Path) -> IpcEndpoint {
+        #[cfg(windows)]
+        {
+            let config_dir = socket.parent().unwrap_or_else(|| std::path::Path::new("."));
+            IpcEndpoint::for_config_dir(config_dir)
+        }
+
+        #[cfg(not(windows))]
+        {
+            IpcEndpoint::Filesystem {
+                path: socket.to_path_buf(),
+            }
+        }
+    }
 
     #[test]
     fn rpc_method_parsing_covers_known_methods() {
@@ -1571,6 +1652,7 @@ mod tests {
             RpcMethod::from_method("story_task_apply_update"),
             RpcMethod::StoryTaskApplyUpdate
         );
+        assert_eq!(RpcMethod::from_method("shutdown"), RpcMethod::Shutdown);
         assert_eq!(RpcMethod::from_method("unknown"), RpcMethod::Unknown);
     }
 
@@ -2784,7 +2866,8 @@ story_board_id = "board-sys"
     async fn json_rpc_socket_round_trip_and_concurrency() {
         let fixture = build_fixture_state().await.expect("fixture");
         let socket = socket_path(&fixture.tempdir);
-        let server = JsonRpcServer::new(Arc::clone(&fixture.state), socket.clone());
+        let endpoint = test_endpoint_for_socket(&socket);
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let local = LocalSet::new();
@@ -2801,8 +2884,9 @@ story_board_id = "board-sys"
             .run_until(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                let held_open = UnixStream::connect(&socket).await.expect("first client");
-                let (reader, mut writer) = UnixStream::connect(&socket).await.expect("second client").into_split();
+                let held_open = connect_endpoint(&endpoint).await.expect("first client");
+                let (reader, mut writer) =
+                    split(connect_endpoint(&endpoint).await.expect("second client"));
                 writer
                     .write_all(br#"{"jsonrpc":"2.0","method":"ping","id":1}"#)
                     .await
@@ -2848,6 +2932,86 @@ story_board_id = "board-sys"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_rpc_stops_server_after_response() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        let endpoint = test_endpoint_for_socket(&socket_path(&fixture.tempdir));
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone())
+            .with_drain_timeout(Duration::from_millis(100));
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+        let local = LocalSet::new();
+        local.spawn_local(async move {
+            let result = server
+                .serve_until(std::future::pending::<Result<(), std::io::Error>>())
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        local
+            .run_until(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let (reader, mut writer) =
+                    split(connect_endpoint(&endpoint).await.expect("client"));
+                writer
+                    .write_all(br#"{"jsonrpc":"2.0","method":"shutdown","id":1}"#)
+                    .await
+                    .expect("write shutdown");
+                writer.write_all(b"\n").await.expect("newline");
+
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read shutdown");
+                assert!(line.contains("\"status\":\"shutting_down\""));
+
+                let result = tokio::time::timeout(Duration::from_secs(1), done_rx)
+                    .await
+                    .expect("server should stop after shutdown")
+                    .expect("server completion signal");
+                result.expect("server result");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_shutdown_waits_for_bounded_connection_drain() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        let endpoint = test_endpoint_for_socket(&socket_path(&fixture.tempdir));
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone())
+            .with_drain_timeout(Duration::from_millis(50));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+        let local = LocalSet::new();
+        local.spawn_local(async move {
+            let result = server
+                .serve_until(async move {
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        local
+            .run_until(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let held_open = connect_endpoint(&endpoint).await.expect("held client");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let _ = shutdown_tx.send(());
+
+                let result = tokio::time::timeout(Duration::from_secs(1), done_rx)
+                    .await
+                    .expect("server should stop after bounded drain")
+                    .expect("server completion signal");
+                result.expect("server result");
+                drop(held_open);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn json_rpc_get_knowledge_article_fresh_uses_live_client() {
         let response = json!({
             "result": [
@@ -2883,7 +3047,8 @@ story_board_id = "board-sys"
             .await
             .expect("fixture");
         let socket = socket_path(&fixture.tempdir);
-        let server = JsonRpcServer::new(Arc::clone(&fixture.state), socket.clone());
+        let endpoint = test_endpoint_for_socket(&socket);
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let local = LocalSet::new();
@@ -2900,10 +3065,8 @@ story_board_id = "board-sys"
             .run_until(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                let (reader, mut writer) = UnixStream::connect(&socket)
-                    .await
-                    .expect("client")
-                    .into_split();
+                let (reader, mut writer) =
+                    split(connect_endpoint(&endpoint).await.expect("client"));
                 writer
                     .write_all(
                         br#"{"jsonrpc":"2.0","method":"get_knowledge_article_fresh","params":{"number":"KB0105015"},"id":1}"#,
@@ -2932,7 +3095,8 @@ story_board_id = "board-sys"
         let fixture = build_fixture_state().await.expect("fixture");
         seed_kb_runtime_state(&fixture).expect("seed kb runtime state");
         let socket = socket_path(&fixture.tempdir);
-        let server = JsonRpcServer::new(Arc::clone(&fixture.state), socket.clone());
+        let endpoint = test_endpoint_for_socket(&socket);
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let local = LocalSet::new();
@@ -2949,10 +3113,8 @@ story_board_id = "board-sys"
             .run_until(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                let (reader, mut writer) = UnixStream::connect(&socket)
-                    .await
-                    .expect("client")
-                    .into_split();
+                let (reader, mut writer) =
+                    split(connect_endpoint(&endpoint).await.expect("client"));
                 writer
                     .write_all(
                         br#"{"jsonrpc":"2.0","method":"search_knowledge","params":{"query":"database","knowledge_base":"IT","limit":5},"id":1}"#,
@@ -3096,8 +3258,8 @@ story_board_id = "board-sys"
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_ignores_broken_pipe_when_client_disconnects() {
         let fixture = build_fixture_state().await.expect("fixture");
-        let (server, client) = UnixStream::pair().expect("socket pair");
-        let (client_reader, mut client_writer) = client.into_split();
+        let (server, client) = duplex(4096);
+        let (client_reader, mut client_writer) = split(client);
         drop(client_reader);
 
         client_writer
@@ -3107,7 +3269,7 @@ story_board_id = "board-sys"
         client_writer.write_all(b"\n").await.expect("newline");
         drop(client_writer);
 
-        handle_connection(server, Arc::clone(&fixture.state))
+        handle_connection(server, Arc::clone(&fixture.state), Arc::new(Notify::new()))
             .await
             .expect("broken pipe should be treated as disconnect");
     }

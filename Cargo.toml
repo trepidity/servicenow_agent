@@ -19,6 +19,7 @@ colored = "3"
 crossterm = "0.29"
 dirs = "6.0.0"
 dotenvy = "0.15"
+interprocess = { version = "2.4.2", features = ["tokio"] }
 open = "5"
 ratatui = "0.30"
 rusqlite = { version = "0.39.0", features = ["bundled"] }

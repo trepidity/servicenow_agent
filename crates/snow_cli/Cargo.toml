@@ -14,7 +14,6 @@ chrono.workspace = true
 clap.workspace = true
 colored.workspace = true
 crossterm.workspace = true
-dirs.workspace = true
 dotenvy.workspace = true
 open.workspace = true
 ratatui.workspace = true
@@ -25,12 +24,9 @@ tokio.workspace = true
 servicenow_rs.workspace = true
 snow_core = { path = "../snow_core" }
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# Daemon mode relies on Unix domain sockets and fork/setsid, so the daemon
-# crate and `nix` are only pulled in on Unix. On Windows the CLI runs every
-# command directly against ServiceNow and daemon mode is unsupported.
-[target.'cfg(unix)'.dependencies]
 snow_daemon = { path = "../snow_daemon" }
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["process", "signal", "fs"] }
 
 [dev-dependencies]

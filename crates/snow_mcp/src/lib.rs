@@ -14,7 +14,10 @@ pub mod tools;
 pub mod transport;
 
 pub use config::{McpConfig, McpEnvironment};
-pub use daemon_bridge::{DaemonBackedMcpBridge, DaemonJsonRpcClient, UnixDaemonJsonRpcClient};
+pub use daemon_bridge::{
+    DaemonBackedMcpBridge, DaemonEndpoint, DaemonJsonRpcClient, LocalSocketDaemonJsonRpcClient,
+    ProcessDaemonAutoSpawn, UnixDaemonJsonRpcClient, default_daemon_endpoint,
+};
 pub use error::{Error, Result};
 pub use protocol::schema::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpResourceDescriptor, McpToolDescriptor,

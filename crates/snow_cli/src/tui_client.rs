@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-// `Ordering` is only used by the Unix daemon `send_request`.
-#[cfg(unix)]
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -15,12 +14,9 @@ use snow_core::{
     KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
     KnowledgeSemanticSearchFilters, KnowledgeSemanticStatus, MatchField, RecordRef, Reference,
     ResourceType, SearchMatchReason, SemanticIndexSummary, SnowCore, SnowRecord, TaskSlaParentRef,
-    TaskSlaStatus,
+    TaskSlaStatus, ipc::IpcEndpoint,
 };
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::error::SnowError;
 
@@ -41,8 +37,21 @@ impl TuiClient {
         Self::Local(core)
     }
 
+    #[allow(dead_code)]
     pub fn remote(socket_path: PathBuf, instance_url: Option<String>) -> Self {
         Self::Remote(Arc::new(DaemonRpcClient::new(socket_path, instance_url)))
+    }
+
+    pub fn remote_endpoint_with_auto_spawn(
+        endpoint: IpcEndpoint,
+        instance_url: Option<String>,
+        env_name: String,
+    ) -> Self {
+        Self::Remote(Arc::new(DaemonRpcClient::with_endpoint_auto_spawn(
+            endpoint,
+            instance_url,
+            env_name,
+        )))
     }
 
     pub fn is_remote(&self) -> bool {
@@ -347,20 +356,33 @@ impl TuiClient {
 }
 
 #[derive(Clone)]
-// On non-Unix targets the socket fields are never read (daemon mode is
-// stubbed out), but the struct is still constructed by the Remote variant.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub struct DaemonRpcClient {
-    socket_path: PathBuf,
+    endpoint: IpcEndpoint,
     instance_url: Option<String>,
+    auto_spawn_env: Option<String>,
     next_id: Arc<AtomicU64>,
 }
 
 impl DaemonRpcClient {
     pub fn new(socket_path: PathBuf, instance_url: Option<String>) -> Self {
+        let endpoint = IpcEndpoint::Filesystem { path: socket_path };
         Self {
-            socket_path,
+            endpoint,
             instance_url,
+            auto_spawn_env: None,
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn with_endpoint_auto_spawn(
+        endpoint: IpcEndpoint,
+        instance_url: Option<String>,
+        env_name: String,
+    ) -> Self {
+        Self {
+            endpoint,
+            instance_url,
+            auto_spawn_env: Some(env_name),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -681,29 +703,51 @@ impl DaemonRpcClient {
         }
     }
 
-    // Daemon mode talks to the daemon over a Unix domain socket, which Windows
-    // lacks. The non-Unix stub keeps `DaemonRpcClient` (and the `Remote` TUI
-    // variant) compiling while making any daemon call fail with a clear error.
-    #[cfg(not(unix))]
-    async fn send_request(
-        &self,
-        _method: &str,
-        _params: Option<Value>,
-    ) -> Result<RpcResponse, SnowError> {
-        Err(SnowError::Api(
-            "daemon mode is not supported on this platform (Windows)".to_string(),
-        ))
-    }
-
-    #[cfg(unix)]
     async fn send_request(
         &self,
         method: &str,
         params: Option<Value>,
     ) -> Result<RpcResponse, SnowError> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|err| SnowError::Api(format!("failed to connect to daemon socket: {err}")))?;
+        let stream = match self.endpoint.connect().await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let Some(env_name) = self.auto_spawn_env.clone() else {
+                    return Err(SnowError::Api(format!(
+                        "failed to connect to daemon endpoint {}: {err}",
+                        self.endpoint
+                    )));
+                };
+                self.auto_spawn_daemon(env_name).await?;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    match self.endpoint.connect().await {
+                        Ok(stream) => break stream,
+                        Err(err) => {
+                            if Instant::now() >= deadline {
+                                return Err(SnowError::Api(format!(
+                                    "failed to connect to daemon endpoint {} after auto-start: {err}",
+                                    self.endpoint
+                                )));
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        };
+
+        self.send_request_on_stream(stream, method, params).await
+    }
+
+    async fn send_request_on_stream<S>(
+        &self,
+        mut stream: S,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<RpcResponse, SnowError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = RpcRequest {
             jsonrpc: "2.0",
@@ -738,6 +782,14 @@ impl DaemonRpcClient {
             return Err(SnowError::Api(message));
         }
         Ok(response)
+    }
+
+    async fn auto_spawn_daemon(&self, env_name: String) -> Result<(), SnowError> {
+        tokio::task::spawn_blocking(move || crate::daemon_cmd::start::ensure_running(&env_name))
+            .await
+            .map_err(|err| SnowError::Api(format!("daemon auto-start task failed: {err}")))?
+            .map(|_| ())
+            .map_err(|err| SnowError::Api(format!("failed to auto-start daemon: {err:#}")))
     }
 }
 
@@ -1155,10 +1207,7 @@ impl From<DaemonCacheSource> for CacheSource {
     }
 }
 
-// The JSON-RPC wire types are only exercised by the Unix `send_request`; on
-// non-Unix targets daemon mode is stubbed out, so they read as dead code.
 #[derive(serde::Serialize)]
-#[cfg_attr(not(unix), allow(dead_code))]
 struct RpcRequest {
     jsonrpc: &'static str,
     method: String,
@@ -1169,12 +1218,10 @@ struct RpcRequest {
 #[derive(serde::Deserialize)]
 struct RpcResponse {
     result: Option<Value>,
-    #[cfg_attr(not(unix), allow(dead_code))]
     error: Option<RpcError>,
 }
 
 #[derive(serde::Deserialize)]
-#[cfg_attr(not(unix), allow(dead_code))]
 struct RpcError {
     code: i64,
     message: String,

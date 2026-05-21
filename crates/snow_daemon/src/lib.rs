@@ -2,12 +2,12 @@
 
 //! Library entry for `snow_daemon`.
 //!
-//! `main.rs` is now a thin wrapper that resolves the socket path and calls
+//! `main.rs` is now a thin wrapper that resolves the endpoint path and calls
 //! [`run_blocking`]. All shared types ([`DaemonState`], [`DaemonConfig`]) and
 //! modules ([`jobs`], [`rpc`], [`transport`]) live here so the
 //! `jobs` module can reference `crate::DaemonState` without forcing a
-//! circular `crate::main` import, and so external callers (such as
-//! `snow daemon start`) can spawn the daemon in-process.
+//! circular `crate::main` import, and so external callers can host the daemon
+//! runtime without duplicating setup.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use snow_core::{
     SnowCore,
     config::{self as core_config, SnowConfig},
     credential::CredentialProvider,
+    ipc::IpcEndpoint,
 };
 
 pub mod jobs;
@@ -33,8 +34,11 @@ use crate::jobs::JobRegistry;
 /// Static configuration captured at daemon startup.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
-    /// Filesystem path of the JSON-RPC Unix socket.
-    pub socket_path: PathBuf,
+    /// Portable local-socket endpoint for JSON-RPC IPC.
+    pub endpoint: IpcEndpoint,
+    /// Directory for daemon-owned files. This is separate from the endpoint
+    /// because Windows named pipes have no filesystem parent.
+    pub data_dir: PathBuf,
     /// Selected MCP transport (`None` disables MCP entirely; rpc-only mode).
     pub mcp_transport: Option<snow_mcp::McpTransport>,
 }
@@ -61,7 +65,14 @@ impl DaemonState {
     /// fresh `JobRegistry` for this daemon process.
     pub fn new(core: Arc<SnowCore>) -> Self {
         let data_dir = daemon_data_dir(core.config().daemon.socket_path.as_path());
-        let mcp_config = mcp_config_from_env();
+        Self::new_with_data_dir(core, data_dir, mcp_config_from_env())
+    }
+
+    fn new_with_data_dir(
+        core: Arc<SnowCore>,
+        data_dir: PathBuf,
+        mcp_config: snow_mcp::McpConfig,
+    ) -> Self {
         Self {
             core,
             jobs: Arc::new(JobRegistry::new()),
@@ -96,19 +107,7 @@ impl DaemonState {
 }
 
 fn daemon_data_dir(socket_path: &Path) -> PathBuf {
-    if let Some(parent) = socket_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        return parent.to_path_buf();
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config/snow");
-    }
-
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".snow")
+    data_dir_from_socket_path(socket_path)
 }
 
 /// Daemon runtime: owns the configuration and shared state, and runs the
@@ -125,7 +124,7 @@ impl DaemonRuntime {
     }
 
     async fn run(self) -> Result<()> {
-        let rpc_server = rpc::JsonRpcServer::new(Arc::clone(&self.state), self.config.socket_path);
+        let rpc_server = rpc::JsonRpcServer::new(Arc::clone(&self.state), self.config.endpoint);
 
         match self.config.mcp_transport {
             Some(transport) => {
@@ -175,49 +174,90 @@ fn mcp_config_from_env() -> snow_mcp::McpConfig {
 
 /// Run the daemon synchronously, blocking the calling thread until shutdown.
 ///
-/// This is the entry point used both by the standalone `snow_daemon` binary
-/// and by `snow daemon start` (which forks and then calls this in the child).
-/// The function owns its own `current_thread` tokio runtime and `LocalSet`
-/// because `SnowCore` is `!Send`.
+/// This is the entry point used by the standalone `snow_daemon` binary and the
+/// hidden detached CLI child entrypoint. The function owns its own
+/// `current_thread` tokio runtime and `LocalSet` because `SnowCore` is `!Send`.
 ///
 /// Loads `.env` from the current directory plus the selected snow config env
 /// file, builds [`SnowCore`] from environment variables (`SNOW_INSTANCE`,
 /// `SNOW_USER`, and the shared credential provider precedence), constructs a
 /// [`DaemonState`], and launches the RPC + MCP servers.
 pub fn run_blocking(socket: &Path) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        load_daemon_env();
-        let config = DaemonConfig {
-            socket_path: socket.to_path_buf(),
-            mcp_transport: Some(snow_mcp::McpTransport::Stdio),
-        };
-        let core = Arc::new(build_core(&config).await?);
-        let state = Arc::new(DaemonState::new(core));
-        let runtime = DaemonRuntime::new(config, state);
-        tokio::task::LocalSet::new().run_until(runtime.run()).await
-    })
+    let config = daemon_config_from_socket_path(socket, Some(snow_mcp::McpTransport::Stdio));
+    run_blocking_with_config(config)
 }
 
 /// Like [`run_blocking`] but disables the MCP stdio transport. Used when the
 /// daemon is started detached (no stdio attached) by `snow daemon start`.
 pub fn run_blocking_rpc_only(socket: &Path) -> Result<()> {
+    let config = daemon_config_from_socket_path(socket, None);
+    run_blocking_with_config(config)
+}
+
+pub fn run_blocking_with_endpoint(
+    endpoint: IpcEndpoint,
+    data_dir: PathBuf,
+    mcp_transport: Option<snow_mcp::McpTransport>,
+) -> Result<()> {
+    run_blocking_with_config(DaemonConfig {
+        endpoint,
+        data_dir,
+        mcp_transport,
+    })
+}
+
+fn run_blocking_with_config(config: DaemonConfig) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
         load_daemon_env();
-        let config = DaemonConfig {
-            socket_path: socket.to_path_buf(),
-            mcp_transport: None,
-        };
         let core = Arc::new(build_core(&config).await?);
-        let state = Arc::new(DaemonState::new(core));
+        let state = Arc::new(DaemonState::new_with_data_dir(
+            core,
+            config.data_dir.clone(),
+            mcp_config_from_env(),
+        ));
         let runtime = DaemonRuntime::new(config, state);
         tokio::task::LocalSet::new().run_until(runtime.run()).await
     })
+}
+
+fn daemon_config_from_socket_path(
+    socket_path: &Path,
+    mcp_transport: Option<snow_mcp::McpTransport>,
+) -> DaemonConfig {
+    let data_dir = data_dir_from_socket_path(socket_path);
+    let endpoint = endpoint_from_socket_path(socket_path, &data_dir);
+
+    DaemonConfig {
+        endpoint,
+        data_dir,
+        mcp_transport,
+    }
+}
+
+fn endpoint_from_socket_path(socket_path: &Path, _data_dir: &Path) -> IpcEndpoint {
+    #[cfg(windows)]
+    {
+        let _ = socket_path;
+        IpcEndpoint::for_config_dir(_data_dir)
+    }
+
+    #[cfg(not(windows))]
+    {
+        IpcEndpoint::Filesystem {
+            path: socket_path.to_path_buf(),
+        }
+    }
+}
+
+fn data_dir_from_socket_path(socket_path: &Path) -> PathBuf {
+    socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_dir)
 }
 
 fn load_daemon_env() {
@@ -252,11 +292,9 @@ fn daemon_env_paths(env_name: &str) -> Vec<PathBuf> {
     {
         paths.push(dir.join(&filename));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let config_dir = PathBuf::from(home).join(".config/snow");
-        paths.push(config_dir.join(&filename));
-        paths.push(config_dir.join(".env"));
-    }
+    let config_dir = default_config_dir();
+    paths.push(config_dir.join(&filename));
+    paths.push(config_dir.join(".env"));
     paths.push(PathBuf::from(filename));
 
     paths
@@ -285,7 +323,11 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
             path: default_vault_path(),
         },
         daemon: core_config::DaemonConfig {
-            socket_path: daemon_config.socket_path.clone(),
+            socket_path: daemon_config
+                .endpoint
+                .filesystem_path()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| daemon_config.data_dir.join("daemon.sock")),
             mcp_transport: if daemon_config.mcp_transport.is_some() {
                 "stdio".to_string()
             } else {
@@ -305,19 +347,21 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
 }
 
 fn default_vault_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config/snow/vault");
-    }
-    PathBuf::from("./vault")
+    default_config_dir().join("vault")
 }
 
-/// Compute the default Unix socket path for the daemon.
+/// Compute the default legacy socket path for the daemon.
 ///
-/// Uses `$HOME/.config/snow/daemon.sock` when `HOME` is set; otherwise falls
-/// back to `./daemon.sock` in the current working directory.
+/// On Unix this is the filesystem socket path. On Windows it is only used to
+/// derive the config directory and named-pipe scope.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config/snow/daemon.sock");
-    }
-    PathBuf::from("./daemon.sock")
+    default_config_dir().join("daemon.sock")
+}
+
+fn default_config_dir() -> PathBuf {
+    snow_core::ipc::resolve_config_dir().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".snow")
+    })
 }

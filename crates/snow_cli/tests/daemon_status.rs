@@ -4,7 +4,7 @@
 //! `~tmp/.config/snow/daemon.pid` (which doesn't exist) and the status
 //! probe takes the `(None, false)` branch and prints `stopped`.
 //!
-//! Daemon mode is Unix-only, so this test does not apply on Windows.
+//! This smoke path binds a Unix socket directly, so it only applies on Unix.
 #![cfg(unix)]
 
 #[test]

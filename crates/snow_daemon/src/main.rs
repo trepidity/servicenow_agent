@@ -1,11 +1,10 @@
 //! `snow_daemon` binary entrypoint — a thin wrapper around
 //! [`snow_daemon::run_blocking`].
 //!
-//! All daemon construction and async-runtime setup lives in `lib.rs` so the
-//! function can be invoked directly by `snow daemon start` after forking.
-//! This binary keeps the historical direct-launch behavior: it resolves the
-//! socket path (overridable via `SNOW_DAEMON_SOCKET`) and hands control to
-//! `run_blocking`.
+//! All daemon construction and async-runtime setup lives in `lib.rs`. This
+//! binary keeps the historical direct-launch behavior: it resolves the legacy
+//! socket/config path (overridable via `SNOW_DAEMON_SOCKET`) and hands control
+//! to `run_blocking`.
 
 use std::path::PathBuf;
 
@@ -19,7 +18,7 @@ struct Args {
     #[arg(long)]
     rpc_only: bool,
 
-    /// Unix socket path for JSON-RPC. Defaults to SNOW_DAEMON_SOCKET or ~/.config/snow/daemon.sock.
+    /// Filesystem socket/config path for JSON-RPC. Defaults to SNOW_DAEMON_SOCKET or the platform config dir.
     #[arg(long, value_name = "PATH")]
     socket_path: Option<PathBuf>,
 }

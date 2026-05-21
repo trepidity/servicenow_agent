@@ -126,9 +126,9 @@ Notes:
 The `snow daemon` subcommands manage a long-running background daemon that hosts the job registry consumed by the admin TUI and other operator surfaces.
 
 ```bash
-snow daemon start                 # fork the daemon as a background process
-snow --env prd daemon start       # fork the daemon against production
-snow daemon stop                  # SIGTERM, then SIGKILL after 10s
+snow daemon start                 # start the daemon as a detached background process
+snow --env prd daemon start       # start the daemon against production
+snow daemon stop                  # graceful JSON-RPC shutdown, with PID fallback
 snow daemon restart               # stop, then start
 snow --env prd daemon restart     # restart against production
 snow daemon status                # running / unreachable / stopped
@@ -138,7 +138,7 @@ snow daemon logs --follow         # stream new log lines as they appear
 
 The pidfile lives at `~/.config/snow/daemon.pid` and the log at `~/.config/snow/daemon.log`. Daemon start, status, and logs include the selected environment.
 
-Use `snow tui --daemon` to launch the record browser against the daemon socket, or `snow --env prd tui --daemon` when you want the TUI header to reflect production mode. The older `scripts/start_daemon.sh` and `scripts/start_tui.sh` wrappers have been removed because these flows are now handled by the CLI.
+Use `snow tui --daemon` to launch the record browser against the daemon endpoint, or `snow --env prd tui --daemon` when you want the TUI header to reflect production mode. The older `scripts/start_daemon.sh` and `scripts/start_tui.sh` wrappers have been removed because these flows are now handled by the CLI.
 
 ### Admin TUI
 

@@ -1,25 +1,25 @@
 //! `snow daemon status` — read-only health probe.
 //!
-//! Reports one of four states based on the pidfile and socket connectability:
-//!  - `running`     — pidfile present and socket connects
-//!  - `unreachable` — pidfile present but socket does not respond, or socket
+//! Reports state based primarily on endpoint connectability, with the pidfile
+//! retained as secondary metadata:
+//!  - `running`     — pidfile present and endpoint connects
+//!  - `unreachable` — pidfile present but endpoint does not respond, or endpoint
 //!    responds without a pidfile (something is half-up)
-//!  - `stopped`     — neither pidfile nor socket
+//!  - `stopped`     — neither pidfile nor endpoint
 //!
 //! Also prints metadata from the JSON statusfile (version, started_at) when
 //! available.
 
-use std::os::unix::net::UnixStream;
-
 use anyhow::Result;
 use serde::Deserialize;
 
+use super::client::endpoint_alive;
 use super::paths::DaemonPaths;
 
 #[derive(Debug, Deserialize)]
 struct StatusFile {
     #[allow(dead_code)]
-    pid: i32,
+    pid: u32,
     started_at: String,
     version: String,
     environment: Option<String>,
@@ -35,15 +35,15 @@ pub fn run() -> Result<()> {
 
     let pid = std::fs::read_to_string(&paths.pidfile)
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
+        .and_then(|s| s.trim().parse::<u32>().ok());
 
     let status: Option<StatusFile> = std::fs::read_to_string(&paths.statusfile)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
 
-    let socket_alive = UnixStream::connect(&paths.socket).is_ok();
+    let endpoint_alive = endpoint_alive(&paths);
 
-    match (pid, socket_alive) {
+    match (pid, endpoint_alive) {
         (Some(pid), true) => {
             let v = status.as_ref().map(|s| s.version.as_str()).unwrap_or("?");
             let started = status
@@ -55,20 +55,20 @@ pub fn run() -> Result<()> {
                 .and_then(|s| s.environment.as_deref())
                 .unwrap_or("?");
             println!(
-                "running\n  pid: {pid}\n  env: {env}\n  version: {v}\n  started: {started}\n  socket: {}",
-                paths.socket.display()
+                "running\n  pid: {pid}\n  env: {env}\n  version: {v}\n  started: {started}\n  endpoint: {}",
+                paths.endpoint
             );
         }
         (Some(pid), false) => {
             println!(
-                "unreachable\n  pid: {pid} (alive but socket {} not connectable)",
-                paths.socket.display()
+                "unreachable\n  pid: {pid} (alive but endpoint {} not connectable)",
+                paths.endpoint
             );
         }
         (None, true) => {
             println!(
-                "unreachable\n  no pidfile but socket {} responds",
-                paths.socket.display()
+                "unreachable\n  no pidfile but endpoint {} responds",
+                paths.endpoint
             );
         }
         (None, false) => {

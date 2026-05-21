@@ -79,26 +79,15 @@ fn main() {
 }
 
 fn run_entry(cli: Cli) -> Result<(), SnowError> {
-    // Daemon lifecycle commands fork the current process. Keep them outside any
-    // Tokio runtime so the child can build the daemon runtime from a clean slate.
-    if matches!(cli.command, Command::Daemon { .. }) {
-        let Command::Daemon { action } = cli.command else {
-            unreachable!()
+    // Daemon lifecycle commands launch or become the daemon process. Keep them
+    // outside any Tokio runtime so the daemon child can build its own runtime.
+    if let Command::Daemon { action } = cli.command {
+        let explicit_env = match &action {
+            cli::DaemonCommand::Serve { env: Some(env) } => Some(env.as_str()),
+            _ => cli.env.as_deref(),
         };
-        #[cfg(unix)]
-        {
-            let env_name = daemon_cmd::paths::selected_env(cli.env.as_deref());
-            return daemon_cmd::dispatch(action, &env_name).map_err(SnowError::from);
-        }
-        // Daemon mode requires Unix domain sockets and is not available on
-        // Windows; surface a clear error instead of a confusing failure later.
-        #[cfg(not(unix))]
-        {
-            let _ = action;
-            return Err(SnowError::Api(
-                "daemon mode is not supported on this platform (Windows)".to_string(),
-            ));
-        }
+        let env_name = daemon_cmd::paths::selected_env(explicit_env);
+        return daemon_cmd::dispatch(action, &env_name).map_err(SnowError::from);
     }
 
     if matches!(cli.command, Command::CacheInfo) {
@@ -150,8 +139,15 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         let instance_url = std::env::var("SNOW_INSTANCE")
             .or_else(|_| std::env::var("SERVICENOW_INSTANCE"))
             .ok();
-        let socket = socket_path.clone().unwrap_or(paths.socket);
-        let tui_client = Arc::new(TuiClient::remote(socket, instance_url));
+        let endpoint = socket_path
+            .clone()
+            .map(|path| snow_core::ipc::IpcEndpoint::Filesystem { path })
+            .unwrap_or_else(|| snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root));
+        let tui_client = Arc::new(TuiClient::remote_endpoint_with_auto_spawn(
+            endpoint,
+            instance_url,
+            env_name.clone(),
+        ));
         let identity = tui_client.runtime_identity(None).await?;
         return tui_app::run_tui(
             tui_client,
@@ -260,15 +256,18 @@ struct RuntimePaths {
     vault: PathBuf,
     database: PathBuf,
     socket: PathBuf,
+    endpoint: snow_core::ipc::IpcEndpoint,
 }
 
 fn runtime_paths() -> RuntimePaths {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let root = home.join(".config/snow");
+    let root = daemon_cmd::paths::resolve_config_dir()
+        .unwrap_or_else(|_| PathBuf::from(".").join(".snow"));
+    let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&root);
     RuntimePaths {
         vault: root.join("vault"),
         database: root.join("snow.db"),
         socket: root.join("daemon.sock"),
+        endpoint,
         root,
     }
 }
@@ -305,9 +304,7 @@ fn load_auth_context(cli: &Cli) -> Result<AuthContext, SnowError> {
     let env_name = selected_env_name(cli);
     let env_file = format!(".env.{env_name}");
     let env_path = config_path(&env_file);
-    let config_dir_hint = dirs::home_dir()
-        .map(|d| d.join(".config/snow").display().to_string())
-        .unwrap_or_default();
+    let config_dir_hint = daemon_cmd::paths::config_dir_hint();
     dotenvy::from_path(&env_path).map_err(|e| {
         SnowError::Api(format!(
             "Failed to load {env_file}: {e}.\n  Searched: next to executable, {config_dir_hint}, and current directory"
@@ -389,7 +386,8 @@ fn cmd_cache_info() -> Result<(), SnowError> {
     println!("Runtime Root: {}", paths.root.display());
     println!("Vault Path: {}", paths.vault.display());
     println!("DB Path: {}", paths.database.display());
-    println!("Socket Path: {}", paths.socket.display());
+    println!("Daemon Endpoint: {}", paths.endpoint);
+    println!("Legacy Socket Path: {}", paths.socket.display());
     println!("Vault Exists: {}", if vault_exists { "yes" } else { "no" });
     println!("DB Exists: {}", if database_exists { "yes" } else { "no" });
     println!("Schema Version: {schema_version}");
