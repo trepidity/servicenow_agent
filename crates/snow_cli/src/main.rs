@@ -85,7 +85,7 @@ fn run_entry(cli: Cli) -> Result<(), SnowError> {
     // outside any Tokio runtime so the daemon child can build its own runtime.
     if let Command::Daemon { action } = cli.command {
         let explicit_env = match &action {
-            cli::DaemonCommand::Serve { env: Some(env) } => Some(env.as_str()),
+            cli::DaemonCommand::Serve { env: Some(env), .. } => Some(env.as_str()),
             _ => cli.env.as_deref(),
         };
         let env_name = daemon_cmd::paths::selected_env(explicit_env);

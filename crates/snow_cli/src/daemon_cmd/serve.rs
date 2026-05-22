@@ -6,8 +6,11 @@ use anyhow::{Context, Result};
 
 use super::paths::DaemonPaths;
 
-pub fn run(env_name: &str) -> Result<()> {
+pub fn run(env_name: &str, no_idle_timeout: bool) -> Result<()> {
     set_selected_env(env_name);
+    if no_idle_timeout {
+        set_no_idle_timeout();
+    }
     let paths = DaemonPaths::resolve()?;
     let env_file = load_env_file(env_name);
     write_runtime_files(&paths, env_name, env_file.as_ref())?;
@@ -62,5 +65,14 @@ fn set_selected_env(env_name: &str) {
     // exist, so this process-wide env write cannot race with other threads.
     unsafe {
         std::env::set_var("SNOW_ENV", env_name);
+    }
+}
+
+fn set_no_idle_timeout() {
+    // The daemon resolves its idle window from `SNOW_DAEMON_IDLE_SECS` at
+    // startup; `0` disables idle self-shutdown. SAFETY: same single-threaded
+    // pre-runtime context as `set_selected_env`.
+    unsafe {
+        std::env::set_var("SNOW_DAEMON_IDLE_SECS", "0");
     }
 }

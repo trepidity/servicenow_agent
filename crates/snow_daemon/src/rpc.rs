@@ -10,8 +10,9 @@ use snow_core::{
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::signal;
@@ -218,9 +219,16 @@ pub struct JsonRpcServer {
     endpoint: IpcEndpoint,
     shutdown: Arc<Notify>,
     drain_timeout: Duration,
+    /// When `Some`, the daemon shuts itself down after this much time with no
+    /// connected clients. `None` disables idle shutdown (pinned daemon).
+    idle_timeout: Option<Duration>,
 }
 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default idle window after which an otherwise-unused daemon self-terminates.
+/// Lazily auto-spawned daemons would otherwise linger until reboot.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 impl JsonRpcServer {
     pub fn new(state: Arc<DaemonState>, endpoint: impl Into<IpcEndpoint>) -> Self {
@@ -229,7 +237,15 @@ impl JsonRpcServer {
             endpoint: endpoint.into(),
             shutdown: Arc::new(Notify::new()),
             drain_timeout: CONNECTION_DRAIN_TIMEOUT,
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
         }
+    }
+
+    /// Configure idle self-shutdown. `Some(d)` shuts the daemon down after `d`
+    /// of inactivity with no connected clients; `None` disables it.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     #[cfg(test)]
@@ -255,16 +271,33 @@ impl JsonRpcServer {
         let tracker = TaskTracker::new();
         tokio::pin!(shutdown);
 
+        // Activity tracking for idle self-shutdown: a count of in-flight
+        // connections and the instant of the most recent connect/disconnect.
+        let active = Arc::new(AtomicUsize::new(0));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let idle_monitor = self.idle_timeout.map(|timeout| {
+            let active = Arc::clone(&active);
+            let last_activity = Arc::clone(&last_activity);
+            let shutdown = Arc::clone(&self.shutdown);
+            tokio::task::spawn_local(idle_monitor(timeout, active, last_activity, shutdown))
+        });
+
         loop {
             tokio::select! {
                 accept = listener.accept() => {
                     let stream = accept?;
                     let state = Arc::clone(&self.state);
                     let shutdown = Arc::clone(&self.shutdown);
+                    let active = Arc::clone(&active);
+                    let last_activity = Arc::clone(&last_activity);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    touch(&last_activity);
                     tracker.spawn_local(async move {
                         if let Err(err) = handle_connection(stream, state, shutdown).await {
                             eprintln!("json-rpc connection error: {err:#}");
                         }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        touch(&last_activity);
                     });
                 }
                 _ = &mut shutdown => {
@@ -276,11 +309,47 @@ impl JsonRpcServer {
             }
         }
 
+        if let Some(handle) = idle_monitor {
+            handle.abort();
+        }
         tracker.close();
         let _ = cleanup_listener(&self.endpoint).await;
         let _ = tokio::time::timeout(self.drain_timeout, tracker.wait()).await;
 
         Ok(())
+    }
+}
+
+/// Record activity (a connect or disconnect) by resetting the idle clock.
+fn touch(last_activity: &Mutex<Instant>) {
+    if let Ok(mut guard) = last_activity.lock() {
+        *guard = Instant::now();
+    }
+}
+
+/// Trigger `shutdown` once there have been zero connected clients for at least
+/// `timeout`. Polls on a fraction of the timeout so a short configured window
+/// (e.g. in tests) is honored promptly without busy-spinning a long one.
+async fn idle_monitor(
+    timeout: Duration,
+    active: Arc<AtomicUsize>,
+    last_activity: Arc<Mutex<Instant>>,
+    shutdown: Arc<Notify>,
+) {
+    let tick = (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(60));
+    loop {
+        tokio::time::sleep(tick).await;
+        if active.load(Ordering::SeqCst) != 0 {
+            continue;
+        }
+        let idle_for = last_activity
+            .lock()
+            .map(|guard| guard.elapsed())
+            .unwrap_or_default();
+        if idle_for >= timeout {
+            shutdown.notify_one();
+            break;
+        }
     }
 }
 
@@ -3139,6 +3208,99 @@ story_board_id = "board-sys"
                     .expect("server should stop after shutdown")
                     .expect("server completion signal");
                 result.expect("server result");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_timeout_shuts_down_server_with_no_clients() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        let endpoint = test_endpoint_for_socket(&socket_path(&fixture.tempdir));
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone())
+            .with_drain_timeout(Duration::from_millis(50))
+            .with_idle_timeout(Some(Duration::from_millis(100)));
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+        let local = LocalSet::new();
+        local.spawn_local(async move {
+            // No external shutdown and no clients: only the idle timer can stop it.
+            let result = server
+                .serve_until(std::future::pending::<Result<(), std::io::Error>>())
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        local
+            .run_until(async move {
+                let result = tokio::time::timeout(Duration::from_secs(2), done_rx)
+                    .await
+                    .expect("idle daemon should self-shut-down")
+                    .expect("server completion signal");
+                result.expect("server result");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_timeout_held_off_by_active_connection() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        let endpoint = test_endpoint_for_socket(&socket_path(&fixture.tempdir));
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone())
+            .with_drain_timeout(Duration::from_millis(50))
+            .with_idle_timeout(Some(Duration::from_millis(100)));
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+        let local = LocalSet::new();
+        local.spawn_local(async move {
+            let result = server
+                .serve_until(std::future::pending::<Result<(), std::io::Error>>())
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        local
+            .run_until(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let held_open = connect_endpoint(&endpoint).await.expect("held client");
+                // Hold the connection open well past the idle window; the
+                // server must not shut down while a client is connected.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let still_running = tokio::time::timeout(Duration::from_millis(1), done_rx).await;
+                assert!(
+                    still_running.is_err(),
+                    "server idled out despite an active connection"
+                );
+                drop(held_open);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_timeout_disabled_keeps_server_running() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        let endpoint = test_endpoint_for_socket(&socket_path(&fixture.tempdir));
+        let server = JsonRpcServer::new(Arc::clone(&fixture.state), endpoint.clone())
+            .with_drain_timeout(Duration::from_millis(50))
+            .with_idle_timeout(None);
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+        let local = LocalSet::new();
+        local.spawn_local(async move {
+            let result = server
+                .serve_until(std::future::pending::<Result<(), std::io::Error>>())
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        local
+            .run_until(async move {
+                // With idle shutdown disabled, the server must still be running
+                // well past any plausible idle interval.
+                let result = tokio::time::timeout(Duration::from_millis(300), done_rx).await;
+                assert!(
+                    result.is_err(),
+                    "server stopped despite idle timeout being disabled"
+                );
             })
             .await;
     }

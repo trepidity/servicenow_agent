@@ -133,7 +133,11 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     /// Start the daemon as a background process
-    Start,
+    Start {
+        /// Keep the daemon running indefinitely; disable idle self-shutdown.
+        #[arg(long)]
+        no_idle_timeout: bool,
+    },
     /// Stop the running daemon
     Stop,
     /// Restart the daemon
@@ -155,6 +159,9 @@ pub enum DaemonCommand {
         /// Environment label passed by the launcher.
         #[arg(long)]
         env: Option<String>,
+        /// Disable idle self-shutdown (propagated from `start --no-idle-timeout`).
+        #[arg(long)]
+        no_idle_timeout: bool,
     },
 }
 
@@ -606,7 +613,9 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Daemon {
-                action: DaemonCommand::Start
+                action: DaemonCommand::Start {
+                    no_idle_timeout: false
+                }
             }
         ));
     }
@@ -617,8 +626,24 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Daemon {
-                action: DaemonCommand::Serve { env: Some(env) }
+                action: DaemonCommand::Serve {
+                    env: Some(env),
+                    no_idle_timeout: false
+                }
             } if env == "prd"
+        ));
+    }
+
+    #[test]
+    fn parses_daemon_start_no_idle_timeout() {
+        let cli = Cli::parse_from(["snow", "daemon", "start", "--no-idle-timeout"]);
+        assert!(matches!(
+            cli.command,
+            Command::Daemon {
+                action: DaemonCommand::Start {
+                    no_idle_timeout: true
+                }
+            }
         ));
     }
 

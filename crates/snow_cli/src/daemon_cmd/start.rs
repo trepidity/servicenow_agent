@@ -33,8 +33,8 @@ pub(crate) enum StartOutcome {
 
 /// Run `snow daemon start`. Returns once the parent has confirmed the daemon
 /// endpoint is reachable, or with an error if the child failed to come up.
-pub fn run(env_name: &str) -> Result<()> {
-    match ensure_running(env_name)? {
+pub fn run(env_name: &str, no_idle_timeout: bool) -> Result<()> {
+    match ensure_running_with_idle(env_name, no_idle_timeout)? {
         StartOutcome::AlreadyRunning { pid, environment } => {
             match (pid, environment) {
                 (Some(pid), Some(environment)) => {
@@ -53,7 +53,16 @@ pub fn run(env_name: &str) -> Result<()> {
     }
 }
 
+/// Auto-spawn entrypoint (lazy startup): brings the daemon up with the default
+/// idle timeout so an unattended daemon eventually shuts itself down.
 pub(crate) fn ensure_running(env_name: &str) -> Result<StartOutcome> {
+    ensure_running_with_idle(env_name, false)
+}
+
+pub(crate) fn ensure_running_with_idle(
+    env_name: &str,
+    no_idle_timeout: bool,
+) -> Result<StartOutcome> {
     let paths = DaemonPaths::resolve()?;
     if endpoint_alive(&paths) {
         return Ok(StartOutcome::AlreadyRunning {
@@ -64,13 +73,17 @@ pub(crate) fn ensure_running(env_name: &str) -> Result<StartOutcome> {
 
     scrub_stale_runtime_files(&paths);
     rotate_log(&paths)?;
-    let mut child = spawn_detached_child(&paths, env_name)?;
+    let mut child = spawn_detached_child(&paths, env_name, no_idle_timeout)?;
     wait_for_endpoint(&paths, &mut child, START_TIMEOUT)
         .with_context(|| format!("daemon child {} did not become reachable", child.id()))?;
     Ok(StartOutcome::Started { pid: child.id() })
 }
 
-fn spawn_detached_child(paths: &DaemonPaths, env_name: &str) -> Result<Child> {
+fn spawn_detached_child(
+    paths: &DaemonPaths,
+    env_name: &str,
+    no_idle_timeout: bool,
+) -> Result<Child> {
     let exe = std::env::current_exe().context("resolving current snow executable")?;
     let log = OpenOptions::new()
         .create(true)
@@ -88,6 +101,9 @@ fn spawn_detached_child(paths: &DaemonPaths, env_name: &str) -> Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    if no_idle_timeout {
+        command.arg("--no-idle-timeout");
+    }
 
     #[cfg(unix)]
     unsafe {

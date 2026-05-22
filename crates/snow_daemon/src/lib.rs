@@ -125,7 +125,8 @@ impl DaemonRuntime {
     }
 
     async fn run(self) -> Result<()> {
-        let rpc_server = rpc::JsonRpcServer::new(Arc::clone(&self.state), self.config.endpoint);
+        let rpc_server = rpc::JsonRpcServer::new(Arc::clone(&self.state), self.config.endpoint)
+            .with_idle_timeout(idle_timeout_from_env());
 
         match self.config.mcp_transport {
             Some(transport) => {
@@ -205,6 +206,25 @@ pub fn run_blocking_with_endpoint(
         data_dir,
         mcp_transport,
     })
+}
+
+/// Resolve the daemon idle-shutdown window from a raw `SNOW_DAEMON_IDLE_SECS`
+/// value. An unset/blank/unparseable value falls back to the default window;
+/// an explicit `0` disables idle shutdown (a pinned daemon).
+fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw.map(str::trim) {
+        Some(value) if !value.is_empty() => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(rpc::DEFAULT_IDLE_TIMEOUT),
+        },
+        _ => Some(rpc::DEFAULT_IDLE_TIMEOUT),
+    }
+}
+
+/// Resolve the idle-shutdown window from the process environment.
+fn idle_timeout_from_env() -> Option<std::time::Duration> {
+    parse_idle_timeout(std::env::var("SNOW_DAEMON_IDLE_SECS").ok().as_deref())
 }
 
 fn run_blocking_with_config(config: DaemonConfig) -> Result<()> {
@@ -365,4 +385,40 @@ fn default_config_dir() -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(".snow")
     })
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn unset_uses_default() {
+        assert_eq!(parse_idle_timeout(None), Some(rpc::DEFAULT_IDLE_TIMEOUT));
+    }
+
+    #[test]
+    fn zero_disables() {
+        assert_eq!(parse_idle_timeout(Some("0")), None);
+    }
+
+    #[test]
+    fn positive_value_is_seconds() {
+        assert_eq!(
+            parse_idle_timeout(Some("90")),
+            Some(Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn blank_or_garbage_uses_default() {
+        assert_eq!(
+            parse_idle_timeout(Some("  ")),
+            Some(rpc::DEFAULT_IDLE_TIMEOUT)
+        );
+        assert_eq!(
+            parse_idle_timeout(Some("nope")),
+            Some(rpc::DEFAULT_IDLE_TIMEOUT)
+        );
+    }
 }
