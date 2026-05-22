@@ -100,6 +100,7 @@ story_board_id = "0123456789abcdef0123456789abcdef"
 field_allowlist = [
     "short_description", "description", "acceptance_criteria",
     "priority", "epic", "story_points", "assigned_to", "state",
+    "percent_complete",
 ]
 
 [mcp.tools.story_task_apply_create]
@@ -120,6 +121,7 @@ story_board_id = "0123456789abcdef0123456789abcdef"
 field_allowlist = [
     "short_description", "description", "assigned_to", "priority",
     "due_date", "state", "planned_hours", "actual_hours",
+    "remaining_hours", "percent_complete",
 ]
 
 # Cancel a cancellable catalog request (sc_req_item).

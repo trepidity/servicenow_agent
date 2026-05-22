@@ -79,6 +79,8 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "timecard_list",
         "timecard_plan_set_hours",
         "timecard_apply_set_hours",
+        "work_note_plan_add",
+        "work_note_apply_add",
         "vault_path",
         "kb_sync",
         "kb_list_tags",
@@ -243,6 +245,10 @@ fn schemas_include_required_fields_for_create_update_apply() {
         story_update["properties"]["number"]["pattern"],
         "^STRY\\d+$"
     );
+    assert_eq!(
+        story_update["properties"]["percent_complete"]["maximum"],
+        json!(100)
+    );
 
     let task_create = &tool("story_task_plan_create").input_schema;
     assert_eq!(task_create["type"], "object");
@@ -258,9 +264,30 @@ fn schemas_include_required_fields_for_create_update_apply() {
     let task_update = &tool("story_task_plan_update").input_schema;
     assert_eq!(task_update["type"], "object");
     assert_eq!(task_update["required"], json!(["number"]));
+    assert_eq!(task_update["properties"]["number"]["pattern"], "^STSK\\d+$");
     assert_eq!(
-        task_update["properties"]["number"]["pattern"],
-        "^SCTASK\\d+$"
+        task_update["properties"]["remaining_hours"]["minimum"],
+        json!(0)
+    );
+    assert_eq!(
+        task_update["properties"]["percent_complete"]["maximum"],
+        json!(100)
+    );
+
+    let work_note_plan = &tool("work_note_plan_add").input_schema;
+    assert_eq!(work_note_plan["type"], "object");
+    assert_eq!(work_note_plan["required"], json!(["number"]));
+    assert_eq!(work_note_plan["properties"]["work_notes"]["type"], "string");
+    assert!(
+        work_note_plan["anyOf"]
+            .as_array()
+            .expect("work-note text aliases")
+            .iter()
+            .any(|schema| schema["required"] == json!(["work_notes"]))
+    );
+    assert_eq!(
+        tool("work_note_apply_add").input_schema["required"],
+        json!(["plan_id", "confirmation_token", "idempotency_key"])
     );
 
     for apply in ["story_apply_create", "story_task_apply_create"] {

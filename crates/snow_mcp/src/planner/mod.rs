@@ -23,6 +23,8 @@ pub const GOVERNED_STORY_TOOL_NAMES: &[&str] = &[
 pub const GOVERNED_TIMECARD_TOOL_NAMES: &[&str] =
     &["timecard_plan_set_hours", "timecard_apply_set_hours"];
 
+pub const GOVERNED_WORK_NOTE_TOOL_NAMES: &[&str] = &["work_note_plan_add", "work_note_apply_add"];
+
 pub fn is_governed_story_tool(tool: &str) -> bool {
     GOVERNED_STORY_TOOL_NAMES.contains(&tool)
 }
@@ -31,6 +33,12 @@ pub fn is_governed_timecard_tool(tool: &str) -> bool {
     GOVERNED_TIMECARD_TOOL_NAMES.contains(&tool)
 }
 
+pub fn is_governed_work_note_tool(tool: &str) -> bool {
+    GOVERNED_WORK_NOTE_TOOL_NAMES.contains(&tool)
+}
+
 pub fn is_governed_write_tool(tool: &str) -> bool {
-    is_governed_story_tool(tool) || is_governed_timecard_tool(tool)
+    is_governed_story_tool(tool)
+        || is_governed_timecard_tool(tool)
+        || is_governed_work_note_tool(tool)
 }

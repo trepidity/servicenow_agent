@@ -29,9 +29,9 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Catalog request (`sc_req_item`) | `catalog_cancel_request` | **Delete** (cancel) | ❌ | yes | |
 | Work note / journal | `work_note_apply_add` | **Create** | ✅ (test/training) | yes | `work_notes` only |
 | Story (`rm_story`) | `story_apply_create` | **Create** | ❌ | yes | governed; daemon required |
-| Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required |
+| Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |
 | Story task (`rm_scrum_task`) | `story_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
-| Story task (`rm_scrum_task`) | `story_task_apply_update` | **Update** | ❌ | yes | governed; daemon required |
+| Story task (`rm_scrum_task`) | `story_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`remaining_hours`,`percent_complete` |
 | Time card (`time_card`) | `timecard_apply_set_hours` | **Update** | ❌ | yes | governed; daemon required; day fields only |
 | Change request | `change_submit_request` | **Create** | ❌ | yes | ⚠️ scaffold — not implemented |
 | Change task | `change_task_apply_assignment` | **Update** | ❌ | yes | `assigned_to`,`start_date`,`end_date`; `max_records=20` |

@@ -82,6 +82,27 @@ impl DaemonJsonRpcClient for MockDaemon {
                     })),
                 })
             }
+            "work_note_plan_add" => Ok(json!({
+                "plan_id": "work-note-plan-1",
+                "target": {
+                    "number": params.get("number").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+                    "table": "rm_story"
+                },
+                "preview": {
+                    "work_notes": params
+                        .get("work_notes")
+                        .or_else(|| params.get("text"))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                },
+                "confirmation_token": "confirmation-1",
+                "idempotency_key": "idem-1"
+            })),
+            "work_note_apply_add" => Ok(json!({
+                "plan_id": params.get("plan_id").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+                "tool": "work_note_apply_add",
+                "status": "success"
+            })),
             _ => Ok(json!({ "ok": true, "method": method })),
         }
     }
@@ -299,6 +320,61 @@ async fn bridge_forwards_enabled_governed_timecard_apply_tool() {
         vec![
             "contract_info".to_string(),
             "timecard_apply_set_hours".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn bridge_forwards_work_note_plan_and_apply_tools() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "work_note_plan_add",
+        "work_note_apply_add",
+    ]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "work_note_plan_add",
+                "arguments": {
+                    "number": "STRY0424335",
+                    "work_notes": "Adding implementation status."
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()["structuredContent"]["target"]["number"],
+        json!("STRY0424335")
+    );
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "work_note_apply_add",
+                "arguments": {
+                    "plan_id": "work-note-plan-1",
+                    "confirmation_token": "confirmation-1",
+                    "idempotency_key": "idem-1"
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()["structuredContent"]["tool"],
+        json!("work_note_apply_add")
+    );
+    assert_eq!(
+        daemon.method_names().await,
+        vec![
+            "contract_info".to_string(),
+            "work_note_plan_add".to_string(),
+            "work_note_apply_add".to_string()
         ]
     );
 }

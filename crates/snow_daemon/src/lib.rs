@@ -26,6 +26,7 @@ pub mod rpc;
 pub mod story_write;
 pub mod timecard_write;
 pub mod transport;
+pub mod work_note_write;
 
 #[cfg(test)]
 pub mod test_support;

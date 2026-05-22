@@ -117,6 +117,8 @@ pub enum RpcMethod {
     ListJobs,
     CancelJob,
     PlanGet,
+    WorkNotePlanAdd,
+    WorkNoteApplyAdd,
     StoryPlanCreate,
     StoryApplyCreate,
     StoryPlanUpdate,
@@ -194,6 +196,8 @@ impl RpcMethod {
             "list_jobs" => Self::ListJobs,
             "cancel_job" => Self::CancelJob,
             "plan_get" => Self::PlanGet,
+            "work_note_plan_add" => Self::WorkNotePlanAdd,
+            "work_note_apply_add" => Self::WorkNoteApplyAdd,
             "story_plan_create" => Self::StoryPlanCreate,
             "story_apply_create" => Self::StoryApplyCreate,
             "story_plan_update" => Self::StoryPlanUpdate,
@@ -1013,6 +1017,12 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::PlanGet => crate::story_write::handle_plan_get(id, &request.params, state).await,
+        RpcMethod::WorkNotePlanAdd => {
+            crate::work_note_write::handle_work_note_plan_add(id, &request.params, state).await
+        }
+        RpcMethod::WorkNoteApplyAdd => {
+            crate::work_note_write::handle_work_note_apply_add(id, &request.params, state).await
+        }
         RpcMethod::StoryPlanCreate
         | RpcMethod::StoryPlanUpdate
         | RpcMethod::StoryTaskPlanCreate
@@ -1142,6 +1152,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "list_jobs",
     "cancel_job",
     "plan_get",
+    "work_note_plan_add",
+    "work_note_apply_add",
     "story_plan_create",
     "story_apply_create",
     "story_plan_update",
@@ -1713,6 +1725,14 @@ mod tests {
         assert_eq!(RpcMethod::from_method("list_jobs"), RpcMethod::ListJobs);
         assert_eq!(RpcMethod::from_method("cancel_job"), RpcMethod::CancelJob);
         assert_eq!(RpcMethod::from_method("plan_get"), RpcMethod::PlanGet);
+        assert_eq!(
+            RpcMethod::from_method("work_note_plan_add"),
+            RpcMethod::WorkNotePlanAdd
+        );
+        assert_eq!(
+            RpcMethod::from_method("work_note_apply_add"),
+            RpcMethod::WorkNoteApplyAdd
+        );
         assert_eq!(
             RpcMethod::from_method("story_plan_create"),
             RpcMethod::StoryPlanCreate

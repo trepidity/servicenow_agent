@@ -145,7 +145,8 @@ fn story_plan_update_input_schema() -> Value {
                 ]
             },
             "assigned_to": {"type": "string"},
-            "state": {"type": "string"}
+            "state": {"type": "string"},
+            "percent_complete": {"type": "number", "minimum": 0, "maximum": 100}
         },
         "required": ["number"]
     })
@@ -173,7 +174,7 @@ fn story_task_plan_update_input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "number": {"type": "string", "pattern": "^SCTASK\\d+$"},
+            "number": {"type": "string", "pattern": "^STSK\\d+$"},
             "short_description": {"type": "string", "maxLength": 240},
             "description": {"type": "string", "maxLength": 16000},
             "assigned_to": {"type": "string"},
@@ -181,7 +182,9 @@ fn story_task_plan_update_input_schema() -> Value {
             "due_date": {"type": "string", "format": "date"},
             "state": {"type": "string"},
             "planned_hours": {"type": "number", "minimum": 0},
-            "actual_hours": {"type": "number", "minimum": 0}
+            "actual_hours": {"type": "number", "minimum": 0},
+            "remaining_hours": {"type": "number", "minimum": 0},
+            "percent_complete": {"type": "number", "minimum": 0, "maximum": 100}
         },
         "required": ["number"]
     })

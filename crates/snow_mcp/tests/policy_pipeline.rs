@@ -301,6 +301,7 @@ fn default_story_tool_policies_match_policy_defaults() {
         "description".to_string(),
         "epic".to_string(),
         "priority".to_string(),
+        "percent_complete".to_string(),
         "short_description".to_string(),
         "state".to_string(),
         "story_points".to_string(),
@@ -313,7 +314,7 @@ fn default_story_tool_policies_match_policy_defaults() {
         story_update_fields
     );
 
-    let task_fields = BTreeSet::from([
+    let task_create_fields = BTreeSet::from([
         "actual_hours".to_string(),
         "assigned_to".to_string(),
         "description".to_string(),
@@ -328,14 +329,17 @@ fn default_story_tool_policies_match_policy_defaults() {
             .get("story_task_apply_create")
             .expect("task create policy")
             .field_allowlist,
-        task_fields
+        task_create_fields
     );
+    let mut task_update_fields = task_create_fields;
+    task_update_fields.insert("percent_complete".to_string());
+    task_update_fields.insert("remaining_hours".to_string());
     assert_eq!(
         cfg.tools
             .get("story_task_apply_update")
             .expect("task update policy")
             .field_allowlist,
-        task_fields
+        task_update_fields
     );
 }
 

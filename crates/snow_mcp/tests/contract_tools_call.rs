@@ -57,6 +57,8 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         "story_task_apply_update",
         "timecard_plan_set_hours",
         "timecard_apply_set_hours",
+        "work_note_plan_add",
+        "work_note_apply_add",
     ]
     .iter()
     .enumerate()

@@ -62,6 +62,8 @@ pub struct StoryUpdatePayload {
     pub assigned_to: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub percent_complete: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +105,10 @@ pub struct StoryTaskUpdatePayload {
     pub planned_hours: Option<f32>,
     #[serde(default)]
     pub actual_hours: Option<f32>,
+    #[serde(default)]
+    pub remaining_hours: Option<f32>,
+    #[serde(default)]
+    pub percent_complete: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

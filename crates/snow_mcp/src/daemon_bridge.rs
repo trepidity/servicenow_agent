@@ -53,6 +53,8 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("timecard_list", "timecard_list"),
     ("timecard_plan_set_hours", "timecard_plan_set_hours"),
     ("timecard_apply_set_hours", "timecard_apply_set_hours"),
+    ("work_note_plan_add", "work_note_plan_add"),
+    ("work_note_apply_add", "work_note_apply_add"),
     ("plan_get", "plan_get"),
     ("search_knowledge", "search_knowledge"),
     ("knowledge_search", "search_knowledge"),
