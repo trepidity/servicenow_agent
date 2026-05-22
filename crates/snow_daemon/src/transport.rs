@@ -471,6 +471,7 @@ pub enum DaemonResourceType {
     ResourcePlan,
     Story,
     ScrumTask,
+    Timecard,
     Knowledge,
     Approval,
 }
@@ -669,6 +670,7 @@ impl From<ResourceType> for DaemonResourceType {
             ResourceType::ResourcePlan => Self::ResourcePlan,
             ResourceType::Story => Self::Story,
             ResourceType::ScrumTask => Self::ScrumTask,
+            ResourceType::Timecard => Self::Timecard,
             ResourceType::Knowledge => Self::Knowledge,
             ResourceType::Approval => Self::Approval,
         }

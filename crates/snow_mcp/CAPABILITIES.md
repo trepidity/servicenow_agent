@@ -32,20 +32,21 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required |
 | Story task (`rm_scrum_task`) | `story_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story task (`rm_scrum_task`) | `story_task_apply_update` | **Update** | ❌ | yes | governed; daemon required |
+| Time card (`time_card`) | `timecard_apply_set_hours` | **Update** | ❌ | yes | governed; daemon required; day fields only |
 | Change request | `change_submit_request` | **Create** | ❌ | yes | ⚠️ scaffold — not implemented |
 | Change task | `change_task_apply_assignment` | **Update** | ❌ | yes | `assigned_to`,`start_date`,`end_date`; `max_records=20` |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
 
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_plan_request`, `change_task_plan_assignment`,
-`work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
+`timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 `*_submit_*` tool executes the plan.
 
 **Enforcement at runtime:**
 - Default posture is `read_only` (`default_mode`, `policy.rs:495`).
 - The daemon bridge rejects all non-governed write tools — `-32040 policy denied` (`daemon_bridge.rs`).
-- Governed story writes need an attached daemon, else `-32044 DAEMON_REQUIRED_FOR_WRITE` (`server.rs`).
+- Governed Story/time-card writes need an attached daemon, else `-32044 DAEMON_REQUIRED_FOR_WRITE` (`server.rs`).
 - A disabled tool returns `-32040 policy denied`.
 
 ---
@@ -62,7 +63,8 @@ or the local cache; none mutate ServiceNow records.
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,
   `kb_semantic_status`, `kb_list_tags`, `verify_vault`
 - **Catalog / plans:** `catalog_items_search`, `catalog_item_get`, `catalog_plan_request`,
-  `resource_plan_get`, `story_get`, `story_tasks_list`, `plan_get`
+  `resource_plan_get`, `story_get`, `story_tasks_list`, `timecard_list`,
+  `timecard_plan_set_hours`, `plan_get`
 - **Governance / audit:** `policy_describe`, `tool_capabilities`, `redaction_rules_describe`,
   `audit_event_get`, `audit_events_search`, `audit_chain_verify`
 

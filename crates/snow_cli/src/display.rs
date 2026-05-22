@@ -1,5 +1,6 @@
 use colored::Colorize;
 use servicenow_rs::prelude::{CatalogVariable, JournalEntry, Record};
+use snow_core::resource::timecard::{TimeCard, TimecardSheet};
 use std::io::Write;
 use std::process::Command;
 
@@ -234,6 +235,130 @@ pub fn print_tasks(records: &[Record]) {
     }
 }
 
+pub fn print_timecard_sheet(sheet: &TimecardSheet) {
+    print!("{}", format_timecard_sheet(sheet));
+}
+
+pub fn format_timecard_sheet(sheet: &TimecardSheet) -> String {
+    let mut out = String::new();
+    let sheet_state = if sheet.state.trim().is_empty() {
+        "-"
+    } else {
+        sheet.state.as_str()
+    };
+    out.push_str(&format!(
+        "Time sheet - week of {} - {}\n",
+        blank_as_dash(&sheet.week_starts_on),
+        sheet_state
+    ));
+
+    if sheet.cards.is_empty() {
+        out.push_str("No time cards found for this week.\n");
+        return out;
+    }
+
+    let task_width = sheet
+        .cards
+        .iter()
+        .map(timecard_task_display)
+        .map(|value| value.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 22);
+    let category_width = sheet
+        .cards
+        .iter()
+        .map(|card| display_category(card).len())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 28);
+    let project_width = sheet
+        .cards
+        .iter()
+        .map(|card| {
+            card.project_time_category
+                .as_deref()
+                .unwrap_or("-")
+                .trim()
+                .len()
+        })
+        .max()
+        .unwrap_or(13)
+        .clamp(13, 24);
+
+    out.push_str(&format!(
+        " {:>3}  {:<task_width$}  {:<category_width$}  {:<project_width$}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {:>5}\n",
+        "Idx", "Task", "Category", "Proj-time-cat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Total"
+    ));
+
+    let mut totals = [0.0_f64; 7];
+    let mut grand_total = 0.0_f64;
+    for (index, card) in sheet.cards.iter().enumerate() {
+        for (day_index, value) in card.hours.iter().enumerate() {
+            totals[day_index] += parse_hours(value).unwrap_or(0.0);
+        }
+        grand_total += parse_hours(&card.total).unwrap_or_else(|| {
+            card.hours
+                .iter()
+                .filter_map(|value| parse_hours(value))
+                .sum::<f64>()
+        });
+        out.push_str(&format!(
+            " {:>3}  {:<task_width$}  {:<category_width$}  {:<project_width$}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {:>5}\n",
+            index + 1,
+            truncate_cell(&timecard_task_display(card), task_width),
+            truncate_cell(&display_category(card), category_width),
+            truncate_cell(
+                card.project_time_category
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("-"),
+                project_width
+            ),
+            format_hour_cell(&card.hours[0]),
+            format_hour_cell(&card.hours[1]),
+            format_hour_cell(&card.hours[2]),
+            format_hour_cell(&card.hours[3]),
+            format_hour_cell(&card.hours[4]),
+            format_hour_cell(&card.hours[5]),
+            format_hour_cell(&card.hours[6]),
+            format_hour_cell(&card.total)
+        ));
+    }
+
+    out.push_str(&format!(
+        " {:>3}  {:<task_width$}  {:<category_width$}  {:>project_width$}  {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}  {:>5}\n",
+        "",
+        "",
+        "",
+        "Totals",
+        format_decimal(totals[0]),
+        format_decimal(totals[1]),
+        format_decimal(totals[2]),
+        format_decimal(totals[3]),
+        format_decimal(totals[4]),
+        format_decimal(totals[5]),
+        format_decimal(totals[6]),
+        format_decimal(grand_total)
+    ));
+
+    out
+}
+
+pub fn timecard_task_display(card: &TimeCard) -> String {
+    card.task
+        .as_ref()
+        .map(|task| {
+            if task.number.trim().is_empty() {
+                task.sys_id.clone()
+            } else {
+                task.number.clone()
+            }
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 pub fn print_approval_records(records: &[Record]) {
     if records.is_empty() {
         return;
@@ -265,6 +390,153 @@ pub fn record_to_json(record: &Record) -> serde_json::Value {
         map.insert(name.clone(), val);
     }
     serde_json::Value::Object(map)
+}
+
+fn display_category(card: &TimeCard) -> String {
+    if !card.category_label.trim().is_empty() {
+        card.category_label.clone()
+    } else if !card.category.trim().is_empty() {
+        card.category.clone()
+    } else {
+        "-".to_string()
+    }
+}
+
+fn blank_as_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return value.chars().take(width).collect();
+    }
+    let mut truncated = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('~');
+    truncated
+}
+
+fn format_hour_cell(value: &str) -> String {
+    parse_hours(value)
+        .map(format_decimal)
+        .unwrap_or_else(|| blank_as_dash(value).to_string())
+}
+
+fn parse_hours(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(0.0);
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+fn format_decimal(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if (rounded.fract()).abs() < f64::EPSILON {
+        format!("{}", rounded as i64)
+    } else {
+        let mut value = format!("{rounded:.2}");
+        while value.contains('.') && value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snow_core::RecordRef;
+    use snow_core::resource::timecard::{SimpleRef, UserRef};
+
+    #[test]
+    fn timecard_sheet_grid_includes_day_and_footer_totals() {
+        let sheet = TimecardSheet {
+            sheet: Some(SimpleRef {
+                sys_id: "sheet-1".to_string(),
+                table: "time_sheet".to_string(),
+                display: "2026-05-17".to_string(),
+            }),
+            week_starts_on: "2026-05-17".to_string(),
+            state: "Pending".to_string(),
+            cards: vec![
+                timecard(
+                    "card-1",
+                    "PRJ0161219",
+                    "project_work",
+                    "Development",
+                    ["0", "2", "0", "0", "0", "0", "0"],
+                ),
+                timecard(
+                    "card-2",
+                    "PRJ0161126",
+                    "project_work",
+                    "Meeting",
+                    ["0", "0", "0", "0", "2", "0", "0"],
+                ),
+            ],
+        };
+
+        let rendered = format_timecard_sheet(&sheet);
+
+        assert!(rendered.contains("Time sheet - week of 2026-05-17 - Pending"));
+        assert!(rendered.contains("Idx"));
+        assert!(rendered.contains("Sun"));
+        assert!(rendered.contains("Sat"));
+        assert!(rendered.contains("PRJ0161219"));
+        assert!(rendered.contains("Development"));
+        assert!(rendered.contains("Totals"));
+        assert!(rendered.contains(" 4"));
+    }
+
+    fn timecard(
+        sys_id: &str,
+        task_number: &str,
+        category: &str,
+        project_time_category: &str,
+        hours: [&str; 7],
+    ) -> TimeCard {
+        TimeCard {
+            sys_id: sys_id.to_string(),
+            time_sheet: Some(SimpleRef {
+                sys_id: "sheet-1".to_string(),
+                table: "time_sheet".to_string(),
+                display: "2026-05-17".to_string(),
+            }),
+            week_starts_on: "2026-05-17".to_string(),
+            user: UserRef {
+                sys_id: "user-1".to_string(),
+                user_name: Some("worker".to_string()),
+                email: Some("worker@example.com".to_string()),
+                display: "Worker".to_string(),
+            },
+            task: Some(RecordRef {
+                sys_id: format!("{task_number}-sys-id"),
+                number: task_number.to_string(),
+                table: "pm_project".to_string(),
+            }),
+            category: category.to_string(),
+            category_label: "Project/Project Task".to_string(),
+            project_time_category: Some(project_time_category.to_string()),
+            hours: hours.map(str::to_string),
+            total: hours
+                .iter()
+                .filter_map(|value| value.parse::<f64>().ok())
+                .sum::<f64>()
+                .to_string(),
+            state: "Pending".to_string(),
+            sys_updated_on: "2026-05-17 00:00:00".to_string(),
+            sys_mod_count: Some(1),
+        }
+    }
 }
 
 pub fn print_multiline_field_pub(label: &str, value: Option<&str>) {

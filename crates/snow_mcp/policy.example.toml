@@ -59,6 +59,17 @@ field_allowlist = ["work_notes"]
 environments = ["test", "training"]
 confirmation_ttl_seconds = 300
 
+# Enable governed MCP time-card hour updates. This is disabled by default and
+# also requires SNOW_ENV or explicit config; an implicit default "test" label is
+# intentionally not enough for writes.
+[mcp.tools.timecard_apply_set_hours]
+enabled = true
+requires_confirmation = true
+requires_kb_evidence = false
+field_allowlist = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+environments = ["test", "training"]
+confirmation_ttl_seconds = 600
+
 # Explicitly DISABLE a tool regardless of its default:
 [mcp.tools.catalog_submit_request]
 enabled = false
@@ -77,6 +88,7 @@ skip_terminal_records = true               # ignore closed/cancelled records
 #   catalog_submit_request, catalog_cancel_request, work_note_apply_add,
 #   story_apply_create, story_apply_update,
 #   story_task_apply_create, story_task_apply_update,
+#   timecard_apply_set_hours,
 #   change_submit_request, change_task_apply_assignment, plan_cancel
 # Read tools are enabled by default and never need an entry here.
 

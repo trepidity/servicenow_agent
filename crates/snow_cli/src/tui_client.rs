@@ -14,7 +14,9 @@ use snow_core::{
     KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
     KnowledgeSemanticSearchFilters, KnowledgeSemanticStatus, MatchField, RecordRef, Reference,
     ResourceType, SearchMatchReason, SemanticIndexSummary, SnowCore, SnowRecord, TaskSlaParentRef,
-    TaskSlaStatus, ipc::IpcEndpoint,
+    TaskSlaStatus,
+    ipc::IpcEndpoint,
+    resource::timecard::{SetMode, TimeCard, TimeValue, TimecardSheet, WeekSelector, Weekday},
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -270,6 +272,33 @@ impl TuiClient {
         match self {
             Self::Local(core) => core.my_incidents_fresh().await.map_err(SnowError::from),
             Self::Remote(client) => client.my_incidents_fresh().await,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn timecard_list(&self, week: WeekSelector) -> Result<TimecardSheet, SnowError> {
+        match self {
+            Self::Local(core) => core.list_my_timecards(week).await.map_err(SnowError::from),
+            Self::Remote(client) => client.timecard_list(week).await,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn timecard_set_hours(
+        &self,
+        sys_id: &str,
+        day: Weekday,
+        hours: &str,
+        mode: SetMode,
+    ) -> Result<TimeCard, SnowError> {
+        match self {
+            Self::Local(core) => {
+                let value = parse_time_value(hours)?;
+                core.set_timecard_hours(sys_id, day, value, mode)
+                    .await
+                    .map_err(SnowError::from)
+            }
+            Self::Remote(client) => client.timecard_set_hours(sys_id, day, hours, mode).await,
         }
     }
 
@@ -570,6 +599,33 @@ impl DaemonRpcClient {
         Ok(records.into_iter().map(Into::into).collect())
     }
 
+    #[allow(dead_code)]
+    pub async fn timecard_list(&self, week: WeekSelector) -> Result<TimecardSheet, SnowError> {
+        self.call_wrapped("timecard_list", Some(week_selector_params(week)), "sheet")
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn timecard_set_hours(
+        &self,
+        sys_id: &str,
+        day: Weekday,
+        hours: &str,
+        mode: SetMode,
+    ) -> Result<TimeCard, SnowError> {
+        self.call_wrapped(
+            "timecard_set_hours",
+            Some(json!({
+                "sys_id": sys_id,
+                "day": weekday_token(day),
+                "hours": hours,
+                "mode": set_mode_token(mode),
+            })),
+            "card",
+        )
+        .await
+    }
+
     pub async fn add_work_note(
         &self,
         number: &str,
@@ -805,6 +861,42 @@ fn unwrap_field_or_self(result: Value, field: &str) -> Value {
     match result {
         Value::Object(mut map) => map.remove(field).unwrap_or(Value::Object(map)),
         other => other,
+    }
+}
+
+#[allow(dead_code)]
+fn parse_time_value(hours: &str) -> Result<TimeValue, SnowError> {
+    hours
+        .parse::<TimeValue>()
+        .map_err(|_| SnowError::Api(format!("invalid hours value {hours:?}")))
+}
+
+#[allow(dead_code)]
+fn week_selector_params(week: WeekSelector) -> Value {
+    match week {
+        WeekSelector::Current => json!({}),
+        WeekSelector::Date(date) => json!({ "week": date.format("%Y-%m-%d").to_string() }),
+    }
+}
+
+#[allow(dead_code)]
+fn weekday_token(day: Weekday) -> &'static str {
+    match day {
+        Weekday::Sun => "sun",
+        Weekday::Mon => "mon",
+        Weekday::Tue => "tue",
+        Weekday::Wed => "wed",
+        Weekday::Thu => "thu",
+        Weekday::Fri => "fri",
+        Weekday::Sat => "sat",
+    }
+}
+
+#[allow(dead_code)]
+fn set_mode_token(mode: SetMode) -> &'static str {
+    match mode {
+        SetMode::Set => "set",
+        SetMode::Add => "add",
     }
 }
 

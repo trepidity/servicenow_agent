@@ -124,6 +124,10 @@ pub enum RpcMethod {
     StoryTaskApplyCreate,
     StoryTaskPlanUpdate,
     StoryTaskApplyUpdate,
+    TimecardList,
+    TimecardSetHours,
+    TimecardPlanSetHours,
+    TimecardApplySetHours,
     Shutdown,
     Ping,
     Unknown,
@@ -197,6 +201,10 @@ impl RpcMethod {
             "story_task_apply_create" => Self::StoryTaskApplyCreate,
             "story_task_plan_update" => Self::StoryTaskPlanUpdate,
             "story_task_apply_update" => Self::StoryTaskApplyUpdate,
+            "timecard_list" => Self::TimecardList,
+            "timecard_set_hours" => Self::TimecardSetHours,
+            "timecard_plan_set_hours" => Self::TimecardPlanSetHours,
+            "timecard_apply_set_hours" => Self::TimecardApplySetHours,
             "shutdown" => Self::Shutdown,
             "ping" => Self::Ping,
             _ => Self::Unknown,
@@ -949,6 +957,18 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             crate::story_write::handle_story_apply(id, &request.method, &request.params, state)
                 .await
         }
+        RpcMethod::TimecardList => {
+            crate::timecard_write::handle_timecard_list(id, &request.params, state).await
+        }
+        RpcMethod::TimecardSetHours => {
+            crate::timecard_write::handle_timecard_set_hours(id, &request.params, state).await
+        }
+        RpcMethod::TimecardPlanSetHours => {
+            crate::timecard_write::handle_timecard_plan_set_hours(id, &request.params, state).await
+        }
+        RpcMethod::TimecardApplySetHours => {
+            crate::timecard_write::handle_timecard_apply_set_hours(id, &request.params, state).await
+        }
         RpcMethod::Unknown => JsonRpcResponse::error(id, -32601, "method not found", None),
     }
 }
@@ -1061,6 +1081,10 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "story_task_apply_create",
     "story_task_plan_update",
     "story_task_apply_update",
+    "timecard_list",
+    "timecard_set_hours",
+    "timecard_plan_set_hours",
+    "timecard_apply_set_hours",
     "shutdown",
 ];
 
@@ -1652,6 +1676,22 @@ mod tests {
             RpcMethod::from_method("story_task_apply_update"),
             RpcMethod::StoryTaskApplyUpdate
         );
+        assert_eq!(
+            RpcMethod::from_method("timecard_list"),
+            RpcMethod::TimecardList
+        );
+        assert_eq!(
+            RpcMethod::from_method("timecard_set_hours"),
+            RpcMethod::TimecardSetHours
+        );
+        assert_eq!(
+            RpcMethod::from_method("timecard_plan_set_hours"),
+            RpcMethod::TimecardPlanSetHours
+        );
+        assert_eq!(
+            RpcMethod::from_method("timecard_apply_set_hours"),
+            RpcMethod::TimecardApplySetHours
+        );
         assert_eq!(RpcMethod::from_method("shutdown"), RpcMethod::Shutdown);
         assert_eq!(RpcMethod::from_method("unknown"), RpcMethod::Unknown);
     }
@@ -1726,6 +1766,136 @@ mod tests {
             assert_eq!(error.code, -32051, "{method}");
             assert_eq!(error.message, "FIELD_REJECTED", "{method}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timecard_apply_dispatch_returns_replay_receipt_through_rpc() {
+        use chrono::Utc;
+        use snow_mcp::domain::audit::ServiceNowMetadata;
+        use snow_mcp::domain::primitives::{IdempotencyKey, IdempotencyKeySource, RecordRef};
+        use snow_mcp::planner::{
+            ConfirmationBinding, ConfirmationStore, FieldChange, IdempotencyOutcome,
+            IdempotencyStore, OperationPlanBuilder, OperationReceipt, PlanLifecycleState,
+            PlanStore, PlanStoreRecord, ReceiptStatus, SqliteConfirmationStore,
+            SqliteIdempotencyStore, SqlitePlanStore,
+        };
+
+        let fixture = build_fixture_state().await.expect("fixture");
+        let mut policy = snow_mcp::domain::policy::PolicyConfig::default();
+        policy
+            .tools
+            .get_mut("timecard_apply_set_hours")
+            .expect("timecard apply policy")
+            .enabled = true;
+        let data_dir = fixture.tempdir.path().join("timecard-rpc-replay");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            data_dir.clone(),
+            snow_mcp::McpConfig {
+                environment: snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago"),
+                policy,
+                ..Default::default()
+            },
+        ));
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let store_path = data_dir.join("mcp_story_write.sqlite3");
+        let plan_store = SqlitePlanStore::open(&store_path).expect("plan store");
+        let confirmation_store =
+            SqliteConfirmationStore::open(&store_path).expect("confirmation store");
+        let idempotency_store =
+            SqliteIdempotencyStore::open(&store_path).expect("idempotency store");
+        let plan = OperationPlanBuilder::new("timecard_plan_set_hours")
+            .target(RecordRef {
+                sys_id: "card-sys".to_string(),
+                number: "PRJ0161219".to_string(),
+                table: "time_card".to_string(),
+            })
+            .planned_changes(json!({ "kind": "TimecardSetHours" }))
+            .build();
+        let now = Utc::now();
+        plan_store
+            .put(PlanStoreRecord {
+                plan_id: plan.plan_id.clone(),
+                tool: plan.tool.clone(),
+                actor: "tester".to_string(),
+                op_hash: plan.op_hash.clone(),
+                plan_json: serde_json::to_value(&plan).expect("plan json"),
+                concurrency_token: None,
+                created_at: now,
+                expires_at: now + chrono::Duration::seconds(600),
+                state: PlanLifecycleState::Pending,
+            })
+            .await
+            .expect("put plan");
+        let binding = ConfirmationBinding {
+            actor: "tester".to_string(),
+            requester: "tester".to_string(),
+            tool: "timecard_apply_set_hours".to_string(),
+            op_hash: plan.op_hash.clone(),
+            environment: "test".to_string(),
+        };
+        let token = confirmation_store
+            .issue(&plan.plan_id, binding, 600)
+            .await
+            .expect("confirmation");
+        let key = IdempotencyKey {
+            value: "rpc-replay-key".to_string(),
+            source: IdempotencyKeySource::ServerDerived,
+        };
+        assert!(matches!(
+            idempotency_store
+                .check_and_record(&key, "timecard_apply_set_hours", &plan.op_hash, 600)
+                .await
+                .expect("record idempotency"),
+            IdempotencyOutcome::NewKey
+        ));
+        let receipt = OperationReceipt {
+            plan_id: plan.plan_id.clone(),
+            audit_id: "audit-1".to_string(),
+            parent_audit_id: plan.plan_id.clone(),
+            tool: "timecard_apply_set_hours".to_string(),
+            status: ReceiptStatus::Success,
+            applied_changes_summary: None,
+            service_now_metadata: Some(ServiceNowMetadata {
+                sys_id: Some("card-sys".to_string()),
+                number: None,
+                transaction_id: None,
+            }),
+            idempotency_replay: false,
+            completed_at: now,
+            op_hash: plan.op_hash.clone(),
+            record_url: None,
+            record_snapshot: None,
+            changed_fields: Vec::<FieldChange>::new(),
+            concurrency_token_observed: None,
+            apply_started_at: Some(now),
+            error_code: None,
+            warnings: Vec::new(),
+        };
+        idempotency_store
+            .save_receipt(&key, &receipt)
+            .await
+            .expect("save receipt");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "timecard_apply_set_hours".to_string(),
+                params: json!({
+                    "plan_id": plan.plan_id,
+                    "confirmation_token": token.token_id,
+                    "idempotency_key": "rpc-replay-key",
+                }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.expect("receipt");
+        assert_eq!(result["idempotency_replay"], json!(true));
+        assert_eq!(result["audit_id"], json!("audit-1"));
     }
 
     #[tokio::test(flavor = "current_thread")]

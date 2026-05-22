@@ -615,6 +615,7 @@ fn resource_type_slug(resource_type: &ResourceType) -> &'static str {
         ResourceType::ResourcePlan => "resource_plan",
         ResourceType::Story => "story",
         ResourceType::ScrumTask => "scrum_task",
+        ResourceType::Timecard => "timecard",
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
     }
@@ -633,6 +634,7 @@ fn resource_type_from_slug(slug: &str) -> Result<ResourceType> {
         "resource_plan" => ResourceType::ResourcePlan,
         "story" => ResourceType::Story,
         "scrum_task" => ResourceType::ScrumTask,
+        "timecard" => ResourceType::Timecard,
         "knowledge" => ResourceType::Knowledge,
         "approval" => ResourceType::Approval,
         other => bail!("unknown resource_type slug: {other}"),

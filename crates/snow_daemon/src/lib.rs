@@ -24,6 +24,7 @@ use snow_core::{
 pub mod jobs;
 pub mod rpc;
 pub mod story_write;
+pub mod timecard_write;
 pub mod transport;
 
 #[cfg(test)]

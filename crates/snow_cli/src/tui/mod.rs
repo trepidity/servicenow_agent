@@ -4,6 +4,7 @@ mod dashboard;
 mod fetch;
 mod keybinds;
 mod knowledge;
+mod timecard;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
@@ -25,6 +26,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use servicenow_rs::prelude::{JournalEntry, Record};
 use snow_core::TaskSlaStatus;
+use snow_core::resource::timecard::{TimecardSheet, WeekSelector};
 use tokio::task::JoinSet;
 
 use self::knowledge::KnowledgeState;
@@ -64,6 +66,13 @@ pub async fn run_tui(
             result.and(restore_result)
         })
         .await
+}
+
+pub async fn run_timecard_editor(
+    core: Arc<TuiClient>,
+    week: WeekSelector,
+) -> Result<TimecardSheet, SnowError> {
+    timecard::run_timecard_editor(core, week).await
 }
 
 async fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<(), SnowError> {

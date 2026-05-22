@@ -18,7 +18,7 @@ use tokio::signal;
 
 use crate::config::McpConfig;
 use crate::domain::policy::is_write_tool;
-use crate::planner::is_governed_story_tool;
+use crate::planner::is_governed_write_tool;
 use crate::planner::knowledge_grounding::{KbGroundedPlanner, content_hash};
 use crate::protocol::schema::{
     JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport,
@@ -128,7 +128,7 @@ impl McpServer {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return invalid_params(id, "missing tool name");
         };
-        if is_governed_story_tool(name) {
+        if is_governed_write_tool(name) {
             return daemon_required_for_write(id, name, "daemon required for governed write");
         }
         if name == "plan_get" {
@@ -174,6 +174,7 @@ impl McpServer {
             "get_work_notes" => self.call_get_work_notes(id, params).await,
             "resource_plan_get" | "story_get" => self.call_get_record(id, params).await,
             "story_tasks_list" => self.call_get_children(id, params).await,
+            "timecard_list" => self.call_timecard_list(id, params).await,
             "work_note_plan_add" => self.call_work_note_plan_add(id, params).await,
             "catalog_items_search" => self.call_catalog_items_search(id, params).await,
             "catalog_item_get" => self.call_get_record(id, params).await,
@@ -304,6 +305,17 @@ impl McpServer {
                 Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
                 Err(err) => service_failure(id, err),
             },
+        }
+    }
+
+    async fn call_timecard_list(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let week = match extract_week_selector_from_arguments(params) {
+            Ok(week) => week,
+            Err(err) => return invalid_params(id, err),
+        };
+        match self.core.list_my_timecards(week).await {
+            Ok(sheet) => JsonRpcResponse::ok(id, json!({ "time_sheet": sheet })),
+            Err(err) => service_failure(id, err),
         }
     }
 
@@ -1084,6 +1096,7 @@ fn resource_type_json(resource_type: &ResourceType) -> &'static str {
         ResourceType::ResourcePlan => "resource_plan",
         ResourceType::Story => "story",
         ResourceType::ScrumTask => "scrum_task",
+        ResourceType::Timecard => "timecard",
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
     }
@@ -1116,6 +1129,23 @@ fn extract_argument_string(params: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| Error::InvalidParams(format!("missing {key}")))
+}
+
+fn extract_week_selector_from_arguments(
+    params: &Value,
+) -> Result<snow_core::resource::timecard::WeekSelector> {
+    let Some(week) = params
+        .get("arguments")
+        .and_then(|arguments| arguments.get("week"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|week| !week.is_empty())
+    else {
+        return Ok(snow_core::resource::timecard::WeekSelector::Current);
+    };
+    let date = chrono::NaiveDate::parse_from_str(week, "%Y-%m-%d")
+        .map_err(|_| Error::InvalidParams("week must be YYYY-MM-DD".to_string()))?;
+    Ok(snow_core::resource::timecard::WeekSelector::Date(date))
 }
 
 fn invalid_params(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {

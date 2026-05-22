@@ -261,6 +261,49 @@ async fn bridge_forwards_enabled_governed_story_apply_tool() {
 }
 
 #[tokio::test]
+async fn bridge_forwards_enabled_governed_timecard_apply_tool() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "timecard_apply_set_hours"]));
+    let mut config = McpConfig::default();
+    config.policy.tools.insert(
+        "timecard_apply_set_hours".to_string(),
+        ToolPolicy {
+            enabled: true,
+            requires_confirmation: true,
+            requires_kb_evidence: false,
+            ..ToolPolicy::default()
+        },
+    );
+    let server = bridge_with_config(daemon.clone(), config);
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "timecard_apply_set_hours",
+                "arguments": {
+                    "plan_id": "plan-1",
+                    "confirmation_token": "confirmation-1",
+                    "idempotency_key": "idem-1",
+                    "concurrency_token": {
+                        "sys_updated_on": "2026-05-21 12:00:00",
+                        "sys_mod_count": 1
+                    }
+                }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        daemon.method_names().await,
+        vec![
+            "contract_info".to_string(),
+            "timecard_apply_set_hours".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn bridge_preserves_structured_daemon_story_errors() {
     let daemon = MockDaemon::new(contract(&["contract_info", "story_apply_create"]));
     let mut config = McpConfig::default();

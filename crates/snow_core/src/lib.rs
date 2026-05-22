@@ -30,6 +30,10 @@ pub use kb::{
 };
 pub(crate) use reference::*;
 pub use resource::story::{StoryWriteConcurrency, StoryWriteResult};
+pub use resource::timecard::{
+    CardSelector, SetMode, SimpleRef, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector,
+    Weekday,
+};
 pub use sla::{
     TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, TaskSlaView,
     is_task_sla_applicable_table,
@@ -44,8 +48,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use servicenow_rs::prelude::{
-    DisplayValue, FieldValue as SnowFieldValue, Order, Record, ServiceNowClient,
-    child_relation_for_table,
+    DisplayValue, Error as SnowApiError, FieldValue as SnowFieldValue, Order, Record,
+    ServiceNowClient, child_relation_for_table,
 };
 
 use crate::cache::store::{AliasRow, KeywordRow, RecordRow, TagRow};
@@ -77,6 +81,40 @@ const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
     "confirmed_hours",
     "description",
     "sys_updated_on",
+];
+const TIME_SHEET_FIELDS: &[&str] = &[
+    "sys_id",
+    "user",
+    "user.user_name",
+    "user.email",
+    "user.name",
+    "week_starts_on",
+    "state",
+];
+const TIME_CARD_FIELDS: &[&str] = &[
+    "sys_id",
+    "time_sheet",
+    "week_starts_on",
+    "user",
+    "user.user_name",
+    "user.email",
+    "user.name",
+    "task",
+    "task.number",
+    "task.sys_class_name",
+    "category",
+    "project_time_category",
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "total",
+    "state",
+    "sys_updated_on",
+    "sys_mod_count",
 ];
 
 fn child_relation_for_parent_table(table_name: &str) -> Option<(&'static str, &'static str)> {
@@ -118,6 +156,7 @@ pub enum ResourceType {
     ResourcePlan,
     Story,
     ScrumTask,
+    Timecard,
     Knowledge,
     Approval,
 }
@@ -561,6 +600,7 @@ impl ResourceType {
             "resource_plan" => Self::ResourcePlan,
             "rm_story" => Self::Story,
             "rm_scrum_task" => Self::ScrumTask,
+            "time_card" => Self::Timecard,
             "kb_knowledge" => Self::Knowledge,
             "sysapproval_approver" => Self::Approval,
             _ => Self::Change,
@@ -599,6 +639,37 @@ fn is_change_request_table(normalized: &str) -> bool {
 
 fn is_change_request_number(number: &str) -> bool {
     number.trim().to_ascii_uppercase().starts_with("CHG")
+}
+
+fn time_sheet_row_contains_date(row: &Record, date: NaiveDate) -> bool {
+    parse_servicenow_date(
+        row.get_raw("week_starts_on")
+            .or_else(|| row.get_display("week_starts_on"))
+            .or_else(|| row.get_str("week_starts_on")),
+    )
+    .map(|start| date >= start && date < start + chrono::Duration::days(7))
+    .unwrap_or(false)
+}
+
+fn parse_servicenow_date(value: Option<&str>) -> Option<NaiveDate> {
+    let value = value?.trim();
+    let date = value.get(..10).unwrap_or(value);
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+fn non_empty_owned(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn first_non_empty_str<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
 }
 
 impl JournalEntry {
@@ -1696,6 +1767,143 @@ impl SnowCore {
         self.resolve_user_sys_id(&self.config.instance.user).await
     }
 
+    pub async fn list_my_timecards(&self, week: WeekSelector) -> Result<TimecardSheet> {
+        let actor = self.resolve_user_ref(&self.config.instance.user).await?;
+        let sheet_row = self.resolve_my_timecard_sheet(week, &actor).await?;
+        let sheet_ref = SimpleRef {
+            sys_id: sheet_row.sys_id.clone(),
+            table: resource::timecard::TimecardResource::SHEET_TABLE.to_string(),
+            display: sheet_row
+                .get_display("week_starts_on")
+                .or_else(|| sheet_row.get_raw("week_starts_on"))
+                .or_else(|| sheet_row.get_str("week_starts_on"))
+                .unwrap_or(sheet_row.sys_id.as_str())
+                .to_string(),
+        };
+        let week_starts_on = sheet_row
+            .get_raw("week_starts_on")
+            .or_else(|| sheet_row.get_display("week_starts_on"))
+            .or_else(|| sheet_row.get_str("week_starts_on"))
+            .unwrap_or_default()
+            .to_string();
+        let state = sheet_row
+            .get_display("state")
+            .or_else(|| sheet_row.get_raw("state"))
+            .or_else(|| sheet_row.get_str("state"))
+            .unwrap_or_default()
+            .to_string();
+
+        let mut card_rows = self
+            .client
+            .table(resource::timecard::TimecardResource::TABLE)
+            .equals("time_sheet", &sheet_ref.sys_id)
+            .fields(TIME_CARD_FIELDS)
+            .display_value(DisplayValue::Both)
+            .order_by("task", Order::Asc)
+            .limit(500)
+            .execute()
+            .await?
+            .records;
+
+        if card_rows.is_empty() && !week_starts_on.trim().is_empty() {
+            card_rows = self
+                .client
+                .table(resource::timecard::TimecardResource::TABLE)
+                .equals("user", &actor.sys_id)
+                .equals("week_starts_on", &week_starts_on)
+                .fields(TIME_CARD_FIELDS)
+                .display_value(DisplayValue::Both)
+                .order_by("task", Order::Asc)
+                .limit(500)
+                .execute()
+                .await?
+                .records;
+        }
+
+        let mut cards = Vec::new();
+        for row in &card_rows {
+            let card = resource::timecard::TimecardResource::from_servicenow(row)?;
+            if card.is_owned_by(&actor.sys_id) {
+                cards.push(card);
+            }
+        }
+
+        Ok(TimecardSheet {
+            sheet: Some(sheet_ref),
+            week_starts_on,
+            state,
+            cards,
+        })
+    }
+
+    pub async fn get_timecard_fresh(&self, sys_id: &str) -> Result<Option<TimeCard>> {
+        let sys_id = sys_id.trim();
+        if sys_id.is_empty() {
+            return Err(anyhow::anyhow!("time card sys_id cannot be empty"));
+        }
+        let record = match self
+            .client
+            .table(resource::timecard::TimecardResource::TABLE)
+            .fields(TIME_CARD_FIELDS)
+            .display_value(DisplayValue::Both)
+            .get(sys_id)
+            .await
+        {
+            Ok(record) => record,
+            Err(SnowApiError::Api { status: 404, .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Some(resource::timecard::TimecardResource::from_servicenow(
+            &record,
+        )?))
+    }
+
+    pub async fn set_timecard_hours(
+        &self,
+        sys_id: &str,
+        day: Weekday,
+        hours: TimeValue,
+        mode: SetMode,
+    ) -> Result<TimeCard> {
+        let actor_sys_id = self.current_user_sys_id().await?;
+        let card = self
+            .get_timecard_fresh(sys_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("time card not found: {sys_id}"))?;
+
+        self.ensure_timecard_write_allowed(&card, &actor_sys_id)?;
+
+        let write_value = match mode {
+            SetMode::Set => hours,
+            SetMode::Add => {
+                let current = resource::timecard::parse_existing_hours(card.day_hours(day))?;
+                TimeValue::from_hours(current + hours.to_f64()?)?
+            }
+        };
+
+        self.client
+            .table(resource::timecard::TimecardResource::TABLE)
+            .display_value(DisplayValue::Both)
+            .update(
+                sys_id.trim(),
+                serde_json::json!({ day.field_name(): write_value.as_str() }),
+            )
+            .await?;
+
+        let updated = self
+            .get_timecard_fresh(sys_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("time card disappeared after update: {sys_id}"))?;
+        if updated.sys_id != sys_id.trim() {
+            return Err(anyhow::anyhow!(
+                "time card update refetched sys_id {}, expected {}",
+                updated.sys_id,
+                sys_id
+            ));
+        }
+        Ok(updated)
+    }
+
     pub async fn my_tasks_fresh(&self) -> Result<Vec<SnowRecord>> {
         let user_sys_id = self.current_user_sys_id().await?;
         self.hydrate_user_records_filtered(
@@ -2558,16 +2766,116 @@ impl SnowCore {
     }
 
     async fn resolve_user_sys_id(&self, user: &str) -> Result<String> {
-        let record = self
-            .client
-            .table("sys_user")
-            .equals("user_name", user)
-            .fields(&["sys_id"])
-            .limit(1)
-            .first()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("user not found: {user}"))?;
-        Ok(record.sys_id)
+        Ok(self.resolve_user_ref(user).await?.sys_id)
+    }
+
+    async fn resolve_user_ref(&self, user: &str) -> Result<UserRef> {
+        let user = user.trim();
+        let mut candidates = Vec::new();
+        if user.contains('@') {
+            candidates.push(("email", user));
+            candidates.push(("user_name", user));
+        } else {
+            candidates.push(("user_name", user));
+            candidates.push(("email", user));
+        }
+
+        for (field, value) in candidates {
+            let Some(record) = self
+                .client
+                .table("sys_user")
+                .equals(field, value)
+                .fields(&["sys_id", "user_name", "email", "name"])
+                .limit(1)
+                .first()
+                .await?
+            else {
+                continue;
+            };
+
+            return Ok(UserRef {
+                sys_id: record.sys_id.clone(),
+                user_name: non_empty_owned(record.get_str("user_name")),
+                email: non_empty_owned(record.get_str("email")),
+                display: first_non_empty_str([
+                    record.get_str("name"),
+                    record.get_str("user_name"),
+                    record.get_str("email"),
+                ])
+                .unwrap_or(user)
+                .to_string(),
+            });
+        }
+
+        Err(anyhow::anyhow!("user not found: {user}"))
+    }
+
+    async fn resolve_my_timecard_sheet(
+        &self,
+        week: WeekSelector,
+        actor: &UserRef,
+    ) -> Result<Record> {
+        match week {
+            WeekSelector::Current => {
+                let mut query = self
+                    .client
+                    .table(resource::timecard::TimecardResource::SHEET_TABLE)
+                    .fields(TIME_SHEET_FIELDS)
+                    .display_value(DisplayValue::Both)
+                    .equals("week_starts_on", "javascript:gs.beginningOfThisWeek()")
+                    .limit(1);
+
+                if let Some(user_name) = actor.user_name.as_deref() {
+                    query = query.equals("user.user_name", user_name);
+                } else {
+                    query = query.equals("user", &actor.sys_id);
+                }
+
+                query.first().await?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No time sheet found for current week. This command edits existing cards only; create them in the portal first."
+                    )
+                })
+            }
+            WeekSelector::Date(date) => {
+                let rows = self
+                    .client
+                    .table(resource::timecard::TimecardResource::SHEET_TABLE)
+                    .equals("user", &actor.sys_id)
+                    .fields(TIME_SHEET_FIELDS)
+                    .display_value(DisplayValue::Both)
+                    .order_by("week_starts_on", Order::Desc)
+                    .limit(80)
+                    .execute()
+                    .await?
+                    .records;
+
+                rows.into_iter()
+                    .find(|row| time_sheet_row_contains_date(row, date))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No time sheet found for {date}. This command edits existing cards only; create them in the portal first."
+                        )
+                    })
+            }
+        }
+    }
+
+    fn ensure_timecard_write_allowed(&self, card: &TimeCard, actor_sys_id: &str) -> Result<()> {
+        if !card.is_owned_by(actor_sys_id) {
+            return Err(anyhow::anyhow!(
+                "time card {} belongs to user {}, not the authenticated user",
+                card.sys_id,
+                card.user.sys_id
+            ));
+        }
+        if !card.is_editable() {
+            return Err(anyhow::anyhow!(
+                "time card sheet is {}; recall it in the portal to edit",
+                card.state
+            ));
+        }
+        Ok(())
     }
 
     async fn hydrate_user_records(
@@ -2953,6 +3261,33 @@ mod tests {
         (core, tempdir)
     }
 
+    async fn core_for_mock_server_with_user(
+        server: &MockServer,
+        user: &str,
+    ) -> (SnowCore, TempDir) {
+        let client = ServiceNowClient::builder()
+            .instance(server.uri())
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+
+        let mut config = config::SnowConfig::default();
+        config.instance.user = user.to_string();
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = SnowCore::builder()
+            .config(config)
+            .client(client)
+            .vault_path(tempdir.path().join("vault"))
+            .build()
+            .await
+            .expect("core");
+
+        (core, tempdir)
+    }
+
     async fn mount_fresh_record_get(
         server: &MockServer,
         table: &str,
@@ -2981,6 +3316,48 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    fn timecard_record_json(monday: &str, state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": "card-sys",
+            "time_sheet": {
+                "value": "sheet-sys",
+                "display_value": "2026-05-17"
+            },
+            "week_starts_on": "2026-05-17",
+            "user": {
+                "value": "user-sys",
+                "display_value": "Test User"
+            },
+            "user.user_name": "test_user",
+            "user.email": "test@example.com",
+            "task": {
+                "value": "task-sys",
+                "display_value": "PRJ0161219"
+            },
+            "task.number": "PRJ0161219",
+            "task.sys_class_name": "pm_project_task",
+            "category": {
+                "value": "project_work",
+                "display_value": "Project/Project Task"
+            },
+            "project_time_category": "Development",
+            "sunday": "0",
+            "monday": monday,
+            "tuesday": "0",
+            "wednesday": "0",
+            "thursday": "0",
+            "friday": "0",
+            "saturday": "0",
+            "total": monday,
+            "state": {
+                "value": state,
+                "display_value": state
+            },
+            "sys_updated_on": "2026-05-21 10:11:12",
+            "sys_mod_count": "3"
+        })
     }
 
     fn sample_projected_record() -> SnowRecord {
@@ -3341,6 +3718,60 @@ mod tests {
                 && row.rel_type == "reference"
                 && row.field_name == "assigned_to"
         }));
+    }
+
+    #[tokio::test]
+    async fn set_timecard_hours_patches_single_day_and_refetches_without_number() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "user-sys",
+                    "user_name": "test_user",
+                    "email": "test@example.com",
+                    "name": "Test User"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/time_card/card-sys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": timecard_record_json("6", "Pending")
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/api/now/table/time_card/card-sys"))
+            .and(body_partial_json(serde_json::json!({ "monday": "6" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": timecard_record_json("6", "Pending")
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let updated = core
+            .set_timecard_hours(
+                "card-sys",
+                Weekday::Mon,
+                TimeValue::parse("6.00").unwrap(),
+                SetMode::Set,
+            )
+            .await
+            .expect("set timecard hours");
+
+        assert_eq!(updated.sys_id, "card-sys");
+        assert_eq!(
+            updated.task.as_ref().map(|task| task.number.as_str()),
+            Some("PRJ0161219")
+        );
+        assert_eq!(updated.day_hours(Weekday::Mon), "6");
+        assert_eq!(updated.sys_mod_count, Some(3));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 mod support;
 
 use serde_json::json;
-use snow_mcp::{JsonRpcRequest, McpServer, planner::GOVERNED_STORY_TOOL_NAMES};
+use snow_mcp::{JsonRpcRequest, McpServer, planner::is_governed_write_tool};
 
 #[tokio::test]
 async fn representative_read_tool_calls_round_trip() {
@@ -42,11 +42,26 @@ async fn representative_read_tool_calls_round_trip() {
 }
 
 #[tokio::test]
-async fn foreground_refuses_governed_story_tools_with_daemon_required() {
+async fn foreground_refuses_governed_write_tools_with_daemon_required() {
     let fixture = support::build_fixture_state().await.expect("fixture");
     let server = McpServer::new(fixture.core);
 
-    for (idx, name) in GOVERNED_STORY_TOOL_NAMES.iter().enumerate() {
+    for (idx, name) in [
+        "story_plan_create",
+        "story_apply_create",
+        "story_plan_update",
+        "story_apply_update",
+        "story_task_plan_create",
+        "story_task_apply_create",
+        "story_task_plan_update",
+        "story_task_apply_update",
+        "timecard_plan_set_hours",
+        "timecard_apply_set_hours",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(is_governed_write_tool(name), "{name}");
         let response = server
             .dispatch(JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),

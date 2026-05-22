@@ -63,6 +63,7 @@ impl ToolRegistry {
         crate::tools::change::register(&mut registry);
         crate::tools::resource_plan::register(&mut registry);
         crate::tools::story::register(&mut registry);
+        crate::tools::timecard::register(&mut registry);
         crate::tools::work_note::register(&mut registry);
         crate::tools::plan_lifecycle::register(&mut registry);
         crate::tools::audit::register(&mut registry);

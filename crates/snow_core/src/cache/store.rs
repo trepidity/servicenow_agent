@@ -2588,6 +2588,7 @@ fn resource_type_to_str(resource_type: &ResourceType) -> &'static str {
         ResourceType::ResourcePlan => "resource_plan",
         ResourceType::Story => "rm_story",
         ResourceType::ScrumTask => "rm_scrum_task",
+        ResourceType::Timecard => "time_card",
         ResourceType::Knowledge => "kb_knowledge",
         ResourceType::Approval => "sysapproval_approver",
     }
@@ -2606,6 +2607,7 @@ fn str_to_resource_type(input: &str) -> std::result::Result<ResourceType, StoreE
         "resource_plan" => ResourceType::ResourcePlan,
         "rm_story" => ResourceType::Story,
         "rm_scrum_task" => ResourceType::ScrumTask,
+        "time_card" => ResourceType::Timecard,
         "kb_knowledge" => ResourceType::Knowledge,
         "sysapproval_approver" => ResourceType::Approval,
         other => return Err(StoreError::InvalidResourceType(other.to_string())),

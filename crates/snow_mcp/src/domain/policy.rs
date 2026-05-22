@@ -175,6 +175,52 @@ impl PolicyConfig {
         Ok(Some(binding))
     }
 
+    pub fn validate_timecard_policy(
+        &self,
+        tool: &str,
+        environment: &McpEnvironment,
+    ) -> Result<(), BoardPolicyError> {
+        if !is_timecard_apply_tool(tool) {
+            return Ok(());
+        }
+
+        let label = environment.label.as_str();
+        if !environment.has_explicit_label_source() {
+            return Err(BoardPolicyError::ImplicitEnvironmentLabel {
+                tool: tool.to_string(),
+                environment: label.to_string(),
+            });
+        }
+
+        let policy = self
+            .tools
+            .get(tool)
+            .ok_or_else(|| BoardPolicyError::MissingToolPolicy {
+                tool: tool.to_string(),
+            })?;
+        if !policy.environments.is_empty() && !policy.environments.iter().any(|env| env == label) {
+            return Err(BoardPolicyError::ToolEnvironmentNotAllowed {
+                tool: tool.to_string(),
+                environment: label.to_string(),
+            });
+        }
+
+        if is_production_environment(label) {
+            if !policy
+                .environments
+                .iter()
+                .any(|env| is_production_environment(env))
+            {
+                return Err(BoardPolicyError::ProductionToolEnvironmentNotAllowed {
+                    tool: tool.to_string(),
+                    board_id: "timecard".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn validate_story_production_gate(
         &self,
         tool: &str,
@@ -320,6 +366,8 @@ pub enum BoardPolicyError {
     ProductionBoardNotAllowed { tool: String, board_id: String },
     #[error("tool policy for {tool} does not allow production environment on board {board_id}")]
     ProductionToolEnvironmentNotAllowed { tool: String, board_id: String },
+    #[error("tool policy for {tool} does not allow environment {environment}")]
+    ToolEnvironmentNotAllowed { tool: String, environment: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,6 +454,10 @@ pub const STORY_APPLY_TOOL_NAMES: &[&str] = &[
     "story_task_apply_update",
 ];
 
+pub const TIMECARD_PLAN_TOOL_NAMES: &[&str] = &["timecard_plan_set_hours"];
+
+pub const TIMECARD_APPLY_TOOL_NAMES: &[&str] = &["timecard_apply_set_hours"];
+
 pub fn is_story_plan_tool(tool: &str) -> bool {
     STORY_PLAN_TOOL_NAMES.contains(&tool)
 }
@@ -416,6 +468,14 @@ pub fn is_story_apply_tool(tool: &str) -> bool {
 
 pub fn is_story_board_tool(tool: &str) -> bool {
     is_story_plan_tool(tool) || is_story_apply_tool(tool)
+}
+
+pub fn is_timecard_plan_tool(tool: &str) -> bool {
+    TIMECARD_PLAN_TOOL_NAMES.contains(&tool)
+}
+
+pub fn is_timecard_apply_tool(tool: &str) -> bool {
+    TIMECARD_APPLY_TOOL_NAMES.contains(&tool)
 }
 
 pub fn is_write_tool(tool: &str) -> bool {
@@ -545,6 +605,8 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "story_plan_update",
                     "story_task_plan_create",
                     "story_task_plan_update",
+                    "timecard_list",
+                    "timecard_plan_set_hours",
                     "policy_describe",
                     "tool_capabilities",
                 ],
@@ -568,6 +630,13 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "story_task_apply_create",
                     "story_task_apply_update",
                 ],
+            ),
+        ),
+        (
+            "timecard_writer".to_string(),
+            role(
+                &["timecard_list", "timecard_plan_set_hours"],
+                &["timecard_apply_set_hours"],
             ),
         ),
         (
@@ -698,6 +767,14 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
                 ..ToolPolicy::default()
             },
         ),
+        (
+            "timecard_plan_set_hours".to_string(),
+            timecard_plan_policy(),
+        ),
+        (
+            "timecard_apply_set_hours".to_string(),
+            timecard_apply_policy(),
+        ),
     ])
 }
 
@@ -728,4 +805,34 @@ fn story_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
 
 fn default_story_environments() -> Vec<String> {
     vec!["test".to_string(), "training".to_string()]
+}
+
+fn timecard_plan_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: true,
+        requires_confirmation: false,
+        requires_kb_evidence: false,
+        environments: default_story_environments(),
+        ..ToolPolicy::default()
+    }
+}
+
+fn timecard_apply_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        field_allowlist: BTreeSet::from([
+            "sunday".to_string(),
+            "monday".to_string(),
+            "tuesday".to_string(),
+            "wednesday".to_string(),
+            "thursday".to_string(),
+            "friday".to_string(),
+            "saturday".to_string(),
+        ]),
+        environments: default_story_environments(),
+        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+        ..ToolPolicy::default()
+    }
 }

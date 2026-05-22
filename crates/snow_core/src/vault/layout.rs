@@ -98,6 +98,10 @@ impl VaultLayout {
                 record.parent.as_ref(),
                 &record.sys_id,
             ),
+            ResourceType::Timecard => self
+                .root
+                .join("timecards")
+                .join(file_name(&record.number, &record.sys_id)),
             ResourceType::Knowledge => self
                 .knowledge_article_path_from_record(record)
                 .unwrap_or_else(|| {

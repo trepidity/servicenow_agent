@@ -28,6 +28,12 @@ const STORY_WRITE_TOOLS: &[&str] = &[
     "story_task_apply_update",
 ];
 
+const TIMECARD_TOOLS: &[&str] = &[
+    "timecard_list",
+    "timecard_plan_set_hours",
+    "timecard_apply_set_hours",
+];
+
 #[tokio::test]
 async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
     let fixture = support::build_fixture_state().await.expect("fixture");
@@ -70,6 +76,9 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "story_task_apply_create",
         "story_task_plan_update",
         "story_task_apply_update",
+        "timecard_list",
+        "timecard_plan_set_hours",
+        "timecard_apply_set_hours",
         "vault_path",
         "kb_sync",
         "kb_list_tags",
@@ -91,6 +100,39 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert_eq!(tool["schema_version"], "1.0");
     }
+}
+
+#[test]
+fn timecard_tools_registered_with_expected_posture() {
+    let registry = ToolRegistry::new();
+    let tool = |name: &str| {
+        registry
+            .metadata()
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing timecard tool {name}"))
+    };
+
+    for expected in TIMECARD_TOOLS {
+        assert_eq!(tool(expected).input_schema["type"], "object");
+        assert_eq!(tool(expected).output_schema["type"], "object");
+    }
+
+    assert!(tool("timecard_list").default_enabled);
+    assert!(!tool("timecard_list").requires_confirmation);
+    assert!(tool("timecard_plan_set_hours").default_enabled);
+    assert!(!tool("timecard_plan_set_hours").requires_confirmation);
+    assert!(!tool("timecard_apply_set_hours").default_enabled);
+    assert!(tool("timecard_apply_set_hours").requires_confirmation);
+    assert_eq!(
+        tool("timecard_apply_set_hours").input_schema["required"],
+        json!([
+            "plan_id",
+            "confirmation_token",
+            "idempotency_key",
+            "concurrency_token"
+        ])
+    );
 }
 
 #[test]

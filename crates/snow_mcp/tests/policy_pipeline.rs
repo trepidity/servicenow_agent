@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use snow_mcp::config::McpEnvironment;
 use snow_mcp::domain::policy::{
     BoardPolicyError, PolicyConfig, PolicyGate, STORY_APPLY_TOOL_NAMES, STORY_PLAN_TOOL_NAMES,
-    is_write_tool, resolve_role_allowlist,
+    TIMECARD_APPLY_TOOL_NAMES, TIMECARD_PLAN_TOOL_NAMES, is_write_tool, resolve_role_allowlist,
 };
 
 #[test]
@@ -336,5 +336,75 @@ fn default_story_tool_policies_match_policy_defaults() {
             .expect("task update policy")
             .field_allowlist,
         task_fields
+    );
+}
+
+#[test]
+fn default_timecard_tool_policies_match_spec_posture() {
+    let cfg = PolicyConfig::default();
+
+    for tool in TIMECARD_PLAN_TOOL_NAMES {
+        let policy = cfg.tools.get(*tool).expect("timecard plan policy");
+        assert!(policy.enabled);
+        assert!(!policy.requires_confirmation);
+        assert!(!policy.requires_kb_evidence);
+    }
+
+    for tool in TIMECARD_APPLY_TOOL_NAMES {
+        let policy = cfg.tools.get(*tool).expect("timecard apply policy");
+        assert!(!policy.enabled);
+        assert!(policy.requires_confirmation);
+        assert!(!policy.requires_kb_evidence);
+        assert_eq!(
+            policy.field_allowlist,
+            BTreeSet::from([
+                "friday".to_string(),
+                "monday".to_string(),
+                "saturday".to_string(),
+                "sunday".to_string(),
+                "thursday".to_string(),
+                "tuesday".to_string(),
+                "wednesday".to_string(),
+            ])
+        );
+        assert!(is_write_tool(tool), "{tool}");
+    }
+}
+
+#[test]
+fn timecard_apply_requires_explicit_environment_label() {
+    let cfg = PolicyConfig::default();
+    let environment = McpEnvironment::default();
+    let error = cfg
+        .validate_timecard_policy("timecard_apply_set_hours", &environment)
+        .expect_err("implicit default label must not permit writes");
+
+    assert_eq!(
+        error,
+        BoardPolicyError::ImplicitEnvironmentLabel {
+            tool: "timecard_apply_set_hours".to_string(),
+            environment: "test".to_string(),
+        }
+    );
+}
+
+#[test]
+fn timecard_apply_rejects_environment_outside_tool_allowlist() {
+    let mut cfg = PolicyConfig::default();
+    cfg.tools
+        .get_mut("timecard_apply_set_hours")
+        .expect("timecard apply policy")
+        .enabled = true;
+    let environment = McpEnvironment::explicit_config("dev", "America/Chicago");
+    let error = cfg
+        .validate_timecard_policy("timecard_apply_set_hours", &environment)
+        .expect_err("timecard apply should be limited to configured environments");
+
+    assert_eq!(
+        error,
+        BoardPolicyError::ToolEnvironmentNotAllowed {
+            tool: "timecard_apply_set_hours".to_string(),
+            environment: "dev".to_string(),
+        }
     );
 }

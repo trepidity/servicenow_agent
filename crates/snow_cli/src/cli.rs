@@ -52,6 +52,11 @@ pub enum Command {
         /// Record number
         number: String,
     },
+    /// List and update your existing weekly time cards
+    Timecard {
+        #[command(subcommand)]
+        action: TimecardCommand,
+    },
     /// List change tasks
     Tasks {
         /// Change number
@@ -150,6 +155,67 @@ pub enum DaemonCommand {
         /// Environment label passed by the launcher.
         #[arg(long)]
         env: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TimecardCommand {
+    /// List your existing time cards for a week
+    List {
+        /// Any date within the target week, formatted as YYYY-MM-DD
+        #[arg(long, value_name = "DATE")]
+        week: Option<String>,
+    },
+    /// Set or add hours on one existing time card
+    Set {
+        /// Card selector: sys_id, exact task display/number, or cached list index
+        card: String,
+        /// Day to update when using positional single-day form
+        day: Option<String>,
+        /// Hours to set or add when using positional single-day form
+        hours: Option<String>,
+        /// Add the supplied hours to the current value instead of replacing it
+        #[arg(long)]
+        add: bool,
+        /// Any date within the target week, formatted as YYYY-MM-DD
+        #[arg(long, value_name = "DATE")]
+        week: Option<String>,
+        /// Show the resolved card and current-to-new preview without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+        /// Disambiguate cards that share the same task display/number
+        #[arg(long)]
+        category: Option<String>,
+        /// Set/add Sunday hours
+        #[arg(long)]
+        sun: Option<String>,
+        /// Set/add Monday hours
+        #[arg(long)]
+        mon: Option<String>,
+        /// Set/add Tuesday hours
+        #[arg(long)]
+        tue: Option<String>,
+        /// Set/add Wednesday hours
+        #[arg(long)]
+        wed: Option<String>,
+        /// Set/add Thursday hours
+        #[arg(long)]
+        thu: Option<String>,
+        /// Set/add Friday hours
+        #[arg(long)]
+        fri: Option<String>,
+        /// Set/add Saturday hours
+        #[arg(long)]
+        sat: Option<String>,
+    },
+    /// Open the timecard editing experience
+    Edit {
+        /// Any date within the target week, formatted as YYYY-MM-DD
+        #[arg(long, value_name = "DATE")]
+        week: Option<String>,
     },
 }
 
@@ -459,6 +525,78 @@ mod tests {
                 resource_plan_state: Some(state),
                 ..
             } if number == "PRJ0161206" && state == "Allocated"
+        ));
+    }
+
+    #[test]
+    fn parses_timecard_commands() {
+        let cli = Cli::parse_from(["snow", "timecard", "list", "--week", "2026-05-17"]);
+        assert!(matches!(
+            cli.command,
+            Command::Timecard {
+                action: TimecardCommand::List { week: Some(week) }
+            } if week == "2026-05-17"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "timecard",
+            "set",
+            "1",
+            "mon",
+            "8",
+            "--add",
+            "--yes",
+            "--category",
+            "project_work",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Timecard {
+                action: TimecardCommand::Set {
+                    card,
+                    day: Some(day),
+                    hours: Some(hours),
+                    add: true,
+                    yes: true,
+                    category: Some(category),
+                    ..
+                }
+            } if card == "1" && day == "mon" && hours == "8" && category == "project_work"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "timecard",
+            "set",
+            "PRJ0161219",
+            "--mon",
+            "8",
+            "--tue",
+            "4",
+            "--dry-run",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Timecard {
+                action: TimecardCommand::Set {
+                    card,
+                    day: None,
+                    hours: None,
+                    mon: Some(mon),
+                    tue: Some(tue),
+                    dry_run: true,
+                    ..
+                }
+            } if card == "PRJ0161219" && mon == "8" && tue == "4"
+        ));
+
+        let cli = Cli::parse_from(["snow", "timecard", "edit"]);
+        assert!(matches!(
+            cli.command,
+            Command::Timecard {
+                action: TimecardCommand::Edit { week: None }
+            }
         ));
     }
 

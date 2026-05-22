@@ -20,6 +20,17 @@ pub const GOVERNED_STORY_TOOL_NAMES: &[&str] = &[
     "story_task_apply_update",
 ];
 
+pub const GOVERNED_TIMECARD_TOOL_NAMES: &[&str] =
+    &["timecard_plan_set_hours", "timecard_apply_set_hours"];
+
 pub fn is_governed_story_tool(tool: &str) -> bool {
     GOVERNED_STORY_TOOL_NAMES.contains(&tool)
+}
+
+pub fn is_governed_timecard_tool(tool: &str) -> bool {
+    GOVERNED_TIMECARD_TOOL_NAMES.contains(&tool)
+}
+
+pub fn is_governed_write_tool(tool: &str) -> bool {
+    is_governed_story_tool(tool) || is_governed_timecard_tool(tool)
 }

@@ -17,7 +17,7 @@ use tokio::time::{Instant, sleep, timeout};
 
 use crate::config::McpConfig;
 use crate::domain::policy::is_write_tool;
-use crate::planner::is_governed_story_tool;
+use crate::planner::is_governed_write_tool;
 use crate::protocol::schema::{
     JsonRpcRequest, JsonRpcResponse, ToolCapabilitiesReport, ToolCapability,
 };
@@ -50,6 +50,9 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("story_task_apply_create", "story_task_apply_create"),
     ("story_task_plan_update", "story_task_plan_update"),
     ("story_task_apply_update", "story_task_apply_update"),
+    ("timecard_list", "timecard_list"),
+    ("timecard_plan_set_hours", "timecard_plan_set_hours"),
+    ("timecard_apply_set_hours", "timecard_apply_set_hours"),
     ("plan_get", "plan_get"),
     ("search_knowledge", "search_knowledge"),
     ("knowledge_search", "search_knowledge"),
@@ -503,7 +506,7 @@ impl DaemonBackedMcpBridge {
             _ => {}
         }
 
-        if is_write_tool(name) && !is_governed_story_tool(name) {
+        if is_write_tool(name) && !is_governed_write_tool(name) {
             return JsonRpcResponse::error(
                 id,
                 -32040,
