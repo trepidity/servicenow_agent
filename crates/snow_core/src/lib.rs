@@ -2815,50 +2815,53 @@ impl SnowCore {
         week: WeekSelector,
         actor: &UserRef,
     ) -> Result<Record> {
-        match week {
-            WeekSelector::Current => {
-                let mut query = self
-                    .client
-                    .table(resource::timecard::TimecardResource::SHEET_TABLE)
-                    .fields(TIME_SHEET_FIELDS)
-                    .display_value(DisplayValue::Both)
-                    .equals("week_starts_on", "javascript:gs.beginningOfThisWeek()")
-                    .limit(1);
+        self.resolve_my_timecard_sheet_at(week, actor, chrono::Local::now().date_naive())
+            .await
+    }
 
-                if let Some(user_name) = actor.user_name.as_deref() {
-                    query = query.equals("user.user_name", user_name);
-                } else {
-                    query = query.equals("user", &actor.sys_id);
-                }
+    /// Resolve the user's time sheet for `week`, treating `today` as the
+    /// current date (injected so tests are deterministic).
+    ///
+    /// Both selectors fetch the user's recent sheets and match the target date
+    /// against each sheet's `[week_starts_on, week_starts_on + 7d)` range on the
+    /// client. This is deliberately independent of the instance's first-day-of-
+    /// week: a Monday-start sheet is matched just as well as a Sunday-start one.
+    ///
+    /// The previous `Current` implementation filtered server-side on
+    /// `week_starts_on=javascript:gs.beginningOfThisWeek()`. That dynamic value
+    /// is a Sunday-based GMT datetime, so on a Monday-start instance it never
+    /// equaled the sheet's `week_starts_on` date and every current-week lookup
+    /// failed with "no time sheet found" — even though the sheet existed.
+    async fn resolve_my_timecard_sheet_at(
+        &self,
+        week: WeekSelector,
+        actor: &UserRef,
+        today: NaiveDate,
+    ) -> Result<Record> {
+        let (date, label) = match week {
+            WeekSelector::Current => (today, "current week".to_string()),
+            WeekSelector::Date(date) => (date, date.to_string()),
+        };
 
-                query.first().await?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No time sheet found for current week. This command edits existing cards only; create them in the portal first."
-                    )
-                })
-            }
-            WeekSelector::Date(date) => {
-                let rows = self
-                    .client
-                    .table(resource::timecard::TimecardResource::SHEET_TABLE)
-                    .equals("user", &actor.sys_id)
-                    .fields(TIME_SHEET_FIELDS)
-                    .display_value(DisplayValue::Both)
-                    .order_by("week_starts_on", Order::Desc)
-                    .limit(80)
-                    .execute()
-                    .await?
-                    .records;
+        let rows = self
+            .client
+            .table(resource::timecard::TimecardResource::SHEET_TABLE)
+            .equals("user", &actor.sys_id)
+            .fields(TIME_SHEET_FIELDS)
+            .display_value(DisplayValue::Both)
+            .order_by("week_starts_on", Order::Desc)
+            .limit(80)
+            .execute()
+            .await?
+            .records;
 
-                rows.into_iter()
-                    .find(|row| time_sheet_row_contains_date(row, date))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No time sheet found for {date}. This command edits existing cards only; create them in the portal first."
-                        )
-                    })
-            }
-        }
+        rows.into_iter()
+            .find(|row| time_sheet_row_contains_date(row, date))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No time sheet found for {label}. This command edits existing cards only; create them in the portal first."
+                )
+            })
     }
 
     fn ensure_timecard_write_allowed(&self, card: &TimeCard, actor_sys_id: &str) -> Result<()> {
@@ -3772,6 +3775,58 @@ mod tests {
         );
         assert_eq!(updated.day_hours(Weekday::Mon), "6");
         assert_eq!(updated.sys_mod_count, Some(3));
+    }
+
+    fn time_sheet_row_json(week_starts_on: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": format!("sheet-{week_starts_on}"),
+            "week_starts_on": week_starts_on,
+            "user": { "value": "user-sys", "display_value": "Test User" },
+            "user.user_name": "test_user",
+            "state": { "value": "Pending", "display_value": "Pending" }
+        })
+    }
+
+    // Regression: the "current week" selector must find the user's existing
+    // sheet via client-side week-range matching, independent of the instance's
+    // first-day-of-week. It previously filtered server-side on
+    // `week_starts_on=javascript:gs.beginningOfThisWeek()`, which returns a
+    // Sunday-based GMT datetime that never equals a Monday-start time sheet's
+    // `week_starts_on` date, so Monday-week instances got "no time sheet found".
+    #[tokio::test]
+    async fn current_week_selects_monday_start_sheet_containing_today() {
+        let server = MockServer::start().await;
+        // Server returns the user's recent sheets, newest first. All are
+        // Monday-start (this instance's policy), so a Sunday-based filter
+        // would never match.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/time_sheet"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    time_sheet_row_json("2026-05-25"),
+                    time_sheet_row_json("2026-05-18"),
+                    time_sheet_row_json("2026-05-11"),
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let actor = UserRef {
+            sys_id: "user-sys".to_string(),
+            user_name: Some("test_user".to_string()),
+            email: None,
+            display: "Test User".to_string(),
+        };
+        // Friday in the Monday-start week of 2026-05-18.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
+
+        let row = core
+            .resolve_my_timecard_sheet_at(WeekSelector::Current, &actor, today)
+            .await
+            .expect("current sheet should resolve to the week containing today");
+
+        assert_eq!(row.get_str("week_starts_on"), Some("2026-05-18"));
     }
 
     #[tokio::test]
