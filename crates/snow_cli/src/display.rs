@@ -157,6 +157,21 @@ pub fn print_story_tasks(tasks: &[(Record, Vec<JournalEntry>)]) {
     }
 }
 
+pub fn print_story_task_summary(record: &Record) {
+    let number = record.get_str("number").unwrap_or("-");
+    let title = record
+        .get_str("short_description")
+        .unwrap_or("(no description)");
+    println!("{} — {}", number.bold(), title);
+    print_field("State", record.get_str("state"));
+    print_field("Priority", record.get_str("priority"));
+    print_field("Assigned to", record.get_str("assigned_to"));
+    print_field("Group", record.get_str("assignment_group"));
+    print_field("Story", record.get_str("story"));
+    print_field("Due", record.get_str("due_date"));
+    print_multiline_field("Description", record.get_str("description"));
+}
+
 pub fn print_task_summary(record: &Record) {
     let number = record.get_str("number").unwrap_or("-");
     let title = record

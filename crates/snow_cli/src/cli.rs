@@ -31,7 +31,7 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         socket_path: Option<PathBuf>,
     },
-    /// Show record details (CHG, PRJ, DMND, INC, RITM, STRY, RPLN)
+    /// Show record details (CHG, PRJ, DMND, INC, RITM, STRY, STSK, RPLN)
     Show {
         /// Record number (e.g., CHG0327604, PRJ0160979, DMND0416237, INC0012345, RITM0067890, STRY0423888, RPLN0089255)
         number: String,

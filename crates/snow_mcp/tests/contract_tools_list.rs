@@ -99,8 +99,18 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
             .unwrap_or_else(|| panic!("missing tool {expected}"));
         assert!(tool["description"].as_str().is_some());
         assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_no_top_level_schema_composition(&tool["inputSchema"]);
         assert_eq!(tool["outputSchema"]["type"], "object");
         assert_eq!(tool["schema_version"], "1.0");
+    }
+}
+
+fn assert_no_top_level_schema_composition(schema: &serde_json::Value) {
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        assert!(
+            schema.get(keyword).is_none(),
+            "tool inputSchema must not use top-level {keyword}"
+        );
     }
 }
 
@@ -276,15 +286,9 @@ fn schemas_include_required_fields_for_create_update_apply() {
 
     let work_note_plan = &tool("work_note_plan_add").input_schema;
     assert_eq!(work_note_plan["type"], "object");
-    assert_eq!(work_note_plan["required"], json!(["number"]));
+    assert_eq!(work_note_plan["required"], json!(["number", "work_notes"]));
     assert_eq!(work_note_plan["properties"]["work_notes"]["type"], "string");
-    assert!(
-        work_note_plan["anyOf"]
-            .as_array()
-            .expect("work-note text aliases")
-            .iter()
-            .any(|schema| schema["required"] == json!(["work_notes"]))
-    );
+    assert!(work_note_plan.get("anyOf").is_none());
     assert_eq!(
         tool("work_note_apply_add").input_schema["required"],
         json!(["plan_id", "confirmation_token", "idempotency_key"])

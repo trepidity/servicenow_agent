@@ -29,11 +29,7 @@ fn work_note_plan_add_input_schema() -> Value {
             "text": {"type": "string", "minLength": 1, "maxLength": 16000},
             "work_notes": {"type": "string", "minLength": 1, "maxLength": 16000}
         },
-        "required": ["number"],
-        "anyOf": [
-            {"required": ["text"]},
-            {"required": ["work_notes"]}
-        ]
+        "required": ["number", "work_notes"]
     })
 }
 

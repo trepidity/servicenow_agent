@@ -65,6 +65,7 @@ enum ShowTarget {
     Request,
     RequestItem,
     Story,
+    StoryTask,
     Task,
     Knowledge,
     ResourcePlan,
@@ -1986,6 +1987,7 @@ async fn cmd_show(
         ShowTarget::Request => cmd_show_request(client, number, extras, full).await,
         ShowTarget::RequestItem => cmd_show_request_item(client, number, extras, full).await,
         ShowTarget::Story => cmd_show_story(client, number, extras, full).await,
+        ShowTarget::StoryTask => cmd_show_story_task(client, number, extras, full).await,
         ShowTarget::Task => cmd_show_task(client, number, extras, full).await,
         ShowTarget::Knowledge => {
             if full || !extras.is_empty() {
@@ -2016,6 +2018,8 @@ fn classify_show_target(number: &str) -> ShowTarget {
         ShowTarget::RequestItem
     } else if number.starts_with("STRY") {
         ShowTarget::Story
+    } else if number.starts_with("STSK") {
+        ShowTarget::StoryTask
     } else if number.starts_with("SCTASK") || number.starts_with("TASK") {
         ShowTarget::Task
     } else if number.starts_with("KB") {
@@ -2025,6 +2029,52 @@ fn classify_show_target(number: &str) -> ShowTarget {
     } else {
         ShowTarget::Change
     }
+}
+
+async fn cmd_show_story_task(
+    client: &ServiceNowClient,
+    number: &str,
+    extras: &[String],
+    full: bool,
+) -> Result<(), SnowError> {
+    if full {
+        let task = client
+            .table("rm_scrum_task")
+            .equals("number", number)
+            .display_value(DisplayValue::Display)
+            .limit(1)
+            .first()
+            .await?
+            .ok_or_else(|| SnowError::NotFound(format!("{number} not found.")))?;
+        display::print_full_dump(&display::record_to_json(&task));
+        return Ok(());
+    }
+
+    let fields = &[
+        "sys_id",
+        "number",
+        "short_description",
+        "state",
+        "priority",
+        "assigned_to",
+        "assignment_group",
+        "story",
+        "opened_at",
+        "due_date",
+        "description",
+    ];
+    let task = client
+        .table("rm_scrum_task")
+        .equals("number", number)
+        .fields(fields)
+        .display_value(DisplayValue::Display)
+        .limit(1)
+        .first()
+        .await?
+        .ok_or_else(|| SnowError::NotFound(format!("{number} not found.")))?;
+    display::print_story_task_summary(&task);
+    fetch_and_print_extras(client, &task, "rm_scrum_task", extras).await?;
+    Ok(())
 }
 
 /// Resolve a record number to its ServiceNow table name.
@@ -3076,6 +3126,7 @@ mod tests {
     fn classify_show_target_routes_known_special_cases() {
         assert_eq!(classify_show_target("REQ2684923"), ShowTarget::Request);
         assert_eq!(classify_show_target("KB0101565"), ShowTarget::Knowledge);
+        assert_eq!(classify_show_target("STSK0049275"), ShowTarget::StoryTask);
         assert_eq!(
             classify_show_target("RPLN0091599"),
             ShowTarget::ResourcePlan
