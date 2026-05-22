@@ -429,6 +429,14 @@ impl StateChoice {
             terminal: false,
         }
     }
+
+    pub fn allowed_spec(spec: impl Into<String>) -> Self {
+        let spec = spec.into();
+        let Some((value, label)) = spec.split_once('=') else {
+            return Self::allowed(spec.clone(), spec);
+        };
+        Self::allowed(value.trim().to_string(), label.trim().to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,7 +513,7 @@ pub fn match_cached_state_choice(
 ) -> Option<StateChoiceMatch> {
     let supplied = supplied.trim();
     choices.iter().find_map(|choice| {
-        if choice.terminal {
+        if !state_choice_write_allowed(choice) {
             return None;
         }
         if choice.value.trim().eq_ignore_ascii_case(supplied) {
@@ -570,7 +578,7 @@ pub async fn resolve_state(
             .sys_choice(table, "state")
             .await?
             .into_iter()
-            .filter(|choice| !choice.terminal)
+            .filter(state_choice_write_allowed)
             .collect();
     }
 
@@ -588,7 +596,8 @@ pub fn state_choices_from_binding(table: &str, binding: &BoardBinding) -> Vec<St
 
     allowed
         .iter()
-        .map(|value| StateChoice::allowed(value.clone(), value.clone()))
+        .cloned()
+        .map(StateChoice::allowed_spec)
         .collect()
 }
 
@@ -797,9 +806,17 @@ pub fn assignee_ambiguous_warning_data(
 fn non_terminal_state_choices(choices: &[StateChoice]) -> Vec<StateChoice> {
     choices
         .iter()
-        .filter(|choice| !choice.terminal)
+        .filter(|choice| state_choice_write_allowed(choice))
         .cloned()
         .collect()
+}
+
+fn state_choice_write_allowed(choice: &StateChoice) -> bool {
+    !is_cancel_state(&choice.value) && !is_cancel_state(&choice.label)
+}
+
+fn is_cancel_state(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("cancel")
 }
 
 fn reference_sys_id_from_json(value: &Value, field: &str) -> Option<String> {
@@ -886,6 +903,7 @@ mod tests {
             column_field: "state".to_string(),
             swim_lane_field: "assignment_group".to_string(),
             assignment_group: GROUP.to_string(),
+            allowed_task_assignment_groups: Vec::new(),
             allowed_sprints: vec![SPRINT.to_string()],
             allow_production: false,
             allowed_story_states: Vec::new(),
@@ -1012,6 +1030,16 @@ mod tests {
                 label: "Closed".to_string(),
                 terminal: true,
             },
+            StateChoice {
+                value: "8".to_string(),
+                label: "Canceled".to_string(),
+                terminal: true,
+            },
+            StateChoice {
+                value: "9".to_string(),
+                label: "Complete".to_string(),
+                terminal: true,
+            },
         ]
     }
 
@@ -1042,6 +1070,60 @@ mod tests {
             ),
             StateResolution::Mapped {
                 label: "Work in Progress".to_string(),
+                value: "3".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn state_resolves_completion_terminal_but_rejects_cancel() {
+        assert_eq!(
+            resolve_state_from_cached_choices(
+                StateResolutionContext {
+                    supplied: Some("Complete"),
+                    current_state_value: Some("3"),
+                    current_state_terminal: false,
+                },
+                &choices()
+            ),
+            StateResolution::Mapped {
+                label: "Complete".to_string(),
+                value: "9".to_string(),
+            }
+        );
+
+        assert_eq!(
+            resolve_state_from_cached_choices(
+                StateResolutionContext {
+                    supplied: Some("Canceled"),
+                    current_state_value: Some("3"),
+                    current_state_terminal: false,
+                },
+                &choices()
+            ),
+            StateResolution::FieldRejected {
+                field: "state".to_string(),
+                reason: FieldRejectionReason::ValueNotInEnum,
+                original: "Canceled".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn state_choice_allowed_spec_maps_label_to_raw_value() {
+        let choices = vec![StateChoice::allowed_spec("3=Complete")];
+
+        assert_eq!(
+            resolve_state_from_cached_choices(
+                StateResolutionContext {
+                    supplied: Some("Complete"),
+                    current_state_value: Some("2"),
+                    current_state_terminal: false,
+                },
+                &choices
+            ),
+            StateResolution::Mapped {
+                label: "Complete".to_string(),
                 value: "3".to_string(),
             }
         );

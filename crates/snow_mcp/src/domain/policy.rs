@@ -303,6 +303,8 @@ pub struct BoardBinding {
     pub swim_lane_field: String,
     pub assignment_group: String,
     #[serde(default)]
+    pub allowed_task_assignment_groups: Vec<String>,
+    #[serde(default)]
     pub allowed_sprints: Vec<String>,
     #[serde(default)]
     pub allow_production: bool,

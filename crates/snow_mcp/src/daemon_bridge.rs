@@ -19,7 +19,7 @@ use crate::config::McpConfig;
 use crate::domain::policy::is_write_tool;
 use crate::planner::is_governed_write_tool;
 use crate::protocol::schema::{
-    JsonRpcRequest, JsonRpcResponse, ToolCapabilitiesReport, ToolCapability,
+    JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport, ToolCapability,
 };
 use crate::tools::ToolRegistry;
 use crate::{Error, Result};
@@ -471,7 +471,10 @@ impl DaemonBackedMcpBridge {
                 Ok(report) => JsonRpcResponse::ok(id, json!(report)),
                 Err(err) => service_failure(id, err),
             },
-            "policy_describe" => self.policy_describe_response(id),
+            "policy_describe" => match self.policy_describe_payload().await {
+                Ok(payload) => JsonRpcResponse::ok(id, payload),
+                Err(err) => service_failure(id, err),
+            },
             "redaction_rules_describe" => JsonRpcResponse::ok(
                 id,
                 json!({
@@ -494,7 +497,10 @@ impl DaemonBackedMcpBridge {
                 Err(err) => return service_failure(id, err),
             },
             "policy_describe" => {
-                return JsonRpcResponse::ok(id, tool_call_result(self.policy_describe_payload()));
+                return match self.policy_describe_payload().await {
+                    Ok(payload) => JsonRpcResponse::ok(id, tool_call_result(payload)),
+                    Err(err) => service_failure(id, err),
+                };
             }
             "redaction_rules_describe" => {
                 return JsonRpcResponse::ok(
@@ -516,17 +522,9 @@ impl DaemonBackedMcpBridge {
                 Some(json!({ "details": "daemon-backed MCP bridge is read-only", "tool": name })),
             );
         }
-        if is_write_tool(name) && !self.config.policy.is_tool_enabled(name) {
-            return JsonRpcResponse::error(
-                id,
-                -32040,
-                "policy denied",
-                Some(
-                    json!({ "details": "write tool is disabled by current MCP policy", "tool": name }),
-                ),
-            );
-        }
-
+        // The daemon owns governed write policy. The bridge only blocks generic
+        // or otherwise ungoverned writes so its static default config cannot
+        // drift away from the daemon's deploy-time policy file.
         let Some(method) = canonical_daemon_method(name) else {
             return JsonRpcResponse::error(id, -32601, "tool not found", None);
         };
@@ -702,16 +700,31 @@ impl DaemonBackedMcpBridge {
         })
     }
 
-    fn policy_describe_payload(&self) -> Value {
-        json!(
-            self.config
-                .policy
-                .policy_describe(self.config.redaction.rules_version.clone())
-        )
-    }
-
-    fn policy_describe_response(&self, id: Option<Value>) -> JsonRpcResponse {
-        JsonRpcResponse::ok(id, self.policy_describe_payload())
+    async fn policy_describe_payload(&self) -> Result<Value> {
+        let mut report: PolicyDescribeReport = self
+            .config
+            .policy
+            .policy_describe(self.config.redaction.rules_version.clone());
+        let capabilities = self.tool_capabilities().await?;
+        report.environment = capabilities.environment;
+        report.default_mode = capabilities.default_mode;
+        let available_writes: HashSet<String> = capabilities
+            .tools
+            .into_iter()
+            .filter(|tool| tool.enabled && tool.mode == "write")
+            .map(|tool| tool.name)
+            .collect();
+        report.write_tools_enabled = self
+            .config
+            .policy
+            .tools
+            .iter()
+            .filter(|(name, policy)| {
+                policy.enabled && is_write_tool(name) && available_writes.contains(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        Ok(json!(report))
     }
 
     async fn contract(&self) -> Result<DaemonContract> {
@@ -872,5 +885,105 @@ fn service_failure(id: Option<Value>, err: Error) -> JsonRpcResponse {
             "daemon bridge failure",
             Some(json!({ "details": err.to_string() })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MockDaemon {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    #[async_trait]
+    impl DaemonJsonRpcClient for MockDaemon {
+        async fn request(&self, method: &str, params: Value) -> Result<Value> {
+            if method == "contract_info" {
+                return Ok(json!({
+                    "contract_version": DEFAULT_CONTRACT_VERSION,
+                    "environment": { "label": "test" },
+                    "supported_methods": ["story_task_apply_update"],
+                    "deprecated_aliases": [],
+                }));
+            }
+
+            self.calls
+                .lock()
+                .await
+                .push((method.to_string(), params.clone()));
+            Ok(json!({ "method": method, "params": params }))
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_writes_are_forwarded_to_daemon_policy() {
+        let daemon = Arc::new(MockDaemon::default());
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "story_task_apply_update",
+                    "arguments": {
+                        "plan_id": "plan-1",
+                        "confirmation_token": "confirm-1",
+                        "idempotency_key": "idem-1",
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "story_task_apply_update");
+    }
+
+    #[tokio::test]
+    async fn policy_describe_reflects_daemon_governed_writes() {
+        let mut config = McpConfig::default();
+        config
+            .policy
+            .tools
+            .get_mut("story_task_apply_update")
+            .expect("story task apply policy")
+            .enabled = true;
+        let bridge = DaemonBackedMcpBridge::new(
+            Arc::new(MockDaemon::default()),
+            config,
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "policy_describe",
+                    "arguments": {}
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("structured policy response");
+        let writes = structured
+            .get("write_tools_enabled")
+            .and_then(Value::as_array)
+            .expect("write tools array");
+        assert!(writes.contains(&json!("story_task_apply_update")));
     }
 }

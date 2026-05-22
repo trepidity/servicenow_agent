@@ -18,9 +18,9 @@ use snow_mcp::domain::story::{
     Actor as StoryActor, InScopeFailure, StateChoice, StateResolution, StateResolutionContext,
     WARNING_ASSIGNEE_AMBIGUOUS, WARNING_ASSIGNEE_DEFAULTED_FROM_CALLER,
     WARNING_ASSIGNEE_UNRESOLVED, WARNING_PRIORITY_VALUE_UNMAPPED, assignee_ambiguous_warning_data,
-    assignee_defaulted_warning_message, assignee_unresolved_warning_message, hash_email_for_audit,
-    in_scope_snapshot_from_json, in_scope_snapshot_from_snow_record, is_sys_id,
-    mask_email_for_receipt, resolve_state_from_cached_choices, story_in_scope,
+    assignee_defaulted_warning_message, assignee_unresolved_warning_message, equal_sys_id,
+    hash_email_for_audit, in_scope_snapshot_from_json, in_scope_snapshot_from_snow_record,
+    is_sys_id, mask_email_for_receipt, resolve_state_from_cached_choices, story_in_scope,
     task_parent_in_scope, task_parent_sys_id_from_json,
 };
 use snow_mcp::planner::{
@@ -965,7 +965,7 @@ async fn build_plan_input(
 ) -> std::result::Result<PlanInput, PlanBuildError> {
     let mut payload = Value::Object(args.clone());
     strip_non_writable_selector_fields(tool, &mut payload);
-    let mut warnings = resolve_assignee_in_payload(&mut payload, actor, state).await?;
+    let mut warnings = resolve_assignee_in_payload(tool, &mut payload, actor, state).await?;
     match tool {
         "story_plan_create" => {
             require_string(args, "short_description")?;
@@ -1039,7 +1039,7 @@ async fn build_plan_input(
             if tool == "story_plan_update" {
                 enforce_story_record_scope(&record, binding)?;
             } else {
-                enforce_task_record_scope(&record, binding, state).await?;
+                enforce_task_record_scope(&record, binding)?;
             }
             warnings.extend(
                 validate_constrained_fields(tool, &mut payload, binding, state, Some(&record))
@@ -1079,6 +1079,7 @@ fn strip_non_writable_selector_fields(tool: &str, payload: &mut Value) {
 }
 
 async fn resolve_assignee_in_payload(
+    tool: &str,
     payload: &mut Value,
     actor: &StoryActor,
     state: &DaemonState,
@@ -1102,6 +1103,7 @@ async fn resolve_assignee_in_payload(
             "field": "assigned_to",
             "reason": "type_mismatch",
         })])),
+        None if tool.ends_with("_plan_update") => Ok(Vec::new()),
         None => default_assignee_from_actor(object, actor, state).await,
     }
 }
@@ -1495,10 +1497,11 @@ async fn state_choices_for_validation(
         return Ok(cached_allowed
             .iter()
             .cloned()
-            .map(|value| StateChoice {
-                label: value.clone(),
-                terminal: is_terminal_choice(&value),
-                value,
+            .map(|spec| {
+                let mut choice = StateChoice::allowed_spec(spec);
+                choice.terminal =
+                    is_terminal_choice(&choice.value) || is_terminal_choice(&choice.label);
+                choice
             })
             .collect());
     }
@@ -1629,94 +1632,57 @@ fn enforce_task_parent_payload_scope(
     .map_err(PlanBuildError::GuardFailed)
 }
 
-async fn enforce_task_record_scope(
+fn enforce_task_record_scope(
     task: &SnowRecord,
     binding: &BoardBinding,
-    state: &DaemonState,
 ) -> std::result::Result<(), PlanBuildError> {
-    task_record_in_scope(task, binding, state)
-        .await
-        .map_err(PlanBuildError::GuardFailed)
+    task_record_in_scope(task, binding).map_err(PlanBuildError::GuardFailed)
 }
 
-async fn task_record_in_scope(
+fn task_record_in_scope(
     task: &SnowRecord,
     binding: &BoardBinding,
-    state: &DaemonState,
 ) -> std::result::Result<(), InScopeFailure> {
-    let Some(parent_ref) = task_story_ref(task) else {
+    if !task.table.trim().eq_ignore_ascii_case(&binding.task_table) {
         return Err(InScopeFailure::TaskParentStoryMismatch {
-            expected: "parent_story".to_string(),
-            observed: String::new(),
+            expected: binding.task_table.clone(),
+            observed: task.table.clone(),
         });
-    };
-    let Some(parent) = state
-        .core
-        .get_record_fresh(&parent_ref.number)
-        .await
-        .map_err(|_| InScopeFailure::TaskParentOutOfScope {
-            cause: Box::new(InScopeFailure::MissingSprint),
-        })?
-    else {
-        return Err(InScopeFailure::TaskParentStoryMismatch {
-            expected: parent_ref.sys_id,
+    }
+
+    let snapshot = in_scope_snapshot_from_snow_record(task).ok_or_else(|| {
+        InScopeFailure::WrongAssignmentGroup {
+            expected: binding.assignment_group.clone(),
             observed: String::new(),
-        });
-    };
-    let snapshot = in_scope_snapshot_from_snow_record(&parent).ok_or_else(|| {
-        InScopeFailure::TaskParentOutOfScope {
-            cause: Box::new(InScopeFailure::WrongAssignmentGroup {
-                expected: binding.assignment_group.clone(),
-                observed: String::new(),
-            }),
         }
     })?;
-    task_parent_in_scope(
-        &snapshot.as_snapshot(),
-        &parent_ref.sys_id,
-        &parent.sys_id,
-        binding,
-    )
-}
 
-struct TaskStoryRef {
-    sys_id: String,
-    number: String,
-}
-
-fn task_story_ref(task: &SnowRecord) -> Option<TaskStoryRef> {
-    if let Some(reference) = task.references.get("story") {
-        let number = reference
-            .extra
-            .get("number")
-            .cloned()
-            .unwrap_or_else(|| reference.display_name.clone());
-        if !reference.sys_id.trim().is_empty() && !number.trim().is_empty() {
-            return Some(TaskStoryRef {
-                sys_id: reference.sys_id.clone(),
-                number,
-            });
-        }
+    if !task_assignment_group_allowed(&snapshot.assignment_group_sys_id, binding) {
+        return Err(InScopeFailure::WrongAssignmentGroup {
+            expected: expected_task_assignment_groups(binding),
+            observed: snapshot.assignment_group_sys_id,
+        });
     }
 
-    if let Some(field) = task.fields.get("story") {
-        let number = field.display_value.clone().unwrap_or_default();
-        if !field.value.trim().is_empty() && !number.trim().is_empty() {
-            return Some(TaskStoryRef {
-                sys_id: field.value.clone(),
-                number,
-            });
+    Ok(())
+}
+
+fn task_assignment_group_allowed(observed: &str, binding: &BoardBinding) -> bool {
+    equal_sys_id(observed, &binding.assignment_group)
+        || binding
+            .allowed_task_assignment_groups
+            .iter()
+            .any(|allowed| equal_sys_id(observed, allowed))
+}
+
+fn expected_task_assignment_groups(binding: &BoardBinding) -> String {
+    let mut groups = vec![binding.assignment_group.clone()];
+    for group in &binding.allowed_task_assignment_groups {
+        if !group.trim().is_empty() && !groups.iter().any(|seen| equal_sys_id(seen, group)) {
+            groups.push(group.clone());
         }
     }
-
-    task.parent.as_ref().and_then(|parent| {
-        (!parent.sys_id.trim().is_empty() && !parent.number.trim().is_empty()).then(|| {
-            TaskStoryRef {
-                sys_id: parent.sys_id.clone(),
-                number: parent.number.clone(),
-            }
-        })
-    })
+    groups.join(",")
 }
 
 fn field_rejected(fields: Vec<Value>) -> PlanBuildError {
@@ -2194,7 +2160,7 @@ async fn enforce_apply_guard(
                     expected: target.sys_id.clone(),
                     observed: String::new(),
                 })?;
-            task_record_in_scope(&current, binding, state).await
+            task_record_in_scope(&current, binding)
         }
         _ => Ok(()),
     }
@@ -3100,6 +3066,15 @@ mod tests {
         }
     }
 
+    fn task_record(fields: &[(&str, &str)]) -> SnowRecord {
+        let mut record = story_record(fields);
+        record.sys_id = "task-sys".to_string();
+        record.number = "STSK001".to_string();
+        record.table = "rm_scrum_task".to_string();
+        record.resource_type = ResourceType::ScrumTask;
+        record
+    }
+
     fn test_board_binding() -> BoardBinding {
         BoardBinding {
             name: "training-board".to_string(),
@@ -3110,6 +3085,7 @@ mod tests {
             column_field: "sprint".to_string(),
             swim_lane_field: "epic".to_string(),
             assignment_group: "group-sys".to_string(),
+            allowed_task_assignment_groups: Vec::new(),
             allowed_sprints: vec!["sprint-sys".to_string()],
             allow_production: false,
             allowed_story_states: vec!["1".to_string()],
@@ -3303,6 +3279,33 @@ story_board_id = "board-sys"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn update_plan_does_not_default_assignee() {
+        let fixture = crate::test_support::build_fixture_state()
+            .await
+            .expect("fixture");
+        let actor = StoryActor {
+            subject: "actor-1".to_string(),
+            email: None,
+            display_name: None,
+        };
+        let mut payload = json!({
+            "state": "3",
+        });
+
+        let warnings = resolve_assignee_in_payload(
+            "story_task_plan_update",
+            &mut payload,
+            &actor,
+            &fixture.state,
+        )
+        .await
+        .expect("assignee resolution");
+
+        assert!(warnings.is_empty());
+        assert!(payload.get("assigned_to").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn apply_guard_rechecks_story_board_scope() {
         let fixture = crate::test_support::build_fixture_state()
             .await
@@ -3329,6 +3332,61 @@ story_board_id = "board-sys"
         assert!(matches!(
             failure,
             InScopeFailure::WrongAssignmentGroup { .. }
+        ));
+    }
+
+    #[test]
+    fn task_update_scope_uses_task_record_not_parent_story_state() {
+        let task = task_record(&[
+            ("assignment_group", "group-sys"),
+            ("active", "false"),
+            ("state", "3"),
+        ]);
+
+        task_record_in_scope(&task, &test_board_binding())
+            .expect("task update scope should not require an active parent Story");
+    }
+
+    #[test]
+    fn task_update_scope_rejects_wrong_assignment_group() {
+        let task = task_record(&[("assignment_group", "other-group")]);
+        let failure = task_record_in_scope(&task, &test_board_binding())
+            .expect_err("task update scope must remain board-bound");
+
+        assert!(matches!(
+            failure,
+            InScopeFailure::WrongAssignmentGroup { .. }
+        ));
+    }
+
+    #[test]
+    fn task_update_scope_allows_configured_task_assignment_group() {
+        let task = task_record(&[("assignment_group", "task-group")]);
+        let mut binding = test_board_binding();
+        binding.allowed_task_assignment_groups = vec!["task-group".to_string()];
+
+        task_record_in_scope(&task, &binding)
+            .expect("task update scope should allow configured task groups");
+    }
+
+    #[test]
+    fn task_create_scope_still_requires_parent_story_in_scope() {
+        let parent = story_record(&[
+            ("assignment_group", "group-sys"),
+            ("sprint", "sprint-sys"),
+            ("active", "false"),
+        ]);
+        let payload = json!({
+            "story": "story-sys",
+            "short_description": "Task"
+        });
+
+        let failure = enforce_task_parent_payload_scope(&payload, &parent, &test_board_binding())
+            .expect_err("task create must still be scoped by the parent Story");
+
+        assert!(matches!(
+            failure,
+            PlanBuildError::GuardFailed(InScopeFailure::TaskParentOutOfScope { .. })
         ));
     }
 

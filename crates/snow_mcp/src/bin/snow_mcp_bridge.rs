@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -17,6 +18,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let config = bridge_config(&args.daemon_endpoint);
     let daemon = match resolve_snow_binary(args.snow_bin) {
         Some(snow_bin) => LocalSocketDaemonJsonRpcClient::with_auto_spawn(
             args.daemon_endpoint,
@@ -28,11 +30,8 @@ async fn main() -> Result<()> {
         ),
     };
 
-    let bridge = DaemonBackedMcpBridge::new(
-        std::sync::Arc::new(daemon),
-        snow_mcp::McpConfig::default(),
-        args.required_contract,
-    );
+    let bridge =
+        DaemonBackedMcpBridge::new(std::sync::Arc::new(daemon), config, args.required_contract);
     bridge.serve_stdio().await?;
     Ok(())
 }
@@ -159,6 +158,78 @@ fn non_empty_path(path: PathBuf) -> Option<PathBuf> {
 
 fn snow_exe_name() -> String {
     format!("snow{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn bridge_config(endpoint: &DaemonEndpoint) -> snow_mcp::McpConfig {
+    let mut config = snow_mcp::McpConfig::default();
+    if let Some(label) = std::env::var("SNOW_ENV")
+        .ok()
+        .or_else(|| daemon_status_value(endpoint, "environment"))
+    {
+        config.environment =
+            snow_mcp::McpEnvironment::snow_env(label, config.environment.instance_timezone);
+    }
+
+    let policy_path = std::env::var_os("SNOW_MCP_POLICY_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            daemon_env_file(endpoint)
+                .and_then(|path| env_file_value(&path, "SNOW_MCP_POLICY_PATH").map(PathBuf::from))
+        });
+    if let Some(path) = policy_path {
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|input| snow_mcp::domain::policy::PolicyConfig::from_toml_str(&input).ok())
+        {
+            Some(policy) => {
+                config.policy = policy;
+            }
+            None => {
+                eprintln!(
+                    "snow_mcp_bridge: failed to load MCP policy from {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    config
+}
+
+fn daemon_env_file(endpoint: &DaemonEndpoint) -> Option<PathBuf> {
+    daemon_status_value(endpoint, "env_file").map(PathBuf::from)
+}
+
+fn daemon_status_value(endpoint: &DaemonEndpoint, field: &str) -> Option<String> {
+    let status_path = endpoint.filesystem_path()?.parent()?.join("daemon.status");
+    let input = fs::read_to_string(status_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&input).ok()?;
+    value.get(field)?.as_str().map(ToOwned::to_owned)
+}
+
+fn env_file_value(path: &Path, key: &str) -> Option<String> {
+    let input = fs::read_to_string(path).ok()?;
+    input.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key).then(|| unquote_env_value(value.trim()))
+    })
+}
+
+fn unquote_env_value(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+        .to_string()
 }
 
 fn print_help() {

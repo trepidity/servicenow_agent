@@ -168,5 +168,8 @@ task_table = "rm_scrum_task"
 column_field = "sprint"
 swim_lane_field = "epic"
 assignment_group = "fedcba9876543210fedcba9876543210"
+allowed_task_assignment_groups = ["11111111111111111111111111111111"]
 allowed_sprints = ["00000000000000000000000000000000"]
+allowed_story_states = ["-6=Draft", "2=Dev in progress", "3=Complete"]
+allowed_task_states = ["-6=Draft", "2=Work in progress", "3=Complete"]
 allow_production = false
