@@ -29,6 +29,7 @@ pub use kb::{
     KnowledgeTagSummary,
 };
 pub(crate) use reference::*;
+pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
 pub use resource::story::{StoryWriteConcurrency, StoryWriteResult};
 pub use resource::timecard::{
     CardSelector, SetMode, SimpleRef, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector,
@@ -2323,6 +2324,116 @@ impl SnowCore {
         }
 
         resource::story::StoryResource::write_result_from_fresh_row(fresh_record, &fresh_row)
+    }
+
+    pub async fn create_change_request(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.create_change_write_record(resource::change::ChangeResource::PARENT_TABLE, payload)
+            .await
+    }
+
+    pub async fn update_change_request(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.update_change_write_record(
+            resource::change::ChangeResource::PARENT_TABLE,
+            sys_id,
+            payload,
+        )
+        .await
+    }
+
+    pub async fn create_change_task(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.create_change_write_record(resource::change::ChangeResource::CHILD_TABLE, payload)
+            .await
+    }
+
+    pub async fn update_change_task(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.update_change_write_record(
+            resource::change::ChangeResource::CHILD_TABLE,
+            sys_id,
+            payload,
+        )
+        .await
+    }
+
+    async fn create_change_write_record(
+        &self,
+        table: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        let written = self.client.table(table).create(payload).await?;
+        self.refetch_change_write_result(table, &written.sys_id, &written)
+            .await
+    }
+
+    async fn update_change_write_record(
+        &self,
+        table: &str,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        let written = self.client.table(table).update(sys_id, payload).await?;
+        self.refetch_change_write_result(table, sys_id, &written)
+            .await
+    }
+
+    async fn refetch_change_write_result(
+        &self,
+        table: &str,
+        expected_sys_id: &str,
+        write_response: &Record,
+    ) -> Result<ChangeWriteResult> {
+        let expected_sys_id = expected_sys_id.trim();
+        if expected_sys_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} write response did not include a sys_id to refetch",
+                table
+            ));
+        }
+
+        let Some((fresh_row, fresh_record)) = self
+            .get_record_by_table_sys_id_fresh_with_source(table, expected_sys_id)
+            .await?
+        else {
+            return Err(anyhow::anyhow!(
+                "{} write response returned {}, but fresh refetch by sys_id {} found no row",
+                table,
+                write_response.sys_id,
+                expected_sys_id
+            ));
+        };
+
+        let fresh_table = canonical_record_table(&fresh_row.table);
+        if fresh_table != table {
+            return Err(anyhow::anyhow!(
+                "{} write refetched sys_id {} from unexpected table {}",
+                table,
+                expected_sys_id,
+                fresh_row.table
+            ));
+        }
+        if fresh_row.sys_id != expected_sys_id {
+            return Err(anyhow::anyhow!(
+                "{} write refetched sys_id {}, expected {}",
+                table,
+                fresh_row.sys_id,
+                expected_sys_id
+            ));
+        }
+
+        resource::change::ChangeResource::write_result_from_fresh_row(fresh_record, &fresh_row)
     }
 
     pub async fn add_work_note(&self, number: &str, text: &str) -> Result<Option<SnowRecord>> {

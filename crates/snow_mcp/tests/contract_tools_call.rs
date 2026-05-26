@@ -1,7 +1,9 @@
 mod support;
 
 use serde_json::json;
-use snow_mcp::{JsonRpcRequest, McpServer, planner::is_governed_write_tool};
+use snow_mcp::{
+    JsonRpcRequest, McpServer, domain::policy::is_write_tool, planner::is_governed_write_tool,
+};
 
 #[tokio::test]
 async fn representative_read_tool_calls_round_trip() {
@@ -32,13 +34,11 @@ async fn representative_read_tool_calls_round_trip() {
 
     let capabilities = call(&server, "tool_capabilities", json!({}), 4).await;
     assert_eq!(capabilities["default_mode"], "read_only");
-    assert!(
-        capabilities["tools"]
-            .as_array()
-            .expect("capabilities")
-            .iter()
-            .all(|tool| tool["read_only"] == true)
-    );
+    let tools = capabilities["tools"].as_array().expect("capabilities");
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        assert_eq!(tool["read_only"], json!(!is_write_tool(name)));
+    }
 }
 
 #[tokio::test]
@@ -55,6 +55,14 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         "story_task_apply_create",
         "story_task_plan_update",
         "story_task_apply_update",
+        "change_request_plan_create",
+        "change_request_apply_create",
+        "change_request_plan_update",
+        "change_request_apply_update",
+        "change_task_plan_create",
+        "change_task_apply_create",
+        "change_task_plan_update",
+        "change_task_apply_update",
         "timecard_plan_set_hours",
         "timecard_apply_set_hours",
         "work_note_plan_add",

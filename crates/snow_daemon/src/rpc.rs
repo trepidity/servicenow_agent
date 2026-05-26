@@ -119,6 +119,14 @@ pub enum RpcMethod {
     PlanGet,
     WorkNotePlanAdd,
     WorkNoteApplyAdd,
+    ChangeRequestPlanCreate,
+    ChangeRequestApplyCreate,
+    ChangeRequestPlanUpdate,
+    ChangeRequestApplyUpdate,
+    ChangeTaskPlanCreate,
+    ChangeTaskApplyCreate,
+    ChangeTaskPlanUpdate,
+    ChangeTaskApplyUpdate,
     StoryPlanCreate,
     StoryApplyCreate,
     StoryPlanUpdate,
@@ -198,6 +206,14 @@ impl RpcMethod {
             "plan_get" => Self::PlanGet,
             "work_note_plan_add" => Self::WorkNotePlanAdd,
             "work_note_apply_add" => Self::WorkNoteApplyAdd,
+            "change_request_plan_create" => Self::ChangeRequestPlanCreate,
+            "change_request_apply_create" => Self::ChangeRequestApplyCreate,
+            "change_request_plan_update" => Self::ChangeRequestPlanUpdate,
+            "change_request_apply_update" => Self::ChangeRequestApplyUpdate,
+            "change_task_plan_create" => Self::ChangeTaskPlanCreate,
+            "change_task_apply_create" => Self::ChangeTaskApplyCreate,
+            "change_task_plan_update" => Self::ChangeTaskPlanUpdate,
+            "change_task_apply_update" => Self::ChangeTaskApplyUpdate,
             "story_plan_create" => Self::StoryPlanCreate,
             "story_apply_create" => Self::StoryApplyCreate,
             "story_plan_update" => Self::StoryPlanUpdate,
@@ -1023,6 +1039,20 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         RpcMethod::WorkNoteApplyAdd => {
             crate::work_note_write::handle_work_note_apply_add(id, &request.params, state).await
         }
+        RpcMethod::ChangeRequestPlanCreate
+        | RpcMethod::ChangeRequestPlanUpdate
+        | RpcMethod::ChangeTaskPlanCreate
+        | RpcMethod::ChangeTaskPlanUpdate => {
+            crate::change_write::handle_change_plan(id, &request.method, &request.params, state)
+                .await
+        }
+        RpcMethod::ChangeRequestApplyCreate
+        | RpcMethod::ChangeRequestApplyUpdate
+        | RpcMethod::ChangeTaskApplyCreate
+        | RpcMethod::ChangeTaskApplyUpdate => {
+            crate::change_write::handle_change_apply(id, &request.method, &request.params, state)
+                .await
+        }
         RpcMethod::StoryPlanCreate
         | RpcMethod::StoryPlanUpdate
         | RpcMethod::StoryTaskPlanCreate
@@ -1154,6 +1184,14 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "plan_get",
     "work_note_plan_add",
     "work_note_apply_add",
+    "change_request_plan_create",
+    "change_request_apply_create",
+    "change_request_plan_update",
+    "change_request_apply_update",
+    "change_task_plan_create",
+    "change_task_apply_create",
+    "change_task_plan_update",
+    "change_task_apply_update",
     "story_plan_create",
     "story_apply_create",
     "story_plan_update",

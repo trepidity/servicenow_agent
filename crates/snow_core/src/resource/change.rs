@@ -1,3 +1,6 @@
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
+
 use crate::{RecordRef, ResourceType, SnowRecord};
 use servicenow_rs::prelude::Record;
 
@@ -15,6 +18,18 @@ pub struct ChangeChildRefreshPlan {
     pub parent: RecordRef,
     pub relation: ChangeRelationSpec,
     pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeWriteConcurrency {
+    pub sys_updated_on: String,
+    pub sys_mod_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeWriteResult {
+    pub record: SnowRecord,
+    pub concurrency: ChangeWriteConcurrency,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +88,16 @@ impl ChangeResource {
             query: format!("{}={}", Self::CHILD_LINK_FIELD, parent_ref.sys_id),
         })
     }
+
+    pub fn write_result_from_fresh_row(
+        record: SnowRecord,
+        fresh_row: &Record,
+    ) -> Result<ChangeWriteResult> {
+        Ok(ChangeWriteResult {
+            record,
+            concurrency: ChangeWriteConcurrency::from_fresh_row(fresh_row)?,
+        })
+    }
 }
 
 impl ChangeChildRefreshPlan {
@@ -82,6 +107,36 @@ impl ChangeChildRefreshPlan {
 
     pub fn child_table(&self) -> &'static str {
         self.relation.child_table
+    }
+}
+
+impl ChangeWriteConcurrency {
+    pub fn from_fresh_row(record: &Record) -> Result<Self> {
+        let sys_updated_on = record
+            .get_raw("sys_updated_on")
+            .or_else(|| record.get_str("sys_updated_on"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "fresh {} row {} did not include sys_updated_on",
+                    record.table,
+                    record.sys_id
+                )
+            })?
+            .to_string();
+
+        let sys_mod_count = record
+            .get_raw("sys_mod_count")
+            .or_else(|| record.get_str("sys_mod_count"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<i64>().ok());
+
+        Ok(Self {
+            sys_updated_on,
+            sys_mod_count,
+        })
     }
 }
 
@@ -116,5 +171,25 @@ mod tests {
         assert_eq!(plan.child_link_field(), "change_request");
         assert_eq!(plan.parent.number, "CHG0001234");
         assert!(plan.query.contains("chg-sys"));
+    }
+
+    #[test]
+    fn captures_concurrency_from_fresh_row() {
+        let record = Record::from_json(
+            "change_request",
+            &serde_json::json!({
+                "sys_id": "chg-sys",
+                "number": "CHG0001234",
+                "sys_updated_on": "2026-05-26 10:11:12",
+                "sys_mod_count": "5"
+            }),
+            DisplayValue::Raw,
+        )
+        .unwrap();
+
+        let concurrency = ChangeWriteConcurrency::from_fresh_row(&record).unwrap();
+
+        assert_eq!(concurrency.sys_updated_on, "2026-05-26 10:11:12");
+        assert_eq!(concurrency.sys_mod_count, Some(5));
     }
 }

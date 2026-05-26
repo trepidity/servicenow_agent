@@ -487,8 +487,6 @@ pub fn is_write_tool(tool: &str) -> bool {
             tool,
             "catalog_submit_request"
                 | "catalog_cancel_request"
-                | "change_submit_request"
-                | "change_task_apply_assignment"
                 | "work_note_apply_add"
                 | "plan_cancel"
         )
@@ -645,6 +643,30 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
             ),
         ),
         (
+            "change_writer".to_string(),
+            role(
+                &[
+                    "get_record",
+                    "get_children",
+                    "get_work_notes",
+                    "change_request_plan_create",
+                    "change_request_plan_update",
+                    "change_task_plan_create",
+                    "change_task_plan_update",
+                    "plan_get",
+                    "policy_describe",
+                    "tool_capabilities",
+                ],
+                &[
+                    "change_request_apply_create",
+                    "change_request_apply_update",
+                    "change_task_apply_create",
+                    "change_task_apply_update",
+                    "work_note_apply_add",
+                ],
+            ),
+        ),
+        (
             "governance_reviewer".to_string(),
             role(
                 &[
@@ -747,6 +769,86 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
             },
         ),
         (
+            "change_request_plan_create".to_string(),
+            change_plan_policy(),
+        ),
+        (
+            "change_request_plan_update".to_string(),
+            change_plan_policy(),
+        ),
+        ("change_task_plan_create".to_string(), change_plan_policy()),
+        ("change_task_plan_update".to_string(), change_plan_policy()),
+        (
+            "change_request_apply_create".to_string(),
+            change_apply_policy(&[
+                "short_description",
+                "description",
+                "type",
+                "category",
+                "assignment_group",
+                "assigned_to",
+                "cmdb_ci",
+                "start_date",
+                "end_date",
+                "implementation_plan",
+                "backout_plan",
+                "test_plan",
+                "risk",
+                "impact",
+                "justification",
+                "work_notes",
+            ]),
+        ),
+        (
+            "change_request_apply_update".to_string(),
+            change_apply_policy(&[
+                "short_description",
+                "description",
+                "type",
+                "category",
+                "assignment_group",
+                "assigned_to",
+                "cmdb_ci",
+                "start_date",
+                "end_date",
+                "implementation_plan",
+                "backout_plan",
+                "test_plan",
+                "risk",
+                "impact",
+                "justification",
+                "state",
+                "work_notes",
+            ]),
+        ),
+        (
+            "change_task_apply_create".to_string(),
+            change_apply_policy(&[
+                "change_request",
+                "short_description",
+                "description",
+                "assignment_group",
+                "assigned_to",
+                "start_date",
+                "end_date",
+                "state",
+                "work_notes",
+            ]),
+        ),
+        (
+            "change_task_apply_update".to_string(),
+            change_apply_policy(&[
+                "short_description",
+                "description",
+                "assignment_group",
+                "assigned_to",
+                "start_date",
+                "end_date",
+                "state",
+                "work_notes",
+            ]),
+        ),
+        (
             "work_note_apply_add".to_string(),
             ToolPolicy {
                 enabled: true,
@@ -755,23 +857,6 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
                 field_allowlist: BTreeSet::from(["work_notes".to_string()]),
                 environments: vec!["test".to_string(), "training".to_string()],
                 confirmation_ttl_seconds: Some(300),
-                ..ToolPolicy::default()
-            },
-        ),
-        (
-            "change_task_apply_assignment".to_string(),
-            ToolPolicy {
-                enabled: false,
-                requires_confirmation: true,
-                requires_kb_evidence: false,
-                field_allowlist: BTreeSet::from([
-                    "assigned_to".to_string(),
-                    "start_date".to_string(),
-                    "end_date".to_string(),
-                ]),
-                environments: vec!["test".to_string(), "training".to_string()],
-                max_records: Some(20),
-                skip_terminal_records: true,
                 ..ToolPolicy::default()
             },
         ),
@@ -813,6 +898,32 @@ fn story_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
 
 fn default_story_environments() -> Vec<String> {
     vec!["test".to_string(), "training".to_string()]
+}
+
+fn change_plan_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: true,
+        requires_confirmation: false,
+        requires_kb_evidence: false,
+        environments: default_story_environments(),
+        ..ToolPolicy::default()
+    }
+}
+
+fn change_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        field_allowlist: field_allowlist
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect(),
+        environments: default_story_environments(),
+        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+        skip_terminal_records: true,
+        ..ToolPolicy::default()
+    }
 }
 
 fn timecard_plan_policy() -> ToolPolicy {

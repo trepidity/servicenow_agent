@@ -74,22 +74,14 @@ confirmation_ttl_seconds = 600
 [mcp.tools.catalog_submit_request]
 enabled = false
 
-# Enable a scaffold/bulk write tool with a record cap:
-[mcp.tools.change_task_apply_assignment]
-enabled = false                            # flip to true to allow
-requires_confirmation = true
-field_allowlist = ["assigned_to", "start_date", "end_date"]
-environments = ["test", "training"]
-max_records = 20                           # reject bulk ops above this size
-skip_terminal_records = true               # ignore closed/cancelled records
-
 # --- Remaining write tools (all ship DISABLED by default) ---
 # The complete set of write tools you may toggle (is_write_tool):
 #   catalog_submit_request, catalog_cancel_request, work_note_apply_add,
 #   story_apply_create, story_apply_update,
 #   story_task_apply_create, story_task_apply_update,
 #   timecard_apply_set_hours,
-#   change_submit_request, change_task_apply_assignment, plan_cancel
+#   change_request_apply_create, change_request_apply_update,
+#   change_task_apply_create, change_task_apply_update, plan_cancel
 # Read tools are enabled by default and never need an entry here.
 
 [mcp.tools.story_apply_update]
@@ -129,10 +121,49 @@ field_allowlist = [
 enabled = false
 requires_confirmation = true
 
-# Scaffold — not yet implemented; listed so the full write surface is visible.
-[mcp.tools.change_submit_request]
+# Create a governed Change Request. Update tools use the same safety posture,
+# plus optimistic concurrency through the plan/apply receipt token.
+[mcp.tools.change_request_apply_create]
 enabled = false
 requires_confirmation = true
+environments = ["test", "training"]
+field_allowlist = [
+    "short_description", "description", "type", "category",
+    "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
+    "implementation_plan", "backout_plan", "test_plan", "risk", "impact",
+    "justification", "work_notes",
+]
+
+[mcp.tools.change_request_apply_update]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+skip_terminal_records = true
+field_allowlist = [
+    "short_description", "description", "type", "category",
+    "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
+    "implementation_plan", "backout_plan", "test_plan", "risk", "impact",
+    "justification", "work_notes", "state",
+]
+
+[mcp.tools.change_task_apply_create]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+field_allowlist = [
+    "change_request", "short_description", "description", "assignment_group",
+    "assigned_to", "start_date", "end_date", "state", "work_notes",
+]
+
+[mcp.tools.change_task_apply_update]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+skip_terminal_records = true
+field_allowlist = [
+    "short_description", "description", "assignment_group", "assigned_to",
+    "start_date", "end_date", "state", "work_notes",
+]
 
 # Cancel a pending MCP operation plan (not a ServiceNow record). No board needed.
 [mcp.tools.plan_cancel]
@@ -154,6 +185,19 @@ write_tools = []
 [mcp.roles.story_writer]
 read_tools = ["story_get", "story_tasks_list", "story_plan_create", "story_plan_update"]
 write_tools = ["story_apply_create", "story_apply_update"]
+
+[mcp.roles.change_writer]
+read_tools = [
+    "get_record", "get_children", "get_work_notes",
+    "change_request_plan_create", "change_request_plan_update",
+    "change_task_plan_create", "change_task_plan_update",
+    "plan_get", "policy_describe", "tool_capabilities",
+]
+write_tools = [
+    "change_request_apply_create", "change_request_apply_update",
+    "change_task_apply_create", "change_task_apply_update",
+    "work_note_apply_add",
+]
 
 # ---------------------------------------------------------------------------
 # Optional: story-board bindings, required for governed story_* write tools.

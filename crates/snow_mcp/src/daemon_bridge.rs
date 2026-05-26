@@ -42,6 +42,14 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("resource_plan_get", "get_record"),
     ("story_get", "get_record"),
     ("story_tasks_list", "get_children"),
+    ("change_request_plan_create", "change_request_plan_create"),
+    ("change_request_apply_create", "change_request_apply_create"),
+    ("change_request_plan_update", "change_request_plan_update"),
+    ("change_request_apply_update", "change_request_apply_update"),
+    ("change_task_plan_create", "change_task_plan_create"),
+    ("change_task_apply_create", "change_task_apply_create"),
+    ("change_task_plan_update", "change_task_plan_update"),
+    ("change_task_apply_update", "change_task_apply_update"),
     ("story_plan_create", "story_plan_create"),
     ("story_apply_create", "story_apply_create"),
     ("story_plan_update", "story_plan_update"),
@@ -674,20 +682,23 @@ impl DaemonBackedMcpBridge {
         let contract = self.contract().await?;
         let mut tools = Vec::new();
         for tool in self.registry.metadata() {
-            let enabled = LOCAL_GOVERNANCE_TOOLS.contains(&tool.name.as_str())
+            let available = LOCAL_GOVERNANCE_TOOLS.contains(&tool.name.as_str())
                 || canonical_daemon_method(&tool.name)
                     .map(|method| method_available(&contract, method))
                     .unwrap_or(false);
-            if enabled {
+            if available {
                 tools.push(ToolCapability {
                     name: tool.name.clone(),
-                    enabled,
+                    enabled: self
+                        .config
+                        .policy
+                        .tool_enabled_in_environment(&tool.name, &self.config.environment.label),
                     mode: if is_write_tool(&tool.name) {
                         "write".to_string()
                     } else {
                         "read".to_string()
                     },
-                    read_only: true,
+                    read_only: !is_write_tool(&tool.name),
                     requires_confirmation: tool.requires_confirmation,
                 });
             }

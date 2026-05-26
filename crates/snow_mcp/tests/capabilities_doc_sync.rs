@@ -15,8 +15,6 @@ use snow_mcp::tools::ToolRegistry;
 const EXPLICIT_WRITE_TOOLS: &[&str] = &[
     "catalog_submit_request",
     "catalog_cancel_request",
-    "change_submit_request",
-    "change_task_apply_assignment",
     "work_note_apply_add",
     "plan_cancel",
 ];

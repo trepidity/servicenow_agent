@@ -28,6 +28,31 @@ const STORY_WRITE_TOOLS: &[&str] = &[
     "story_task_apply_update",
 ];
 
+const CHANGE_PLAN_TOOLS: &[&str] = &[
+    "change_request_plan_create",
+    "change_request_plan_update",
+    "change_task_plan_create",
+    "change_task_plan_update",
+];
+
+const CHANGE_APPLY_TOOLS: &[&str] = &[
+    "change_request_apply_create",
+    "change_request_apply_update",
+    "change_task_apply_create",
+    "change_task_apply_update",
+];
+
+const CHANGE_WRITE_TOOLS: &[&str] = &[
+    "change_request_plan_create",
+    "change_request_apply_create",
+    "change_request_plan_update",
+    "change_request_apply_update",
+    "change_task_plan_create",
+    "change_task_apply_create",
+    "change_task_plan_update",
+    "change_task_apply_update",
+];
+
 const TIMECARD_TOOLS: &[&str] = &[
     "timecard_list",
     "timecard_plan_set_hours",
@@ -76,6 +101,14 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "story_task_apply_create",
         "story_task_plan_update",
         "story_task_apply_update",
+        "change_request_plan_create",
+        "change_request_apply_create",
+        "change_request_plan_update",
+        "change_request_apply_update",
+        "change_task_plan_create",
+        "change_task_apply_create",
+        "change_task_plan_update",
+        "change_task_apply_update",
         "timecard_list",
         "timecard_plan_set_hours",
         "timecard_apply_set_hours",
@@ -178,6 +211,21 @@ fn eight_story_tools_registered() {
 }
 
 #[test]
+fn eight_change_tools_registered() {
+    let registry = ToolRegistry::new();
+
+    for expected in CHANGE_WRITE_TOOLS {
+        let tool = registry
+            .metadata()
+            .iter()
+            .find(|tool| tool.name == *expected)
+            .unwrap_or_else(|| panic!("missing Change write tool {expected}"));
+        assert_eq!(tool.input_schema["type"], "object");
+        assert_eq!(tool.output_schema["type"], "object");
+    }
+}
+
+#[test]
 fn apply_default_enabled_false() {
     let registry = ToolRegistry::new();
 
@@ -200,6 +248,32 @@ fn apply_default_enabled_false() {
             .iter()
             .find(|tool| tool.name == *expected)
             .unwrap_or_else(|| panic!("missing Story apply tool {expected}"));
+        assert!(!tool.default_enabled, "{expected} should default disabled");
+        assert!(
+            tool.requires_confirmation,
+            "{expected} should require confirmation"
+        );
+    }
+
+    for expected in CHANGE_PLAN_TOOLS {
+        let tool = registry
+            .metadata()
+            .iter()
+            .find(|tool| tool.name == *expected)
+            .unwrap_or_else(|| panic!("missing Change plan tool {expected}"));
+        assert!(tool.default_enabled, "{expected} should default enabled");
+        assert!(
+            !tool.requires_confirmation,
+            "{expected} should not require confirmation"
+        );
+    }
+
+    for expected in CHANGE_APPLY_TOOLS {
+        let tool = registry
+            .metadata()
+            .iter()
+            .find(|tool| tool.name == *expected)
+            .unwrap_or_else(|| panic!("missing Change apply tool {expected}"));
         assert!(!tool.default_enabled, "{expected} should default disabled");
         assert!(
             tool.requires_confirmation,
@@ -284,6 +358,55 @@ fn schemas_include_required_fields_for_create_update_apply() {
         json!(100)
     );
 
+    let change_create = &tool("change_request_plan_create").input_schema;
+    assert_eq!(change_create["type"], "object");
+    assert_eq!(
+        change_create["required"],
+        json!([
+            "short_description",
+            "description",
+            "assignment_group",
+            "cmdb_ci",
+            "start_date",
+            "end_date",
+            "implementation_plan",
+            "backout_plan",
+            "test_plan"
+        ])
+    );
+    assert_eq!(
+        change_create["properties"]["implementation_plan"]["type"],
+        "string"
+    );
+
+    let change_update = &tool("change_request_plan_update").input_schema;
+    assert_eq!(change_update["type"], "object");
+    assert_eq!(change_update["required"], json!(["number"]));
+    assert_eq!(
+        change_update["properties"]["number"]["pattern"],
+        "^CHG\\d+$"
+    );
+    assert_eq!(change_update["properties"]["state"]["type"], "string");
+
+    let change_task_create = &tool("change_task_plan_create").input_schema;
+    assert_eq!(change_task_create["type"], "object");
+    assert_eq!(
+        change_task_create["required"],
+        json!(["parent_change_number", "short_description"])
+    );
+    assert_eq!(
+        change_task_create["properties"]["parent_change_number"]["pattern"],
+        "^CHG\\d+$"
+    );
+
+    let change_task_update = &tool("change_task_plan_update").input_schema;
+    assert_eq!(change_task_update["type"], "object");
+    assert_eq!(change_task_update["required"], json!(["number"]));
+    assert_eq!(
+        change_task_update["properties"]["number"]["pattern"],
+        "^CTASK\\d+$"
+    );
+
     let work_note_plan = &tool("work_note_plan_add").input_schema;
     assert_eq!(work_note_plan["type"], "object");
     assert_eq!(work_note_plan["required"], json!(["number", "work_notes"]));
@@ -294,7 +417,12 @@ fn schemas_include_required_fields_for_create_update_apply() {
         json!(["plan_id", "confirmation_token", "idempotency_key"])
     );
 
-    for apply in ["story_apply_create", "story_task_apply_create"] {
+    for apply in [
+        "story_apply_create",
+        "story_task_apply_create",
+        "change_request_apply_create",
+        "change_task_apply_create",
+    ] {
         let schema = &tool(apply).input_schema;
         assert_eq!(schema["type"], "object");
         assert_eq!(
@@ -303,7 +431,12 @@ fn schemas_include_required_fields_for_create_update_apply() {
         );
     }
 
-    for apply in ["story_apply_update", "story_task_apply_update"] {
+    for apply in [
+        "story_apply_update",
+        "story_task_apply_update",
+        "change_request_apply_update",
+        "change_task_apply_update",
+    ] {
         let schema = &tool(apply).input_schema;
         assert_eq!(schema["type"], "object");
         assert_eq!(

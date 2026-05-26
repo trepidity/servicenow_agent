@@ -33,7 +33,7 @@ impl ToolMetadata {
             } else {
                 "read".to_string()
             },
-            read_only: true,
+            read_only: !is_write_tool(&self.name),
             requires_confirmation: self.requires_confirmation,
         }
     }

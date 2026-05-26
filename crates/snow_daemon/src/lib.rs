@@ -21,6 +21,7 @@ use snow_core::{
     ipc::IpcEndpoint,
 };
 
+pub mod change_write;
 pub mod jobs;
 pub mod rpc;
 pub mod story_write;

@@ -178,12 +178,11 @@ impl McpServer {
             "work_note_plan_add" => self.call_work_note_plan_add(id, params).await,
             "catalog_items_search" => self.call_catalog_items_search(id, params).await,
             "catalog_item_get" => self.call_get_record(id, params).await,
-            "catalog_plan_request" | "change_plan_request" | "change_task_plan_assignment" => self
-                .not_implemented(
-                    id,
-                    name,
-                    "planning scaffold is registered but not implemented",
-                ),
+            "catalog_plan_request" => self.not_implemented(
+                id,
+                name,
+                "planning scaffold is registered but not implemented",
+            ),
             "plan_get" => self.not_implemented(id, name, "plan persistence is not enabled"),
             "audit_event_get" | "audit_events_search" | "audit_chain_verify" => self
                 .not_implemented(
@@ -753,12 +752,17 @@ impl McpServer {
     }
 
     fn tool_capabilities_response(&self, id: Option<Value>) -> JsonRpcResponse {
-        let tools = self
-            .registry
-            .metadata()
-            .iter()
-            .map(|metadata| metadata.capability(self.config.policy.is_tool_enabled(&metadata.name)))
-            .collect::<Vec<_>>();
+        let tools =
+            self.registry
+                .metadata()
+                .iter()
+                .map(|metadata| {
+                    metadata.capability(self.config.policy.tool_enabled_in_environment(
+                        &metadata.name,
+                        &self.config.environment.label,
+                    ))
+                })
+                .collect::<Vec<_>>();
         JsonRpcResponse::ok(
             id,
             json!(ToolCapabilitiesReport {
@@ -782,7 +786,10 @@ impl McpServer {
                     .iter()
                     .filter(|metadata| {
                         is_write_tool(&metadata.name)
-                            && self.config.policy.is_tool_enabled(&metadata.name)
+                            && self.config.policy.tool_enabled_in_environment(
+                                &metadata.name,
+                                &self.config.environment.label,
+                            )
                     })
                     .map(|metadata| metadata.name.clone())
                     .collect(),
