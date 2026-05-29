@@ -24,6 +24,7 @@ use crate::protocol::schema::{
     JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport,
 };
 use crate::tools::ToolRegistry;
+use crate::tools::records::{RESOURCE_PLAN_LOOKUP_TABLES, RecordLookup, parse_record_lookup};
 use crate::transport::McpTransport;
 use crate::{Error, Result};
 
@@ -172,17 +173,17 @@ impl McpServer {
             "rebuild_cache" => self.call_rebuild_cache(id),
             "verify_vault" => self.call_verify_vault(id),
             "get_work_notes" => self.call_get_work_notes(id, params).await,
-            "resource_plan_get" | "story_get" => self.call_get_record(id, params).await,
+            "attachment_list" => self.call_attachment_list(id, params).await,
+            "resource_plan_get" => {
+                self.call_get_record_with_allowed_tables(id, params, RESOURCE_PLAN_LOOKUP_TABLES)
+                    .await
+            }
+            "story_get" => self.call_get_record_number(id, params).await,
             "story_tasks_list" => self.call_get_children(id, params).await,
             "timecard_list" => self.call_timecard_list(id, params).await,
             "work_note_plan_add" => self.call_work_note_plan_add(id, params).await,
             "catalog_items_search" => self.call_catalog_items_search(id, params).await,
-            "catalog_item_get" => self.call_get_record(id, params).await,
-            "catalog_plan_request" => self.not_implemented(
-                id,
-                name,
-                "planning scaffold is registered but not implemented",
-            ),
+            "catalog_item_get" => self.call_catalog_item_get(id, params).await,
             "plan_get" => self.not_implemented(id, name, "plan persistence is not enabled"),
             "audit_event_get" | "audit_events_search" | "audit_chain_verify" => self
                 .not_implemented(
@@ -249,10 +250,74 @@ impl McpServer {
     }
 
     async fn call_get_record(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        self.call_get_record_with_allowed_tables(
+            id,
+            params,
+            snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+        )
+        .await
+    }
+
+    async fn call_get_record_with_allowed_tables(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+        allowed_tables: &[&str],
+    ) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let lookup = match parse_record_lookup(arguments, allowed_tables) {
+            Ok(lookup) => lookup,
+            Err(err) => return invalid_params(id, err.to_string()),
+        };
+
+        match lookup {
+            RecordLookup::Number(number) => self.get_record_by_number_response(id, &number).await,
+            RecordLookup::TableSysId { table, sys_id } => {
+                self.get_record_by_table_sys_id_response(id, &table, &sys_id)
+                    .await
+            }
+        }
+    }
+
+    async fn call_get_record_number(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        if params
+            .get("arguments")
+            .and_then(Value::as_object)
+            .is_some_and(|args| args.contains_key("table") || args.contains_key("sys_id"))
+        {
+            return invalid_params(id, "tool only accepts number-based lookups");
+        }
         let Ok(number) = extract_argument_string(params, "number") else {
             return invalid_params(id, "missing number");
         };
-        match get_record_cached_or_fresh(self.core.as_ref(), &number).await {
+        self.get_record_by_number_response(id, &number).await
+    }
+
+    async fn get_record_by_number_response(
+        &self,
+        id: Option<Value>,
+        number: &str,
+    ) -> JsonRpcResponse {
+        match get_record_cached_or_fresh(self.core.as_ref(), number).await {
+            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "record": record })),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn get_record_by_table_sys_id_response(
+        &self,
+        id: Option<Value>,
+        table: &str,
+        sys_id: &str,
+    ) -> JsonRpcResponse {
+        match self
+            .core
+            .get_record_by_table_sys_id_fresh(table, sys_id)
+            .await
+        {
             Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "record": record })),
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
             Err(err) => service_failure(id, err),
@@ -274,6 +339,13 @@ impl McpServer {
     }
 
     async fn call_get_children(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        if params
+            .get("arguments")
+            .and_then(Value::as_object)
+            .is_some_and(|args| args.contains_key("table") || args.contains_key("sys_id"))
+        {
+            return invalid_params(id, "tool only accepts number-based lookups");
+        }
         let Ok(number) = extract_argument_string(params, "number") else {
             return invalid_params(id, "missing number");
         };
@@ -696,11 +768,26 @@ impl McpServer {
     }
 
     async fn call_get_work_notes(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let lookup = match parse_record_lookup(arguments, snow_core::RECORD_LOOKUP_ALLOWED_TABLES) {
+            Ok(lookup) => lookup,
+            Err(err) => return invalid_params(id, err.to_string()),
+        };
+        match get_record_by_lookup_cached_or_fresh(self.core.as_ref(), lookup).await {
+            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes })),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_attachment_list(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
         let Ok(number) = extract_argument_string(params, "number") else {
             return invalid_params(id, "missing number");
         };
-        match get_record_cached_or_fresh(self.core.as_ref(), &number).await {
-            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes })),
+        match self.core.list_attachments(&number).await {
+            Ok(Some(attachments)) => JsonRpcResponse::ok(id, json!({ "attachments": attachments })),
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
             Err(err) => service_failure(id, err),
         }
@@ -742,11 +829,30 @@ impl McpServer {
         let Some(query) = arguments.get("query").and_then(Value::as_str) else {
             return invalid_params(id, "missing query");
         };
-        match self.core.search_enriched(query, SearchScope::All).await {
-            Ok(results) => JsonRpcResponse::ok(
-                id,
-                json!({ "candidates": results.into_iter().take(10).collect::<Vec<_>>() }),
-            ),
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .min(50) as u32;
+        match self.core.search_catalog_items(query, limit).await {
+            Ok(items) => JsonRpcResponse::ok(id, json!({ "items": items })),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_catalog_item_get(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let Some(arguments) = params.get("arguments") else {
+            return invalid_params(id, "missing arguments");
+        };
+        let Some(sys_id) = arguments
+            .get("sys_id")
+            .or_else(|| arguments.get("item_sys_id"))
+            .and_then(Value::as_str)
+        else {
+            return invalid_params(id, "missing sys_id");
+        };
+        match self.core.get_catalog_item(sys_id).await {
+            Ok(item) => JsonRpcResponse::ok(id, json!({ "item": item })),
             Err(err) => service_failure(id, err),
         }
     }
@@ -1009,6 +1115,7 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "request_task" | "sc_task" => Ok(ResourceType::RequestTask),
         "project" | "pm_project" => Ok(ResourceType::Project),
         "demand" | "dmn_demand" => Ok(ResourceType::Demand),
+        "demand_task" | "dmn_demand_task" | "dmntsk" => Ok(ResourceType::DemandTask),
         "resource_plan" | "resourceplan" | "rpln" => Ok(ResourceType::ResourcePlan),
         "story" | "rm_story" => Ok(ResourceType::Story),
         "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),
@@ -1035,6 +1142,18 @@ async fn get_record_cached_or_fresh(
     match core.get_record(number).await? {
         Some(record) => Ok(Some(record)),
         None => core.get_record_fresh(number).await,
+    }
+}
+
+async fn get_record_by_lookup_cached_or_fresh(
+    core: &SnowCore,
+    lookup: RecordLookup,
+) -> anyhow::Result<Option<SnowRecord>> {
+    match lookup {
+        RecordLookup::Number(number) => get_record_cached_or_fresh(core, &number).await,
+        RecordLookup::TableSysId { table, sys_id } => {
+            core.get_record_by_table_sys_id_fresh(&table, &sys_id).await
+        }
     }
 }
 
@@ -1100,6 +1219,7 @@ fn resource_type_json(resource_type: &ResourceType) -> &'static str {
         ResourceType::RequestTask => "request_task",
         ResourceType::Project => "project",
         ResourceType::Demand => "demand",
+        ResourceType::DemandTask => "demand_task",
         ResourceType::ResourcePlan => "resource_plan",
         ResourceType::Story => "story",
         ResourceType::ScrumTask => "scrum_task",

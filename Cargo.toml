@@ -25,8 +25,9 @@ ratatui = "0.30"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-servicenow_rs = { git = "https://github.com/trepidity/servicenow_rs.git", rev = "12cf719d1f3d45d73d99979e2cf893afc5da60c4" }
+servicenow_rs = { git = "https://github.com/trepidity/servicenow_rs.git", rev = "c15781bb5c604d079889386c7f846d82fe597e70" }
 tokio = { version = "1", features = ["full"] }
 toml = "1.1.2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"

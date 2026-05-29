@@ -9,8 +9,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use snow_core::{
-    ApprovalRecord, CacheSource, FieldChoice, FieldValue, JournalEntry, KnowledgeArticle,
-    KnowledgeBaseSummary, KnowledgeCategorySummary, KnowledgeEmbeddingCoverage,
+    ApprovalRecord, AttachmentMetadata, CacheSource, FieldChoice, FieldValue, JournalEntry,
+    KnowledgeArticle, KnowledgeBaseSummary, KnowledgeCategorySummary, KnowledgeEmbeddingCoverage,
     KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
     KnowledgeSemanticSearchFilters, KnowledgeSemanticStatus, MatchField, RecordRef, Reference,
     ResourceType, SearchMatchReason, SemanticIndexSummary, SnowCore, SnowRecord, TaskSlaParentRef,
@@ -113,6 +113,20 @@ impl TuiClient {
         match self {
             Self::Local(core) => core.get_record_fresh(number).await.map_err(SnowError::from),
             Self::Remote(client) => client.get_record_fresh(number).await,
+        }
+    }
+
+    pub async fn get_record_by_table_sys_id_fresh(
+        &self,
+        table: &str,
+        sys_id: &str,
+    ) -> Result<Option<SnowRecord>, SnowError> {
+        match self {
+            Self::Local(core) => core
+                .get_record_by_table_sys_id_fresh(table, sys_id)
+                .await
+                .map_err(SnowError::from),
+            Self::Remote(client) => client.get_record_by_table_sys_id_fresh(table, sys_id).await,
         }
     }
 
@@ -316,6 +330,38 @@ impl TuiClient {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn list_attachments(
+        &self,
+        number: &str,
+    ) -> Result<Option<Vec<AttachmentMetadata>>, SnowError> {
+        match self {
+            Self::Local(core) => core.list_attachments(number).await.map_err(SnowError::from),
+            Self::Remote(client) => client.list_attachments(number).await,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn upload_attachment_file(
+        &self,
+        number: &str,
+        path: &Path,
+        file_name: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<Option<AttachmentMetadata>, SnowError> {
+        match self {
+            Self::Local(core) => core
+                .upload_attachment_file(number, path, file_name, content_type)
+                .await
+                .map_err(SnowError::from),
+            Self::Remote(client) => {
+                client
+                    .upload_attachment_file(number, path, file_name, content_type)
+                    .await
+            }
+        }
+    }
+
     pub async fn set_state(
         &self,
         number: &str,
@@ -428,6 +474,21 @@ impl DaemonRpcClient {
             .call_optional_wrapped(
                 "get_record_fresh",
                 Some(json!({ "number": number })),
+                "record",
+            )
+            .await?;
+        Ok(record.map(Into::into))
+    }
+
+    pub async fn get_record_by_table_sys_id_fresh(
+        &self,
+        table: &str,
+        sys_id: &str,
+    ) -> Result<Option<SnowRecord>, SnowError> {
+        let record: Option<DaemonSnowRecord> = self
+            .call_optional_wrapped(
+                "get_record",
+                Some(json!({ "table": table, "sys_id": sys_id })),
                 "record",
             )
             .await?;
@@ -639,6 +700,40 @@ impl DaemonRpcClient {
             )
             .await?;
         Ok(record.map(Into::into))
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_attachments(
+        &self,
+        number: &str,
+    ) -> Result<Option<Vec<AttachmentMetadata>>, SnowError> {
+        self.call_optional_wrapped(
+            "attachment_list",
+            Some(json!({ "number": number })),
+            "attachments",
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn upload_attachment_file(
+        &self,
+        number: &str,
+        path: &Path,
+        file_name: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<Option<AttachmentMetadata>, SnowError> {
+        self.call_optional_wrapped(
+            "attachment_upload",
+            Some(json!({
+                "number": number,
+                "path": path.display().to_string(),
+                "file_name": file_name,
+                "content_type": content_type,
+            })),
+            "attachment",
+        )
+        .await
     }
 
     pub async fn set_state(
@@ -1051,6 +1146,7 @@ enum DaemonResourceType {
     RequestTask,
     Project,
     Demand,
+    DemandTask,
     ResourcePlan,
     Story,
     ScrumTask,
@@ -1265,6 +1361,7 @@ impl From<DaemonResourceType> for ResourceType {
             DaemonResourceType::RequestTask => Self::RequestTask,
             DaemonResourceType::Project => Self::Project,
             DaemonResourceType::Demand => Self::Demand,
+            DaemonResourceType::DemandTask => Self::DemandTask,
             DaemonResourceType::ResourcePlan => Self::ResourcePlan,
             DaemonResourceType::Story => Self::Story,
             DaemonResourceType::ScrumTask => Self::ScrumTask,

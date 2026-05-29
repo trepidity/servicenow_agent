@@ -1,7 +1,7 @@
 mod support;
 
 use serde_json::json;
-use snow_mcp::{JsonRpcRequest, McpServer, tools::ToolRegistry};
+use snow_mcp::{JsonRpcRequest, McpServer, domain::policy::PolicyConfig, tools::ToolRegistry};
 
 const STORY_PLAN_TOOLS: &[&str] = &[
     "story_plan_create",
@@ -91,6 +91,12 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "list_my_projects",
         "get_children",
         "get_work_notes",
+        "catalog_items_search",
+        "catalog_item_get",
+        "catalog_plan_request",
+        "catalog_submit_request",
+        "attachment_list",
+        "attachment_upload",
         "story_get",
         "story_tasks_list",
         "story_plan_create",
@@ -145,6 +151,61 @@ fn assert_no_top_level_schema_composition(schema: &serde_json::Value) {
             "tool inputSchema must not use top-level {keyword}"
         );
     }
+}
+
+#[test]
+fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "get_record")
+        .expect("get_record registered");
+
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert!(tool.input_schema.get("required").is_none());
+    assert_eq!(
+        tool.input_schema["properties"]["number"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["table"]["enum"],
+        json!([
+            "dmn_demand",
+            "dmn_demand_task",
+            "resource_plan",
+            "pm_project"
+        ])
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+}
+
+#[test]
+fn resource_plan_schema_only_allows_resource_plan_table_sys_id_lookup() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "resource_plan_get")
+        .expect("resource_plan_get registered");
+
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert!(tool.input_schema.get("required").is_none());
+    assert_eq!(
+        tool.input_schema["properties"]["number"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["table"]["enum"],
+        json!(["resource_plan"])
+    );
 }
 
 #[test]
@@ -321,6 +382,45 @@ fn schemas_include_required_fields_for_create_update_apply() {
         "string"
     );
     assert_eq!(story_create["properties"]["description"]["type"], "string");
+    for field in [
+        "cmdb_ci",
+        "u_story_owner",
+        "sprint",
+        "assignment_group",
+        "parent",
+        "vendor",
+        "team",
+        "release_scrum",
+        "state",
+        "u_impacted_users",
+        "u_release_notes",
+        "u_lead_dev",
+        "u_division",
+        "u_region",
+        "u_location",
+        "u_type",
+        "u_moscow",
+        "classification",
+        "product",
+        "release",
+        "project",
+        "theme",
+        "u_points_est",
+    ] {
+        assert!(
+            story_create["properties"].get(field).is_some(),
+            "story_plan_create missing {field}"
+        );
+    }
+    assert_eq!(story_create["properties"]["due_date"]["format"], "date");
+    assert_eq!(
+        story_create["properties"]["u_desired_delivery_date"]["format"],
+        "date"
+    );
+    assert_eq!(
+        story_create["properties"]["u_points_est"]["oneOf"][1]["type"],
+        "integer"
+    );
 
     let story_update = &tool("story_plan_update").input_schema;
     assert_eq!(story_update["type"], "object");
@@ -333,6 +433,37 @@ fn schemas_include_required_fields_for_create_update_apply() {
         story_update["properties"]["percent_complete"]["maximum"],
         json!(100)
     );
+    for field in [
+        "cmdb_ci",
+        "u_story_owner",
+        "sprint",
+        "assignment_group",
+        "parent",
+        "vendor",
+        "team",
+        "release_scrum",
+        "u_impacted_users",
+        "u_release_notes",
+        "u_lead_dev",
+        "u_division",
+        "u_region",
+        "u_location",
+        "u_type",
+        "u_moscow",
+        "classification",
+        "due_date",
+        "u_desired_delivery_date",
+        "product",
+        "release",
+        "project",
+        "theme",
+        "u_points_est",
+    ] {
+        assert!(
+            story_update["properties"].get(field).is_some(),
+            "story_plan_update missing {field}"
+        );
+    }
 
     let task_create = &tool("story_task_plan_create").input_schema;
     assert_eq!(task_create["type"], "object");
@@ -343,6 +474,10 @@ fn schemas_include_required_fields_for_create_update_apply() {
     assert_eq!(
         task_create["properties"]["parent_story_number"]["pattern"],
         "^STRY\\d+$"
+    );
+    assert_eq!(
+        task_create["properties"]["assignment_group"]["type"],
+        "string"
     );
 
     let task_update = &tool("story_task_plan_update").input_schema;
@@ -369,15 +504,27 @@ fn schemas_include_required_fields_for_create_update_apply() {
             "cmdb_ci",
             "start_date",
             "end_date",
-            "implementation_plan",
+            "change_plan",
             "backout_plan",
             "test_plan"
         ])
     );
+    assert_eq!(change_create["properties"]["change_plan"]["type"], "string");
     assert_eq!(
         change_create["properties"]["implementation_plan"]["type"],
         "string"
     );
+    for field in [
+        "requested_by",
+        "u_subcategory",
+        "u_division",
+        "u_does_this_change_need_cmdb_update",
+    ] {
+        assert_eq!(
+            change_create["properties"][field]["type"], "string",
+            "missing field {field}"
+        );
+    }
 
     let change_update = &tool("change_request_plan_update").input_schema;
     assert_eq!(change_update["type"], "object");
@@ -415,6 +562,25 @@ fn schemas_include_required_fields_for_create_update_apply() {
     assert_eq!(
         tool("work_note_apply_add").input_schema["required"],
         json!(["plan_id", "confirmation_token", "idempotency_key"])
+    );
+
+    let attachment_list = &tool("attachment_list").input_schema;
+    assert_eq!(attachment_list["type"], "object");
+    assert_eq!(attachment_list["required"], json!(["number"]));
+    assert_eq!(
+        attachment_list["properties"]["number"]["pattern"],
+        "^[A-Z]+\\d+$"
+    );
+
+    let attachment_upload = &tool("attachment_upload").input_schema;
+    assert_eq!(attachment_upload["type"], "object");
+    assert_eq!(
+        attachment_upload["required"],
+        json!(["number", "path", "confirm_upload", "idempotency_key"])
+    );
+    assert_eq!(
+        attachment_upload["properties"]["confirm_upload"]["const"],
+        true
     );
 
     for apply in [
@@ -469,4 +635,64 @@ fn schemas_include_required_fields_for_create_update_apply() {
             "concurrency_token"
         ])
     );
+}
+
+#[test]
+fn policy_defaults_allow_full_story_form_fields() {
+    let cfg = PolicyConfig::default();
+    let create = &cfg
+        .tools
+        .get("story_apply_create")
+        .expect("story create policy")
+        .field_allowlist;
+    let update = &cfg
+        .tools
+        .get("story_apply_update")
+        .expect("story update policy")
+        .field_allowlist;
+
+    for field in [
+        "short_description",
+        "description",
+        "acceptance_criteria",
+        "cmdb_ci",
+        "u_story_owner",
+        "sprint",
+        "assignment_group",
+        "parent",
+        "vendor",
+        "team",
+        "release_scrum",
+        "state",
+        "u_impacted_users",
+        "u_release_notes",
+        "u_lead_dev",
+        "u_division",
+        "u_region",
+        "u_location",
+        "u_type",
+        "u_moscow",
+        "classification",
+        "due_date",
+        "u_desired_delivery_date",
+        "product",
+        "release",
+        "project",
+        "theme",
+        "priority",
+        "epic",
+        "story_points",
+        "u_points_est",
+        "assigned_to",
+    ] {
+        assert!(
+            create.contains(field),
+            "story_apply_create allowlist missing {field}"
+        );
+        assert!(
+            update.contains(field),
+            "story_apply_update allowlist missing {field}"
+        );
+    }
+    assert!(update.contains("percent_complete"));
 }

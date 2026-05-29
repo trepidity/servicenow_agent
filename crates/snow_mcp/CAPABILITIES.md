@@ -13,7 +13,7 @@ There are two layers to "what is allowed":
 
 | Layer | Fixed at | Question it answers | Source of truth |
 |-------|----------|---------------------|-----------------|
-| **Capability** | compile time | What tools exist? Which mutate ServiceNow? | `is_write_tool()` — `src/domain/policy.rs:421` |
+| **Capability** | compile time | What tools exist? Which mutate ServiceNow? | `is_write_tool()` — `src/domain/policy.rs:546` |
 | **Policy** | deploy time | Which tools are *enabled*, where, with what limits? | TOML at `SNOW_MCP_POLICY_PATH` (see [below](#deploy-time-policy)) |
 
 ---
@@ -32,6 +32,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |
 | Story task (`rm_scrum_task`) | `story_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story task (`rm_scrum_task`) | `story_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`remaining_hours`,`percent_complete` |
+| Attachment (`sys_attachment`) | `attachment_upload` | **Create** | ❌ | yes | local-file upload; disabled unless policy allows it |
 | Time card (`time_card`) | `timecard_apply_set_hours` | **Update** | ❌ | yes | governed; daemon required; day fields only |
 | Change request (`change_request`) | `change_request_apply_create` | **Create** | ❌ | yes | governed; daemon required; no delete/cancel |
 | Change request (`change_request`) | `change_request_apply_update` | **Update** | ❌ | yes | governed; daemon required; field allowlist |
@@ -60,7 +61,8 @@ Enabled by default (unless a policy entry disables them). Operate against Servic
 or the local cache; none mutate ServiceNow records.
 
 - **Records:** `get_record`, `search_records`, `list_records`, `list_my_tasks`,
-  `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`, `get_work_notes`
+  `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`, `get_work_notes`,
+  `attachment_list`
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,

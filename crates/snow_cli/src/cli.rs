@@ -6,7 +6,7 @@ use snow_core::KnowledgeSearchMode;
 #[derive(Parser)]
 #[command(name = "snow", about = "ServiceNow CLI for change management")]
 pub struct Cli {
-    /// Environment: test (default) or prd. Falls back to SNOW_ENV env var.
+    /// Environment override, such as test or prd. Falls back to SNOW_ENV env var.
     #[arg(long)]
     pub env: Option<String>,
 
@@ -90,6 +90,11 @@ pub enum Command {
         /// Show what would be sent without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// List or upload record attachments
+    Attachment {
+        #[command(subcommand)]
+        action: AttachmentCommand,
     },
     /// Repair missing vault files from cached runtime data
     RepairVault,
@@ -223,6 +228,34 @@ pub enum TimecardCommand {
         /// Any date within the target week, formatted as YYYY-MM-DD
         #[arg(long, value_name = "DATE")]
         week: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttachmentCommand {
+    /// List attachments on a record
+    List {
+        /// Record number (e.g., CHG0327604, INC0012345)
+        number: String,
+    },
+    /// Upload a local file as an attachment on a record
+    Upload {
+        /// Record number (e.g., CHG0327604, INC0012345)
+        number: String,
+        /// Local file path to upload
+        path: PathBuf,
+        /// Attachment file name. Defaults to the local file name.
+        #[arg(long = "file-name")]
+        file_name: Option<String>,
+        /// Attachment MIME type. Defaults from common file extensions.
+        #[arg(long = "content-type")]
+        content_type: Option<String>,
+        /// Show the resolved target and file metadata without uploading.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 

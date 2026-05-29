@@ -85,6 +85,12 @@ impl VaultLayout {
             ResourceType::Demand => {
                 hierarchical_parent_record_path(self.demands_dir(), &record.number, &record.sys_id)
             }
+            ResourceType::DemandTask => hierarchical_child_record_path(
+                self.demands_dir(),
+                &record.number,
+                record.parent.as_ref(),
+                &record.sys_id,
+            ),
             ResourceType::ResourcePlan => self
                 .root
                 .join("resource_plans")

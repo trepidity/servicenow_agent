@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use snow_core::ipc::IpcEndpoint;
 
+const DEFAULT_ENV: &str = "test";
+const DEFAULT_DAEMON_START_ENV: &str = "prd";
+
 pub struct DaemonPaths {
     pub config_dir: PathBuf,
     pub pidfile: PathBuf,
@@ -57,17 +60,45 @@ impl DaemonPaths {
 }
 
 pub fn selected_env(explicit: Option<&str>) -> String {
+    selected_env_with_default(explicit, DEFAULT_ENV)
+}
+
+pub fn selected_daemon_start_env(explicit: Option<&str>) -> String {
+    selected_env_with_default(explicit, DEFAULT_DAEMON_START_ENV)
+}
+
+fn selected_env_with_default(explicit: Option<&str>, default_env: &str) -> String {
+    let env_var = std::env::var("SNOW_ENV").ok();
+    let persisted = persisted_env_selection();
+    select_env(
+        explicit,
+        env_var.as_deref(),
+        persisted.as_deref(),
+        default_env,
+    )
+}
+
+fn select_env(
+    explicit: Option<&str>,
+    env_var: Option<&str>,
+    persisted: Option<&str>,
+    default_env: &str,
+) -> String {
     explicit
         .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("SNOW_ENV").ok())
+        .or_else(|| env_var.map(ToOwned::to_owned))
         .or_else(|| {
-            DaemonPaths::resolve()
-                .ok()
-                .and_then(|paths| std::fs::read_to_string(paths.config_dir.join("env")).ok())
+            persisted
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| "test".to_string())
+        .unwrap_or_else(|| default_env.to_string())
+}
+
+fn persisted_env_selection() -> Option<String> {
+    DaemonPaths::resolve()
+        .ok()
+        .and_then(|paths| std::fs::read_to_string(paths.config_dir.join("env")).ok())
 }
 
 pub fn config_path(filename: &str) -> PathBuf {
@@ -111,5 +142,25 @@ mod tests {
         assert_eq!(p.socket.file_name().unwrap(), "daemon.sock");
         assert_eq!(p.logfile.file_name().unwrap(), "daemon.log");
         assert_eq!(p.statusfile.file_name().unwrap(), "daemon.status");
+    }
+
+    #[test]
+    fn select_env_respects_source_precedence() {
+        assert_eq!(
+            select_env(Some("training"), Some("prd"), Some("test"), "prd"),
+            "training"
+        );
+        assert_eq!(
+            select_env(None, Some("training"), Some("test"), "prd"),
+            "training"
+        );
+        assert_eq!(select_env(None, None, Some("test"), "prd"), "test");
+    }
+
+    #[test]
+    fn select_env_allows_different_fallback_defaults() {
+        assert_eq!(select_env(None, None, None, "test"), "test");
+        assert_eq!(select_env(None, None, None, "prd"), "prd");
+        assert_eq!(select_env(None, None, Some("  "), "prd"), "prd");
     }
 }

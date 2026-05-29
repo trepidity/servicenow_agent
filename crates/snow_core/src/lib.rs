@@ -29,12 +29,14 @@ pub use kb::{
     KnowledgeTagSummary,
 };
 pub(crate) use reference::*;
+pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
 pub use resource::story::{StoryWriteConcurrency, StoryWriteResult};
 pub use resource::timecard::{
     CardSelector, SetMode, SimpleRef, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector,
     Weekday,
 };
+pub use servicenow_rs::prelude::AttachmentMetadata;
 pub use sla::{
     TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, TaskSlaView,
     is_task_sla_applicable_table,
@@ -42,6 +44,7 @@ pub use sla::{
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +52,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use servicenow_rs::prelude::{
-    DisplayValue, Error as SnowApiError, FieldValue as SnowFieldValue, Order, Record,
+    DisplayValue, Error as SnowApiError, FieldValue as SnowFieldValue, Operator, Order, Record,
     ServiceNowClient, child_relation_for_table,
 };
 
@@ -154,12 +157,19 @@ pub enum ResourceType {
     RequestTask,
     Project,
     Demand,
+    DemandTask,
     ResourcePlan,
     Story,
     ScrumTask,
     Timecard,
     Knowledge,
     Approval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordLookup {
+    Number(String),
+    TableSysId { table: String, sys_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -594,10 +604,11 @@ impl ResourceType {
             "incident" => Self::Incident,
             "change_request" => Self::Change,
             "change_task" => Self::ChangeTask,
-            "sc_req_item" | "request_item" => Self::Request,
+            "sc_request" | "sc_req_item" | "request_item" => Self::Request,
             "sc_task" => Self::RequestTask,
             "pm_project" => Self::Project,
             "dmn_demand" => Self::Demand,
+            "dmn_demand_task" => Self::DemandTask,
             "resource_plan" => Self::ResourcePlan,
             "rm_story" => Self::Story,
             "rm_scrum_task" => Self::ScrumTask,
@@ -624,6 +635,60 @@ pub(crate) fn canonical_record_table_for_number(table: &str, number: &str) -> St
         "change_request".to_string()
     } else {
         normalized
+    }
+}
+
+pub fn normalize_record_lookup_sys_id(sys_id: &str) -> Result<String> {
+    let normalized = sys_id.trim().to_ascii_lowercase();
+    if normalized.len() != 32 || !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("sys_id must be exactly 32 ASCII hex characters");
+    }
+    Ok(normalized)
+}
+
+pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
+    let normalized = table.trim().to_ascii_lowercase();
+    if is_record_lookup_table_allowed(&normalized) {
+        Ok(normalized)
+    } else {
+        anyhow::bail!("table `{}` is not allowed for record lookup", table.trim());
+    }
+}
+
+pub fn is_record_lookup_table_allowed(table: &str) -> bool {
+    matches!(
+        table.trim().to_ascii_lowercase().as_str(),
+        "dmn_demand" | "dmn_demand_task" | "resource_plan" | "pm_project"
+    )
+}
+
+pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
+    "dmn_demand",
+    "dmn_demand_task",
+    "resource_plan",
+    "pm_project",
+];
+
+pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {
+    match record_number_prefix(number)?.as_str() {
+        "DMNTSK" => Some("dmn_demand_task"),
+        _ => None,
+    }
+}
+
+fn record_number_prefix(number: &str) -> Option<String> {
+    let number = number.trim();
+    if number.is_empty() {
+        return None;
+    }
+    let prefix = number
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .collect::<String>();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_ascii_uppercase())
     }
 }
 
@@ -763,18 +828,53 @@ impl SnowCore {
             .map(|(_, record)| record))
     }
 
+    pub async fn get_record_by_lookup_fresh(
+        &self,
+        lookup: RecordLookup,
+    ) -> Result<Option<SnowRecord>> {
+        match lookup {
+            RecordLookup::Number(number) => self.get_record_fresh(&number).await,
+            RecordLookup::TableSysId { table, sys_id } => {
+                self.get_record_by_table_sys_id_fresh(&table, &sys_id).await
+            }
+        }
+    }
+
+    pub async fn get_record_by_table_sys_id_fresh(
+        &self,
+        table: &str,
+        sys_id: &str,
+    ) -> Result<Option<SnowRecord>> {
+        let table = normalize_record_lookup_table(table)?;
+        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
+        match self
+            .get_record_by_table_sys_id_fresh_with_source(&table, &sys_id)
+            .await
+        {
+            Ok(record) => Ok(record.map(|(_, snow_record)| snow_record)),
+            Err(err)
+                if err
+                    .downcast_ref::<SnowApiError>()
+                    .is_some_and(|err| matches!(err, SnowApiError::Api { status: 404, .. })) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn get_record_fresh_with_source(
         &self,
         number: &str,
     ) -> Result<Option<(Record, SnowRecord)>> {
-        let table = self.client.table_for_number(number).ok_or_else(|| {
+        let table = self.table_for_number(number).ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
             )
         })?;
         let Some(mut record) = self
             .client
-            .table(table)
+            .table(&table)
             .equals("number", number)
             .display_value(DisplayValue::Both)
             .first()
@@ -806,6 +906,9 @@ impl SnowCore {
             .display_value(DisplayValue::Both)
             .get(sys_id)
             .await?;
+        if record.sys_id.eq_ignore_ascii_case(sys_id) {
+            record.sys_id = sys_id.to_string();
+        }
         let number = record
             .get_raw("number")
             .or_else(|| record.get_str("number"))
@@ -2214,7 +2317,7 @@ impl SnowCore {
             let normalized = query.trim().to_uppercase();
             // Gate on table_for_number: we can only fetch if the prefix maps
             // to a known table (INC→incident, CHG→change_request, etc.)
-            if self.client.table_for_number(&normalized).is_some()
+            if self.table_for_number(&normalized).is_some()
                 && let Ok(Some(_)) = self.get_record_fresh(&normalized).await
             {
                 return self.query.search_enriched(&normalized, scope).await;
@@ -2442,6 +2545,316 @@ impl SnowCore {
         };
         self.client.add_work_note(&table, &sys_id, text).await?;
         self.get_record_fresh(number).await
+    }
+
+    pub async fn search_catalog_items(&self, query: &str, limit: u32) -> Result<Vec<CatalogItem>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 50);
+        let records = self
+            .client
+            .table("sc_cat_item")
+            .contains("name", query)
+            .or_filter("short_description", Operator::Contains, query)
+            .equals("active", "true")
+            .fields(&[
+                "sys_id",
+                "name",
+                "short_description",
+                "sys_class_name",
+                "active",
+            ])
+            .display_value(DisplayValue::Both)
+            .limit(limit)
+            .execute()
+            .await?
+            .records;
+
+        Ok(records
+            .into_iter()
+            .map(|record| catalog_item_from_record(record, Vec::new()))
+            .collect())
+    }
+
+    pub async fn get_catalog_item(&self, sys_id: &str) -> Result<CatalogItem> {
+        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
+        let item = self
+            .client
+            .table("sc_cat_item")
+            .fields(&[
+                "sys_id",
+                "name",
+                "short_description",
+                "sys_class_name",
+                "active",
+            ])
+            .display_value(DisplayValue::Both)
+            .get(&sys_id)
+            .await?;
+        let variables = self.catalog_item_variables(&sys_id).await?;
+        Ok(catalog_item_from_record(item, variables))
+    }
+
+    async fn catalog_item_variables(&self, item_sys_id: &str) -> Result<Vec<CatalogVariable>> {
+        let mut records = self
+            .catalog_variable_rows("cat_item", &[item_sys_id])
+            .await?;
+        let variable_set_ids = self.catalog_variable_set_ids(item_sys_id).await?;
+        if !variable_set_ids.is_empty() {
+            let variable_set_refs = variable_set_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            records.extend(
+                self.catalog_variable_rows("variable_set", &variable_set_refs)
+                    .await?,
+            );
+        }
+        let mut seen = HashSet::new();
+        records.retain(|record| seen.insert(record.sys_id.clone()));
+        let choices = self
+            .catalog_choices_for_variables(records.iter().map(|record| record.sys_id.as_str()))
+            .await?;
+
+        Ok(records
+            .into_iter()
+            .map(|record| catalog_variable_from_record(&record, &choices))
+            .collect())
+    }
+
+    async fn catalog_variable_rows(&self, field: &str, values: &[&str]) -> Result<Vec<Record>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = self
+            .client
+            .table("item_option_new")
+            .fields(&[
+                "sys_id",
+                "name",
+                "question_text",
+                "type",
+                "mandatory",
+                "default_value",
+                "reference",
+                "lookup_table",
+                "list_table",
+                "max_length",
+                "order",
+                "active",
+            ])
+            .display_value(DisplayValue::Both)
+            .order_by("order", Order::Asc)
+            .limit(1000);
+        if values.len() == 1 {
+            query = query.equals(field, values[0]);
+        } else {
+            query = query.in_list(field, values);
+        }
+        match query.equals("active", "true").execute().await {
+            Ok(result) => Ok(result.records),
+            Err(_) => {
+                let mut fallback = self
+                    .client
+                    .table("item_option_new")
+                    .fields(&[
+                        "sys_id",
+                        "name",
+                        "question_text",
+                        "type",
+                        "mandatory",
+                        "default_value",
+                        "reference",
+                        "lookup_table",
+                        "list_table",
+                        "max_length",
+                        "order",
+                        "active",
+                    ])
+                    .display_value(DisplayValue::Both)
+                    .order_by("order", Order::Asc)
+                    .limit(1000);
+                if values.len() == 1 {
+                    fallback = fallback.equals(field, values[0]);
+                } else {
+                    fallback = fallback.in_list(field, values);
+                }
+                Ok(fallback.execute().await?.records)
+            }
+        }
+    }
+
+    async fn catalog_variable_set_ids(&self, item_sys_id: &str) -> Result<Vec<String>> {
+        match self
+            .client
+            .table("io_set_item")
+            .equals("sc_cat_item", item_sys_id)
+            .fields(&["sys_id", "variable_set", "order"])
+            .display_value(DisplayValue::Both)
+            .order_by("order", Order::Asc)
+            .limit(200)
+            .execute()
+            .await
+        {
+            Ok(result) => Ok(result
+                .records
+                .into_iter()
+                .filter_map(|record| record_field_raw_or_display(&record, "variable_set"))
+                .collect()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    async fn catalog_choices_for_variables<'a>(
+        &self,
+        variable_sys_ids: impl Iterator<Item = &'a str>,
+    ) -> Result<HashMap<String, Vec<CatalogChoice>>> {
+        let variable_sys_ids = variable_sys_ids
+            .filter(|sys_id| !sys_id.trim().is_empty())
+            .collect::<Vec<_>>();
+        if variable_sys_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let choices = self
+            .client
+            .table("question_choice")
+            .in_list("question", &variable_sys_ids)
+            .fields(&["sys_id", "question", "value", "text", "order"])
+            .display_value(DisplayValue::Both)
+            .order_by("order", Order::Asc)
+            .limit(1000)
+            .execute()
+            .await?
+            .records;
+        let mut grouped: HashMap<String, Vec<CatalogChoice>> = HashMap::new();
+        for choice in choices {
+            let Some(question) = record_field_raw_or_display(&choice, "question") else {
+                continue;
+            };
+            let value = record_field_raw_or_display(&choice, "value").unwrap_or_default();
+            let label =
+                record_field_display_or_raw(&choice, "text").unwrap_or_else(|| value.clone());
+            grouped
+                .entry(question)
+                .or_default()
+                .push(CatalogChoice { value, label });
+        }
+        Ok(grouped)
+    }
+
+    pub async fn submit_catalog_request(
+        &self,
+        item_sys_id: &str,
+        request_body: serde_json::Value,
+    ) -> Result<CatalogSubmitResult> {
+        let item_sys_id = normalize_record_lookup_sys_id(item_sys_id)?;
+        let path = format!("/api/sn_sc/v1/servicecatalog/items/{item_sys_id}/order_now");
+        let raw_result = self.client.post(&path, request_body).await?;
+        let mut result = catalog_submit_result_from_response(
+            item_sys_id.clone(),
+            raw_result,
+            self.client.base_url(),
+        );
+
+        if let (Some(table), Some(sys_id)) = (result.table.as_deref(), result.sys_id.as_deref()) {
+            let canonical_table = canonical_record_table(table);
+            if matches!(canonical_table.as_str(), "sc_req_item" | "sc_request")
+                && let Ok(Some((_, fresh))) = self
+                    .get_record_by_table_sys_id_fresh_with_source(&canonical_table, sys_id)
+                    .await
+            {
+                result.table = Some(fresh.table);
+                result.sys_id = Some(fresh.sys_id);
+                result.number = Some(fresh.number);
+            }
+        }
+        if result.request_item_sys_id.is_none()
+            && let Some(request_sys_id) = result.request_sys_id.clone()
+            && let Some(mut ritm) = self.lookup_catalog_request_item(&request_sys_id).await
+        {
+            let ritm_sys_id = ritm.sys_id.clone();
+            let ritm_number = ritm
+                .get_raw("number")
+                .or_else(|| ritm.get_str("number"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            if let Err(err) = self.enrich_record_journals(&mut ritm).await {
+                eprintln!(
+                    "snow_core: journal enrichment failed for catalog request item {ritm_sys_id}: {err}"
+                );
+            }
+            if let Err(err) = self.persist_record(&ritm) {
+                eprintln!(
+                    "snow_core: cache persist failed for catalog request item {ritm_sys_id}: {err}"
+                );
+            }
+            result.table = Some("sc_req_item".to_string());
+            result.sys_id = Some(ritm_sys_id.clone());
+            result.number = ritm_number.clone();
+            result.request_item_sys_id = Some(ritm_sys_id.clone());
+            result.request_item_number = ritm_number;
+            result.browser_url = Some(catalog_browser_url(
+                self.client.base_url(),
+                "sc_req_item",
+                &ritm_sys_id,
+            ));
+        }
+
+        Ok(result)
+    }
+
+    async fn lookup_catalog_request_item(&self, request_sys_id: &str) -> Option<Record> {
+        for attempt in 0..4 {
+            match self
+                .client
+                .table("sc_req_item")
+                .equals("request", request_sys_id)
+                .display_value(DisplayValue::Both)
+                .first()
+                .await
+            {
+                Ok(Some(record)) => return Some(record),
+                Ok(None) if attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Ok(None) => return None,
+                Err(err) => {
+                    eprintln!(
+                        "snow_core: request item lookup failed for catalog request {request_sys_id}: {err}"
+                    );
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn list_attachments(&self, number: &str) -> Result<Option<Vec<AttachmentMetadata>>> {
+        let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.client.list_attachments(&table, &sys_id).await?))
+    }
+
+    pub async fn upload_attachment_file(
+        &self,
+        number: &str,
+        path: impl AsRef<Path>,
+        file_name: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Result<Option<AttachmentMetadata>> {
+        let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.client
+                .upload_attachment_file(&table, &sys_id, path, file_name, content_type)
+                .await?,
+        ))
     }
 
     pub async fn set_state(&self, number: &str, state: &str) -> Result<Option<SnowRecord>> {
@@ -2777,10 +3190,28 @@ impl SnowCore {
     }
 
     async fn lookup_table_and_sys_id(&self, number: &str) -> Result<Option<(String, String)>> {
-        let Some(record) = self.client.get_by_number(number).await? else {
+        let table = self.table_for_number(number).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
+            )
+        })?;
+        let Some(record) = self
+            .client
+            .table(&table)
+            .equals("number", number)
+            .first()
+            .await?
+        else {
             return Ok(None);
         };
         Ok(Some((record.table.clone(), record.sys_id.clone())))
+    }
+
+    fn table_for_number(&self, number: &str) -> Option<String> {
+        self.client
+            .table_for_number(number)
+            .map(str::to_string)
+            .or_else(|| table_for_builtin_record_number(number).map(str::to_string))
     }
 
     async fn field_choices_for_table(&self, table: &str, field: &str) -> Result<Vec<FieldChoice>> {
@@ -3116,10 +3547,8 @@ impl SnowCore {
     }
 
     fn infer_table(&self, number: &str) -> String {
-        self.client
-            .table_for_number(number)
-            .unwrap_or("task")
-            .to_string()
+        self.table_for_number(number)
+            .unwrap_or_else(|| "task".to_string())
     }
 }
 
@@ -3130,6 +3559,182 @@ fn is_open_user_work_record(record: &SnowRecord) -> bool {
 fn servicenow_record_is_open_user_work(record: &Record) -> bool {
     !is_terminal_state(record.get_display("state").or(record.get_str("state")))
         && !servicenow_record_field_is_false(record, "active")
+}
+
+fn catalog_item_from_record(record: Record, variables: Vec<CatalogVariable>) -> CatalogItem {
+    let name = record
+        .get_str("name")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&record.sys_id)
+        .to_string();
+    let short_description = record
+        .get_str("short_description")
+        .unwrap_or_default()
+        .to_string();
+    let table = record
+        .get_raw("sys_class_name")
+        .or_else(|| record.get_display("sys_class_name"))
+        .unwrap_or("sc_cat_item")
+        .to_string();
+    CatalogItem {
+        sys_id: record.sys_id,
+        name,
+        short_description,
+        table,
+        variables,
+    }
+}
+
+fn catalog_variable_from_record(
+    record: &Record,
+    choices: &HashMap<String, Vec<CatalogChoice>>,
+) -> CatalogVariable {
+    let name = record_field_raw_or_display(record, "name").unwrap_or_else(|| record.sys_id.clone());
+    let label = record
+        .get_display("question_text")
+        .or_else(|| record.get_raw("question_text"))
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| name.clone());
+    CatalogVariable {
+        sys_id: record.sys_id.clone(),
+        name,
+        label,
+        variable_type: record_field_display_or_raw(record, "type").unwrap_or_default(),
+        mandatory: record_bool(record, "mandatory"),
+        default_value: record_field_raw_or_display(record, "default_value")
+            .filter(|value| !value.trim().is_empty()),
+        reference_table: record_field_raw_or_display(record, "reference")
+            .filter(|value| !value.trim().is_empty()),
+        lookup_table: record_field_raw_or_display(record, "lookup_table")
+            .or_else(|| record_field_raw_or_display(record, "list_table"))
+            .filter(|value| !value.trim().is_empty()),
+        max_length: record_field_raw_or_display(record, "max_length")
+            .and_then(|value| value.parse().ok()),
+        choices: choices.get(&record.sys_id).cloned().unwrap_or_default(),
+    }
+}
+
+fn record_field_raw_or_display(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_raw(field)
+        .or_else(|| record.get_display(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn record_field_display_or_raw(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_display(field)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn record_bool(record: &Record, field: &str) -> bool {
+    match record_field_raw_or_display(record, field)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "1" | "yes" | "y" => true,
+        "false" | "0" | "no" | "n" | "" => false,
+        _ => false,
+    }
+}
+
+fn catalog_submit_result_from_response(
+    item_sys_id: String,
+    raw_result: Value,
+    base_url: &str,
+) -> CatalogSubmitResult {
+    let request_item = first_result_item(&raw_result);
+    let request_item_sys_id = request_item.and_then(|item| string_at(item, &["sys_id"]));
+    let request_item_number = request_item.and_then(|item| string_at(item, &["number"]));
+
+    let request_sys_id = string_at(&raw_result, &["request_id"])
+        .or_else(|| string_at(&raw_result, &["request", "sys_id"]))
+        .or_else(|| {
+            if table_at(&raw_result, &["table"]).as_deref() == Some("sc_request") {
+                string_at(&raw_result, &["sys_id"])
+            } else {
+                None
+            }
+        });
+    let request_number = string_at(&raw_result, &["request_number"])
+        .or_else(|| string_at(&raw_result, &["request", "number"]))
+        .or_else(|| {
+            string_at(&raw_result, &["number"])
+                .filter(|number| number.to_ascii_uppercase().starts_with("REQ"))
+        });
+
+    let result_table = request_item_sys_id
+        .as_ref()
+        .map(|_| "sc_req_item".to_string())
+        .or_else(|| table_at(&raw_result, &["table"]))
+        .or_else(|| table_at(&raw_result, &["request", "table"]));
+    let result_sys_id = request_item_sys_id
+        .clone()
+        .or_else(|| string_at(&raw_result, &["sys_id"]))
+        .or_else(|| request_sys_id.clone());
+    let result_number = request_item_number
+        .clone()
+        .or_else(|| string_at(&raw_result, &["number"]))
+        .or_else(|| request_number.clone());
+    let browser_url = result_table
+        .as_ref()
+        .zip(result_sys_id.as_ref())
+        .map(|(table, sys_id)| catalog_browser_url(base_url, table, sys_id));
+
+    CatalogSubmitResult {
+        item_sys_id,
+        table: result_table,
+        sys_id: result_sys_id,
+        number: result_number,
+        request_table: request_sys_id.as_ref().map(|_| "sc_request".to_string()),
+        request_sys_id,
+        request_number,
+        request_item_sys_id,
+        request_item_number,
+        browser_url,
+        raw_result,
+    }
+}
+
+fn catalog_browser_url(base_url: &str, table: &str, sys_id: &str) -> String {
+    format!(
+        "{}/sp?id=ticket&table={table}&sys_id={sys_id}&view=sp",
+        base_url.trim_end_matches('/')
+    )
+}
+
+fn first_result_item(value: &Value) -> Option<&Value> {
+    ["items", "request_items"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_array))
+        .and_then(|items| items.first())
+        .or_else(|| value.get("request_item"))
+}
+
+fn string_at(value: &Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = cursor.get(*segment)?;
+    }
+    cursor
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn table_at(value: &Value, path: &[&str]) -> Option<String> {
+    string_at(value, path).map(|table| canonical_record_table(&table))
 }
 
 fn record_field_is_false(record: &SnowRecord, field_name: &str) -> bool {
@@ -3325,6 +3930,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builtin_prefixes_include_demand_task_numbers() {
+        assert_eq!(
+            table_for_builtin_record_number("DMNTSK0001122"),
+            Some("dmn_demand_task")
+        );
+        assert_eq!(
+            table_for_builtin_record_number("dmntsk0001122"),
+            Some("dmn_demand_task")
+        );
+    }
+
     fn sample_incident_record() -> SnowRecord {
         SnowRecord {
             sys_id: "inc-sys".to_string(),
@@ -3400,6 +4017,305 @@ mod tests {
             .expect("core");
 
         (core, tempdir)
+    }
+
+    async fn mount_number_lookup(server: &MockServer, table: &str, number: &str, sys_id: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/{table}")))
+            .and(query_param("sysparm_query", format!("number={number}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "number": number,
+                    "short_description": "Attachment target",
+                    "state": "Open"
+                }]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_attachments_resolves_record_number() {
+        let server = MockServer::start().await;
+        mount_number_lookup(&server, "change_request", "CHG0010001", "chg-sys").await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/attachment"))
+            .and(query_param(
+                "sysparm_query",
+                "table_name=change_request^table_sys_id=chg-sys",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "att-sys",
+                    "file_name": "evidence.jpeg",
+                    "table_name": "change_request",
+                    "table_sys_id": "chg-sys",
+                    "content_type": "image/jpeg",
+                    "size_bytes": "83338"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let attachments = core
+            .list_attachments("CHG0010001")
+            .await
+            .expect("attachments")
+            .expect("record");
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].sys_id, "att-sys");
+        assert_eq!(attachments[0].size_bytes, Some(83338));
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_file_resolves_record_number_and_posts_file() {
+        let server = MockServer::start().await;
+        mount_number_lookup(&server, "change_request", "CHG0010001", "chg-sys").await;
+        Mock::given(method("POST"))
+            .and(path("/api/now/attachment/file"))
+            .and(query_param("table_name", "change_request"))
+            .and(query_param("table_sys_id", "chg-sys"))
+            .and(query_param("file_name", "evidence.jpeg"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": "att-sys",
+                    "file_name": "evidence.jpeg",
+                    "table_name": "change_request",
+                    "table_sys_id": "chg-sys",
+                    "content_type": "image/jpeg",
+                    "size_bytes": "4"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let path = tempdir.path().join("evidence.jpeg");
+        std::fs::write(&path, b"jpeg").expect("write fixture");
+
+        let attachment = core
+            .upload_attachment_file(
+                "CHG0010001",
+                &path,
+                Some("evidence.jpeg"),
+                Some("image/jpeg"),
+            )
+            .await
+            .expect("upload")
+            .expect("record");
+
+        assert_eq!(attachment.sys_id, "att-sys");
+        assert_eq!(attachment.size_bytes, Some(4));
+
+        let requests = server.received_requests().await.expect("requests");
+        let upload = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/now/attachment/file")
+            .expect("upload request");
+        assert_eq!(upload.body, b"jpeg");
+    }
+
+    #[tokio::test]
+    async fn get_catalog_item_fetches_item_variables_and_choices() {
+        let server = MockServer::start().await;
+        let item_sys_id = "300d473b13f00c10906630128144b0d1";
+        let variable_sys_id = "11111111111111111111111111111111";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/sc_cat_item/{item_sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": item_sys_id,
+                    "name": "Windows Server Administration Access Request (SAAR)",
+                    "short_description": "Request server admin access",
+                    "sys_class_name": "sc_cat_item",
+                    "active": "true"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/item_option_new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": variable_sys_id,
+                    "name": "does_the_active_directory_group_exist",
+                    "question_text": "Does the Active Directory group exist?",
+                    "type": { "value": "5", "display_value": "Select Box" },
+                    "mandatory": "true",
+                    "default_value": "",
+                    "order": "100"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/question_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "22222222222222222222222222222222",
+                    "question": variable_sys_id,
+                    "value": "Yes",
+                    "text": "Yes",
+                    "order": "100"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let item = core.get_catalog_item(item_sys_id).await.expect("item");
+
+        assert_eq!(item.sys_id, item_sys_id);
+        assert_eq!(
+            item.name,
+            "Windows Server Administration Access Request (SAAR)"
+        );
+        assert_eq!(item.variables.len(), 1);
+        assert_eq!(
+            item.variables[0].name,
+            "does_the_active_directory_group_exist"
+        );
+        assert!(item.variables[0].mandatory);
+        assert_eq!(item.variables[0].choices[0].value, "Yes");
+    }
+
+    #[tokio::test]
+    async fn submit_catalog_request_posts_order_now_and_parses_request_item() {
+        let server = MockServer::start().await;
+        let item_sys_id = "300d473b13f00c10906630128144b0d1";
+        let ritm_sys_id = "29ebf58b2b0dcbd0f7a2fe995e91bfb7";
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/api/sn_sc/v1/servicecatalog/items/{item_sys_id}/order_now"
+            )))
+            .and(body_partial_json(serde_json::json!({
+                "variables": {
+                    "business_justification": "Needed for IAM server administration"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "request_number": "REQ0010001",
+                    "request_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "items": [{
+                        "table": "sc_req_item",
+                        "sys_id": ritm_sys_id,
+                        "number": "RITM0010001"
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/sc_req_item/{ritm_sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": ritm_sys_id,
+                    "number": "RITM0010001",
+                    "short_description": "Windows Server Administration Access Request (SAAR)",
+                    "state": "Open"
+                }
+            })))
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "sc_req_item", ritm_sys_id).await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .submit_catalog_request(
+                item_sys_id,
+                serde_json::json!({
+                    "sysparm_quantity": "1",
+                    "variables": {
+                        "business_justification": "Needed for IAM server administration"
+                    }
+                }),
+            )
+            .await
+            .expect("submit");
+
+        assert_eq!(result.table.as_deref(), Some("sc_req_item"));
+        assert_eq!(result.sys_id.as_deref(), Some(ritm_sys_id));
+        assert_eq!(result.number.as_deref(), Some("RITM0010001"));
+        assert_eq!(result.request_number.as_deref(), Some("REQ0010001"));
+        let expected_url = format!(
+            "{}/sp?id=ticket&table=sc_req_item&sys_id={ritm_sys_id}&view=sp",
+            server.uri()
+        );
+        assert_eq!(result.browser_url.as_deref(), Some(expected_url.as_str()));
+    }
+
+    #[tokio::test]
+    async fn submit_catalog_request_resolves_request_item_from_request_response() {
+        let server = MockServer::start().await;
+        let item_sys_id = "300d473b13f00c10906630128144b0d1";
+        let request_sys_id = "2df34a472b810fd0f7a2fe995e91bf45";
+        let ritm_sys_id = "29ebf58b2b0dcbd0f7a2fe995e91bfb7";
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/api/sn_sc/v1/servicecatalog/items/{item_sys_id}/order_now"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "table": "sc_request",
+                    "sys_id": request_sys_id,
+                    "request_id": request_sys_id,
+                    "number": "REQ2688830",
+                    "request_number": "REQ2688830"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/sc_request/{request_sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": request_sys_id,
+                    "number": "REQ2688830",
+                    "short_description": "Windows Server Administration Access Request (SAAR)",
+                    "state": "requested"
+                }
+            })))
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "sc_request", request_sys_id).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sc_req_item"))
+            .and(query_param(
+                "sysparm_query",
+                format!("request={request_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": ritm_sys_id,
+                    "number": "RITM2688830",
+                    "short_description": "Windows Server Administration Access Request (SAAR)",
+                    "state": "Open"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "sc_req_item", ritm_sys_id).await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .submit_catalog_request(item_sys_id, serde_json::json!({ "variables": {} }))
+            .await
+            .expect("submit");
+
+        assert_eq!(result.table.as_deref(), Some("sc_req_item"));
+        assert_eq!(result.sys_id.as_deref(), Some(ritm_sys_id));
+        assert_eq!(result.number.as_deref(), Some("RITM2688830"));
+        assert_eq!(result.request_number.as_deref(), Some("REQ2688830"));
+        assert_eq!(result.request_item_number.as_deref(), Some("RITM2688830"));
+        let expected_url = format!(
+            "{}/sp?id=ticket&table=sc_req_item&sys_id={ritm_sys_id}&view=sp",
+            server.uri()
+        );
+        assert_eq!(result.browser_url.as_deref(), Some(expected_url.as_str()));
     }
 
     async fn mount_fresh_record_get(
@@ -3832,6 +4748,148 @@ mod tests {
                 && row.rel_type == "reference"
                 && row.field_name == "assigned_to"
         }));
+    }
+
+    #[tokio::test]
+    async fn get_record_by_table_sys_id_fresh_fetches_and_persists_demand() {
+        let server = MockServer::start().await;
+        let sys_id = "7f029b89c3e7565067bdfd73e40131a1";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/dmn_demand/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "DMND0320098",
+                    "short_description": "Network refresh demand",
+                    "description": "Upgrade branch switching",
+                    "state": "draft"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/dmn_demand"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let record = core
+            .get_record_by_table_sys_id_fresh("dmn_demand", "7F029B89C3E7565067BDFD73E40131A1")
+            .await
+            .expect("fresh record")
+            .expect("record");
+
+        assert_eq!(record.number, "DMND0320098");
+        assert_eq!(record.sys_id, sys_id);
+        assert_eq!(record.resource_type, ResourceType::Demand);
+
+        let cached = core
+            .get_record("DMND0320098")
+            .await
+            .expect("cached record")
+            .expect("persisted record");
+        assert_eq!(cached.sys_id, sys_id);
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == format!("/api/now/table/dmn_demand/{sys_id}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_record_by_table_sys_id_fresh_allows_resource_plan() {
+        let server = MockServer::start().await;
+        let sys_id = "11111111111111111111111111111111";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/resource_plan/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "RPLN0092386",
+                    "short_description": "Identity Access Management plan",
+                    "state": "allocated"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let record = core
+            .get_record_by_table_sys_id_fresh("resource_plan", sys_id)
+            .await
+            .expect("fresh record")
+            .expect("record");
+
+        assert_eq!(record.number, "RPLN0092386");
+        assert_eq!(record.resource_type, ResourceType::ResourcePlan);
+    }
+
+    #[tokio::test]
+    async fn get_record_by_table_sys_id_fresh_allows_demand_task() {
+        let server = MockServer::start().await;
+        let sys_id = "22222222222222222222222222222222";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/dmn_demand_task/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "DMNTSK0001122",
+                    "short_description": "Review demand intake",
+                    "state": "2"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/dmn_demand_task"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let record = core
+            .get_record_by_table_sys_id_fresh("dmn_demand_task", sys_id)
+            .await
+            .expect("fresh record")
+            .expect("record");
+
+        assert_eq!(record.number, "DMNTSK0001122");
+        assert_eq!(record.resource_type, ResourceType::DemandTask);
     }
 
     #[tokio::test]
@@ -5349,6 +6407,74 @@ mod tests {
             .expect("search cached");
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0].record.number, "INC4992697");
+    }
+
+    #[tokio::test]
+    async fn search_enriched_falls_back_to_live_fetch_for_demand_task_number() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/dmn_demand_task"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "dmntsk-sys-fallback",
+                    "number": "DMNTSK0001122",
+                    "short_description": "Review demand intake",
+                    "description": "Demand task should hydrate from exact search",
+                    "state": "2",
+                    "parent": {
+                        "value": "demand-parent-sys",
+                        "display_value": "DMND0002002"
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/dmn_demand_task"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "dmntsk-sys-fallback",
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ServiceNowClient::builder()
+            .instance(server.uri())
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = SnowCore::builder()
+            .client(client)
+            .vault_path(tempdir.path().join("vault"))
+            .build()
+            .await
+            .expect("core");
+
+        let results = core
+            .search_enriched("DMNTSK0001122", SearchScope::All)
+            .await
+            .expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.number, "DMNTSK0001122");
+        assert_eq!(results[0].record.table, "dmn_demand_task");
+
+        let record = core
+            .get_record("DMNTSK0001122")
+            .await
+            .expect("cached record")
+            .expect("record");
+        assert_eq!(record.resource_type, ResourceType::DemandTask);
+        assert_eq!(record.table, "dmn_demand_task");
     }
 
     #[tokio::test]

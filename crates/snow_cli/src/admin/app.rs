@@ -357,7 +357,7 @@ impl AdminApp {
     async fn handle_config_key(&mut self, key: KeyCode) -> Result<()> {
         match key {
             KeyCode::Char('e') => {
-                let current = crate::daemon_cmd::paths::selected_env(None);
+                let current = crate::daemon_cmd::paths::selected_daemon_start_env(None);
                 self.pending_confirm = Some(PendingConfirm {
                     title: "Confirm: toggle env".into(),
                     action_label: format!("Switch SNOW_ENV (currently {current})"),
@@ -446,7 +446,8 @@ impl AdminApp {
                     .spawn()?;
             }
             ConfirmAction::ToggleEnv => {
-                let next = match crate::daemon_cmd::paths::selected_env(None).as_str() {
+                let next = match crate::daemon_cmd::paths::selected_daemon_start_env(None).as_str()
+                {
                     "prd" => "test",
                     _ => "prd",
                 };

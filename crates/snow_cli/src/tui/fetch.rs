@@ -1546,11 +1546,6 @@ async fn fetch_pending_approvers(
 
 async fn lookup_record_ref(core: &TuiClient, input: &str) -> Result<RecordRef, SnowError> {
     if let Some((table, sys_id)) = parse_record_url(input) {
-        if core.is_remote() {
-            return Err(SnowError::Api(
-                "Jump by URL is not supported in daemon-backed TUI mode yet.".to_string(),
-            ));
-        }
         return lookup_record_ref_by_sys_id(core, &table, &sys_id).await;
     }
 
@@ -1577,98 +1572,11 @@ async fn lookup_record_ref_by_sys_id(
     table: &str,
     sys_id: &str,
 ) -> Result<RecordRef, SnowError> {
-    lookup_record_ref_by_sys_id_or_number(core, table, None, Some(sys_id)).await
-}
-
-async fn lookup_record_ref_by_sys_id_or_number(
-    core: &TuiClient,
-    table: &str,
-    number: Option<&str>,
-    sys_id: Option<&str>,
-) -> Result<RecordRef, SnowError> {
-    let Some(local) = core.as_local_core() else {
-        return Err(SnowError::Api(
-            "Jump by sys_id is not supported in daemon-backed TUI mode yet.".to_string(),
-        ));
-    };
-    let client = local.client();
-    let mut fields = vec!["sys_id", "number", "short_description", "state"];
-    if table == "pm_project" {
-        fields.push("name");
-    } else if table == "resource_plan" {
-        fields.extend([
-            "task",
-            "resource_type",
-            "user_resource",
-            "group_resource",
-            "start_date",
-            "end_date",
-            "planned_hours",
-            "allocated_hours",
-            "confirmed_hours",
-        ]);
-    }
-
-    let mut query = client
-        .table(table)
-        .fields(&fields)
-        .display_value(DisplayValue::Both)
-        .limit(1);
-    query = match (number, sys_id) {
-        (Some(number), None) => query.equals("number", number),
-        (None, Some(sys_id)) => query.equals("sys_id", sys_id),
-        _ => {
-            return Err(SnowError::Api(
-                "Jump lookup requires either a record number or a sys_id URL.".to_string(),
-            ));
-        }
-    };
-
-    let record = query.first().await?.ok_or_else(|| match (number, sys_id) {
-        (Some(number), None) => SnowError::NotFound(format!("{number} not found.")),
-        (None, Some(sys_id)) => SnowError::NotFound(format!("{table}:{sys_id} not found.")),
-        _ => SnowError::Api("Record not found.".to_string()),
-    })?;
-
-    let short_description = record
-        .get_str("short_description")
-        .or_else(|| record.get_str("name"))
-        .unwrap_or("(no description)")
-        .to_string();
-
-    Ok(RecordRef {
-        kind: entity_kind_for_table(table),
-        table: table.to_string(),
-        sys_id: record.sys_id.clone(),
-        number: record
-            .get_str("number")
-            .or(number)
-            .unwrap_or("(unknown)")
-            .to_string(),
-        short_description,
-        assigned_to: record
-            .get_str("assigned_to")
-            .or(record.get_str("project_manager"))
-            .or(record.get_str("demand_manager"))
-            .or(record.get_str("user_resource"))
-            .or(record.get_str("group_resource"))
-            .map(ToString::to_string),
-        planned_start: extract_planned_start(&record),
-        planned_end: extract_planned_end(&record),
-        planned_hours: record_display_value(&record, "planned_hours"),
-        allocated_hours: record_display_value(&record, "allocated_hours"),
-        confirmed_hours: record_display_value(&record, "confirmed_hours"),
-        state_label: record
-            .get_display("state")
-            .or(record.get_str("state"))
-            .map(ToString::to_string),
-        state_value: record.get_raw("state").map(ToString::to_string),
-        record_class: None,
-        parent_table: None,
-        parent_sys_id: None,
-        parent_number: None,
-        approval: None,
-    })
+    let record = core
+        .get_record_by_table_sys_id_fresh(table, sys_id)
+        .await?
+        .ok_or_else(|| SnowError::NotFound(format!("{table}:{sys_id} not found.")))?;
+    Ok(map_child_record(record))
 }
 
 fn parse_record_url(input: &str) -> Option<(String, String)> {
@@ -2227,39 +2135,6 @@ fn detail_extra_sections(page: &DetailPageModel, record: &Record) -> Vec<(String
                 .map(|value| (spec.label.to_string(), value))
         })
         .collect()
-}
-
-fn extract_planned_start(record: &Record) -> Option<String> {
-    [
-        "planned_start_date",
-        "planned_start",
-        "work_start",
-        "expected_start",
-        "start_date",
-    ]
-    .into_iter()
-    .find_map(|field| record.get_display(field).or(record.get_str(field)))
-    .map(ToString::to_string)
-}
-
-fn extract_planned_end(record: &Record) -> Option<String> {
-    [
-        "planned_end_date",
-        "planned_end",
-        "work_end",
-        "expected_end",
-        "end_date",
-    ]
-    .into_iter()
-    .find_map(|field| record.get_display(field).or(record.get_str(field)))
-    .map(ToString::to_string)
-}
-
-fn record_display_value(record: &Record, field: &str) -> Option<String> {
-    record
-        .get_display(field)
-        .or(record.get_str(field))
-        .map(ToString::to_string)
 }
 
 fn optional_detail_line(record: &Record, label: &str, fields: &[&str]) -> Option<(String, String)> {

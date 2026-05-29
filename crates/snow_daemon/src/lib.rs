@@ -21,6 +21,7 @@ use snow_core::{
     ipc::IpcEndpoint,
 };
 
+pub mod catalog_write;
 pub mod change_write;
 pub mod jobs;
 pub mod rpc;
@@ -33,6 +34,8 @@ pub mod work_note_write;
 pub mod test_support;
 
 use crate::jobs::JobRegistry;
+
+pub(crate) const DEFAULT_DAEMON_ENV: &str = "prd";
 
 /// Static configuration captured at daemon startup.
 #[derive(Debug, Clone)]
@@ -155,7 +158,7 @@ fn mcp_config_from_env() -> snow_mcp::McpConfig {
                 snow_mcp::McpEnvironment::snow_env(label, config.environment.instance_timezone);
         }
         Err(_) => {
-            config.environment.label = "test".to_string();
+            config.environment.label = DEFAULT_DAEMON_ENV.to_string();
         }
     }
 
@@ -286,7 +289,7 @@ fn data_dir_from_socket_path(socket_path: &Path) -> PathBuf {
 fn load_daemon_env() {
     let default_env_path = dotenvy::dotenv().ok();
 
-    let env_name = std::env::var("SNOW_ENV").unwrap_or_else(|_| "test".to_string());
+    let env_name = std::env::var("SNOW_ENV").unwrap_or_else(|_| DEFAULT_DAEMON_ENV.to_string());
     let mut loaded_path = None;
     for path in daemon_env_paths(&env_name) {
         if path.exists() {
@@ -329,10 +332,12 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let username = std::env::var("SNOW_USER").or_else(|_| std::env::var("SERVICENOW_USERNAME"))?;
     let credential = CredentialProvider::from_runtime_env();
     let password = credential.resolve()?;
+    let auth = BasicAuth::new(&username, password.as_str()).without_session();
+    drop(password);
 
     let client = ServiceNowClient::builder()
         .instance(&instance)
-        .auth(BasicAuth::new(&username, &password))
+        .auth(auth)
         .build()
         .await?;
 

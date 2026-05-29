@@ -38,7 +38,7 @@ A Rust CLI for ServiceNow change management. View change requests, list tasks, a
 
 ## Usage
 
-By default, `snow` uses the `test` environment. Use `--env prd` or set `SNOW_ENV=prd` for production.
+By default, regular `snow` commands use the `test` environment. Daemon startup defaults to `prd`. Use `--env` or `SNOW_ENV` to override either path explicitly.
 
 ### Show a change request
 
@@ -126,11 +126,11 @@ Notes:
 The `snow daemon` subcommands manage a long-running background daemon that hosts the job registry consumed by the admin TUI and other operator surfaces.
 
 ```bash
-snow daemon start                 # start the daemon as a detached background process
-snow --env prd daemon start       # start the daemon against production
+snow daemon start                 # start the daemon against production
+snow --env test daemon start      # start the daemon against test
 snow daemon stop                  # graceful JSON-RPC shutdown, with PID fallback
-snow daemon restart               # stop, then start
-snow --env prd daemon restart     # restart against production
+snow daemon restart               # stop, then start against production
+snow --env test daemon restart    # restart against test
 snow daemon status                # running / unreachable / stopped
 snow daemon logs --lines 50       # tail the daemon log
 snow daemon logs --follow         # stream new log lines as they appear
@@ -138,7 +138,7 @@ snow daemon logs --follow         # stream new log lines as they appear
 
 The pidfile lives at `~/.config/snow/daemon.pid` and the log at `~/.config/snow/daemon.log`. Daemon start, status, and logs include the selected environment.
 
-Use `snow tui --daemon` to launch the record browser against the daemon endpoint, or `snow --env prd tui --daemon` when you want the TUI header to reflect production mode. The older `scripts/start_daemon.sh` and `scripts/start_tui.sh` wrappers have been removed because these flows are now handled by the CLI.
+Use `snow tui --daemon` to launch the record browser against the daemon endpoint; if it needs to auto-start the daemon, it uses the same production default. Pass `--env test` when you want daemon-mode TUI startup against test. The older `scripts/start_daemon.sh` and `scripts/start_tui.sh` wrappers have been removed because these flows are now handled by the CLI.
 
 ### Admin TUI
 
@@ -163,10 +163,13 @@ The smoke harness loads `.env.test` and refuses to continue unless the normalize
 
 ## Environment Selection
 
-1. `--env` flag (e.g., `--env prd`)
+1. `--env` flag (e.g., `--env prd` or `--env test`)
 2. `SNOW_ENV` environment variable
-3. Defaults to `test`
+3. Saved daemon selection in `~/.config/snow/env`
+4. Defaults to `test` for regular commands and `prd` for daemon startup
 
 ## Authentication
 
 By default, provide the ServiceNow password through `SNOW_PASSWORD` or `SERVICENOW_PASSWORD`. This supports any external vault that can inject an environment variable at runtime. 1Password remains optional through `OP_ITEM_ID` for environments that use the `op` CLI. Do not commit real `.env.test`, `.env.prd`, passwords, vault item IDs, cookies, or session tokens.
+
+At runtime, `snow` resolves the password into zeroizing memory, clears password environment variables after resolution, builds Basic auth clients with session-cookie reuse disabled, and drops the resolved password before awaiting client construction. This reduces retained secret material; it does not eliminate transient copies from env/config loading, 1Password subprocess output, request headers, reqwest internals, or OS/process memory.

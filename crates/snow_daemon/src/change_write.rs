@@ -636,7 +636,7 @@ async fn build_plan_input(
                 "cmdb_ci",
                 "start_date",
                 "end_date",
-                "implementation_plan",
+                "change_plan",
                 "backout_plan",
                 "test_plan",
             ] {
@@ -1343,6 +1343,7 @@ fn is_free_text_field(field: &str) -> bool {
         "short_description"
             | "description"
             | "implementation_plan"
+            | "change_plan"
             | "backout_plan"
             | "test_plan"
             | "justification"

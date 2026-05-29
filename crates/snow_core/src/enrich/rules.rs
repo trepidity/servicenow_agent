@@ -277,6 +277,7 @@ fn resource_type_tag(resource_type: ResourceType) -> String {
         ResourceType::RequestTask => "request_task",
         ResourceType::Project => "project",
         ResourceType::Demand => "demand",
+        ResourceType::DemandTask => "demand_task",
         ResourceType::ResourcePlan => "resource_plan",
         ResourceType::Story => "story",
         ResourceType::ScrumTask => "scrum_task",

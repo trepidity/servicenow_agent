@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod catalog;
 pub mod change;
 pub mod incident;
 pub mod knowledge;

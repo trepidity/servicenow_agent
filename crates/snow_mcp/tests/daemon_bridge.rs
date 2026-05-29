@@ -46,6 +46,7 @@ impl DaemonJsonRpcClient for MockDaemon {
             "get_record" => Ok(json!({
                 "record": {
                     "number": params.get("number").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+                    "table": params.get("table").and_then(Value::as_str),
                     "sys_id": "0123456789abcdef0123456789abcdef"
                 }
             })),
@@ -135,6 +136,153 @@ fn request(method: &str, params: Value) -> JsonRpcRequest {
         params,
         id: Some(json!(1)),
     }
+}
+
+fn assert_no_top_level_schema_composition(tool_name: &str, schema: &Value) {
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        assert!(
+            schema.get(keyword).is_none(),
+            "{tool_name} inputSchema must not use top-level {keyword}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "get_record"]));
+    let server = bridge(daemon.clone());
+    let sys_id = "7F029B89C3E7565067BDFD73E40131A1";
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "get_record",
+                "arguments": { "table": "dmn_demand", "sys_id": sys_id }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "get_record");
+    assert_eq!(
+        calls[1].1,
+        json!({
+            "table": "dmn_demand",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        })
+    );
+}
+
+#[tokio::test]
+async fn bridge_forwards_get_work_notes_table_sys_id_lookup() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "get_work_notes"]));
+    let server = bridge(daemon.clone());
+    let sys_id = "7F029B89C3E7565067BDFD73E40131A1";
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "get_work_notes",
+                "arguments": { "table": "dmn_demand_task", "sys_id": sys_id }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "get_work_notes");
+    assert_eq!(
+        calls[1].1,
+        json!({
+            "table": "dmn_demand_task",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        })
+    );
+}
+
+#[tokio::test]
+async fn bridge_rejects_demand_table_lookup_for_resource_plan_get() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "get_record"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "resource_plan_get",
+                "arguments": {
+                    "table": "dmn_demand",
+                    "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+                }
+            }),
+        ))
+        .await;
+
+    let error = response
+        .error
+        .expect("resource_plan_get should reject demand");
+    assert_eq!(error.code, -32602);
+    assert!(
+        error.data.unwrap()["details"]
+            .as_str()
+            .unwrap()
+            .contains("table `dmn_demand` is not allowed")
+    );
+    assert_eq!(
+        daemon.method_names().await,
+        vec!["contract_info".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn bridge_keeps_story_tools_number_only() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "get_record", "get_children"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "story_get",
+                "arguments": {
+                    "number": "STRY0010001",
+                    "table": "resource_plan",
+                    "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+                }
+            }),
+        ))
+        .await;
+    assert_eq!(
+        response.error.expect("story_get rejects table").code,
+        -32602
+    );
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "story_tasks_list",
+                "arguments": {
+                    "number": "STRY0010001",
+                    "table": "resource_plan",
+                    "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+                }
+            }),
+        ))
+        .await;
+    assert_eq!(
+        response.error.expect("story_tasks_list rejects table").code,
+        -32602
+    );
+    assert_eq!(
+        daemon.method_names().await,
+        vec!["contract_info".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -380,6 +528,57 @@ async fn bridge_forwards_work_note_plan_and_apply_tools() {
 }
 
 #[tokio::test]
+async fn bridge_forwards_catalog_plan_and_submit_tools() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "catalog_plan_request",
+        "catalog_submit_request",
+    ]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "catalog_plan_request",
+                "arguments": {
+                    "item_sys_id": "300d473b13f00c10906630128144b0d1",
+                    "variables": {
+                        "business_justification": "Needed for IAM server administration"
+                    },
+                    "quantity": "1"
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "catalog_submit_request",
+                "arguments": {
+                    "plan_id": "catalog-plan-1",
+                    "confirmation_token": "confirmation-1",
+                    "idempotency_key": "idem-1"
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls[1].0, "catalog_plan_request");
+    assert_eq!(
+        calls[1].1["variables"]["business_justification"],
+        json!("Needed for IAM server administration")
+    );
+    assert_eq!(calls[2].0, "catalog_submit_request");
+    assert_eq!(calls[2].1["plan_id"], json!("catalog-plan-1"));
+}
+
+#[tokio::test]
 async fn bridge_preserves_structured_daemon_story_errors() {
     let daemon = MockDaemon::new(contract(&["contract_info", "story_apply_create"]));
     let mut config = McpConfig::default();
@@ -427,18 +626,37 @@ async fn bridge_filters_tools_against_daemon_contract() {
     let response = server.dispatch(request("tools/list", json!({}))).await;
     assert!(response.error.is_none(), "{response:?}");
     let result = response.result.unwrap();
-    let tools = result["tools"]
-        .as_array()
-        .unwrap()
+    let tools = result["tools"].as_array().unwrap();
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let input_schema = &tool["inputSchema"];
+        assert_eq!(input_schema["type"], "object", "{name}");
+        assert_no_top_level_schema_composition(name, input_schema);
+    }
+    let names = tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
 
-    assert!(tools.contains(&"get_record"));
-    assert!(tools.contains(&"resource_plan_get"));
-    assert!(tools.contains(&"story_get"));
-    assert!(tools.contains(&"tool_capabilities"));
-    assert!(!tools.contains(&"knowledge_fetch"));
+    assert!(names.contains(&"get_record"));
+    assert!(names.contains(&"resource_plan_get"));
+    assert!(names.contains(&"story_get"));
+    assert!(names.contains(&"tool_capabilities"));
+    assert!(!names.contains(&"knowledge_fetch"));
+
+    let get_record = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_record")
+        .expect("get_record advertised");
+    assert_eq!(
+        get_record["inputSchema"]["properties"]["table"]["enum"],
+        json!([
+            "dmn_demand",
+            "dmn_demand_task",
+            "resource_plan",
+            "pm_project"
+        ])
+    );
 }
 
 #[tokio::test]

@@ -41,13 +41,14 @@ requires_kb_evidence = false
 environments = ["test", "training"]        # never callable in production
 confirmation_ttl_seconds = 600
 field_allowlist = [                        # only these fields may be written
-    "short_description",
-    "description",
-    "acceptance_criteria",
-    "priority",
-    "epic",
-    "story_points",
-    "assigned_to",
+    "short_description", "description", "acceptance_criteria",
+    "cmdb_ci", "u_story_owner", "sprint", "assignment_group", "state",
+    "parent", "vendor", "team", "release_scrum",
+    "u_impacted_users", "u_release_notes", "u_lead_dev",
+    "u_division", "u_region", "u_location", "u_type", "u_moscow",
+    "classification", "due_date", "u_desired_delivery_date",
+    "product", "release", "project", "theme",
+    "priority", "epic", "story_points", "u_points_est", "assigned_to",
 ]
 story_board_id = "0123456789abcdef0123456789abcdef"
 
@@ -79,6 +80,7 @@ enabled = false
 #   catalog_submit_request, catalog_cancel_request, work_note_apply_add,
 #   story_apply_create, story_apply_update,
 #   story_task_apply_create, story_task_apply_update,
+#   attachment_upload,
 #   timecard_apply_set_hours,
 #   change_request_apply_create, change_request_apply_update,
 #   change_task_apply_create, change_task_apply_update, plan_cancel
@@ -91,7 +93,13 @@ environments = ["test", "training"]
 story_board_id = "0123456789abcdef0123456789abcdef"
 field_allowlist = [
     "short_description", "description", "acceptance_criteria",
-    "priority", "epic", "story_points", "assigned_to", "state",
+    "cmdb_ci", "u_story_owner", "sprint", "assignment_group", "state",
+    "parent", "vendor", "team", "release_scrum",
+    "u_impacted_users", "u_release_notes", "u_lead_dev",
+    "u_division", "u_region", "u_location", "u_type", "u_moscow",
+    "classification", "due_date", "u_desired_delivery_date",
+    "product", "release", "project", "theme",
+    "priority", "epic", "story_points", "u_points_est", "assigned_to",
     "percent_complete",
 ]
 
@@ -121,6 +129,13 @@ field_allowlist = [
 enabled = false
 requires_confirmation = true
 
+# Upload local files as ServiceNow attachments. Keep disabled unless the
+# deployment explicitly allows local-file writes in this environment.
+[mcp.tools.attachment_upload]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+
 # Create a governed Change Request. Update tools use the same safety posture,
 # plus optimistic concurrency through the plan/apply receipt token.
 [mcp.tools.change_request_apply_create]
@@ -130,8 +145,11 @@ environments = ["test", "training"]
 field_allowlist = [
     "short_description", "description", "type", "category",
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
-    "implementation_plan", "backout_plan", "test_plan", "risk", "impact",
-    "justification", "work_notes",
+    "implementation_plan", "change_plan", "backout_plan", "test_plan",
+    "risk", "impact", "justification",
+    "requested_by", "u_subcategory", "u_division",
+    "u_does_this_change_need_cmdb_update",
+    "work_notes",
 ]
 
 [mcp.tools.change_request_apply_update]
@@ -142,8 +160,11 @@ skip_terminal_records = true
 field_allowlist = [
     "short_description", "description", "type", "category",
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
-    "implementation_plan", "backout_plan", "test_plan", "risk", "impact",
-    "justification", "work_notes", "state",
+    "implementation_plan", "change_plan", "backout_plan", "test_plan",
+    "risk", "impact", "justification",
+    "requested_by", "u_subcategory", "u_division",
+    "u_does_this_change_need_cmdb_update",
+    "work_notes", "state",
 ]
 
 [mcp.tools.change_task_apply_create]

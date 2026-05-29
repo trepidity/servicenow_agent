@@ -114,9 +114,39 @@ fn story_plan_create_input_schema() -> Value {
             "short_description": {"type": "string", "minLength": 1, "maxLength": 240},
             "description": {"type": "string", "maxLength": 16000},
             "acceptance_criteria": {"type": "string", "maxLength": 16000},
+            "cmdb_ci": {"type": "string"},
+            "u_story_owner": {"type": "string"},
+            "sprint": {"type": "string"},
+            "assignment_group": {"type": "string"},
+            "parent": {"type": "string"},
+            "vendor": {"type": "string"},
+            "team": {"type": "string"},
+            "release_scrum": {"type": "string"},
+            "state": {"type": "string"},
+            "u_impacted_users": {"type": "string", "maxLength": 16000},
+            "u_release_notes": {"type": "string", "maxLength": 16000},
+            "u_lead_dev": {"type": "string"},
+            "u_division": {"type": "string"},
+            "u_region": {"type": "string"},
+            "u_location": {"type": "string"},
+            "u_type": {"type": "string"},
+            "u_moscow": {"type": "string"},
+            "classification": {"type": "string"},
+            "due_date": {"type": "string", "format": "date"},
+            "u_desired_delivery_date": {"type": "string", "format": "date"},
+            "product": {"type": "string"},
+            "release": {"type": "string"},
+            "project": {"type": "string"},
+            "theme": {"type": "string"},
             "priority": {"type": "string"},
             "epic": {"type": "string"},
             "story_points": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer", "minimum": 0}
+                ]
+            },
+            "u_points_est": {
                 "oneOf": [
                     {"type": "string"},
                     {"type": "integer", "minimum": 0}
@@ -136,6 +166,30 @@ fn story_plan_update_input_schema() -> Value {
             "short_description": {"type": "string", "maxLength": 240},
             "description": {"type": "string", "maxLength": 16000},
             "acceptance_criteria": {"type": "string", "maxLength": 16000},
+            "cmdb_ci": {"type": "string"},
+            "u_story_owner": {"type": "string"},
+            "sprint": {"type": "string"},
+            "assignment_group": {"type": "string"},
+            "parent": {"type": "string"},
+            "vendor": {"type": "string"},
+            "team": {"type": "string"},
+            "release_scrum": {"type": "string"},
+            "state": {"type": "string"},
+            "u_impacted_users": {"type": "string", "maxLength": 16000},
+            "u_release_notes": {"type": "string", "maxLength": 16000},
+            "u_lead_dev": {"type": "string"},
+            "u_division": {"type": "string"},
+            "u_region": {"type": "string"},
+            "u_location": {"type": "string"},
+            "u_type": {"type": "string"},
+            "u_moscow": {"type": "string"},
+            "classification": {"type": "string"},
+            "due_date": {"type": "string", "format": "date"},
+            "u_desired_delivery_date": {"type": "string", "format": "date"},
+            "product": {"type": "string"},
+            "release": {"type": "string"},
+            "project": {"type": "string"},
+            "theme": {"type": "string"},
             "priority": {"type": "string"},
             "epic": {"type": "string"},
             "story_points": {
@@ -144,8 +198,13 @@ fn story_plan_update_input_schema() -> Value {
                     {"type": "integer", "minimum": 0}
                 ]
             },
+            "u_points_est": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer", "minimum": 0}
+                ]
+            },
             "assigned_to": {"type": "string"},
-            "state": {"type": "string"},
             "percent_complete": {"type": "number", "minimum": 0, "maximum": 100}
         },
         "required": ["number"]
@@ -159,6 +218,7 @@ fn story_task_plan_create_input_schema() -> Value {
             "parent_story_number": {"type": "string", "pattern": "^STRY\\d+$"},
             "short_description": {"type": "string", "minLength": 1, "maxLength": 240},
             "description": {"type": "string", "maxLength": 16000},
+            "assignment_group": {"type": "string"},
             "assigned_to": {"type": "string"},
             "priority": {"type": "string"},
             "due_date": {"type": "string", "format": "date"},

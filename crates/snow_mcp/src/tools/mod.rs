@@ -1,3 +1,4 @@
+pub mod attachment;
 pub mod audit;
 pub mod catalog;
 pub mod change;

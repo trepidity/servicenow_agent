@@ -22,6 +22,7 @@ use crate::protocol::schema::{
     JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport, ToolCapability,
 };
 use crate::tools::ToolRegistry;
+use crate::tools::records::{RESOURCE_PLAN_LOOKUP_TABLES, RecordLookup, parse_record_lookup};
 use crate::{Error, Result};
 
 const JSON_RPC_VERSION: &str = "2.0";
@@ -32,6 +33,10 @@ const AUTOSPAWN_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("get_record", "get_record"),
     ("get_approval", "get_approval"),
+    ("catalog_items_search", "catalog_items_search"),
+    ("catalog_item_get", "catalog_item_get"),
+    ("catalog_plan_request", "catalog_plan_request"),
+    ("catalog_submit_request", "catalog_submit_request"),
     ("search_records", "search_records"),
     ("list_records", "list_records"),
     ("list_my_tasks", "list_my_tasks"),
@@ -39,6 +44,8 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("list_my_projects", "list_my_projects"),
     ("get_children", "get_children"),
     ("get_work_notes", "get_work_notes"),
+    ("attachment_list", "attachment_list"),
+    ("attachment_upload", "attachment_upload"),
     ("resource_plan_get", "get_record"),
     ("story_get", "get_record"),
     ("story_tasks_list", "get_children"),
@@ -554,11 +561,28 @@ impl DaemonBackedMcpBridge {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        match self
-            .daemon
-            .request(method, daemon_params_for(method, args))
-            .await
-        {
+        if name == "attachment_upload" {
+            if !self
+                .config
+                .policy
+                .tool_enabled_in_environment(name, &self.config.environment.label)
+            {
+                return JsonRpcResponse::error(
+                    id,
+                    -32040,
+                    "policy denied",
+                    Some(json!({ "tool": name, "details": "attachment uploads are disabled" })),
+                );
+            }
+            if args.get("confirm_upload").and_then(Value::as_bool) != Some(true) {
+                return invalid_params(id, "attachment_upload requires confirm_upload=true");
+            }
+        }
+        let daemon_params = match daemon_params_for_tool(name, method, args) {
+            Ok(params) => params,
+            Err(err) => return invalid_params(id, err.to_string()),
+        };
+        match self.daemon.request(method, daemon_params).await {
             Ok(result) => JsonRpcResponse::ok(id, tool_call_result(result)),
             Err(err) => service_failure(id, err),
         }
@@ -692,7 +716,7 @@ impl DaemonBackedMcpBridge {
                     enabled: self
                         .config
                         .policy
-                        .tool_enabled_in_environment(&tool.name, &self.config.environment.label),
+                        .tool_enabled_in_environment(&tool.name, &contract.environment),
                     mode: if is_write_tool(&tool.name) {
                         "write".to_string()
                     } else {
@@ -810,21 +834,36 @@ fn dashboard_key(method: &str) -> &'static str {
     }
 }
 
-fn daemon_params_for(method: &str, args: Value) -> Value {
+fn daemon_params_for_tool(tool: &str, method: &str, args: Value) -> Result<Value> {
     let mut object = match args {
         Value::Object(map) => map,
-        _ => return json!({}),
+        _ => return Ok(json!({})),
     };
 
-    if method == "get_record"
-        && !object.contains_key("number")
-        && let Some(record_number) = object.get("record_number").and_then(Value::as_str)
-    {
-        object.insert(
-            "number".to_string(),
-            Value::String(record_number.to_string()),
-        );
+    normalize_number_alias(&mut object);
+
+    match tool {
+        "get_record" | "get_work_notes" => {
+            return lookup_params(parse_record_lookup_value(
+                Value::Object(object),
+                snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+            )?);
+        }
+        "resource_plan_get" => {
+            return lookup_params(parse_record_lookup_value(
+                Value::Object(object),
+                RESOURCE_PLAN_LOOKUP_TABLES,
+            )?);
+        }
+        "story_get" => {
+            reject_table_sys_id(&object, "story_get")?;
+        }
+        "story_tasks_list" => {
+            reject_table_sys_id(&object, "story_tasks_list")?;
+        }
+        _ => {}
     }
+
     if method == "get_children" && !object.contains_key("number") {
         let parent = object
             .get("parent_number")
@@ -835,8 +874,45 @@ fn daemon_params_for(method: &str, args: Value) -> Value {
             object.insert("number".to_string(), Value::String(parent));
         }
     }
+    if method == "attachment_upload" {
+        object.remove("confirm_upload");
+        object.remove("idempotency_key");
+    }
 
-    Value::Object(object)
+    Ok(Value::Object(object))
+}
+
+fn normalize_number_alias(object: &mut serde_json::Map<String, Value>) {
+    if !object.contains_key("number")
+        && let Some(record_number) = object.get("record_number").and_then(Value::as_str)
+    {
+        object.insert(
+            "number".to_string(),
+            Value::String(record_number.to_string()),
+        );
+    }
+}
+
+fn reject_table_sys_id(object: &serde_json::Map<String, Value>, tool: &str) -> Result<()> {
+    if object.contains_key("table") || object.contains_key("sys_id") {
+        return Err(Error::InvalidParams(format!(
+            "{tool} only accepts number-based lookups"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_record_lookup_value(args: Value, allowed_tables: &[&str]) -> Result<RecordLookup> {
+    parse_record_lookup(&args, allowed_tables)
+}
+
+fn lookup_params(lookup: RecordLookup) -> Result<Value> {
+    Ok(match lookup {
+        RecordLookup::Number(number) => json!({ "number": number }),
+        RecordLookup::TableSysId { table, sys_id } => {
+            json!({ "table": table, "sys_id": sys_id })
+        }
+    })
 }
 
 /// Wrap a daemon/governance payload in the MCP `tools/call` result envelope.
@@ -906,6 +982,16 @@ mod tests {
     #[derive(Default)]
     struct MockDaemon {
         calls: Mutex<Vec<(String, Value)>>,
+        supported_methods: Vec<&'static str>,
+    }
+
+    impl MockDaemon {
+        fn with_supported_methods(supported_methods: Vec<&'static str>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                supported_methods,
+            }
+        }
     }
 
     #[async_trait]
@@ -915,7 +1001,11 @@ mod tests {
                 return Ok(json!({
                     "contract_version": DEFAULT_CONTRACT_VERSION,
                     "environment": { "label": "test" },
-                    "supported_methods": ["story_task_apply_update"],
+                    "supported_methods": if self.supported_methods.is_empty() {
+                        json!(["story_task_apply_update"])
+                    } else {
+                        json!(self.supported_methods)
+                    },
                     "deprecated_aliases": [],
                 }));
             }
@@ -996,5 +1086,100 @@ mod tests {
             .and_then(Value::as_array)
             .expect("write tools array");
         assert!(writes.contains(&json!("story_task_apply_update")));
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_is_denied_when_policy_disabled() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec![
+            "attachment_upload",
+        ]));
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "attachment_upload",
+                    "arguments": {
+                        "number": "CHG0010001",
+                        "path": "/tmp/evidence.jpeg",
+                        "confirm_upload": true,
+                        "idempotency_key": "idem-1",
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        let error = response.error.expect("policy denied");
+        assert_eq!(error.code, -32040);
+        assert!(daemon.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_requires_confirmation_and_forwards_clean_daemon_params() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec![
+            "attachment_upload",
+        ]));
+        let mut config = McpConfig::default();
+        config
+            .policy
+            .tools
+            .get_mut("attachment_upload")
+            .expect("attachment upload policy")
+            .enabled = true;
+        let bridge = DaemonBackedMcpBridge::new(daemon.clone(), config, DEFAULT_CONTRACT_VERSION);
+
+        let missing_confirmation = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "attachment_upload",
+                    "arguments": {
+                        "number": "CHG0010001",
+                        "path": "/tmp/evidence.jpeg",
+                        "idempotency_key": "idem-1",
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+        assert_eq!(missing_confirmation.error.expect("error").code, -32602);
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "attachment_upload",
+                    "arguments": {
+                        "number": "CHG0010001",
+                        "path": "/tmp/evidence.jpeg",
+                        "file_name": "evidence.jpeg",
+                        "content_type": "image/jpeg",
+                        "confirm_upload": true,
+                        "idempotency_key": "idem-1",
+                    }
+                }),
+                id: Some(json!(2)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "attachment_upload");
+        assert_eq!(calls[0].1["number"], json!("CHG0010001"));
+        assert_eq!(calls[0].1["path"], json!("/tmp/evidence.jpeg"));
+        assert_eq!(calls[0].1["file_name"], json!("evidence.jpeg"));
+        assert_eq!(calls[0].1["content_type"], json!("image/jpeg"));
+        assert!(calls[0].1.get("confirm_upload").is_none());
+        assert!(calls[0].1.get("idempotency_key").is_none());
     }
 }

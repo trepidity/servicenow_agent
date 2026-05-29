@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::process::{Command, Output};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 const SNOW_PASSWORD_ENV: &str = "SNOW_PASSWORD";
 const SERVICENOW_PASSWORD_ENV: &str = "SERVICENOW_PASSWORD";
@@ -21,6 +22,8 @@ const SECRET_ENV_VARS: &[&str] = &[
     "ONEPASSWORD_CONNECT_TOKEN",
 ];
 
+pub type SecretString = Zeroizing<String>;
+
 /// Where the ServiceNow password is resolved from at runtime.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "provider", rename_all = "lowercase")]
@@ -37,7 +40,7 @@ pub enum CredentialProvider {
 }
 
 impl CredentialProvider {
-    pub fn resolve(&self) -> Result<String, CredentialError> {
+    pub fn resolve(&self) -> Result<SecretString, CredentialError> {
         match self {
             Self::Env => resolve_env_password(),
             Self::OnePassword { item_id, field } => resolve_one_password(item_id, field),
@@ -118,18 +121,18 @@ fn default_op_field() -> String {
     "password".to_string()
 }
 
-fn resolve_env_password() -> Result<String, CredentialError> {
+fn resolve_env_password() -> Result<SecretString, CredentialError> {
     for key in PASSWORD_ENV_VARS {
         if let Some(password) = non_empty_env(key) {
             clear_password_env_vars();
-            return Ok(password);
+            return Ok(Zeroizing::new(password));
         }
     }
 
     Err(CredentialError::MissingEnv)
 }
 
-fn resolve_one_password(item_id: &str, field: &str) -> Result<String, CredentialError> {
+fn resolve_one_password(item_id: &str, field: &str) -> Result<SecretString, CredentialError> {
     resolve_one_password_with_runner(item_id, field, |args| {
         let mut command = Command::new("op");
         command.args(args);
@@ -141,7 +144,7 @@ fn resolve_one_password_with_runner<F>(
     item_id: &str,
     field: &str,
     runner: F,
-) -> Result<String, CredentialError>
+) -> Result<SecretString, CredentialError>
 where
     F: FnOnce(&[String]) -> std::io::Result<Output>,
 {
@@ -155,7 +158,7 @@ where
     }
 
     let args = op_item_get_args(item_id, field);
-    let output = runner(&args).map_err(|source| CredentialError::OnePasswordUnavailable {
+    let mut output = runner(&args).map_err(|source| CredentialError::OnePasswordUnavailable {
         item_id: item_id.to_string(),
         source,
     })?;
@@ -173,7 +176,8 @@ where
         });
     }
 
-    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let password = Zeroizing::new(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    output.stdout.zeroize();
     if password.is_empty() {
         return Err(CredentialError::OnePasswordEmpty {
             item_id: item_id.to_string(),
@@ -264,7 +268,7 @@ mod tests {
 
         let password = CredentialProvider::Env.resolve().expect("password");
 
-        assert_eq!(password, "snow-secret");
+        assert_eq!(password.as_str(), "snow-secret");
         assert!(std::env::var(SNOW_PASSWORD_ENV).is_err());
         assert!(std::env::var(SERVICENOW_PASSWORD_ENV).is_err());
     }
@@ -276,7 +280,7 @@ mod tests {
 
         let password = CredentialProvider::Env.resolve().expect("password");
 
-        assert_eq!(password, "servicenow-secret");
+        assert_eq!(password.as_str(), "servicenow-secret");
     }
 
     #[test]
@@ -373,7 +377,7 @@ mod tests {
         })
         .expect("password");
 
-        assert_eq!(password, "secret-value");
+        assert_eq!(password.as_str(), "secret-value");
     }
 
     #[test]

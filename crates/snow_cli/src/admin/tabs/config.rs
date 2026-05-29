@@ -19,7 +19,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut AdminApp) {
 }
 
 fn render_config(f: &mut Frame, area: Rect, _app: &AdminApp) {
-    let env = crate::daemon_cmd::paths::selected_env(None);
+    let env = crate::daemon_cmd::paths::selected_daemon_start_env(None);
     let paths = DaemonPaths::resolve().ok();
     let provider = credential_provider_summary();
     let lines = vec![

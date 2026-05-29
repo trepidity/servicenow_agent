@@ -1,1 +1,1 @@
-pub use snow_core::credential::{CredentialProvider, strip_secret_env};
+pub use snow_core::credential::{CredentialProvider, SecretString, strip_secret_env};

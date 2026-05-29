@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snow_core::ipc::IpcEndpoint;
 use snow_core::{
-    KnowledgeSemanticSearchFilters, ResourceType, SearchScope, SnowCore, SnowRecord,
+    KnowledgeSemanticSearchFilters, RecordLookup, ResourceType, SearchScope, SnowCore, SnowRecord,
     TaskSlaParentRef, cache::store::Store, query::filter::ListQuery,
 };
 use std::future::Future;
@@ -76,6 +76,10 @@ pub enum RpcMethod {
     ListCategories,
     ListKnowledgeArticles,
     GetApproval,
+    CatalogItemsSearch,
+    CatalogItemGet,
+    CatalogPlanRequest,
+    CatalogSubmitRequest,
     GetChildren,
     GetWorkNotes,
     ListRecords,
@@ -94,6 +98,8 @@ pub enum RpcMethod {
     MyIncidentsFresh,
     VaultPath,
     AddWorkNote,
+    AttachmentList,
+    AttachmentUpload,
     SetState,
     FieldChoices,
     Approve,
@@ -163,6 +169,10 @@ impl RpcMethod {
             "list_categories" => Self::ListCategories,
             "list_knowledge_articles" => Self::ListKnowledgeArticles,
             "get_approval" => Self::GetApproval,
+            "catalog_items_search" => Self::CatalogItemsSearch,
+            "catalog_item_get" => Self::CatalogItemGet,
+            "catalog_plan_request" => Self::CatalogPlanRequest,
+            "catalog_submit_request" => Self::CatalogSubmitRequest,
             "get_children" => Self::GetChildren,
             "get_work_notes" => Self::GetWorkNotes,
             "list_records" => Self::ListRecords,
@@ -181,6 +191,8 @@ impl RpcMethod {
             "my_incidents_fresh" => Self::MyIncidentsFresh,
             "vault_path" => Self::VaultPath,
             "add_work_note" => Self::AddWorkNote,
+            "attachment_list" => Self::AttachmentList,
+            "attachment_upload" => Self::AttachmentUpload,
             "set_state" => Self::SetState,
             "field_choices" => Self::FieldChoices,
             "approve" => Self::Approve,
@@ -487,8 +499,22 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         RpcMethod::Ping => JsonRpcResponse::ok(id, json!({ "ok": true })),
         RpcMethod::Shutdown => JsonRpcResponse::ok(id, json!({ "status": "shutting_down" })),
         RpcMethod::VaultPath => JsonRpcResponse::ok(id, json!({ "path": transport.vault_path() })),
-        RpcMethod::GetRecord => match extract_number(&request.params) {
-            Ok(number) => match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
+        RpcMethod::GetRecord => match extract_record_lookup(&request.params) {
+            Ok(RecordLookup::Number(number)) => {
+                match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
+                    Ok(Some(record)) => match transport.record(&record) {
+                        Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
+                        Err(err) => internal_error(id, err),
+                    },
+                    Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+                    Err(err) => internal_error(id, err),
+                }
+            }
+            Ok(RecordLookup::TableSysId { table, sys_id }) => match state
+                .core
+                .get_record_by_table_sys_id_fresh(&table, &sys_id)
+                .await
+            {
                 Ok(Some(record)) => match transport.record(&record) {
                     Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
                     Err(err) => internal_error(id, err),
@@ -498,8 +524,20 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
-        RpcMethod::GetRecordFresh => match extract_number(&request.params) {
-            Ok(number) => match state.core.get_record_fresh(&number).await {
+        RpcMethod::GetRecordFresh => match extract_record_lookup(&request.params) {
+            Ok(RecordLookup::Number(number)) => match state.core.get_record_fresh(&number).await {
+                Ok(Some(record)) => match transport.record(&record) {
+                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
+                    Err(err) => internal_error(id, err),
+                },
+                Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+                Err(err) => internal_error(id, err),
+            },
+            Ok(RecordLookup::TableSysId { table, sys_id }) => match state
+                .core
+                .get_record_by_table_sys_id_fresh(&table, &sys_id)
+                .await
+            {
                 Ok(Some(record)) => match transport.record(&record) {
                     Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
                     Err(err) => internal_error(id, err),
@@ -690,6 +728,12 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
+        RpcMethod::CatalogItemsSearch => {
+            crate::catalog_write::handle_catalog_items_search(id, &request.params, state).await
+        }
+        RpcMethod::CatalogItemGet => {
+            crate::catalog_write::handle_catalog_item_get(id, &request.params, state).await
+        }
         RpcMethod::GetChildren => match extract_number(&request.params) {
             Ok(number) => match state.core.get_children(&number).await {
                 Ok(records) => {
@@ -706,17 +750,19 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
-        RpcMethod::GetWorkNotes => match extract_number(&request.params) {
-            Ok(number) => match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => {
-                        JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes }))
-                    }
+        RpcMethod::GetWorkNotes => match extract_record_lookup(&request.params) {
+            Ok(lookup) => {
+                match get_record_by_lookup_cached_or_fresh(state.core.as_ref(), lookup).await {
+                    Ok(Some(record)) => match transport.record(&record) {
+                        Ok(record) => {
+                            JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes }))
+                        }
+                        Err(err) => internal_error(id, err),
+                    },
+                    Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
                     Err(err) => internal_error(id, err),
-                },
-                Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
-            },
+                }
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::ListRecords => match extract_list_records_params(&request.params) {
@@ -838,6 +884,37 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             (Err(err), _) | (_, Err(err)) => invalid_params(id, err),
         },
+        RpcMethod::AttachmentList => match extract_number(&request.params) {
+            Ok(number) => match state.core.list_attachments(&number).await {
+                Ok(Some(attachments)) => {
+                    JsonRpcResponse::ok(id, json!({ "attachments": attachments }))
+                }
+                Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::AttachmentUpload => {
+            match serde_json::from_value::<AttachmentUploadParams>(request.params.clone()) {
+                Ok(params) => match state
+                    .core
+                    .upload_attachment_file(
+                        &params.number,
+                        &params.path,
+                        params.file_name.as_deref(),
+                        params.content_type.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(Some(attachment)) => {
+                        JsonRpcResponse::ok(id, json!({ "attachment": attachment }))
+                    }
+                    Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+                    Err(err) => internal_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
         RpcMethod::SetState => {
             match serde_json::from_value::<SetStateParams>(request.params.clone()) {
                 Ok(params) => match state.core.set_state(&params.number, &params.state).await {
@@ -1033,6 +1110,12 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::PlanGet => crate::story_write::handle_plan_get(id, &request.params, state).await,
+        RpcMethod::CatalogPlanRequest => {
+            crate::catalog_write::handle_catalog_plan_request(id, &request.params, state).await
+        }
+        RpcMethod::CatalogSubmitRequest => {
+            crate::catalog_write::handle_catalog_submit_request(id, &request.params, state).await
+        }
         RpcMethod::WorkNotePlanAdd => {
             crate::work_note_write::handle_work_note_plan_add(id, &request.params, state).await
         }
@@ -1122,6 +1205,16 @@ struct FieldChoicesParams {
     field: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentUploadParams {
+    number: String,
+    path: PathBuf,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct CacheInfo {
     vault_path: String,
@@ -1149,6 +1242,10 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "list_categories",
     "list_knowledge_articles",
     "get_approval",
+    "catalog_items_search",
+    "catalog_item_get",
+    "catalog_plan_request",
+    "catalog_submit_request",
     "get_children",
     "get_work_notes",
     "list_records",
@@ -1159,6 +1256,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "list_my_incidents",
     "vault_path",
     "add_work_note",
+    "attachment_list",
+    "attachment_upload",
     "set_state",
     "field_choices",
     "approve",
@@ -1221,7 +1320,8 @@ const DEPRECATED_RPC_ALIASES: &[(&str, &str)] = &[
 ];
 
 fn contract_info(state: &DaemonState) -> Value {
-    let env_label = std::env::var("SNOW_ENV").unwrap_or_else(|_| "test".to_string());
+    let env_label =
+        std::env::var("SNOW_ENV").unwrap_or_else(|_| crate::DEFAULT_DAEMON_ENV.to_string());
     let instance_host = normalize_instance_host(&state.core.config().instance.url);
     let (mcp_mode, mcp_transport) =
         normalize_mcp_availability(state.core.config().daemon.mcp_transport.as_str());
@@ -1333,6 +1433,34 @@ fn extract_number(params: &Value) -> Result<String> {
             .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow!("missing required field `number`")),
         _ => Err(anyhow!("expected object params")),
+    }
+}
+
+pub(crate) fn extract_record_lookup(params: &Value) -> Result<RecordLookup> {
+    let Value::Object(map) = params else {
+        return Err(anyhow!("expected object params"));
+    };
+
+    let number = map.get("number").and_then(Value::as_str);
+    let table = map.get("table").and_then(Value::as_str);
+    let sys_id = map.get("sys_id").and_then(Value::as_str);
+
+    match (number, table, sys_id) {
+        (Some(number), None, None) => Ok(RecordLookup::Number(number.to_owned())),
+        (None, Some(table), Some(sys_id)) => Ok(RecordLookup::TableSysId {
+            table: snow_core::normalize_record_lookup_table(table)?,
+            sys_id: snow_core::normalize_record_lookup_sys_id(sys_id)?,
+        }),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(anyhow!(
+            "provide either `number` or `table` + `sys_id`, not both"
+        )),
+        (None, None, Some(_)) => Err(anyhow!(
+            "missing required lookup: provide either `number` or `table` + `sys_id`"
+        )),
+        (None, Some(_), None) => Err(anyhow!("missing required field `sys_id`")),
+        (None, None, None) => Err(anyhow!(
+            "missing required lookup: provide either `number` or `table` + `sys_id`"
+        )),
     }
 }
 
@@ -1514,6 +1642,7 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "request_task" | "sc_task" => Ok(ResourceType::RequestTask),
         "project" | "pm_project" => Ok(ResourceType::Project),
         "demand" | "dmn_demand" => Ok(ResourceType::Demand),
+        "demand_task" | "dmn_demand_task" | "dmntsk" => Ok(ResourceType::DemandTask),
         "resource_plan" | "resourceplan" | "rpln" => Ok(ResourceType::ResourcePlan),
         "story" | "rm_story" => Ok(ResourceType::Story),
         "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),
@@ -1555,6 +1684,18 @@ async fn get_record_cached_or_fresh(core: &SnowCore, number: &str) -> Result<Opt
     match core.get_record(number).await? {
         Some(record) => Ok(Some(record)),
         None => core.get_record_fresh(number).await,
+    }
+}
+
+pub(crate) async fn get_record_by_lookup_cached_or_fresh(
+    core: &SnowCore,
+    lookup: RecordLookup,
+) -> Result<Option<SnowRecord>> {
+    match lookup {
+        RecordLookup::Number(number) => get_record_cached_or_fresh(core, &number).await,
+        RecordLookup::TableSysId { table, sys_id } => {
+            core.get_record_by_table_sys_id_fresh(&table, &sys_id).await
+        }
     }
 }
 
@@ -1744,6 +1885,14 @@ mod tests {
         );
         assert_eq!(RpcMethod::from_method("set_state"), RpcMethod::SetState);
         assert_eq!(
+            RpcMethod::from_method("attachment_list"),
+            RpcMethod::AttachmentList
+        );
+        assert_eq!(
+            RpcMethod::from_method("attachment_upload"),
+            RpcMethod::AttachmentUpload
+        );
+        assert_eq!(
             RpcMethod::from_method("field_choices"),
             RpcMethod::FieldChoices
         );
@@ -1763,6 +1912,22 @@ mod tests {
         assert_eq!(RpcMethod::from_method("list_jobs"), RpcMethod::ListJobs);
         assert_eq!(RpcMethod::from_method("cancel_job"), RpcMethod::CancelJob);
         assert_eq!(RpcMethod::from_method("plan_get"), RpcMethod::PlanGet);
+        assert_eq!(
+            RpcMethod::from_method("catalog_items_search"),
+            RpcMethod::CatalogItemsSearch
+        );
+        assert_eq!(
+            RpcMethod::from_method("catalog_item_get"),
+            RpcMethod::CatalogItemGet
+        );
+        assert_eq!(
+            RpcMethod::from_method("catalog_plan_request"),
+            RpcMethod::CatalogPlanRequest
+        );
+        assert_eq!(
+            RpcMethod::from_method("catalog_submit_request"),
+            RpcMethod::CatalogSubmitRequest
+        );
         assert_eq!(
             RpcMethod::from_method("work_note_plan_add"),
             RpcMethod::WorkNotePlanAdd
@@ -2289,6 +2454,49 @@ story_board_id = "board-sys"
     fn extract_number_reads_param() {
         let params = json!({ "number": "INC0012345" });
         assert_eq!(extract_number(&params).unwrap(), "INC0012345");
+    }
+
+    #[test]
+    fn extract_record_lookup_accepts_number() {
+        let lookup = extract_record_lookup(&json!({ "number": "DMND0012345" })).expect("lookup");
+        assert_eq!(lookup, RecordLookup::Number("DMND0012345".to_string()));
+    }
+
+    #[test]
+    fn extract_record_lookup_accepts_table_sys_id_and_lowercases() {
+        let lookup = extract_record_lookup(&json!({
+            "table": "dmn_demand",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }))
+        .expect("lookup");
+        assert_eq!(
+            lookup,
+            RecordLookup::TableSysId {
+                table: "dmn_demand".to_string(),
+                sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn extract_record_lookup_rejects_invalid_shapes() {
+        for params in [
+            json!({ "sys_id": "7f029b89c3e7565067bdfd73e40131a1" }),
+            json!({
+                "number": "DMND0012345",
+                "table": "dmn_demand",
+                "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+            }),
+            json!({ "table": "dmn_demand" }),
+            json!({ "table": "dmn_demand", "sys_id": "7f029b89c3e7565067bdfd73e40131a" }),
+            json!({ "table": "dmn_demand", "sys_id": "7f029b89c3e7565067bdfd73e40131ag" }),
+            json!({ "table": "sys_user", "sys_id": "7f029b89c3e7565067bdfd73e40131a1" }),
+        ] {
+            assert!(
+                extract_record_lookup(&params).is_err(),
+                "accepted invalid params: {params}"
+            );
+        }
     }
 
     #[test]
@@ -3067,6 +3275,105 @@ story_board_id = "board-sys"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_get_record_fetches_demand_by_table_sys_id() {
+        let sys_id = "7f029b89c3e7565067bdfd73e40131a1";
+        let response = json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "DMND0320098",
+                "short_description": "Network refresh demand",
+                "description": "Upgrade branch switching",
+                "state": "draft"
+            }
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "get_record".to_string(),
+                params: json!({
+                    "table": "dmn_demand",
+                    "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let record = response
+            .result
+            .expect("record result")
+            .get("record")
+            .cloned()
+            .expect("wrapped record");
+        assert_eq!(
+            record.get("number").and_then(Value::as_str),
+            Some("DMND0320098")
+        );
+        assert_eq!(record.get("sys_id").and_then(Value::as_str), Some(sys_id));
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/dmn_demand/"));
+        assert!(request_line.contains(sys_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_get_work_notes_accepts_demand_task_table_sys_id() {
+        let sys_id = "7f029b89c3e7565067bdfd73e40131a1";
+        let response = json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "DMNTSK0001122",
+                "short_description": "Review demand intake",
+                "state": "2",
+                "work_notes": "2026-05-27 10:11:12 - Casey User (Work notes)\nReady for review.\n"
+            }
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "get_work_notes".to_string(),
+                params: json!({
+                    "table": "dmn_demand_task",
+                    "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let work_notes = response
+            .result
+            .expect("work notes result")
+            .get("work_notes")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("work notes");
+        assert_eq!(work_notes.len(), 1);
+        assert_eq!(
+            work_notes[0].get("body").and_then(Value::as_str),
+            Some("Ready for review.")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/dmn_demand_task/"));
+        assert!(request_line.contains(sys_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn direct_rpc_and_mcp_return_matching_wrapped_payloads() {
         let fixture = build_fixture_state().await.expect("fixture");
 
@@ -3643,6 +3950,62 @@ story_board_id = "board-sys"
                 .and_then(Value::as_str),
             Some("INC4992697")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_records_falls_back_to_live_fetch_for_demand_task_number() {
+        let response = serde_json::json!({
+            "result": [{
+                "sys_id": "dmntsk-sys-fallback",
+                "number": "DMNTSK0001122",
+                "short_description": "Review demand intake",
+                "description": "Demand task should hydrate from exact search",
+                "state": "2"
+            }]
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let search = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "search_records".to_string(),
+                params: json!({ "query": "DMNTSK0001122" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let results = search
+            .result
+            .expect("search result")
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("results array");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .get("record")
+                .and_then(|r| r.get("number"))
+                .and_then(Value::as_str),
+            Some("DMNTSK0001122")
+        );
+        assert_eq!(
+            results[0]
+                .get("record")
+                .and_then(|r| r.get("table"))
+                .and_then(Value::as_str),
+            Some("dmn_demand_task")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/dmn_demand_task"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -71,6 +71,38 @@ story_board_id = "0123456789abcdef0123456789abcdef"
 }
 
 #[test]
+fn parsed_policy_inherits_missing_builtin_tool_defaults() {
+    let cfg = PolicyConfig::from_toml_str(
+        r#"
+[mcp]
+environment = "test"
+"#,
+    )
+    .expect("policy TOML should parse");
+
+    assert!(cfg.tool_enabled_in_environment("catalog_submit_request", "test"));
+    assert!(
+        cfg.tools
+            .get("catalog_submit_request")
+            .expect("catalog submit policy")
+            .requires_confirmation
+    );
+}
+
+#[test]
+fn parsed_policy_honors_explicit_builtin_tool_disable() {
+    let cfg = PolicyConfig::from_toml_str(
+        r#"
+[mcp.tools.catalog_submit_request]
+enabled = false
+"#,
+    )
+    .expect("policy TOML should parse");
+
+    assert!(!cfg.tool_enabled_in_environment("catalog_submit_request", "test"));
+}
+
+#[test]
 fn production_label_refuses_without_override() {
     let cfg = PolicyConfig::from_toml_str(
         r#"
@@ -281,11 +313,36 @@ fn default_story_tool_policies_match_policy_defaults() {
     let story_fields = BTreeSet::from([
         "acceptance_criteria".to_string(),
         "assigned_to".to_string(),
+        "assignment_group".to_string(),
+        "classification".to_string(),
+        "cmdb_ci".to_string(),
         "description".to_string(),
+        "due_date".to_string(),
         "epic".to_string(),
+        "parent".to_string(),
         "priority".to_string(),
+        "product".to_string(),
+        "project".to_string(),
+        "release".to_string(),
+        "release_scrum".to_string(),
         "short_description".to_string(),
+        "sprint".to_string(),
+        "state".to_string(),
         "story_points".to_string(),
+        "team".to_string(),
+        "theme".to_string(),
+        "u_desired_delivery_date".to_string(),
+        "u_division".to_string(),
+        "u_impacted_users".to_string(),
+        "u_lead_dev".to_string(),
+        "u_location".to_string(),
+        "u_moscow".to_string(),
+        "u_points_est".to_string(),
+        "u_region".to_string(),
+        "u_release_notes".to_string(),
+        "u_story_owner".to_string(),
+        "u_type".to_string(),
+        "vendor".to_string(),
     ]);
     assert_eq!(
         cfg.tools
@@ -298,13 +355,37 @@ fn default_story_tool_policies_match_policy_defaults() {
     let story_update_fields = BTreeSet::from([
         "acceptance_criteria".to_string(),
         "assigned_to".to_string(),
+        "assignment_group".to_string(),
+        "classification".to_string(),
+        "cmdb_ci".to_string(),
         "description".to_string(),
+        "due_date".to_string(),
         "epic".to_string(),
+        "parent".to_string(),
         "priority".to_string(),
         "percent_complete".to_string(),
+        "product".to_string(),
+        "project".to_string(),
+        "release".to_string(),
+        "release_scrum".to_string(),
         "short_description".to_string(),
+        "sprint".to_string(),
         "state".to_string(),
         "story_points".to_string(),
+        "team".to_string(),
+        "theme".to_string(),
+        "u_desired_delivery_date".to_string(),
+        "u_division".to_string(),
+        "u_impacted_users".to_string(),
+        "u_lead_dev".to_string(),
+        "u_location".to_string(),
+        "u_moscow".to_string(),
+        "u_points_est".to_string(),
+        "u_region".to_string(),
+        "u_release_notes".to_string(),
+        "u_story_owner".to_string(),
+        "u_type".to_string(),
+        "vendor".to_string(),
     ]);
     assert_eq!(
         cfg.tools

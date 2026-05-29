@@ -5,6 +5,77 @@ use crate::protocol::schema::PolicyDescribeReport;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const STORY_APPLY_CREATE_FIELDS: &[&str] = &[
+    "short_description",
+    "description",
+    "acceptance_criteria",
+    "cmdb_ci",
+    "u_story_owner",
+    "sprint",
+    "assignment_group",
+    "parent",
+    "vendor",
+    "team",
+    "release_scrum",
+    "state",
+    "u_impacted_users",
+    "u_release_notes",
+    "u_lead_dev",
+    "u_division",
+    "u_region",
+    "u_location",
+    "u_type",
+    "u_moscow",
+    "classification",
+    "due_date",
+    "u_desired_delivery_date",
+    "product",
+    "release",
+    "project",
+    "theme",
+    "priority",
+    "epic",
+    "story_points",
+    "u_points_est",
+    "assigned_to",
+];
+
+const STORY_APPLY_UPDATE_FIELDS: &[&str] = &[
+    "short_description",
+    "description",
+    "acceptance_criteria",
+    "cmdb_ci",
+    "u_story_owner",
+    "sprint",
+    "assignment_group",
+    "parent",
+    "vendor",
+    "team",
+    "release_scrum",
+    "state",
+    "u_impacted_users",
+    "u_release_notes",
+    "u_lead_dev",
+    "u_division",
+    "u_region",
+    "u_location",
+    "u_type",
+    "u_moscow",
+    "classification",
+    "due_date",
+    "u_desired_delivery_date",
+    "product",
+    "release",
+    "project",
+    "theme",
+    "priority",
+    "epic",
+    "story_points",
+    "u_points_est",
+    "assigned_to",
+    "percent_complete",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyConfig {
     #[serde(default = "default_environment")]
@@ -56,6 +127,7 @@ impl PolicyConfig {
 
         toml::from_str::<Wrapper>(input).map(|wrapper| {
             let mut config = wrapper.mcp;
+            config.apply_missing_tool_defaults();
             config.apply_board_key_defaults();
             config.normalize_production_hosts();
             config
@@ -109,6 +181,12 @@ impl PolicyConfig {
             if binding.board_sys_id.is_empty() {
                 binding.board_sys_id = board_id.clone();
             }
+        }
+    }
+
+    pub fn apply_missing_tool_defaults(&mut self) {
+        for (tool, policy) in default_tools() {
+            self.tools.entry(tool).or_insert(policy);
         }
     }
 
@@ -488,6 +566,7 @@ pub fn is_write_tool(tool: &str) -> bool {
             "catalog_submit_request"
                 | "catalog_cancel_request"
                 | "work_note_apply_add"
+                | "attachment_upload"
                 | "plan_cancel"
         )
 }
@@ -597,6 +676,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "knowledge_fetch",
                     "record_get",
                     "record_search",
+                    "attachment_list",
                     "get_work_notes",
                     "work_note_plan_add",
                     "resource_plan_get",
@@ -649,6 +729,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "get_record",
                     "get_children",
                     "get_work_notes",
+                    "attachment_list",
                     "change_request_plan_create",
                     "change_request_plan_update",
                     "change_task_plan_create",
@@ -662,6 +743,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "change_request_apply_update",
                     "change_task_apply_create",
                     "change_task_apply_update",
+                    "attachment_upload",
                     "work_note_apply_add",
                 ],
             ),
@@ -705,29 +787,11 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         ("story_task_plan_update".to_string(), story_plan_policy()),
         (
             "story_apply_create".to_string(),
-            story_apply_policy(&[
-                "short_description",
-                "description",
-                "acceptance_criteria",
-                "priority",
-                "epic",
-                "story_points",
-                "assigned_to",
-            ]),
+            story_apply_policy(STORY_APPLY_CREATE_FIELDS),
         ),
         (
             "story_apply_update".to_string(),
-            story_apply_policy(&[
-                "short_description",
-                "description",
-                "acceptance_criteria",
-                "priority",
-                "epic",
-                "story_points",
-                "assigned_to",
-                "state",
-                "percent_complete",
-            ]),
+            story_apply_policy(STORY_APPLY_UPDATE_FIELDS),
         ),
         (
             "story_task_apply_create".to_string(),
@@ -769,6 +833,27 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
             },
         ),
         (
+            "attachment_list".to_string(),
+            ToolPolicy {
+                enabled: true,
+                requires_confirmation: false,
+                requires_kb_evidence: false,
+                environments: default_story_environments(),
+                ..ToolPolicy::default()
+            },
+        ),
+        (
+            "attachment_upload".to_string(),
+            ToolPolicy {
+                enabled: false,
+                requires_confirmation: true,
+                requires_kb_evidence: false,
+                environments: default_story_environments(),
+                confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+                ..ToolPolicy::default()
+            },
+        ),
+        (
             "change_request_plan_create".to_string(),
             change_plan_policy(),
         ),
@@ -791,11 +876,16 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
                 "start_date",
                 "end_date",
                 "implementation_plan",
+                "change_plan",
                 "backout_plan",
                 "test_plan",
                 "risk",
                 "impact",
                 "justification",
+                "requested_by",
+                "u_subcategory",
+                "u_division",
+                "u_does_this_change_need_cmdb_update",
                 "work_notes",
             ]),
         ),
@@ -812,11 +902,16 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
                 "start_date",
                 "end_date",
                 "implementation_plan",
+                "change_plan",
                 "backout_plan",
                 "test_plan",
                 "risk",
                 "impact",
                 "justification",
+                "requested_by",
+                "u_subcategory",
+                "u_division",
+                "u_does_this_change_need_cmdb_update",
                 "state",
                 "work_notes",
             ]),

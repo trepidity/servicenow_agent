@@ -2,7 +2,10 @@ mod support;
 
 use serde_json::json;
 use snow_mcp::{
-    JsonRpcRequest, McpServer, domain::policy::is_write_tool, planner::is_governed_write_tool,
+    JsonRpcRequest, McpServer,
+    domain::policy::is_write_tool,
+    planner::is_governed_write_tool,
+    tools::records::{RESOURCE_PLAN_LOOKUP_TABLES, RecordLookup, parse_record_lookup},
 };
 
 #[tokio::test]
@@ -67,6 +70,8 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         "timecard_apply_set_hours",
         "work_note_plan_add",
         "work_note_apply_add",
+        "catalog_plan_request",
+        "catalog_submit_request",
     ]
     .iter()
     .enumerate()
@@ -89,6 +94,155 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
     }
 }
 
+#[test]
+fn foreground_record_lookup_parser_accepts_generic_table_sys_id_and_rejects_mixed_modes() {
+    let lookup = parse_record_lookup(
+        &json!({
+            "number": "TASK3497879"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect("number lookup");
+    assert_eq!(lookup, RecordLookup::Number("TASK3497879".to_string()));
+
+    let lookup = parse_record_lookup(
+        &json!({
+            "table": "dmn_demand",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect("generic lookup");
+    assert_eq!(
+        lookup,
+        RecordLookup::TableSysId {
+            table: "dmn_demand".to_string(),
+            sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string(),
+        }
+    );
+
+    let lookup = parse_record_lookup(
+        &json!({
+            "table": "dmn_demand_task",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect("demand task lookup");
+    assert_eq!(
+        lookup,
+        RecordLookup::TableSysId {
+            table: "dmn_demand_task".to_string(),
+            sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string(),
+        }
+    );
+
+    let lookup = parse_record_lookup(
+        &json!({
+            "table": "resource_plan",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }),
+        RESOURCE_PLAN_LOOKUP_TABLES,
+    )
+    .expect("resource_plan lookup");
+    assert_eq!(
+        lookup,
+        RecordLookup::TableSysId {
+            table: "resource_plan".to_string(),
+            sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string(),
+        }
+    );
+
+    let err = parse_record_lookup(
+        &json!({
+            "number": "DMND0012345",
+            "table": "dmn_demand",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect_err("mixed number plus table/sys_id should be invalid");
+    assert!(err.to_string().contains("provide either number"));
+
+    let err = parse_record_lookup(
+        &json!({
+            "table": "dmn_demand"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect_err("partial table/sys_id lookup should be invalid");
+    assert!(err.to_string().contains("table and sys_id"));
+
+    let err = parse_record_lookup(
+        &json!({
+            "table": "incident",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect_err("unsupported table should be invalid");
+    assert!(err.to_string().contains("not allowed"));
+}
+
+#[tokio::test]
+async fn foreground_rejects_table_sys_id_for_resource_plan_wrong_table_and_story_tools() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+
+    let response = raw_call(
+        &server,
+        "resource_plan_get",
+        json!({
+            "table": "dmn_demand",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        }),
+        40,
+    )
+    .await;
+    assert_eq!(
+        response
+            .error
+            .expect("resource_plan_get rejects demand")
+            .code,
+        -32602
+    );
+
+    let response = raw_call(
+        &server,
+        "story_get",
+        json!({
+            "number": "STRY0010001",
+            "table": "resource_plan",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        }),
+        41,
+    )
+    .await;
+    assert_eq!(
+        response.error.expect("story_get rejects table lookup").code,
+        -32602
+    );
+
+    let response = raw_call(
+        &server,
+        "story_tasks_list",
+        json!({
+            "number": "STRY0010001",
+            "table": "resource_plan",
+            "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
+        }),
+        42,
+    )
+    .await;
+    assert_eq!(
+        response
+            .error
+            .expect("story_tasks_list rejects table lookup")
+            .code,
+        -32602
+    );
+}
+
 async fn call(
     server: &McpServer,
     name: &str,
@@ -105,4 +259,20 @@ async fn call(
         .await
         .result
         .unwrap_or_else(|| panic!("result for {name}"))
+}
+
+async fn raw_call(
+    server: &McpServer,
+    name: &str,
+    arguments: serde_json::Value,
+    id: i64,
+) -> snow_mcp::JsonRpcResponse {
+    server
+        .dispatch(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({ "name": name, "arguments": arguments }),
+            id: Some(json!(id)),
+        })
+        .await
 }

@@ -38,6 +38,8 @@ use crate::rpc::JsonRpcResponse;
 const PLAN_TTL_SECONDS: i64 = 600;
 const RATE_LIMIT_WINDOW_SECONDS: i64 = 60;
 const CREATE_RECOVERY_CLOCK_SKEW_SECONDS: i64 = 300;
+const WARNING_STORY_OWNER_DEFAULTED_FROM_CALLER: &str = "STORY_OWNER_DEFAULTED_FROM_CALLER";
+const WARNING_MISSING_OPTIONAL_REQUIRED_FIELD: &str = "MISSING_OPTIONAL_REQUIRED_FIELD";
 
 pub async fn handle_plan_get(
     id: Option<Value>,
@@ -152,6 +154,14 @@ pub async fn handle_story_plan(
             );
         }
         Err(PlanBuildError::GuardFailed(failure)) => {
+            if let Some(fields) = story_scope_failure_field_rejections(&failure) {
+                return story_error(
+                    id,
+                    -32051,
+                    "FIELD_REJECTED",
+                    json!({ "code": "FIELD_REJECTED", "fields": fields }),
+                );
+            }
             let data = match serde_json::to_value(failure.to_guard_failed_data()) {
                 Ok(data) => data,
                 Err(err) => return internal_error(id, err),
@@ -653,6 +663,18 @@ pub async fn handle_story_apply(
     }
 
     if let Err(failure) = enforce_apply_guard(tool, &plan, &board_binding_cfg, state).await {
+        if let Some(fields) = story_scope_failure_field_rejections(&failure) {
+            return audited_story_error(
+                state,
+                id,
+                tool,
+                -32051,
+                "FIELD_REJECTED",
+                json!({ "code": "FIELD_REJECTED", "fields": fields }),
+                ResultStatus::Denied,
+            )
+            .await;
+        }
         let data = match serde_json::to_value(failure.to_guard_failed_data()) {
             Ok(data) => data,
             Err(err) => return internal_error(id, err),
@@ -970,14 +992,9 @@ async fn build_plan_input(
         "story_plan_create" => {
             require_string(args, "short_description")?;
             require_string(args, "description")?;
-            inject(
-                &mut payload,
-                "assignment_group",
-                binding.assignment_group.clone(),
-            );
-            if let Some(sprint) = binding.allowed_sprints.first() {
-                inject(&mut payload, "sprint", sprint.clone());
-            }
+            default_story_create_reference_fields(&mut payload, binding)?;
+            warnings.extend(default_story_owner_from_actor(&mut payload, actor, state).await?);
+            warnings.extend(warn_missing_story_create_optional_required_fields(&payload));
             inject(&mut payload, "active", true);
             warnings.extend(
                 validate_constrained_fields(tool, &mut payload, binding, state, None).await?,
@@ -1005,12 +1022,10 @@ async fn build_plan_input(
                     PlanBuildError::NotFound(format!("parent story {parent_number} not found"))
                 })?;
             enforce_story_record_scope(&parent, binding)?;
+            let assignment_group =
+                resolve_story_task_create_assignment_group(args, &parent, binding)?;
             inject(&mut payload, "story", parent.sys_id.clone());
-            inject(
-                &mut payload,
-                "assignment_group",
-                binding.assignment_group.clone(),
-            );
+            inject(&mut payload, "assignment_group", assignment_group);
             warnings.extend(
                 validate_constrained_fields(tool, &mut payload, binding, state, None).await?,
             );
@@ -1058,6 +1073,149 @@ async fn build_plan_input(
             "unsupported Story plan tool {tool}"
         ))),
     }
+}
+
+fn default_story_create_reference_fields(
+    payload: &mut Value,
+    binding: &BoardBinding,
+) -> std::result::Result<(), PlanBuildError> {
+    if let Some(object) = payload.as_object()
+        && let Some(supplied) = object.get("assignment_group")
+    {
+        if reference_sys_id_from_value(supplied).is_none() {
+            return Err(field_rejected(vec![json!({
+                "field": "assignment_group",
+                "reason": "type_mismatch",
+            })]));
+        }
+    } else {
+        inject(
+            payload,
+            "assignment_group",
+            binding.assignment_group.clone(),
+        );
+    }
+
+    if let Some(object) = payload.as_object()
+        && let Some(supplied) = object.get("sprint")
+    {
+        if reference_sys_id_from_value(supplied).is_none() {
+            return Err(field_rejected(vec![json!({
+                "field": "sprint",
+                "reason": "type_mismatch",
+            })]));
+        }
+    } else if let Some(sprint) = binding.allowed_sprints.first() {
+        inject(payload, "sprint", sprint.clone());
+    } else {
+        return Err(field_rejected(vec![json!({
+            "field": "sprint",
+            "reason": "missing_no_default",
+            "remediation": "Either populate allowed_sprints in the board binding, or supply sprint=<sys_id> in the plan input",
+        })]));
+    }
+
+    Ok(())
+}
+
+async fn default_story_owner_from_actor(
+    payload: &mut Value,
+    actor: &StoryActor,
+    state: &DaemonState,
+) -> std::result::Result<Vec<ReceiptWarning>, PlanBuildError> {
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    if object.get("u_story_owner").is_some() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(sys_id) = resolve_actor_sys_user_sys_id(actor, state).await {
+        object.insert("u_story_owner".to_string(), Value::String(sys_id));
+        return Ok(vec![receipt_warning(
+            WARNING_STORY_OWNER_DEFAULTED_FROM_CALLER,
+            Some("u_story_owner"),
+            "Substituted caller identity for omitted story owner.",
+            Some(json!({ "source": "caller_identity" })),
+        )]);
+    }
+
+    Ok(Vec::new())
+}
+
+async fn resolve_actor_sys_user_sys_id(actor: &StoryActor, state: &DaemonState) -> Option<String> {
+    if let Some(email) = actor
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        if let [sys_id] = find_active_user_sys_ids(state, "email", email)
+            .await
+            .as_slice()
+        {
+            return Some(sys_id.clone());
+        }
+    }
+
+    let subject = actor.subject.trim();
+    if !subject.is_empty() {
+        if is_sys_id(subject) {
+            return Some(subject.to_string());
+        }
+        if let [sys_id] = find_active_user_sys_ids(state, "user_name", subject)
+            .await
+            .as_slice()
+        {
+            return Some(sys_id.clone());
+        }
+    }
+
+    None
+}
+
+fn warn_missing_story_create_optional_required_fields(payload: &Value) -> Vec<ReceiptWarning> {
+    if reference_sys_id_from_json(payload, "cmdb_ci").is_some() {
+        return Vec::new();
+    }
+
+    vec![receipt_warning(
+        WARNING_MISSING_OPTIONAL_REQUIRED_FIELD,
+        Some("cmdb_ci"),
+        "Configuration Item was not supplied; ServiceNow may reject the Story create.",
+        Some(json!({ "field": "cmdb_ci" })),
+    )]
+}
+
+fn story_scope_failure_field_rejections(failure: &InScopeFailure) -> Option<Vec<Value>> {
+    let field = match failure {
+        InScopeFailure::WrongAssignmentGroup { expected, observed } => json!({
+            "field": "assignment_group",
+            "reason": "not_in_allowlist",
+            "expected": expected,
+            "observed": observed,
+        }),
+        InScopeFailure::MissingSprint => json!({
+            "field": "sprint",
+            "reason": "missing_no_default",
+            "remediation": "Either populate allowed_sprints in the board binding, or supply sprint=<sys_id> in the plan input",
+        }),
+        InScopeFailure::SprintNotAllowed { observed, allowed } => json!({
+            "field": "sprint",
+            "reason": "not_in_allowlist",
+            "allowed": allowed,
+            "observed": observed,
+        }),
+        InScopeFailure::NotActive => json!({
+            "field": "active",
+            "reason": "active_false",
+        }),
+        InScopeFailure::TaskParentOutOfScope { cause } => {
+            return story_scope_failure_field_rejections(cause);
+        }
+        InScopeFailure::TaskParentStoryMismatch { .. } => return None,
+    };
+    Some(vec![field])
 }
 
 fn strip_non_writable_selector_fields(tool: &str, payload: &mut Value) {
@@ -1586,7 +1744,11 @@ fn enforce_story_payload_scope(
             observed: String::new(),
         })
     })?;
-    story_in_scope(&snapshot.as_snapshot(), binding).map_err(PlanBuildError::GuardFailed)
+    story_in_scope(&snapshot.as_snapshot(), binding).map_err(|failure| {
+        story_scope_failure_field_rejections(&failure)
+            .map(field_rejected)
+            .unwrap_or(PlanBuildError::GuardFailed(failure))
+    })
 }
 
 fn enforce_story_record_scope(
@@ -1665,6 +1827,55 @@ fn task_record_in_scope(
     }
 
     Ok(())
+}
+
+fn resolve_story_task_create_assignment_group(
+    args: &Map<String, Value>,
+    parent: &SnowRecord,
+    binding: &BoardBinding,
+) -> std::result::Result<String, PlanBuildError> {
+    if let Some(supplied) = args.get("assignment_group") {
+        let Some(assignment_group) = reference_sys_id_from_value(supplied) else {
+            return Err(PlanBuildError::Invalid("assignment_group".to_string()));
+        };
+        let assignment_group = assignment_group.trim();
+        if assignment_group.is_empty() {
+            return Err(PlanBuildError::Invalid("assignment_group".to_string()));
+        }
+        return ensure_task_assignment_group_allowed(assignment_group, binding)
+            .map(|_| assignment_group.to_string())
+            .map_err(PlanBuildError::GuardFailed);
+    }
+
+    let parent_assignment_group = in_scope_snapshot_from_snow_record(parent)
+        .map(|snapshot| snapshot.assignment_group_sys_id)
+        .filter(|assignment_group| task_assignment_group_allowed(assignment_group, binding));
+
+    Ok(parent_assignment_group.unwrap_or_else(|| binding.assignment_group.clone()))
+}
+
+fn enforce_task_assignment_group_payload_scope(
+    payload: &Value,
+    binding: &BoardBinding,
+) -> std::result::Result<(), InScopeFailure> {
+    let Some(assignment_group) = reference_sys_id_from_json(payload, "assignment_group") else {
+        return Ok(());
+    };
+    ensure_task_assignment_group_allowed(&assignment_group, binding)
+}
+
+fn ensure_task_assignment_group_allowed(
+    observed: &str,
+    binding: &BoardBinding,
+) -> std::result::Result<(), InScopeFailure> {
+    if task_assignment_group_allowed(observed, binding) {
+        Ok(())
+    } else {
+        Err(InScopeFailure::WrongAssignmentGroup {
+            expected: expected_task_assignment_groups(binding),
+            observed: observed.to_string(),
+        })
+    }
 }
 
 fn task_assignment_group_allowed(observed: &str, binding: &BoardBinding) -> bool {
@@ -2116,7 +2327,8 @@ async fn enforce_apply_guard(
                 &task_parent,
                 &parent.sys_id,
                 binding,
-            )
+            )?;
+            enforce_task_assignment_group_payload_scope(&plan.planned_changes, binding)
         }
         "story_apply_update" => {
             let target =
@@ -2329,6 +2541,9 @@ fn field_governance_rejections(
     let mut rejected = BTreeSet::new();
 
     for field in args.keys() {
+        if field_governance_allows_without_policy(tool, field, mode) {
+            continue;
+        }
         if blocked.contains(field.as_str()) {
             rejected.insert(field.clone());
             fields.push(json!({
@@ -2347,6 +2562,9 @@ fn field_governance_rejections(
         if metadata_fields().contains(&field.as_str()) {
             continue;
         }
+        if field_governance_allows_without_policy(tool, field, mode) {
+            continue;
+        }
         if mode == FieldGovernanceMode::PlanInput
             && plan_selector_fields(tool).contains(&field.as_str())
         {
@@ -2361,6 +2579,33 @@ fn field_governance_rejections(
     }
 
     fields
+}
+
+fn field_governance_allows_without_policy(
+    tool: &str,
+    field: &str,
+    mode: FieldGovernanceMode,
+) -> bool {
+    matches!(
+        (mode, tool, field),
+        (
+            FieldGovernanceMode::PlanInput,
+            "story_task_plan_create",
+            "assignment_group"
+        ) | (
+            FieldGovernanceMode::WritePayload,
+            "story_task_apply_create",
+            "assignment_group"
+        ) | (
+            FieldGovernanceMode::WritePayload,
+            "story_task_apply_create",
+            "story"
+        ) | (
+            FieldGovernanceMode::WritePayload,
+            "story_apply_create",
+            "active"
+        )
+    )
 }
 
 fn field_allowlist_for_apply_tool(
@@ -2391,6 +2636,26 @@ fn plan_selector_fields(tool: &str) -> &'static [&'static str] {
 }
 
 fn blocked_fields_for_tool(tool: &str) -> BTreeSet<&'static str> {
+    let mut blocked = blocked_system_fields_for_story_tool(tool);
+    if !story_tool_accepts_form_fields(tool) {
+        blocked.extend([
+            "parent",
+            "cmdb_ci",
+            "release_scrum",
+            "team",
+            "vendor",
+            "assignment_group",
+            "sprint",
+            "story",
+        ]);
+    }
+    if !matches!(tool, "story_plan_update" | "story_task_plan_update") {
+        blocked.insert("number");
+    }
+    blocked
+}
+
+fn blocked_system_fields_for_story_tool(tool: &str) -> BTreeSet<&'static str> {
     let mut blocked = BTreeSet::from([
         "sys_id",
         "sys_class_name",
@@ -2400,22 +2665,21 @@ fn blocked_fields_for_tool(tool: &str) -> BTreeSet<&'static str> {
         "sys_updated_by",
         "sys_mod_count",
         "approval",
-        "parent",
-        "cmdb_ci",
-        "release_scrum",
-        "team",
         "opened_by",
         "closed_by",
-        "vendor",
-        "assignment_group",
-        "sprint",
-        "story",
         "active",
     ]);
     if !matches!(tool, "story_plan_update" | "story_task_plan_update") {
         blocked.insert("number");
     }
     blocked
+}
+
+fn story_tool_accepts_form_fields(tool: &str) -> bool {
+    matches!(
+        tool,
+        "story_plan_create" | "story_plan_update" | "story_apply_create" | "story_apply_update"
+    )
 }
 
 fn require_string(
@@ -2431,6 +2695,24 @@ fn require_string(
 fn inject<T: serde::Serialize>(payload: &mut Value, field: &str, value: T) {
     if let Value::Object(object) = payload {
         object.insert(field.to_string(), json!(value));
+    }
+}
+
+fn reference_sys_id_from_json(value: &Value, field: &str) -> Option<String> {
+    value.get(field).and_then(reference_sys_id_from_value)
+}
+
+fn reference_sys_id_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Value::Object(object) => object
+            .get("sys_id")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("value").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        _ => None,
     }
 }
 
@@ -3101,12 +3383,17 @@ mod tests {
         assert!(reject_blocked_fields(None, "story_task_plan_update", &args).is_none());
 
         let args = Map::from_iter([("assignment_group".to_string(), json!("group-sys"))]);
-        let error = reject_blocked_fields(None, "story_plan_update", &args)
-            .expect("assignment_group should be blocked")
+        assert!(reject_blocked_fields(None, "story_plan_update", &args).is_none());
+        let error = reject_blocked_fields(None, "story_task_plan_update", &args)
+            .expect("task assignment_group should remain blocked")
             .error
             .expect("error");
         assert_eq!(error.message, "FIELD_REJECTED");
         assert_eq!(error.code, -32051);
+
+        let args = Map::from_iter([("parent".to_string(), json!("parent-sys"))]);
+        assert!(reject_blocked_fields(None, "story_plan_update", &args).is_none());
+        assert!(reject_blocked_fields(None, "story_task_plan_update", &args).is_some());
     }
 
     #[test]
@@ -3201,6 +3488,290 @@ story_board_id = "board-sys"
         assert_eq!(task_create["short_description"], json!("Task"));
         assert!(task_create.get("parent_story_number").is_none());
         assert!(task_create.get("requester").is_none());
+    }
+
+    #[test]
+    fn story_create_accepts_full_form_fields_when_policy_allows() {
+        let policy = snow_mcp::domain::policy::PolicyConfig::from_toml_str(
+            r#"
+[mcp.tools.story_apply_create]
+enabled = true
+requires_confirmation = true
+story_board_id = "board-sys"
+field_allowlist = [
+  "short_description",
+  "description",
+  "acceptance_criteria",
+  "cmdb_ci",
+  "u_story_owner",
+  "sprint",
+  "assignment_group",
+  "parent",
+  "vendor",
+  "team",
+  "release_scrum",
+  "u_impacted_users",
+  "u_release_notes",
+  "u_lead_dev",
+  "u_division",
+  "u_region",
+  "u_location",
+  "u_type",
+  "u_moscow",
+  "classification",
+  "due_date",
+  "u_desired_delivery_date",
+  "product",
+  "release",
+  "project",
+  "theme",
+  "priority",
+  "epic",
+  "story_points",
+  "u_points_est",
+  "assigned_to",
+]
+"#,
+        )
+        .expect("policy");
+        let args = Map::from_iter([
+            ("short_description".to_string(), json!("Story")),
+            ("description".to_string(), json!("Description")),
+            ("acceptance_criteria".to_string(), json!("Done")),
+            ("cmdb_ci".to_string(), json!("ci-sys")),
+            ("u_story_owner".to_string(), json!("owner-sys")),
+            ("assignment_group".to_string(), json!("group-sys")),
+            ("sprint".to_string(), json!("caller-sprint")),
+            ("parent".to_string(), json!("parent-sys")),
+            ("vendor".to_string(), json!("vendor-sys")),
+            ("team".to_string(), json!("team-sys")),
+            ("release_scrum".to_string(), json!("release-sys")),
+            ("u_impacted_users".to_string(), json!("operators")),
+            ("u_release_notes".to_string(), json!("notes")),
+            ("u_lead_dev".to_string(), json!("lead-sys")),
+            ("u_division".to_string(), json!("division")),
+            ("u_region".to_string(), json!("region")),
+            ("u_location".to_string(), json!("location")),
+            ("u_type".to_string(), json!("Standard")),
+            ("u_moscow".to_string(), json!("Must")),
+            ("classification".to_string(), json!("Feature")),
+            ("due_date".to_string(), json!("2026-06-01")),
+            ("u_desired_delivery_date".to_string(), json!("2026-06-02")),
+            ("product".to_string(), json!("product-sys")),
+            ("release".to_string(), json!("release-sys")),
+            ("project".to_string(), json!("project-sys")),
+            ("theme".to_string(), json!("theme-sys")),
+            ("priority".to_string(), json!("3")),
+            ("epic".to_string(), json!("epic-sys")),
+            ("story_points".to_string(), json!("5")),
+            ("u_points_est".to_string(), json!("5")),
+            ("assigned_to".to_string(), json!("assignee-sys")),
+        ]);
+
+        let rejections = field_governance_rejections(
+            "story_plan_create",
+            &args,
+            &policy,
+            FieldGovernanceMode::PlanInput,
+        );
+        assert!(rejections.is_empty(), "{rejections:?}");
+
+        let mut binding = test_board_binding();
+        binding.allowed_sprints = vec!["default-sprint".to_string(), "caller-sprint".to_string()];
+        let mut payload = Value::Object(args);
+        default_story_create_reference_fields(&mut payload, &binding).expect("defaults");
+
+        assert_eq!(payload["assignment_group"], json!("group-sys"));
+        assert_eq!(payload["sprint"], json!("caller-sprint"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn story_create_defaults_story_owner_from_actor_sys_id() {
+        let fixture = crate::test_support::build_fixture_state()
+            .await
+            .expect("fixture");
+        let actor_sys_id = "0123456789abcdef0123456789abcdef";
+        let actor = StoryActor {
+            subject: actor_sys_id.to_string(),
+            email: None,
+            display_name: None,
+        };
+        let mut payload = json!({
+            "short_description": "Story",
+            "description": "Description",
+        });
+
+        let warnings = default_story_owner_from_actor(&mut payload, &actor, &fixture.state)
+            .await
+            .expect("owner default");
+
+        assert_eq!(payload["u_story_owner"], json!(actor_sys_id));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, WARNING_STORY_OWNER_DEFAULTED_FROM_CALLER);
+        assert_eq!(warnings[0].field.as_deref(), Some("u_story_owner"));
+    }
+
+    #[test]
+    fn story_create_warns_when_cmdb_ci_omitted() {
+        let payload = json!({
+            "short_description": "Story",
+            "description": "Description",
+        });
+
+        let warnings = warn_missing_story_create_optional_required_fields(&payload);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, WARNING_MISSING_OPTIONAL_REQUIRED_FIELD);
+        assert_eq!(warnings[0].field.as_deref(), Some("cmdb_ci"));
+    }
+
+    #[test]
+    fn story_create_rejects_missing_sprint_when_no_default_configured() {
+        let mut binding = test_board_binding();
+        binding.allowed_sprints.clear();
+        let mut payload = json!({
+            "short_description": "Story",
+            "description": "Description",
+            "assignment_group": "group-sys",
+        });
+
+        let err = default_story_create_reference_fields(&mut payload, &binding)
+            .expect_err("sprint requires caller value or configured default");
+
+        match err {
+            PlanBuildError::FieldRejected(fields) => assert_eq!(
+                fields,
+                vec![json!({
+                    "field": "sprint",
+                    "reason": "missing_no_default",
+                    "remediation": "Either populate allowed_sprints in the board binding, or supply sprint=<sys_id> in the plan input",
+                })]
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn story_create_rejects_unallowed_assignment_group_as_field_error() {
+        let payload = json!({
+            "short_description": "Story",
+            "description": "Description",
+            "assignment_group": "other-group",
+            "sprint": "sprint-sys",
+            "active": true,
+        });
+
+        let err = enforce_story_payload_scope(&payload, &test_board_binding())
+            .expect_err("assignment_group must stay in board scope");
+
+        match err {
+            PlanBuildError::FieldRejected(fields) => assert_eq!(
+                fields,
+                vec![json!({
+                    "field": "assignment_group",
+                    "reason": "not_in_allowlist",
+                    "expected": "group-sys",
+                    "observed": "other-group",
+                })]
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn story_task_create_assignment_group_is_governed_not_allowlist_blocked() {
+        let policy = snow_mcp::domain::policy::PolicyConfig::from_toml_str(
+            r#"
+[mcp.tools.story_task_apply_create]
+enabled = true
+requires_confirmation = true
+story_board_id = "board-sys"
+field_allowlist = ["short_description"]
+"#,
+        )
+        .expect("policy");
+        let plan_args = Map::from_iter([
+            ("parent_story_number".to_string(), json!("STRY001")),
+            ("short_description".to_string(), json!("Task")),
+            ("assignment_group".to_string(), json!("task-group")),
+        ]);
+
+        let plan_rejections = field_governance_rejections(
+            "story_task_plan_create",
+            &plan_args,
+            &policy,
+            FieldGovernanceMode::PlanInput,
+        );
+        assert!(plan_rejections.is_empty(), "{plan_rejections:?}");
+
+        let write_payload = Map::from_iter([
+            ("story".to_string(), json!("story-sys")),
+            ("short_description".to_string(), json!("Task")),
+            ("assignment_group".to_string(), json!("task-group")),
+        ]);
+        let write_rejections = field_governance_rejections(
+            "story_task_apply_create",
+            &write_payload,
+            &policy,
+            FieldGovernanceMode::WritePayload,
+        );
+        assert!(write_rejections.is_empty(), "{write_rejections:?}");
+    }
+
+    #[test]
+    fn story_task_create_accepts_allowed_assignment_group_override() {
+        let mut binding = test_board_binding();
+        binding.allowed_task_assignment_groups = vec!["task-group".to_string()];
+        let parent = story_record(&[("assignment_group", "group-sys"), ("sprint", "sprint-sys")]);
+        let args = Map::from_iter([("assignment_group".to_string(), json!("task-group"))]);
+
+        let assignment_group = resolve_story_task_create_assignment_group(&args, &parent, &binding)
+            .expect("assignment group");
+
+        assert_eq!(assignment_group, "task-group");
+    }
+
+    #[test]
+    fn story_task_create_inherits_parent_assignment_group_without_override() {
+        let parent = story_record(&[("assignment_group", "group-sys"), ("sprint", "sprint-sys")]);
+        let args = Map::new();
+
+        let assignment_group =
+            resolve_story_task_create_assignment_group(&args, &parent, &test_board_binding())
+                .expect("assignment group");
+
+        assert_eq!(assignment_group, "group-sys");
+    }
+
+    #[test]
+    fn story_task_create_rejects_unallowed_assignment_group_override() {
+        let parent = story_record(&[("assignment_group", "group-sys"), ("sprint", "sprint-sys")]);
+        let args = Map::from_iter([("assignment_group".to_string(), json!("other-group"))]);
+
+        let err = resolve_story_task_create_assignment_group(&args, &parent, &test_board_binding())
+            .expect_err("assignment group must be scoped");
+
+        assert!(matches!(
+            err,
+            PlanBuildError::GuardFailed(InScopeFailure::WrongAssignmentGroup { .. })
+        ));
+    }
+
+    #[test]
+    fn story_task_apply_create_rechecks_assignment_group_scope() {
+        let payload = json!({
+            "story": "story-sys",
+            "short_description": "Task",
+            "assignment_group": "other-group"
+        });
+
+        let failure = enforce_task_assignment_group_payload_scope(&payload, &test_board_binding())
+            .expect_err("apply must re-check task assignment group");
+
+        assert!(matches!(
+            failure,
+            InScopeFailure::WrongAssignmentGroup { .. }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -171,6 +171,7 @@ impl QueryEngine {
             ResourceType::ChangeTask,
             ResourceType::Request,
             ResourceType::RequestTask,
+            ResourceType::DemandTask,
             ResourceType::Story,
             ResourceType::ScrumTask,
         ];
@@ -2481,6 +2482,7 @@ mod tests {
         assert!(is_exact_record_number("KB0105015"));
         assert!(is_exact_record_number("RITM1234567"));
         assert!(is_exact_record_number("PRJ0161206"));
+        assert!(is_exact_record_number("DMNTSK0001122"));
         assert!(is_exact_record_number("STRY0423187"));
         assert!(is_exact_record_number("STSK0048820"));
         assert!(is_exact_record_number("REQ1234567"));

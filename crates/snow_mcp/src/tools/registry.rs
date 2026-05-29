@@ -60,6 +60,7 @@ impl ToolRegistry {
         crate::tools::records::register(&mut registry);
         crate::tools::knowledge::register(&mut registry);
         crate::tools::catalog::register(&mut registry);
+        crate::tools::attachment::register(&mut registry);
         crate::tools::change::register(&mut registry);
         crate::tools::resource_plan::register(&mut registry);
         crate::tools::story::register(&mut registry);

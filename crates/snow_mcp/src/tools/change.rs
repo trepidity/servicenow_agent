@@ -99,7 +99,7 @@ fn change_request_plan_create_input_schema() -> Value {
     json!({
         "type": "object",
         "properties": change_request_properties(false),
-        "required": ["short_description", "description", "assignment_group", "cmdb_ci", "start_date", "end_date", "implementation_plan", "backout_plan", "test_plan"],
+        "required": ["short_description", "description", "assignment_group", "cmdb_ci", "start_date", "end_date", "change_plan", "backout_plan", "test_plan"],
     })
 }
 
@@ -161,11 +161,16 @@ fn change_request_properties(include_state: bool) -> Value {
         "start_date": {"type": "string"},
         "end_date": {"type": "string"},
         "implementation_plan": {"type": "string", "maxLength": 32000},
+        "change_plan": {"type": "string", "maxLength": 32000},
         "backout_plan": {"type": "string", "maxLength": 32000},
         "test_plan": {"type": "string", "maxLength": 32000},
         "risk": {"type": "string"},
         "impact": {"type": "string"},
         "justification": {"type": "string", "maxLength": 16000},
+        "requested_by": {"type": "string"},
+        "u_subcategory": {"type": "string"},
+        "u_division": {"type": "string"},
+        "u_does_this_change_need_cmdb_update": {"type": "string"},
         "work_notes": {"type": "string", "minLength": 1, "maxLength": 16000}
     });
     if include_state {

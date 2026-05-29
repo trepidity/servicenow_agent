@@ -16,7 +16,8 @@ use crate::{
     DaemonState,
     rpc::{
         JsonRpcRequest, JsonRpcResponse, extract_kb_list_tags_params,
-        extract_kb_semantic_search_filters, extract_kb_sync_params,
+        extract_kb_semantic_search_filters, extract_kb_sync_params, extract_record_lookup,
+        get_record_by_lookup_cached_or_fresh,
     },
     transport::DaemonTransport,
 };
@@ -803,16 +804,19 @@ impl McpServer {
                 Some(json!({ "details": "missing arguments" })),
             );
         };
-        let Some(number) = arguments.get("number").and_then(Value::as_str) else {
-            return JsonRpcResponse::error(
-                id,
-                -32602,
-                "invalid params",
-                Some(json!({ "details": "missing number" })),
-            );
+        let lookup = match extract_record_lookup(arguments) {
+            Ok(lookup) => lookup,
+            Err(err) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "invalid params",
+                    Some(json!({ "details": err.to_string() })),
+                );
+            }
         };
 
-        match get_record_cached_or_fresh(self.state.core.as_ref(), number).await {
+        match get_record_by_lookup_cached_or_fresh(self.state.core.as_ref(), lookup).await {
             Ok(Some(record)) => match transport.record(&record) {
                 Ok(record) => JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes })),
                 Err(err) => service_failure(id, err),
@@ -1010,8 +1014,11 @@ impl McpServer {
             },
             McpTool {
                 name: "get_work_notes".to_string(),
-                description: "Get work notes for a record".to_string(),
-                input_schema: json!({"type":"object","properties":{"number":{"type":"string"}},"required":["number"]}),
+                description: "Get work notes for a record by number or allowed table/sys_id"
+                    .to_string(),
+                input_schema: snow_mcp::tools::records::record_lookup_arg_schema(
+                    snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+                ),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1175,6 +1182,7 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "request_task" | "sc_task" => Ok(ResourceType::RequestTask),
         "project" | "pm_project" => Ok(ResourceType::Project),
         "demand" | "dmn_demand" => Ok(ResourceType::Demand),
+        "demand_task" | "dmn_demand_task" | "dmntsk" => Ok(ResourceType::DemandTask),
         "resource_plan" | "resourceplan" | "rpln" => Ok(ResourceType::ResourcePlan),
         "story" | "rm_story" => Ok(ResourceType::Story),
         "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),

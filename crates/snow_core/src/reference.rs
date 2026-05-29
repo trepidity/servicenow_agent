@@ -87,6 +87,7 @@ pub(crate) fn collect_record_references(record: &Record) -> HashMap<String, Refe
 pub(crate) fn parent_reference_for_table(table_name: &str) -> Option<(&'static str, &'static str)> {
     match table_name {
         "resource_plan" => Some(("task", "task")),
+        "dmn_demand_task" => Some(("parent", "dmn_demand")),
         _ => parent_reference_field(table_name),
     }
 }
