@@ -30,6 +30,11 @@ pub fn register(registry: &mut ToolRegistry) {
             json!({"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["all","knowledge","work_notes"]},"limit":{"type":"integer","minimum":1}},"required":["query"]}),
         ),
         (
+            "user_lookup",
+            "Resolve one active ServiceNow user by login, email, employee number, sys_id, or inferred query",
+            user_lookup_arg_schema(),
+        ),
+        (
             "list_records",
             "List records with optional daemon-side filters",
             json!({"type":"object","properties":{"resource_type":{"type":"string"},"parent_number":{"type":"string"},"assigned_to":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
@@ -92,6 +97,42 @@ pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {
             }
         },
         "additionalProperties": false
+    })
+}
+
+fn user_lookup_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Provide exactly one of query, user_name, email, employee_number, or sys_id. query infers sys_id/email/login lookup order. active defaults to true.",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "User identifier. Non-email values try user_name, then email, then employee_number."
+            },
+            "user_name": {
+                "type": "string",
+                "description": "Exact ServiceNow sys_user.user_name value"
+            },
+            "email": {
+                "type": "string",
+                "description": "Exact ServiceNow sys_user.email value"
+            },
+            "employee_number": {
+                "type": "string",
+                "description": "Exact ServiceNow sys_user.employee_number value"
+            },
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "Exact sys_user sys_id"
+            },
+            "active": {
+                "type": "boolean",
+                "default": true,
+                "description": "Filter by sys_user.active. Omitted means true."
+            }
+        }
     })
 }
 

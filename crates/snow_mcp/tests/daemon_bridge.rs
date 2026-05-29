@@ -177,6 +177,28 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
 }
 
 #[tokio::test]
+async fn bridge_forwards_user_lookup() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "user_lookup"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "user_lookup",
+                "arguments": { "query": "JOW2145" }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "user_lookup");
+    assert_eq!(calls[1].1, json!({ "query": "JOW2145" }));
+}
+
+#[tokio::test]
 async fn bridge_forwards_get_work_notes_table_sys_id_lookup() {
     let daemon = MockDaemon::new(contract(&["contract_info", "get_work_notes"]));
     let server = bridge(daemon.clone());

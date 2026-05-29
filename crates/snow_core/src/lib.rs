@@ -120,6 +120,23 @@ const TIME_CARD_FIELDS: &[&str] = &[
     "sys_updated_on",
     "sys_mod_count",
 ];
+const USER_LOOKUP_FIELDS: &[&str] = &[
+    "sys_id",
+    "user_name",
+    "name",
+    "email",
+    "employee_number",
+    "active",
+    "department",
+    "location",
+    "title",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserLookupCandidate {
+    field: &'static str,
+    value: String,
+}
 
 fn child_relation_for_parent_table(table_name: &str) -> Option<(&'static str, &'static str)> {
     match table_name {
@@ -170,6 +187,77 @@ pub enum ResourceType {
 pub enum RecordLookup {
     Number(String),
     TableSysId { table: String, sys_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UserLookup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub employee_number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sys_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+impl UserLookup {
+    pub fn validate_selector(&self) -> Result<()> {
+        let count = [
+            self.query.as_deref(),
+            self.user_name.as_deref(),
+            self.email.as_deref(),
+            self.employee_number.as_deref(),
+            self.sys_id.as_deref(),
+        ]
+        .into_iter()
+        .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+        .count();
+        if count == 1 {
+            Ok(())
+        } else if count == 0 {
+            anyhow::bail!(
+                "missing required user lookup: provide exactly one of query, user_name, email, employee_number, or sys_id"
+            )
+        } else {
+            anyhow::bail!(
+                "ambiguous user lookup: provide exactly one of query, user_name, email, employee_number, or sys_id"
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserLookupResult {
+    pub matched_by: String,
+    pub user: UserRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserRecord {
+    pub sys_id: String,
+    pub table: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub employee_number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub display: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -662,6 +750,121 @@ pub fn is_record_lookup_table_allowed(table: &str) -> bool {
     )
 }
 
+fn user_lookup_candidates(lookup: &UserLookup) -> Result<Vec<UserLookupCandidate>> {
+    if let Some(sys_id) = non_empty_owned(lookup.sys_id.as_deref()) {
+        return Ok(vec![UserLookupCandidate {
+            field: "sys_id",
+            value: normalize_record_lookup_sys_id(&sys_id)?,
+        }]);
+    }
+    if let Some(user_name) = non_empty_owned(lookup.user_name.as_deref()) {
+        return Ok(vec![UserLookupCandidate {
+            field: "user_name",
+            value: user_name,
+        }]);
+    }
+    if let Some(email) = non_empty_owned(lookup.email.as_deref()) {
+        return Ok(vec![UserLookupCandidate {
+            field: "email",
+            value: email,
+        }]);
+    }
+    if let Some(employee_number) = non_empty_owned(lookup.employee_number.as_deref()) {
+        return Ok(vec![UserLookupCandidate {
+            field: "employee_number",
+            value: employee_number,
+        }]);
+    }
+
+    let Some(query) = non_empty_owned(lookup.query.as_deref()) else {
+        anyhow::bail!(
+            "missing required user lookup: provide exactly one of query, user_name, email, employee_number, or sys_id"
+        );
+    };
+
+    if query.contains('@') {
+        return Ok(vec![
+            UserLookupCandidate {
+                field: "email",
+                value: query.clone(),
+            },
+            UserLookupCandidate {
+                field: "user_name",
+                value: query,
+            },
+        ]);
+    }
+    if let Ok(sys_id) = normalize_record_lookup_sys_id(&query) {
+        return Ok(vec![UserLookupCandidate {
+            field: "sys_id",
+            value: sys_id,
+        }]);
+    }
+
+    Ok(vec![
+        UserLookupCandidate {
+            field: "user_name",
+            value: query.clone(),
+        },
+        UserLookupCandidate {
+            field: "email",
+            value: query.clone(),
+        },
+        UserLookupCandidate {
+            field: "employee_number",
+            value: query,
+        },
+    ])
+}
+
+fn user_record_from_record(record: &Record) -> UserRecord {
+    let display = first_non_empty_str([
+        record.get_str("name"),
+        record.get_str("user_name"),
+        record.get_str("email"),
+    ])
+    .unwrap_or(record.sys_id.as_str())
+    .to_string();
+
+    UserRecord {
+        sys_id: record.sys_id.clone(),
+        table: "sys_user".to_string(),
+        user_name: non_empty_owned(record.get_str("user_name")),
+        name: non_empty_owned(record.get_str("name")),
+        email: non_empty_owned(record.get_str("email")),
+        employee_number: non_empty_owned(record.get_str("employee_number")),
+        active: bool_field(record, "active"),
+        department: non_empty_owned(record.get_str("department")),
+        location: non_empty_owned(record.get_str("location")),
+        title: non_empty_owned(record.get_str("title")),
+        display,
+    }
+}
+
+fn bool_field(record: &Record, field: &str) -> Option<bool> {
+    let value = record.get(field)?;
+    value
+        .value
+        .as_ref()
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .value
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(parse_bool)
+        })
+        .or_else(|| value.display_value.as_deref().and_then(parse_bool))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
     "dmn_demand",
     "dmn_demand_task",
@@ -794,6 +997,44 @@ impl SnowCore {
 
     pub fn vault_path(&self) -> &Path {
         &self.vault_path
+    }
+
+    pub async fn lookup_user(&self, lookup: UserLookup) -> Result<Option<UserLookupResult>> {
+        lookup.validate_selector()?;
+        let candidates = user_lookup_candidates(&lookup)?;
+        let active = lookup.active.unwrap_or(true);
+
+        for candidate in candidates {
+            let response = self
+                .client
+                .table("sys_user")
+                .equals(candidate.field, &candidate.value)
+                .equals("active", if active { "true" } else { "false" })
+                .fields(USER_LOOKUP_FIELDS)
+                .display_value(DisplayValue::Both)
+                .limit(2)
+                .execute()
+                .await?;
+
+            if response.records.is_empty() {
+                continue;
+            }
+            if response.records.len() > 1 {
+                anyhow::bail!(
+                    "multiple sys_user records matched {}={}",
+                    candidate.field,
+                    candidate.value
+                );
+            }
+
+            let user = user_record_from_record(&response.records[0]);
+            return Ok(Some(UserLookupResult {
+                matched_by: candidate.field.to_string(),
+                user,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// Look up a record by number, checking the in-memory L1 cache first

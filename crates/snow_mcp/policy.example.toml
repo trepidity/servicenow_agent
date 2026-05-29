@@ -200,16 +200,17 @@ requires_confirmation = true
 # (e.g. `get_record`/`search_records`, not `record_get`); an unknown name is a
 # silent no-op in the allow-list.
 [mcp.roles.read_only_agent]
-read_tools = ["get_record", "search_records", "knowledge_search", "story_get"]
+read_tools = ["get_record", "search_records", "user_lookup", "knowledge_search", "story_get"]
 write_tools = []
 
 [mcp.roles.story_writer]
-read_tools = ["story_get", "story_tasks_list", "story_plan_create", "story_plan_update"]
+read_tools = ["story_get", "story_tasks_list", "user_lookup", "story_plan_create", "story_plan_update"]
 write_tools = ["story_apply_create", "story_apply_update"]
 
 [mcp.roles.change_writer]
 read_tools = [
     "get_record", "get_children", "get_work_notes",
+    "user_lookup",
     "change_request_plan_create", "change_request_plan_update",
     "change_task_plan_create", "change_task_plan_update",
     "plan_get", "policy_describe", "tool_capabilities",

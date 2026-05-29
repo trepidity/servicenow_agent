@@ -38,6 +38,7 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("catalog_plan_request", "catalog_plan_request"),
     ("catalog_submit_request", "catalog_submit_request"),
     ("search_records", "search_records"),
+    ("user_lookup", "user_lookup"),
     ("list_records", "list_records"),
     ("list_my_tasks", "list_my_tasks"),
     ("list_my_approvals", "list_my_approvals"),

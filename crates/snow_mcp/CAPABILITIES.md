@@ -60,7 +60,7 @@ build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 Enabled by default (unless a policy entry disables them). Operate against ServiceNow
 or the local cache; none mutate ServiceNow records.
 
-- **Records:** `get_record`, `search_records`, `list_records`, `list_my_tasks`,
+- **Records:** `get_record`, `search_records`, `user_lookup`, `list_records`, `list_my_tasks`,
   `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`, `get_work_notes`,
   `attachment_list`
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,

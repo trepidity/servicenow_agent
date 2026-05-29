@@ -79,6 +79,7 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "get_record",
         "get_approval",
         "search_records",
+        "user_lookup",
         "search_knowledge",
         "get_article",
         "kb_semantic_search",
@@ -182,6 +183,35 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
     assert_eq!(
         tool.input_schema["properties"]["sys_id"]["pattern"],
         json!("^[0-9a-fA-F]{32}$")
+    );
+}
+
+#[test]
+fn user_lookup_schema_advertises_exact_user_selectors() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "user_lookup")
+        .expect("user_lookup registered");
+
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert!(tool.input_schema.get("required").is_none());
+    for field in ["query", "user_name", "email", "employee_number"] {
+        assert_eq!(
+            tool.input_schema["properties"][field]["type"],
+            json!("string")
+        );
+    }
+    assert_eq!(
+        tool.input_schema["properties"]["sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["active"]["default"],
+        json!(true)
     );
 }
 

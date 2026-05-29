@@ -72,6 +72,7 @@ pub enum RpcMethod {
     SearchKnowledge,
     KbSemanticSearch,
     SearchRecords,
+    UserLookup,
     ListKnowledgeBases,
     ListCategories,
     ListKnowledgeArticles,
@@ -165,6 +166,7 @@ impl RpcMethod {
             "search_knowledge" => Self::SearchKnowledge,
             "kb_semantic_search" => Self::KbSemanticSearch,
             "search_records" => Self::SearchRecords,
+            "user_lookup" => Self::UserLookup,
             "list_knowledge_bases" => Self::ListKnowledgeBases,
             "list_categories" => Self::ListCategories,
             "list_knowledge_articles" => Self::ListKnowledgeArticles,
@@ -653,6 +655,14 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                     }
                     JsonRpcResponse::ok(id, json!({ "results": search_results }))
                 }
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::UserLookup => match extract_user_lookup_params(&request.params) {
+            Ok(params) => match state.core.lookup_user(params).await {
+                Ok(Some(result)) => JsonRpcResponse::ok(id, json!(result)),
+                Ok(None) => JsonRpcResponse::error(id, -32004, "user not found", None),
                 Err(err) => internal_error(id, err),
             },
             Err(err) => invalid_params(id, err),
@@ -1236,6 +1246,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "task_sla_status",
     "task_sla_status_for_tasks",
     "search_records",
+    "user_lookup",
     "search_knowledge",
     "kb_semantic_search",
     "list_knowledge_bases",
@@ -1608,6 +1619,12 @@ fn extract_search_records_params(params: &Value) -> Result<SearchRecordsParams> 
     Ok(params)
 }
 
+fn extract_user_lookup_params(params: &Value) -> Result<snow_core::UserLookup> {
+    let params: snow_core::UserLookup = serde_json::from_value(params.clone())?;
+    params.validate_selector()?;
+    Ok(params)
+}
+
 fn extract_list_records_params(params: &Value) -> Result<ListRecordsParams> {
     Ok(serde_json::from_value(params.clone())?)
 }
@@ -1844,6 +1861,7 @@ mod tests {
             RpcMethod::from_method("search_records"),
             RpcMethod::SearchRecords
         );
+        assert_eq!(RpcMethod::from_method("user_lookup"), RpcMethod::UserLookup);
         assert_eq!(RpcMethod::from_method("vault_path"), RpcMethod::VaultPath);
         assert_eq!(
             RpcMethod::from_method("search_knowledge"),
@@ -3321,6 +3339,61 @@ story_board_id = "board-sys"
         let request_line = request_rx.await.expect("request line");
         assert!(request_line.contains("/api/now/table/dmn_demand/"));
         assert!(request_line.contains(sys_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_user_lookup_fetches_active_user_by_user_name() {
+        let sys_id = "0123456789abcdef0123456789abcdef";
+        let response = json!({
+            "result": [
+                {
+                    "sys_id": sys_id,
+                    "user_name": "JOW2145",
+                    "name": "Jordan Worker",
+                    "email": "jordan.worker@example.com",
+                    "employee_number": "2145",
+                    "active": "true",
+                    "department": "IAM",
+                    "location": "Main Street",
+                    "title": "Analyst"
+                }
+            ]
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "user_lookup".to_string(),
+                params: json!({ "user_name": "JOW2145" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.expect("user lookup result");
+        assert_eq!(
+            result.get("matched_by").and_then(Value::as_str),
+            Some("user_name")
+        );
+        let user = result.get("user").expect("user");
+        assert_eq!(user.get("sys_id").and_then(Value::as_str), Some(sys_id));
+        assert_eq!(
+            user.get("user_name").and_then(Value::as_str),
+            Some("JOW2145")
+        );
+        assert_eq!(user.get("active").and_then(Value::as_bool), Some(true));
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/sys_user"));
+        assert!(request_line.contains("user_name%3DJOW2145"));
+        assert!(request_line.contains("active%3Dtrue"));
     }
 
     #[tokio::test(flavor = "current_thread")]
