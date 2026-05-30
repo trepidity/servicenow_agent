@@ -676,7 +676,10 @@ async fn bridge_filters_tools_against_daemon_contract() {
             "dmn_demand",
             "dmn_demand_task",
             "resource_plan",
-            "pm_project"
+            "pm_project",
+            "business_application",
+            "business_app",
+            "cmdb_ci_business_app"
         ])
     );
 }

@@ -121,6 +121,27 @@ Notes:
 - semantic and hybrid modes use the local KB semantic index and require semantic search to be enabled in config
 - exact KB number lookups like `KB0105015` remain direct article reads; they do not require embeddings
 
+### Business Applications
+
+Business Applications (`cmdb_ci_business_app`) are a first-class local primitive; the canonical local resource type is `business_application` (`cmdb_ci_business_app` is an accepted filter alias). The read-only surface is the daemon JSON-RPC methods (`business_application_search`, `business_application_get`, `business_application_query`, `business_application_fields`, `business_application_sync`) and the matching MCP tools, driven through a running daemon (`snow daemon start`). There is no write/create/update surface.
+
+The `snow business-app` subcommand family is a thin CLI over those daemon methods (it auto-spawns the daemon as needed):
+
+```bash
+snow business-app get --sys-id <sys_id> | --name "Epic" [--fresh] [--json] [--full]
+snow business-app search --name Epic --operational-state-not 2 [--limit N] [--json] [--full]
+snow business-app query --field business_owner --contains "Jane" [--limit N] [--json]
+snow business-app query --field u_custom_field --eq "value"
+snow business-app fields [--refresh] [--json]
+snow business-app sync --name Epic [--persist] [--resolve-references] [--reference-depth N] [--refresh-dictionary] [--json]
+```
+
+Default human output shows name, sys_id, owners, groups, portfolio, operational status, attested date, vault path, and unresolved-reference count; `--json` emits the raw daemon payload and `--full` adds the all-fields table. `query`'s `--field` is repeatable and pairs by position with `--contains`/`--eq` (one operator value per field). `sync` runs a live search+persist and prints a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`); `--persist` defaults on. The TUI routes `cmdb_ci_business_app` records to a first-class Business Application detail view (typed ownership/operational sections, then the all-fields table).
+
+Search/sync/fresh-fetch persists by default: each Business Application is fetched as a full row (no `sysparm_fields`, `display_value=all`), written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md`, and projected into local SQLite (schema v8) so `business_application_query` filters/sorts on any field locally. Reference sys_ids (owners, groups, portfolio) hydrate into local primitive objects when supported, or persist as unresolved stubs otherwise; reference failures degrade rather than fail the read. The daemon DTO returns `browser_url` and `vault_relative_path` when available.
+
+`snow business-app fields` returns dictionary-enriched metadata. `--refresh` triggers a live `sys_dictionary` fetch for `cmdb_ci_business_app` and its inherited tables (cached in `business_application_field_dictionary`); each entry then merges label, field type, reference table, mandatory/read-only/choice flags, max length, and `dictionary_verified=true` with observed per-field counts. When the dictionary is unreachable, entries fall back to observed-only plus a degraded diagnostic. See `crates/snow_mcp/CAPABILITIES.md` for the MCP tools — `sync` is JSON-RPC + CLI only and is deliberately not an MCP tool.
+
 ## Daemon and TUI
 
 ```bash

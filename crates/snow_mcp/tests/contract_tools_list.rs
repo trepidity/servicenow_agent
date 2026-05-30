@@ -177,7 +177,10 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
             "dmn_demand",
             "dmn_demand_task",
             "resource_plan",
-            "pm_project"
+            "pm_project",
+            "business_application",
+            "business_app",
+            "cmdb_ci_business_app"
         ])
     );
     assert_eq!(

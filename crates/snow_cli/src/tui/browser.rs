@@ -644,6 +644,7 @@ mod tests {
                 EntityKind::RequestItem => "sc_req_item",
                 EntityKind::CatalogTask => "sc_task",
                 EntityKind::Incident => "incident",
+                EntityKind::BusinessApplication => "cmdb_ci_business_app",
             }
             .to_string(),
             sys_id: sys_id.to_string(),

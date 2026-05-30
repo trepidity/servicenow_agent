@@ -43,11 +43,11 @@ use snow_core::{
 };
 
 use cli::{
-    AttachmentCommand, Cli, Command, KnowledgeCommand, KnowledgeSearchModeArg,
+    AttachmentCommand, BusinessAppCommand, Cli, Command, KnowledgeCommand, KnowledgeSearchModeArg,
     KnowledgeSemanticCommand, KnowledgeTagLayer, TimecardCommand,
 };
 use error::SnowError;
-use tui_client::TuiClient;
+use tui_client::{BusinessApplicationQueryFilter, DaemonRpcClient, TuiClient};
 
 struct AuthContext {
     env_name: String,
@@ -176,6 +176,20 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         .await;
     }
 
+    // Business Application commands talk to the backend exclusively over the
+    // daemon JSON-RPC interface (auto-spawning the daemon if needed), so they
+    // are dispatched here before local-credential setup.
+    if let Command::BusinessApp { action } = cli.command {
+        let paths = runtime_paths();
+        let instance_url = std::env::var("SNOW_INSTANCE")
+            .or_else(|_| std::env::var("SERVICENOW_INSTANCE"))
+            .ok();
+        let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root);
+        let client =
+            DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
+        return cmd_business_app(&client, action).await;
+    }
+
     let AuthContext {
         instance,
         username,
@@ -268,6 +282,9 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             action,
         } => cmd_knowledge(core.as_ref(), number, fresh, action).await,
         Command::Approval { number } => cmd_show_approval_runtime(core.as_ref(), &number).await,
+        Command::BusinessApp { .. } => {
+            unreachable!("business-app is dispatched before local-credential setup")
+        }
         Command::Daemon { .. } | Command::Admin => {
             unreachable!("daemon and admin are dispatched before auth setup")
         }
@@ -315,12 +332,17 @@ fn command_uses_daemon_auto_spawn(command: &Command) -> bool {
             socket_path,
             ..
         } if *daemon || socket_path.is_some()
-    )
+    ) || matches!(command, Command::BusinessApp { .. })
 }
 
 fn command_uses_local_credentials(command: &Command) -> bool {
     match command {
-        Command::Daemon { .. } | Command::Admin | Command::CacheInfo => false,
+        // Business Application commands go through the daemon (auto-spawned),
+        // so the CLI process itself does not load local credentials.
+        Command::Daemon { .. }
+        | Command::Admin
+        | Command::CacheInfo
+        | Command::BusinessApp { .. } => false,
         Command::Tui {
             daemon,
             socket_path,
@@ -380,6 +402,7 @@ async fn build_core(
             url: instance.to_string(),
             user: username.to_string(),
             credential,
+            portal: std::env::var("SNOW_PORTAL").unwrap_or_default(),
         },
         vault: CoreVaultConfig { path: paths.vault },
         transport: CoreTransportConfig::default(),
@@ -1489,6 +1512,186 @@ async fn cmd_show_approval_runtime(core: &SnowCore, number: &str) -> Result<(), 
         None => println!("Approval not found: {number}"),
     }
     Ok(())
+}
+
+/// Build daemon query filters by pairing each `--field` with operator values in
+/// declaration order (contains first, then eq). This honors the documented
+/// single-filter forms and homogeneous repeated filters; a mismatch between the
+/// number of fields and operator values is rejected so the user gets a clear
+/// error instead of a silently dropped predicate.
+fn build_business_app_query_filters(
+    fields: Vec<String>,
+    contains: Vec<String>,
+    eq: Vec<String>,
+) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
+    if fields.is_empty() {
+        return Err(SnowError::Api(
+            "business-app query requires at least one --field".to_string(),
+        ));
+    }
+    // Flatten operator values, tagging each with its operator token in the same
+    // order clap collected them.
+    let mut operands: Vec<(String, String)> = Vec::new();
+    operands.extend(contains.into_iter().map(|v| ("contains".to_string(), v)));
+    operands.extend(eq.into_iter().map(|v| ("eq".to_string(), v)));
+
+    if operands.len() != fields.len() {
+        return Err(SnowError::Api(format!(
+            "business-app query needs one operator value per --field (got {} fields, {} operator values)",
+            fields.len(),
+            operands.len()
+        )));
+    }
+
+    Ok(fields
+        .into_iter()
+        .zip(operands)
+        .map(
+            |(field, (operator, value))| BusinessApplicationQueryFilter {
+                field,
+                operator,
+                value,
+            },
+        )
+        .collect())
+}
+
+/// Dispatch the `snow business-app` subcommand family over the daemon client.
+async fn cmd_business_app(
+    client: &DaemonRpcClient,
+    action: BusinessAppCommand,
+) -> Result<(), SnowError> {
+    match action {
+        BusinessAppCommand::Get {
+            sys_id,
+            name,
+            fresh,
+            json,
+            full,
+        } => {
+            if sys_id.is_none() && name.is_none() {
+                return Err(SnowError::Api(
+                    "business-app get requires --sys-id or --name".to_string(),
+                ));
+            }
+            let app = client
+                .business_application_get(sys_id.as_deref(), name.as_deref(), fresh)
+                .await?;
+            match app {
+                Some(app) => {
+                    if json {
+                        print_json(&app)?;
+                    } else {
+                        print!("{}", display::format_business_application(&app, full));
+                    }
+                }
+                None => println!("Business Application not found."),
+            }
+            Ok(())
+        }
+        BusinessAppCommand::Search {
+            name,
+            operational_state_not,
+            limit,
+            json,
+            full,
+        } => {
+            let apps = client
+                .business_application_search(
+                    name.as_deref(),
+                    operational_state_not.as_deref(),
+                    limit,
+                )
+                .await?;
+            if json {
+                return print_json(&apps);
+            }
+            if apps.is_empty() {
+                println!("No Business Applications found.");
+                return Ok(());
+            }
+            for app in &apps {
+                if full {
+                    print!("{}", display::format_business_application(app, true));
+                } else {
+                    println!("{}", display::format_business_application_summary(app));
+                }
+                println!();
+            }
+            Ok(())
+        }
+        BusinessAppCommand::Query {
+            field,
+            contains,
+            eq,
+            limit,
+            json,
+        } => {
+            let filters = build_business_app_query_filters(field, contains, eq)?;
+            let result = client.business_application_query(&filters, limit).await?;
+            if json {
+                print_full_dump_or_inline(&result);
+            } else {
+                // Query returns records in a backend-owned shape; render generically.
+                print_full_dump_or_inline(&result);
+            }
+            Ok(())
+        }
+        BusinessAppCommand::Fields { refresh, json } => {
+            let fields = client.business_application_fields(refresh).await?;
+            if json {
+                print_full_dump_or_inline(&fields);
+            } else {
+                print!("{}", display::format_business_application_fields(&fields));
+            }
+            Ok(())
+        }
+        BusinessAppCommand::Sync {
+            name,
+            operational_state_not,
+            persist,
+            resolve_references,
+            reference_depth,
+            refresh_dictionary,
+            json,
+        } => {
+            let summary = client
+                .business_application_sync(
+                    name.as_deref(),
+                    operational_state_not.as_deref(),
+                    persist,
+                    resolve_references,
+                    reference_depth,
+                    refresh_dictionary,
+                )
+                .await?;
+            if json {
+                print_full_dump_or_inline(&summary);
+            } else {
+                print!(
+                    "{}",
+                    display::format_business_application_summary_object(&summary)
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Serialize a value to pretty JSON and print it, surfacing serialization errors.
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), SnowError> {
+    let text =
+        serde_json::to_string_pretty(value).map_err(|err| SnowError::Api(err.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Print a `serde_json::Value` as pretty JSON to stdout.
+fn print_full_dump_or_inline(value: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    );
 }
 
 fn confirm_action(prompt: &str) -> Result<bool, SnowError> {

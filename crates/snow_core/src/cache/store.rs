@@ -1,12 +1,13 @@
-use crate::{KnowledgeEmbeddingCoverage, ResourceType};
+use crate::{FieldValue, KnowledgeEmbeddingCoverage, ResourceType, SnowRecord};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, HashMap};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -18,6 +19,8 @@ pub enum StoreError {
     InvalidResourceType(String),
     #[error("invalid schema version: {0}")]
     InvalidSchemaVersion(String),
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(i64),
     #[error("serde json error: {0}")]
@@ -260,6 +263,89 @@ pub struct KnowledgeSemanticMeta {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessApplicationProjectionRow {
+    pub record_sys_id: String,
+    pub name: String,
+    pub number: Option<String>,
+    pub business_owner_sys_id: Option<String>,
+    pub business_owner_name: Option<String>,
+    pub is_owner_sys_id: Option<String>,
+    pub is_owner_name: Option<String>,
+    pub ci_owner_group_sys_id: Option<String>,
+    pub ci_owner_group_name: Option<String>,
+    pub primary_support_group_sys_id: Option<String>,
+    pub primary_support_group_name: Option<String>,
+    pub operational_status_value: Option<String>,
+    pub operational_status_display: Option<String>,
+    pub primary_portfolio_sys_id: Option<String>,
+    pub primary_portfolio_name: Option<String>,
+    pub primary_portfolio_table: Option<String>,
+    pub attested_date: Option<String>,
+    pub sys_updated_on: Option<String>,
+    pub field_count: usize,
+    pub reference_count: usize,
+    pub unresolved_reference_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedFieldRow {
+    pub owner_sys_id: String,
+    pub field_name: String,
+    pub field_label: Option<String>,
+    pub field_type: Option<String>,
+    pub value_text: Option<String>,
+    pub display_value: Option<String>,
+    pub value_number: Option<f64>,
+    pub value_date: Option<String>,
+    pub value_bool: Option<bool>,
+    pub reference_sys_id: Option<String>,
+    pub reference_table: Option<String>,
+    pub raw_json: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessApplicationFieldDictionaryRow {
+    pub table_name: String,
+    pub field_name: String,
+    pub field_label: Option<String>,
+    pub field_type: Option<String>,
+    pub reference_table: Option<String>,
+    pub choice: bool,
+    pub mandatory: bool,
+    pub read_only: bool,
+    pub max_length: Option<i64>,
+    pub active: bool,
+    pub synced_at: DateTime<Utc>,
+    pub raw_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimitiveResolutionStatus {
+    Resolved,
+    Unresolved,
+    UnknownTable,
+    NotFound,
+    AclRestricted,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimitiveObjectRow {
+    pub sys_id: String,
+    pub table_name: String,
+    pub resource_type: String,
+    pub display_name: String,
+    pub number: Option<String>,
+    pub file_path: Option<String>,
+    pub raw_json: String,
+    pub synced_at: DateTime<Utc>,
+    pub sys_updated_on: Option<String>,
+    pub resolution_status: PrimitiveResolutionStatus,
+    pub last_error: Option<String>,
+}
+
 pub struct Store {
     path: PathBuf,
     conn: Connection,
@@ -321,6 +407,9 @@ impl Store {
         }
         if self.needs_v7_migration(schema_version)? {
             self.migrate_to_v7()?;
+        }
+        if self.needs_v8_migration(schema_version)? {
+            self.migrate_to_v8()?;
         }
         self.create_post_migration_indexes()?;
         self.set_schema_version(SCHEMA_VERSION)?;
@@ -476,6 +565,101 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS business_applications (
+                record_sys_id TEXT PRIMARY KEY
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                number TEXT,
+                business_owner_sys_id TEXT,
+                business_owner_name TEXT,
+                is_owner_sys_id TEXT,
+                is_owner_name TEXT,
+                ci_owner_group_sys_id TEXT,
+                ci_owner_group_name TEXT,
+                primary_support_group_sys_id TEXT,
+                primary_support_group_name TEXT,
+                operational_status_value TEXT,
+                operational_status_display TEXT,
+                primary_portfolio_sys_id TEXT,
+                primary_portfolio_name TEXT,
+                primary_portfolio_table TEXT,
+                attested_date TEXT,
+                sys_updated_on TEXT,
+                field_count INTEGER NOT NULL DEFAULT 0,
+                reference_count INTEGER NOT NULL DEFAULT 0,
+                unresolved_reference_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS business_application_fields (
+                record_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                value_text TEXT,
+                display_value TEXT,
+                value_number REAL,
+                value_date TEXT,
+                value_bool INTEGER CHECK (value_bool IN (0, 1)),
+                reference_sys_id TEXT,
+                reference_table TEXT,
+                raw_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(record_sys_id, field_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS business_application_field_dictionary (
+                table_name TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                reference_table TEXT,
+                choice INTEGER NOT NULL DEFAULT 0 CHECK (choice IN (0, 1)),
+                mandatory INTEGER NOT NULL DEFAULT 0 CHECK (mandatory IN (0, 1)),
+                read_only INTEGER NOT NULL DEFAULT 0 CHECK (read_only IN (0, 1)),
+                max_length INTEGER,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                synced_at INTEGER NOT NULL,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(table_name, field_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS primitive_objects (
+                sys_id TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                number TEXT,
+                file_path TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                synced_at INTEGER NOT NULL,
+                sys_updated_on TEXT,
+                resolution_status TEXT NOT NULL
+                    CHECK (resolution_status IN ('resolved','unresolved','unknown_table','not_found','acl_restricted','error')),
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS primitive_object_fields (
+                primitive_sys_id TEXT NOT NULL
+                    REFERENCES primitive_objects(sys_id)
+                    ON DELETE CASCADE,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                value_text TEXT,
+                display_value TEXT,
+                value_number REAL,
+                value_date TEXT,
+                value_bool INTEGER CHECK (value_bool IN (0, 1)),
+                reference_sys_id TEXT,
+                reference_table TEXT,
+                raw_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(primitive_sys_id, field_name)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_records_number ON records(number);
             CREATE INDEX IF NOT EXISTS idx_records_table_scope ON records(table_name, in_scope, number);
             CREATE INDEX IF NOT EXISTS idx_records_parent ON records(parent_id);
@@ -497,6 +681,42 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_kb_local_file_state_path ON kb_local_file_state(file_path);
             CREATE INDEX IF NOT EXISTS idx_kb_embeddings_model
                 ON knowledge_article_embeddings(model, coverage);
+            CREATE INDEX IF NOT EXISTS idx_ba_name ON business_applications(name);
+            CREATE INDEX IF NOT EXISTS idx_ba_business_owner
+                ON business_applications(business_owner_sys_id, business_owner_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_is_owner
+                ON business_applications(is_owner_sys_id, is_owner_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_ci_owner_group
+                ON business_applications(ci_owner_group_sys_id, ci_owner_group_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_support_group
+                ON business_applications(primary_support_group_sys_id, primary_support_group_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_operational_status
+                ON business_applications(operational_status_value, operational_status_display);
+            CREATE INDEX IF NOT EXISTS idx_ba_portfolio
+                ON business_applications(primary_portfolio_table, primary_portfolio_sys_id, primary_portfolio_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_attested_date ON business_applications(attested_date);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_text
+                ON business_application_fields(field_name, value_text);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_display
+                ON business_application_fields(field_name, display_value);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_date
+                ON business_application_fields(field_name, value_date);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_number
+                ON business_application_fields(field_name, value_number);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_ref
+                ON business_application_fields(field_name, reference_table, reference_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_primitive_objects_table
+                ON primitive_objects(table_name, display_name);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_text
+                ON primitive_object_fields(field_name, value_text);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_display
+                ON primitive_object_fields(field_name, display_value);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_date
+                ON primitive_object_fields(field_name, value_date);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_number
+                ON primitive_object_fields(field_name, value_number);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_ref
+                ON primitive_object_fields(field_name, reference_table, reference_sys_id);
             "#,
         )?;
         self.conn
@@ -751,6 +971,185 @@ impl Store {
         Ok(!self.table_exists("knowledge_article_embeddings")?)
     }
 
+    fn migrate_to_v8(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.create_v8_schema_objects()?;
+            self.conn.execute(
+                r#"
+                UPDATE records
+                SET resource_type = 'business_application'
+                WHERE resource_type = 'cmdb_ci_business_app'
+                   OR table_name = 'cmdb_ci_business_app'
+                "#,
+                [],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn needs_v8_migration(&self, schema_version: i64) -> Result<bool> {
+        if schema_version > 0 && schema_version < 8 {
+            return Ok(true);
+        }
+        Ok(!self.table_exists("business_applications")?
+            || !self.table_exists("business_application_fields")?
+            || !self.table_exists("business_application_field_dictionary")?
+            || !self.table_exists("primitive_objects")?
+            || !self.table_exists("primitive_object_fields")?
+            || !self.index_exists("idx_ba_fields_ref")?
+            || !self.index_exists("idx_primitive_fields_ref")?)
+    }
+
+    fn create_v8_schema_objects(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS business_applications (
+                record_sys_id TEXT PRIMARY KEY
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                number TEXT,
+                business_owner_sys_id TEXT,
+                business_owner_name TEXT,
+                is_owner_sys_id TEXT,
+                is_owner_name TEXT,
+                ci_owner_group_sys_id TEXT,
+                ci_owner_group_name TEXT,
+                primary_support_group_sys_id TEXT,
+                primary_support_group_name TEXT,
+                operational_status_value TEXT,
+                operational_status_display TEXT,
+                primary_portfolio_sys_id TEXT,
+                primary_portfolio_name TEXT,
+                primary_portfolio_table TEXT,
+                attested_date TEXT,
+                sys_updated_on TEXT,
+                field_count INTEGER NOT NULL DEFAULT 0,
+                reference_count INTEGER NOT NULL DEFAULT 0,
+                unresolved_reference_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS business_application_fields (
+                record_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                value_text TEXT,
+                display_value TEXT,
+                value_number REAL,
+                value_date TEXT,
+                value_bool INTEGER CHECK (value_bool IN (0, 1)),
+                reference_sys_id TEXT,
+                reference_table TEXT,
+                raw_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(record_sys_id, field_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS business_application_field_dictionary (
+                table_name TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                reference_table TEXT,
+                choice INTEGER NOT NULL DEFAULT 0 CHECK (choice IN (0, 1)),
+                mandatory INTEGER NOT NULL DEFAULT 0 CHECK (mandatory IN (0, 1)),
+                read_only INTEGER NOT NULL DEFAULT 0 CHECK (read_only IN (0, 1)),
+                max_length INTEGER,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                synced_at INTEGER NOT NULL,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(table_name, field_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS primitive_objects (
+                sys_id TEXT PRIMARY KEY,
+                table_name TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                number TEXT,
+                file_path TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                synced_at INTEGER NOT NULL,
+                sys_updated_on TEXT,
+                resolution_status TEXT NOT NULL
+                    CHECK (resolution_status IN ('resolved','unresolved','unknown_table','not_found','acl_restricted','error')),
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS primitive_object_fields (
+                primitive_sys_id TEXT NOT NULL
+                    REFERENCES primitive_objects(sys_id)
+                    ON DELETE CASCADE,
+                field_name TEXT NOT NULL,
+                field_label TEXT,
+                field_type TEXT,
+                value_text TEXT,
+                display_value TEXT,
+                value_number REAL,
+                value_date TEXT,
+                value_bool INTEGER CHECK (value_bool IN (0, 1)),
+                reference_sys_id TEXT,
+                reference_table TEXT,
+                raw_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(primitive_sys_id, field_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ba_name ON business_applications(name);
+            CREATE INDEX IF NOT EXISTS idx_ba_business_owner
+                ON business_applications(business_owner_sys_id, business_owner_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_is_owner
+                ON business_applications(is_owner_sys_id, is_owner_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_ci_owner_group
+                ON business_applications(ci_owner_group_sys_id, ci_owner_group_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_support_group
+                ON business_applications(primary_support_group_sys_id, primary_support_group_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_operational_status
+                ON business_applications(operational_status_value, operational_status_display);
+            CREATE INDEX IF NOT EXISTS idx_ba_portfolio
+                ON business_applications(primary_portfolio_table, primary_portfolio_sys_id, primary_portfolio_name);
+            CREATE INDEX IF NOT EXISTS idx_ba_attested_date ON business_applications(attested_date);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_text
+                ON business_application_fields(field_name, value_text);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_display
+                ON business_application_fields(field_name, display_value);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_date
+                ON business_application_fields(field_name, value_date);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_number
+                ON business_application_fields(field_name, value_number);
+            CREATE INDEX IF NOT EXISTS idx_ba_fields_ref
+                ON business_application_fields(field_name, reference_table, reference_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_primitive_objects_table
+                ON primitive_objects(table_name, display_name);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_text
+                ON primitive_object_fields(field_name, value_text);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_display
+                ON primitive_object_fields(field_name, display_value);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_date
+                ON primitive_object_fields(field_name, value_date);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_number
+                ON primitive_object_fields(field_name, value_number);
+            CREATE INDEX IF NOT EXISTS idx_primitive_fields_ref
+                ON primitive_object_fields(field_name, reference_table, reference_sys_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
     fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
         if self.table_has_column(table, column)? {
             return Ok(());
@@ -777,6 +1176,15 @@ impl Store {
         let exists = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
             [table],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists > 0)
+    }
+
+    fn index_exists(&self, index: &str) -> Result<bool> {
+        let exists = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index],
             |row| row.get::<_, i64>(0),
         )?;
         Ok(exists > 0)
@@ -1343,6 +1751,432 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_business_application_projection(
+        &self,
+        record: &SnowRecord,
+        raw_fields: Option<&Value>,
+    ) -> Result<()> {
+        if record.resource_type != ResourceType::BusinessApplication
+            && record.table != "cmdb_ci_business_app"
+        {
+            return Err(StoreError::InvalidQuery(format!(
+                "record {} is not a Business Application",
+                record.sys_id
+            )));
+        }
+
+        let raw_map = raw_fields
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| field_values_to_json_map(&record.fields));
+        let dictionary = self.business_application_dictionary_map()?;
+        let now = Utc::now();
+        let fields = projected_fields_from_json(
+            &record.sys_id,
+            &raw_map,
+            Some(&record.fields),
+            &dictionary,
+            now,
+        )?;
+        let projection = business_application_projection_from_fields(record, &fields);
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.upsert_business_application_projection_row(&projection)?;
+            self.conn.execute(
+                "DELETE FROM business_application_fields WHERE record_sys_id = ?1",
+                params![&record.sys_id],
+            )?;
+            for field in &fields {
+                self.upsert_business_application_field(field)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    pub fn rebuild_business_application_projection_from_raw_json(
+        &self,
+        row: &RecordRow,
+    ) -> Result<bool> {
+        if row.resource_type != ResourceType::BusinessApplication
+            && row.table_name != "cmdb_ci_business_app"
+        {
+            return Ok(false);
+        }
+        let raw = serde_json::from_str::<Value>(&row.raw_json)?;
+        let Some(raw_map) = raw.as_object() else {
+            return Ok(false);
+        };
+        let fields_map = raw_map
+            .iter()
+            .map(|(key, value)| (key.clone(), field_value_from_raw_json(value)))
+            .collect::<HashMap<_, _>>();
+        let record = SnowRecord {
+            sys_id: row.sys_id.clone(),
+            number: row.number.clone(),
+            table: row.table_name.clone(),
+            resource_type: ResourceType::BusinessApplication,
+            state: row.state.clone().unwrap_or_default(),
+            short_description: row.short_desc.clone().unwrap_or_default(),
+            description: row.description.clone().unwrap_or_default(),
+            fields: fields_map,
+            work_notes: Vec::new(),
+            comments: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            references: HashMap::new(),
+            synced_at: row.synced_at,
+            source: crate::CacheSource::Disk,
+        };
+        self.upsert_business_application_projection(&record, Some(&raw))?;
+        Ok(true)
+    }
+
+    pub fn get_business_application_projection(
+        &self,
+        record_sys_id: &str,
+    ) -> Result<Option<BusinessApplicationProjectionRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT record_sys_id, name, number, business_owner_sys_id, business_owner_name,
+                       is_owner_sys_id, is_owner_name, ci_owner_group_sys_id, ci_owner_group_name,
+                       primary_support_group_sys_id, primary_support_group_name,
+                       operational_status_value, operational_status_display,
+                       primary_portfolio_sys_id, primary_portfolio_name, primary_portfolio_table,
+                       attested_date, sys_updated_on, field_count, reference_count,
+                       unresolved_reference_count
+                FROM business_applications
+                WHERE record_sys_id = ?1
+                "#,
+                params![record_sys_id],
+                row_to_business_application_projection,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_business_application_fields(
+        &self,
+        record_sys_id: &str,
+    ) -> Result<Vec<ProjectedFieldRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT record_sys_id, field_name, field_label, field_type, value_text,
+                   display_value, value_number, value_date, value_bool, reference_sys_id,
+                   reference_table, raw_json, updated_at
+            FROM business_application_fields
+            WHERE record_sys_id = ?1
+            ORDER BY field_name
+            "#,
+        )?;
+        let rows = stmt.query_map(params![record_sys_id], row_to_projected_field)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_business_application_field_dictionary(
+        &self,
+        field: &BusinessApplicationFieldDictionaryRow,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO business_application_field_dictionary (
+                table_name, field_name, field_label, field_type, reference_table, choice,
+                mandatory, read_only, max_length, active, synced_at, raw_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(table_name, field_name) DO UPDATE SET
+                field_label = excluded.field_label,
+                field_type = excluded.field_type,
+                reference_table = excluded.reference_table,
+                choice = excluded.choice,
+                mandatory = excluded.mandatory,
+                read_only = excluded.read_only,
+                max_length = excluded.max_length,
+                active = excluded.active,
+                synced_at = excluded.synced_at,
+                raw_json = excluded.raw_json
+            "#,
+            params![
+                &field.table_name,
+                &field.field_name,
+                &field.field_label,
+                &field.field_type,
+                &field.reference_table,
+                bool_to_i64(field.choice),
+                bool_to_i64(field.mandatory),
+                bool_to_i64(field.read_only),
+                &field.max_length,
+                bool_to_i64(field.active),
+                to_ts(field.synced_at),
+                &field.raw_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_primitive_object(&self, object: &PrimitiveObjectRow) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO primitive_objects (
+                sys_id, table_name, resource_type, display_name, number, file_path, raw_json,
+                synced_at, sys_updated_on, resolution_status, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(sys_id) DO UPDATE SET
+                table_name = excluded.table_name,
+                resource_type = excluded.resource_type,
+                display_name = excluded.display_name,
+                number = excluded.number,
+                file_path = excluded.file_path,
+                raw_json = excluded.raw_json,
+                synced_at = excluded.synced_at,
+                sys_updated_on = excluded.sys_updated_on,
+                resolution_status = excluded.resolution_status,
+                last_error = excluded.last_error
+            "#,
+            params![
+                &object.sys_id,
+                &object.table_name,
+                &object.resource_type,
+                &object.display_name,
+                &object.number,
+                &object.file_path,
+                &object.raw_json,
+                to_ts(object.synced_at),
+                &object.sys_updated_on,
+                primitive_resolution_status_to_str(object.resolution_status),
+                &object.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_unresolved_primitive_stub(
+        &self,
+        sys_id: impl Into<String>,
+        table_name: impl Into<String>,
+        display_name: impl Into<String>,
+        resolution_status: PrimitiveResolutionStatus,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        let table_name = table_name.into();
+        let sys_id = sys_id.into();
+        let display_name = display_name.into();
+        let raw_json = serde_json::json!({
+            "sys_id": sys_id,
+            "table": table_name,
+            "display_value": display_name,
+            "resolution_status": primitive_resolution_status_to_str(resolution_status),
+        })
+        .to_string();
+        self.upsert_primitive_object(&PrimitiveObjectRow {
+            sys_id,
+            table_name,
+            resource_type: "referenced_record".to_string(),
+            display_name,
+            number: None,
+            file_path: None,
+            raw_json,
+            synced_at: Utc::now(),
+            sys_updated_on: None,
+            resolution_status,
+            last_error,
+        })
+    }
+
+    pub fn upsert_primitive_object_field(
+        &self,
+        primitive_sys_id: &str,
+        field: &ProjectedFieldRow,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO primitive_object_fields (
+                primitive_sys_id, field_name, field_label, field_type, value_text,
+                display_value, value_number, value_date, value_bool, reference_sys_id,
+                reference_table, raw_json, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(primitive_sys_id, field_name) DO UPDATE SET
+                field_label = excluded.field_label,
+                field_type = excluded.field_type,
+                value_text = excluded.value_text,
+                display_value = excluded.display_value,
+                value_number = excluded.value_number,
+                value_date = excluded.value_date,
+                value_bool = excluded.value_bool,
+                reference_sys_id = excluded.reference_sys_id,
+                reference_table = excluded.reference_table,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                primitive_sys_id,
+                &field.field_name,
+                &field.field_label,
+                &field.field_type,
+                &field.value_text,
+                &field.display_value,
+                &field.value_number,
+                &field.value_date,
+                field.value_bool.map(bool_to_i64),
+                &field.reference_sys_id,
+                &field.reference_table,
+                &field.raw_json,
+                to_ts(field.updated_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_primitive_object(&self, sys_id: &str) -> Result<Option<PrimitiveObjectRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT sys_id, table_name, resource_type, display_name, number, file_path,
+                       raw_json, synced_at, sys_updated_on, resolution_status, last_error
+                FROM primitive_objects
+                WHERE sys_id = ?1
+                "#,
+                params![sys_id],
+                |row| {
+                    Ok(PrimitiveObjectRow {
+                        sys_id: row.get(0)?,
+                        table_name: row.get(1)?,
+                        resource_type: row.get(2)?,
+                        display_name: row.get(3)?,
+                        number: row.get(4)?,
+                        file_path: row.get(5)?,
+                        raw_json: row.get(6)?,
+                        synced_at: from_ts(row.get(7)?).map_err(to_sqlite_err)?,
+                        sys_updated_on: row.get(8)?,
+                        resolution_status: primitive_resolution_status_from_str(
+                            &row.get::<_, String>(9)?,
+                        )
+                        .map_err(to_sqlite_err)?,
+                        last_error: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn upsert_business_application_projection_row(
+        &self,
+        projection: &BusinessApplicationProjectionRow,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO business_applications (
+                record_sys_id, name, number, business_owner_sys_id, business_owner_name,
+                is_owner_sys_id, is_owner_name, ci_owner_group_sys_id, ci_owner_group_name,
+                primary_support_group_sys_id, primary_support_group_name,
+                operational_status_value, operational_status_display,
+                primary_portfolio_sys_id, primary_portfolio_name, primary_portfolio_table,
+                attested_date, sys_updated_on, field_count, reference_count,
+                unresolved_reference_count
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            )
+            ON CONFLICT(record_sys_id) DO UPDATE SET
+                name = excluded.name,
+                number = excluded.number,
+                business_owner_sys_id = excluded.business_owner_sys_id,
+                business_owner_name = excluded.business_owner_name,
+                is_owner_sys_id = excluded.is_owner_sys_id,
+                is_owner_name = excluded.is_owner_name,
+                ci_owner_group_sys_id = excluded.ci_owner_group_sys_id,
+                ci_owner_group_name = excluded.ci_owner_group_name,
+                primary_support_group_sys_id = excluded.primary_support_group_sys_id,
+                primary_support_group_name = excluded.primary_support_group_name,
+                operational_status_value = excluded.operational_status_value,
+                operational_status_display = excluded.operational_status_display,
+                primary_portfolio_sys_id = excluded.primary_portfolio_sys_id,
+                primary_portfolio_name = excluded.primary_portfolio_name,
+                primary_portfolio_table = excluded.primary_portfolio_table,
+                attested_date = excluded.attested_date,
+                sys_updated_on = excluded.sys_updated_on,
+                field_count = excluded.field_count,
+                reference_count = excluded.reference_count,
+                unresolved_reference_count = excluded.unresolved_reference_count
+            "#,
+            params![
+                &projection.record_sys_id,
+                &projection.name,
+                &projection.number,
+                &projection.business_owner_sys_id,
+                &projection.business_owner_name,
+                &projection.is_owner_sys_id,
+                &projection.is_owner_name,
+                &projection.ci_owner_group_sys_id,
+                &projection.ci_owner_group_name,
+                &projection.primary_support_group_sys_id,
+                &projection.primary_support_group_name,
+                &projection.operational_status_value,
+                &projection.operational_status_display,
+                &projection.primary_portfolio_sys_id,
+                &projection.primary_portfolio_name,
+                &projection.primary_portfolio_table,
+                &projection.attested_date,
+                &projection.sys_updated_on,
+                projection.field_count as i64,
+                projection.reference_count as i64,
+                projection.unresolved_reference_count as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_business_application_field(&self, field: &ProjectedFieldRow) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO business_application_fields (
+                record_sys_id, field_name, field_label, field_type, value_text,
+                display_value, value_number, value_date, value_bool, reference_sys_id,
+                reference_table, raw_json, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(record_sys_id, field_name) DO UPDATE SET
+                field_label = excluded.field_label,
+                field_type = excluded.field_type,
+                value_text = excluded.value_text,
+                display_value = excluded.display_value,
+                value_number = excluded.value_number,
+                value_date = excluded.value_date,
+                value_bool = excluded.value_bool,
+                reference_sys_id = excluded.reference_sys_id,
+                reference_table = excluded.reference_table,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                &field.owner_sys_id,
+                &field.field_name,
+                &field.field_label,
+                &field.field_type,
+                &field.value_text,
+                &field.display_value,
+                &field.value_number,
+                &field.value_date,
+                field.value_bool.map(bool_to_i64),
+                &field.reference_sys_id,
+                &field.reference_table,
+                &field.raw_json,
+                to_ts(field.updated_at),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn replace_tags(&self, record_sys_id: &str, tags: &[TagRow]) -> Result<()> {
@@ -2460,6 +3294,107 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn query_business_application_records(
+        &self,
+        query: &crate::query::filter::BusinessApplicationQuery,
+    ) -> Result<Vec<RecordRow>> {
+        let limit = query.limit.unwrap_or(20);
+        if limit > 500 {
+            return Err(StoreError::InvalidQuery(
+                "Business Application local query limit cannot exceed 500".to_string(),
+            ));
+        }
+
+        for filter in &query.filters {
+            if !query.allow_unknown_fields
+                && !self.business_application_field_exists(&filter.field)?
+            {
+                return Err(StoreError::InvalidQuery(format!(
+                    "unknown Business Application field `{}`",
+                    filter.field
+                )));
+            }
+        }
+        for sort in &query.sort {
+            if !query.allow_unknown_fields
+                && !self.business_application_field_exists(&sort.field)?
+            {
+                return Err(StoreError::InvalidQuery(format!(
+                    "unknown Business Application sort field `{}`",
+                    sort.field
+                )));
+            }
+        }
+
+        let sql = if query.include_tombstoned {
+            r#"
+            SELECT sys_id, number, table_name, resource_type, state, short_desc, description,
+                   assigned_to, parent_id, file_path, synced_at, sys_updated_on, etag,
+                   in_scope, last_seen_at, tombstoned_at, pruned_at, raw_json
+            FROM records
+            WHERE resource_type IN ('business_application', 'cmdb_ci_business_app')
+               OR table_name = 'cmdb_ci_business_app'
+            "#
+        } else {
+            r#"
+            SELECT sys_id, number, table_name, resource_type, state, short_desc, description,
+                   assigned_to, parent_id, file_path, synced_at, sys_updated_on, etag,
+                   in_scope, last_seen_at, tombstoned_at, pruned_at, raw_json
+            FROM records
+            WHERE in_scope = 1
+              AND (resource_type IN ('business_application', 'cmdb_ci_business_app')
+                   OR table_name = 'cmdb_ci_business_app')
+            "#
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], row_to_record_row)?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let row = row?;
+            if self
+                .list_business_application_fields(&row.sys_id)?
+                .is_empty()
+            {
+                let _ = self.rebuild_business_application_projection_from_raw_json(&row)?;
+            }
+            let projection = self.get_business_application_projection(&row.sys_id)?;
+            let fields = self
+                .list_business_application_fields(&row.sys_id)?
+                .into_iter()
+                .map(|field| (field.field_name.clone(), field))
+                .collect::<BTreeMap<_, _>>();
+            if !business_application_matches_query(&row, projection.as_ref(), &fields, query) {
+                continue;
+            }
+            candidates.push((row, projection, fields));
+        }
+
+        candidates.sort_by(|left, right| {
+            compare_business_application_candidates(left, right, &query.sort)
+                .then_with(|| {
+                    left.1
+                        .as_ref()
+                        .map(|row| row.name.as_str())
+                        .unwrap_or(left.0.short_desc.as_deref().unwrap_or(""))
+                        .cmp(
+                            right
+                                .1
+                                .as_ref()
+                                .map(|row| row.name.as_str())
+                                .unwrap_or(right.0.short_desc.as_deref().unwrap_or("")),
+                        )
+                })
+                .then_with(|| left.0.sys_id.cmp(&right.0.sys_id))
+        });
+
+        Ok(candidates
+            .into_iter()
+            .skip(query.offset.unwrap_or(0))
+            .take(limit)
+            .map(|(row, _, _)| row)
+            .collect())
+    }
+
     fn find_record_sys_ids_by_enrichment(
         &self,
         table: &str,
@@ -2482,6 +3417,131 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![value, limit as i64], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn business_application_field_exists(&self, field: &str) -> Result<bool> {
+        if matches!(
+            field,
+            "sys_id"
+                | "number"
+                | "name"
+                | "short_description"
+                | "description"
+                | "business_owner"
+                | "it_application_owner"
+                | "managed_by_group"
+                | "support_group"
+                | "operational_status"
+                | "portfolio"
+                | "attested_date"
+                | "sys_updated_on"
+        ) {
+            return Ok(true);
+        }
+        let count = self.conn.query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM business_application_fields WHERE field_name = ?1)
+              + (SELECT COUNT(*) FROM business_application_field_dictionary WHERE field_name = ?1)
+            "#,
+            params![field],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn business_application_dictionary_map(
+        &self,
+    ) -> Result<HashMap<String, BusinessApplicationFieldDictionaryRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT table_name, field_name, field_label, field_type, reference_table, choice,
+                   mandatory, read_only, max_length, active, synced_at, raw_json
+            FROM business_application_field_dictionary
+            WHERE table_name = 'cmdb_ci_business_app'
+               OR table_name = 'task'
+               OR table_name = 'cmdb_ci'
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BusinessApplicationFieldDictionaryRow {
+                table_name: row.get(0)?,
+                field_name: row.get(1)?,
+                field_label: row.get(2)?,
+                field_type: row.get(3)?,
+                reference_table: row.get(4)?,
+                choice: i64_to_bool(row.get(5)?),
+                mandatory: i64_to_bool(row.get(6)?),
+                read_only: i64_to_bool(row.get(7)?),
+                max_length: row.get(8)?,
+                active: i64_to_bool(row.get(9)?),
+                synced_at: from_ts(row.get(10)?).map_err(to_sqlite_err)?,
+                raw_json: row.get(11)?,
+            })
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let row = row?;
+            map.insert(row.field_name.clone(), row);
+        }
+        Ok(map)
+    }
+
+    /// List all cached dictionary rows for a single table, ordered by field name.
+    ///
+    /// Returns an empty vector when the dictionary has never been synced for the
+    /// table. Callers treat an empty result as a dictionary cache miss and fall
+    /// back to baseline/observed behavior (degraded-read mode).
+    pub fn list_business_application_field_dictionary(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<BusinessApplicationFieldDictionaryRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT table_name, field_name, field_label, field_type, reference_table, choice,
+                   mandatory, read_only, max_length, active, synced_at, raw_json
+            FROM business_application_field_dictionary
+            WHERE table_name = ?1
+            ORDER BY field_name
+            "#,
+        )?;
+        let rows = stmt.query_map(params![table_name], |row| {
+            Ok(BusinessApplicationFieldDictionaryRow {
+                table_name: row.get(0)?,
+                field_name: row.get(1)?,
+                field_label: row.get(2)?,
+                field_type: row.get(3)?,
+                reference_table: row.get(4)?,
+                choice: i64_to_bool(row.get(5)?),
+                mandatory: i64_to_bool(row.get(6)?),
+                read_only: i64_to_bool(row.get(7)?),
+                max_length: row.get(8)?,
+                active: i64_to_bool(row.get(9)?),
+                synced_at: from_ts(row.get(10)?).map_err(to_sqlite_err)?,
+                raw_json: row.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Merged dictionary across the Business Application table and its inherited
+    /// tables, keyed by field name. Child-table rows win over ancestor rows when
+    /// the same field name appears at multiple levels (closest definition wins).
+    ///
+    /// Returns an empty map on a full dictionary cache miss.
+    pub fn business_application_dictionary_for_tables(
+        &self,
+        tables: &[String],
+    ) -> Result<HashMap<String, BusinessApplicationFieldDictionaryRow>> {
+        // Walk from the most-derived table (index 0) to the base so earlier
+        // entries are not overwritten by ancestor definitions.
+        let mut map: HashMap<String, BusinessApplicationFieldDictionaryRow> = HashMap::new();
+        for table in tables {
+            for row in self.list_business_application_field_dictionary(table)? {
+                map.entry(row.field_name.clone()).or_insert(row);
+            }
+        }
+        Ok(map)
     }
 
     /// Delete relationships where the source record is tombstoned or pruned.
@@ -2575,6 +3635,556 @@ fn row_to_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
     })
 }
 
+fn row_to_business_application_projection(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BusinessApplicationProjectionRow> {
+    Ok(BusinessApplicationProjectionRow {
+        record_sys_id: row.get(0)?,
+        name: row.get(1)?,
+        number: row.get(2)?,
+        business_owner_sys_id: row.get(3)?,
+        business_owner_name: row.get(4)?,
+        is_owner_sys_id: row.get(5)?,
+        is_owner_name: row.get(6)?,
+        ci_owner_group_sys_id: row.get(7)?,
+        ci_owner_group_name: row.get(8)?,
+        primary_support_group_sys_id: row.get(9)?,
+        primary_support_group_name: row.get(10)?,
+        operational_status_value: row.get(11)?,
+        operational_status_display: row.get(12)?,
+        primary_portfolio_sys_id: row.get(13)?,
+        primary_portfolio_name: row.get(14)?,
+        primary_portfolio_table: row.get(15)?,
+        attested_date: row.get(16)?,
+        sys_updated_on: row.get(17)?,
+        field_count: row.get::<_, i64>(18)? as usize,
+        reference_count: row.get::<_, i64>(19)? as usize,
+        unresolved_reference_count: row.get::<_, i64>(20)? as usize,
+    })
+}
+
+fn row_to_projected_field(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectedFieldRow> {
+    Ok(ProjectedFieldRow {
+        owner_sys_id: row.get(0)?,
+        field_name: row.get(1)?,
+        field_label: row.get(2)?,
+        field_type: row.get(3)?,
+        value_text: row.get(4)?,
+        display_value: row.get(5)?,
+        value_number: row.get(6)?,
+        value_date: row.get(7)?,
+        value_bool: row.get::<_, Option<i64>>(8)?.map(i64_to_bool),
+        reference_sys_id: row.get(9)?,
+        reference_table: row.get(10)?,
+        raw_json: row.get(11)?,
+        updated_at: from_ts(row.get(12)?).map_err(to_sqlite_err)?,
+    })
+}
+
+fn business_application_projection_from_fields(
+    record: &SnowRecord,
+    fields: &[ProjectedFieldRow],
+) -> BusinessApplicationProjectionRow {
+    let field = |name: &str| fields.iter().find(|field| field.field_name == name);
+    let reference = |name: &str| {
+        field(name).map(|field| {
+            (
+                field
+                    .reference_sys_id
+                    .clone()
+                    .or_else(|| field.value_text.clone()),
+                field
+                    .display_value
+                    .clone()
+                    .or_else(|| field.value_text.clone())
+                    .filter(|value| !value.trim().is_empty()),
+                field.reference_table.clone(),
+            )
+        })
+    };
+    let (business_owner_sys_id, business_owner_name, _) =
+        reference("business_owner").unwrap_or((None, None, None));
+    let (is_owner_sys_id, is_owner_name, _) =
+        reference("it_application_owner").unwrap_or((None, None, None));
+    let (ci_owner_group_sys_id, ci_owner_group_name, _) =
+        reference("managed_by_group").unwrap_or((None, None, None));
+    let (primary_support_group_sys_id, primary_support_group_name, _) =
+        reference("support_group").unwrap_or((None, None, None));
+    let (primary_portfolio_sys_id, primary_portfolio_name, primary_portfolio_table) =
+        reference("portfolio").unwrap_or((None, None, None));
+    let operational_status = field("operational_status");
+    let reference_count = fields
+        .iter()
+        .filter(|field| field.reference_sys_id.is_some())
+        .count();
+    let name = field("name")
+        .and_then(projected_field_display_or_value)
+        .or_else(|| non_empty_string(Some(&record.short_description)))
+        .unwrap_or_else(|| record.sys_id.clone());
+
+    BusinessApplicationProjectionRow {
+        record_sys_id: record.sys_id.clone(),
+        name,
+        number: non_empty_string(Some(&record.number)),
+        business_owner_sys_id,
+        business_owner_name,
+        is_owner_sys_id,
+        is_owner_name,
+        ci_owner_group_sys_id,
+        ci_owner_group_name,
+        primary_support_group_sys_id,
+        primary_support_group_name,
+        operational_status_value: operational_status.and_then(|field| field.value_text.clone()),
+        operational_status_display: operational_status
+            .and_then(|field| field.display_value.clone()),
+        primary_portfolio_sys_id,
+        primary_portfolio_name,
+        primary_portfolio_table,
+        attested_date: field("attested_date").and_then(|field| {
+            field
+                .value_date
+                .clone()
+                .or_else(|| projected_field_display_or_value(field))
+        }),
+        sys_updated_on: field("sys_updated_on").and_then(|field| {
+            field
+                .value_date
+                .clone()
+                .or_else(|| projected_field_display_or_value(field))
+        }),
+        field_count: fields.len(),
+        reference_count,
+        unresolved_reference_count: 0,
+    }
+}
+
+fn projected_fields_from_json(
+    owner_sys_id: &str,
+    raw_map: &Map<String, Value>,
+    field_values: Option<&HashMap<String, FieldValue>>,
+    dictionary: &HashMap<String, BusinessApplicationFieldDictionaryRow>,
+    updated_at: DateTime<Utc>,
+) -> Result<Vec<ProjectedFieldRow>> {
+    let mut names = raw_map.keys().cloned().collect::<BTreeSet<_>>();
+    if let Some(field_values) = field_values {
+        for key in field_values.keys() {
+            names.insert(key.clone());
+        }
+    }
+
+    let mut rows = Vec::with_capacity(names.len());
+    for field_name in &names {
+        let raw = raw_map.get(field_name);
+        let field_value = field_values.and_then(|fields| fields.get(field_name));
+        let dictionary_row = dictionary.get(field_name);
+        let raw_field = raw
+            .cloned()
+            .unwrap_or_else(|| field_value_json(field_value));
+        let value_text = field_value
+            .map(|field| field.value.clone())
+            .or_else(|| raw.and_then(raw_value_text));
+        let display_value = field_value
+            .and_then(|field| field.display_value.clone())
+            .or_else(|| raw.and_then(raw_display_value));
+        let field_type = dictionary_row.and_then(|row| row.field_type.clone());
+        let reference_table = dictionary_row
+            .and_then(|row| row.reference_table.clone())
+            .or_else(|| known_business_application_reference_table(field_name).map(str::to_string));
+        let reference_sys_id = reference_table
+            .as_ref()
+            .and_then(|_| value_text.as_deref())
+            .filter(|value| is_sys_id(value))
+            .map(str::to_string);
+        let value_number = value_text
+            .as_deref()
+            .and_then(|value| value.trim().parse::<f64>().ok());
+        let value_bool = parse_bool(value_text.as_deref());
+        let value_date =
+            projected_date_value(field_name, field_type.as_deref(), value_text.as_deref());
+
+        rows.push(ProjectedFieldRow {
+            owner_sys_id: owner_sys_id.to_string(),
+            field_name: field_name.clone(),
+            field_label: dictionary_row.and_then(|row| row.field_label.clone()),
+            field_type,
+            value_text: non_empty_string(value_text.as_deref()),
+            display_value: non_empty_string(display_value.as_deref()),
+            value_number,
+            value_date,
+            value_bool,
+            reference_sys_id,
+            reference_table,
+            raw_json: raw_field.to_string(),
+            updated_at,
+        });
+    }
+    Ok(rows)
+}
+
+fn field_values_to_json_map(fields: &HashMap<String, FieldValue>) -> Map<String, Value> {
+    fields
+        .iter()
+        .map(|(name, field)| (name.clone(), field_value_json(Some(field))))
+        .collect()
+}
+
+fn field_value_json(field: Option<&FieldValue>) -> Value {
+    let Some(field) = field else {
+        return Value::Null;
+    };
+    let mut map = Map::new();
+    map.insert("value".to_string(), Value::String(field.value.clone()));
+    if let Some(display_value) = &field.display_value {
+        map.insert(
+            "display_value".to_string(),
+            Value::String(display_value.clone()),
+        );
+    }
+    Value::Object(map)
+}
+
+fn field_value_from_raw_json(value: &Value) -> FieldValue {
+    FieldValue {
+        value: raw_value_text(value).unwrap_or_default(),
+        display_value: raw_display_value(value),
+    }
+}
+
+fn raw_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map.get("value").map(json_value_to_projection_string),
+        Value::Null => None,
+        other => Some(json_value_to_projection_string(other)),
+    }
+}
+
+fn raw_display_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get("display_value")
+            .map(json_value_to_projection_string)
+            .and_then(|value| non_empty_string(Some(&value))),
+        _ => None,
+    }
+}
+
+fn json_value_to_projection_string(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn projected_date_value(
+    field_name: &str,
+    field_type: Option<&str>,
+    value: Option<&str>,
+) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let field_type = field_type.unwrap_or_default().to_ascii_lowercase();
+    let name = field_name.to_ascii_lowercase();
+    if field_type.contains("date") || name.ends_with("_date") || name.ends_with("_on") {
+        return Some(value.replace(' ', "T"));
+    }
+    None
+}
+
+fn parse_bool(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn known_business_application_reference_table(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "business_owner" | "it_application_owner" | "owned_by" | "managed_by" => Some("sys_user"),
+        "managed_by_group" | "support_group" | "assignment_group" => Some("sys_user_group"),
+        "cmdb_ci" => Some("cmdb_ci"),
+        _ => None,
+    }
+}
+
+fn projected_field_display_or_value(field: &ProjectedFieldRow) -> Option<String> {
+    field
+        .display_value
+        .clone()
+        .or_else(|| field.value_text.clone())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn is_sys_id(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn business_application_matches_query(
+    row: &RecordRow,
+    projection: Option<&BusinessApplicationProjectionRow>,
+    fields: &BTreeMap<String, ProjectedFieldRow>,
+    query: &crate::query::filter::BusinessApplicationQuery,
+) -> bool {
+    if let Some(text) = non_empty_string(query.text.as_deref()) {
+        let text = text.to_ascii_lowercase();
+        let haystack = business_application_search_text(row, projection, fields);
+        if !haystack.to_ascii_lowercase().contains(&text) {
+            return false;
+        }
+    }
+    query
+        .filters
+        .iter()
+        .all(|filter| business_application_field_matches(fields.get(&filter.field), filter))
+}
+
+fn business_application_search_text(
+    row: &RecordRow,
+    projection: Option<&BusinessApplicationProjectionRow>,
+    fields: &BTreeMap<String, ProjectedFieldRow>,
+) -> String {
+    let mut values = Vec::new();
+    values.push(row.number.as_str());
+    if let Some(value) = row.short_desc.as_deref() {
+        values.push(value);
+    }
+    if let Some(value) = row.description.as_deref() {
+        values.push(value);
+    }
+    if let Some(projection) = projection {
+        values.push(projection.name.as_str());
+        for value in [
+            projection.business_owner_name.as_deref(),
+            projection.is_owner_name.as_deref(),
+            projection.ci_owner_group_name.as_deref(),
+            projection.primary_support_group_name.as_deref(),
+            projection.primary_portfolio_name.as_deref(),
+            projection.operational_status_display.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            values.push(value);
+        }
+    }
+    for field in fields.values() {
+        if let Some(value) = field.value_text.as_deref() {
+            values.push(value);
+        }
+        if let Some(value) = field.display_value.as_deref() {
+            values.push(value);
+        }
+    }
+    values.join(" ")
+}
+
+fn business_application_field_matches(
+    field: Option<&ProjectedFieldRow>,
+    filter: &crate::query::filter::FieldFilter,
+) -> bool {
+    use crate::query::filter::FieldOperator;
+
+    match filter.op {
+        FieldOperator::IsEmpty => return field.map(projected_field_is_empty).unwrap_or(true),
+        FieldOperator::IsNotEmpty => {
+            return field
+                .map(|field| !projected_field_is_empty(field))
+                .unwrap_or(false);
+        }
+        _ => {}
+    }
+
+    let Some(field) = field else {
+        return matches!(filter.op, FieldOperator::Ne);
+    };
+
+    match filter.op {
+        FieldOperator::Eq => field_values(field)
+            .iter()
+            .any(|candidate| value_matches_exact(candidate, &filter.value)),
+        FieldOperator::Ne => !field_values(field)
+            .iter()
+            .any(|candidate| value_matches_exact(candidate, &filter.value)),
+        FieldOperator::Contains => value_as_string(&filter.value)
+            .map(|needle| {
+                let needle = needle.to_ascii_lowercase();
+                field_values(field)
+                    .iter()
+                    .any(|candidate| candidate.to_ascii_lowercase().contains(&needle))
+            })
+            .unwrap_or(false),
+        FieldOperator::StartsWith => value_as_string(&filter.value)
+            .map(|needle| {
+                let needle = needle.to_ascii_lowercase();
+                field_values(field)
+                    .iter()
+                    .any(|candidate| candidate.to_ascii_lowercase().starts_with(&needle))
+            })
+            .unwrap_or(false),
+        FieldOperator::In => filter
+            .value
+            .as_array()
+            .map(|values| {
+                values.iter().any(|value| {
+                    field_values(field)
+                        .iter()
+                        .any(|candidate| value_matches_exact(candidate, value))
+                })
+            })
+            .unwrap_or(false),
+        FieldOperator::Gt => compare_projected_field(field, &filter.value)
+            .map(|ordering| ordering == std::cmp::Ordering::Greater)
+            .unwrap_or(false),
+        FieldOperator::Gte => compare_projected_field(field, &filter.value)
+            .map(|ordering| {
+                ordering == std::cmp::Ordering::Greater || ordering == std::cmp::Ordering::Equal
+            })
+            .unwrap_or(false),
+        FieldOperator::Lt => compare_projected_field(field, &filter.value)
+            .map(|ordering| ordering == std::cmp::Ordering::Less)
+            .unwrap_or(false),
+        FieldOperator::Lte => compare_projected_field(field, &filter.value)
+            .map(|ordering| {
+                ordering == std::cmp::Ordering::Less || ordering == std::cmp::Ordering::Equal
+            })
+            .unwrap_or(false),
+        FieldOperator::IsEmpty | FieldOperator::IsNotEmpty => unreachable!(),
+    }
+}
+
+fn projected_field_is_empty(field: &ProjectedFieldRow) -> bool {
+    field_values(field)
+        .into_iter()
+        .all(|value| value.trim().is_empty())
+}
+
+fn field_values(field: &ProjectedFieldRow) -> Vec<String> {
+    [
+        field.value_text.clone(),
+        field.display_value.clone(),
+        field.reference_sys_id.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn value_matches_exact(candidate: &str, value: &Value) -> bool {
+    value_as_string(value)
+        .map(|value| candidate.eq_ignore_ascii_case(value.as_str()))
+        .unwrap_or(false)
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn compare_projected_field(field: &ProjectedFieldRow, value: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (
+        field.value_number,
+        value
+            .as_f64()
+            .or_else(|| value_as_string(value)?.parse::<f64>().ok()),
+    ) {
+        return left.partial_cmp(&right);
+    }
+    if let (Some(left), Some(right)) = (field.value_date.as_deref(), value_as_string(value)) {
+        return Some(left.cmp(right.as_str()));
+    }
+    let left = field.value_text.as_deref()?;
+    let right = value_as_string(value)?;
+    Some(left.cmp(right.as_str()))
+}
+
+type BusinessApplicationCandidate = (
+    RecordRow,
+    Option<BusinessApplicationProjectionRow>,
+    BTreeMap<String, ProjectedFieldRow>,
+);
+
+fn compare_business_application_candidates(
+    left: &BusinessApplicationCandidate,
+    right: &BusinessApplicationCandidate,
+    sort: &[crate::query::filter::SortField],
+) -> std::cmp::Ordering {
+    use crate::query::filter::SortDirection;
+
+    for sort_field in sort {
+        let ordering = business_application_sort_value(left, &sort_field.field)
+            .cmp(&business_application_sort_value(right, &sort_field.field));
+        let ordering = match sort_field.direction {
+            SortDirection::Asc => ordering,
+            SortDirection::Desc => ordering.reverse(),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn business_application_sort_value(
+    candidate: &BusinessApplicationCandidate,
+    field: &str,
+) -> String {
+    let (row, projection, fields) = candidate;
+    match field {
+        "sys_id" => return row.sys_id.clone(),
+        "number" => return row.number.clone(),
+        "short_description" => return row.short_desc.clone().unwrap_or_default(),
+        "description" => return row.description.clone().unwrap_or_default(),
+        "name" => {
+            if let Some(projection) = projection {
+                return projection.name.clone();
+            }
+        }
+        _ => {}
+    }
+    fields
+        .get(field)
+        .and_then(projected_field_display_or_value)
+        .unwrap_or_default()
+}
+
+fn primitive_resolution_status_to_str(status: PrimitiveResolutionStatus) -> &'static str {
+    match status {
+        PrimitiveResolutionStatus::Resolved => "resolved",
+        PrimitiveResolutionStatus::Unresolved => "unresolved",
+        PrimitiveResolutionStatus::UnknownTable => "unknown_table",
+        PrimitiveResolutionStatus::NotFound => "not_found",
+        PrimitiveResolutionStatus::AclRestricted => "acl_restricted",
+        PrimitiveResolutionStatus::Error => "error",
+    }
+}
+
+fn primitive_resolution_status_from_str(value: &str) -> Result<PrimitiveResolutionStatus> {
+    match value {
+        "resolved" => Ok(PrimitiveResolutionStatus::Resolved),
+        "unresolved" => Ok(PrimitiveResolutionStatus::Unresolved),
+        "unknown_table" => Ok(PrimitiveResolutionStatus::UnknownTable),
+        "not_found" => Ok(PrimitiveResolutionStatus::NotFound),
+        "acl_restricted" => Ok(PrimitiveResolutionStatus::AclRestricted),
+        "error" => Ok(PrimitiveResolutionStatus::Error),
+        other => Err(StoreError::InvalidSchemaVersion(other.to_string())),
+    }
+}
+
 fn resource_type_to_str(resource_type: &ResourceType) -> &'static str {
     match resource_type {
         ResourceType::Task => "task",
@@ -2592,6 +4202,7 @@ fn resource_type_to_str(resource_type: &ResourceType) -> &'static str {
         ResourceType::Timecard => "time_card",
         ResourceType::Knowledge => "kb_knowledge",
         ResourceType::Approval => "sysapproval_approver",
+        ResourceType::BusinessApplication => "business_application",
     }
 }
 
@@ -2612,6 +4223,9 @@ fn str_to_resource_type(input: &str) -> std::result::Result<ResourceType, StoreE
         "time_card" => ResourceType::Timecard,
         "kb_knowledge" => ResourceType::Knowledge,
         "sysapproval_approver" => ResourceType::Approval,
+        "business_application" | "business_app" | "cmdb_ci_business_app" => {
+            ResourceType::BusinessApplication
+        }
         other => return Err(StoreError::InvalidResourceType(other.to_string())),
     })
 }
@@ -2695,6 +4309,8 @@ fn decode_embedding_vector(raw: &[u8], dimensions: usize) -> Result<Vec<f32>> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use serde_json::Value;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[test]
@@ -2746,6 +4362,289 @@ mod tests {
         assert_eq!(loaded.table_name, "task");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].number, "TASK0012345");
+    }
+
+    fn business_application_record(sys_id: &str, name: &str, cost: &str) -> SnowRecord {
+        let owner_sys_id = "6816f79cc0a8016401c5a33be04be441";
+        SnowRecord {
+            sys_id: sys_id.to_string(),
+            number: format!("BA:{sys_id}"),
+            table: "cmdb_ci_business_app".to_string(),
+            resource_type: ResourceType::BusinessApplication,
+            state: "1".to_string(),
+            short_description: name.to_string(),
+            description: "Business Application".to_string(),
+            fields: HashMap::from([
+                (
+                    "sys_id".to_string(),
+                    FieldValue {
+                        value: sys_id.to_string(),
+                        display_value: None,
+                    },
+                ),
+                (
+                    "name".to_string(),
+                    FieldValue {
+                        value: name.to_string(),
+                        display_value: None,
+                    },
+                ),
+                (
+                    "business_owner".to_string(),
+                    FieldValue {
+                        value: owner_sys_id.to_string(),
+                        display_value: Some("Jane Owner".to_string()),
+                    },
+                ),
+                (
+                    "operational_status".to_string(),
+                    FieldValue {
+                        value: "1".to_string(),
+                        display_value: Some("Operational".to_string()),
+                    },
+                ),
+                (
+                    "attested_date".to_string(),
+                    FieldValue {
+                        value: "2026-05-01".to_string(),
+                        display_value: None,
+                    },
+                ),
+                (
+                    "u_cost".to_string(),
+                    FieldValue {
+                        value: cost.to_string(),
+                        display_value: None,
+                    },
+                ),
+                (
+                    "u_code".to_string(),
+                    FieldValue {
+                        value: "ABC-123".to_string(),
+                        display_value: None,
+                    },
+                ),
+                (
+                    "u_region".to_string(),
+                    FieldValue {
+                        value: "north".to_string(),
+                        display_value: Some("North".to_string()),
+                    },
+                ),
+                (
+                    "u_empty".to_string(),
+                    FieldValue {
+                        value: String::new(),
+                        display_value: None,
+                    },
+                ),
+            ]),
+            work_notes: Vec::new(),
+            comments: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            references: HashMap::new(),
+            synced_at: Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
+            source: crate::CacheSource::Disk,
+        }
+    }
+
+    fn insert_business_application(store: &Store, record: &SnowRecord) {
+        let mut row = RecordRow::active(
+            record.sys_id.clone(),
+            record.number.clone(),
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
+        );
+        row.short_desc = Some(record.short_description.clone());
+        row.description = Some(record.description.clone());
+        row.raw_json = serde_json::to_string(&field_values_to_json_map(&record.fields))
+            .expect("raw business application json");
+        store.upsert_record(&row, "", "").expect("insert BA row");
+        let raw = serde_json::from_str::<Value>(&row.raw_json).expect("raw json");
+        store
+            .upsert_business_application_projection(record, Some(&raw))
+            .expect("project BA row");
+    }
+
+    #[test]
+    fn initializes_schema_v8_business_application_projection_tables() {
+        let store = Store::open_in_memory().expect("store");
+
+        assert_eq!(store.schema_version().expect("version"), Some(8));
+        for table in [
+            "business_applications",
+            "business_application_fields",
+            "business_application_field_dictionary",
+            "primitive_objects",
+            "primitive_object_fields",
+        ] {
+            assert!(store.table_exists(table).expect("table exists"), "{table}");
+        }
+        for index in [
+            "idx_ba_name",
+            "idx_ba_fields_ref",
+            "idx_primitive_fields_ref",
+        ] {
+            assert!(store.index_exists(index).expect("index exists"), "{index}");
+        }
+    }
+
+    #[test]
+    fn projects_business_application_unknown_fields_and_references() {
+        let store = Store::open_in_memory().expect("store");
+        let record = business_application_record("54a4b61b6fe845000ed852a03f3ee4d0", "Epic", "150");
+        insert_business_application(&store, &record);
+
+        let projection = store
+            .get_business_application_projection(&record.sys_id)
+            .expect("projection")
+            .expect("projection row");
+        let fields = store
+            .list_business_application_fields(&record.sys_id)
+            .expect("fields");
+
+        assert_eq!(projection.name, "Epic");
+        assert_eq!(
+            projection.business_owner_sys_id.as_deref(),
+            Some("6816f79cc0a8016401c5a33be04be441")
+        );
+        assert_eq!(
+            projection.business_owner_name.as_deref(),
+            Some("Jane Owner")
+        );
+        assert!(fields.iter().any(|field| field.field_name == "u_cost"));
+        let custom = fields
+            .iter()
+            .find(|field| field.field_name == "u_region")
+            .expect("custom field");
+        assert_eq!(custom.value_text.as_deref(), Some("north"));
+        assert_eq!(custom.display_value.as_deref(), Some("North"));
+    }
+
+    #[test]
+    fn local_business_application_query_filters_all_projected_field_shapes() {
+        use crate::query::filter::{BusinessApplicationQuery, FieldOperator, SortDirection};
+
+        let store = Store::open_in_memory().expect("store");
+        let epic = business_application_record("54a4b61b6fe845000ed852a03f3ee4d0", "Epic", "150");
+        let other = business_application_record("74a4b61b6fe845000ed852a03f3ee4d1", "Other", "50");
+        insert_business_application(&store, &epic);
+        insert_business_application(&store, &other);
+
+        let rows = store
+            .query_business_application_records(
+                &BusinessApplicationQuery::new()
+                    .filter("name", FieldOperator::Contains, serde_json::json!("pic"))
+                    .filter(
+                        "business_owner",
+                        FieldOperator::Eq,
+                        serde_json::json!("6816f79cc0a8016401c5a33be04be441"),
+                    )
+                    .filter(
+                        "business_owner",
+                        FieldOperator::Contains,
+                        serde_json::json!("Jane"),
+                    )
+                    .filter(
+                        "operational_status",
+                        FieldOperator::Eq,
+                        serde_json::json!("Operational"),
+                    )
+                    .filter(
+                        "attested_date",
+                        FieldOperator::Gte,
+                        serde_json::json!("2026-01-01"),
+                    )
+                    .filter("u_cost", FieldOperator::Gt, serde_json::json!(100))
+                    .filter("u_cost", FieldOperator::Lte, serde_json::json!(200))
+                    .filter("u_cost", FieldOperator::Ne, serde_json::json!(0))
+                    .filter(
+                        "u_code",
+                        FieldOperator::StartsWith,
+                        serde_json::json!("ABC"),
+                    )
+                    .filter(
+                        "u_region",
+                        FieldOperator::In,
+                        serde_json::json!(["South", "North"]),
+                    )
+                    .filter("u_empty", FieldOperator::IsEmpty, Value::Null)
+                    .filter("u_code", FieldOperator::IsNotEmpty, Value::Null)
+                    .text("owner")
+                    .sort_by("name", SortDirection::Desc)
+                    .limit(10),
+            )
+            .expect("query BA records");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sys_id, epic.sys_id);
+    }
+
+    #[test]
+    fn stores_unresolved_primitive_stub() {
+        let store = Store::open_in_memory().expect("store");
+
+        store
+            .upsert_unresolved_primitive_stub(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "u_unknown_reference",
+                "Unknown Owner",
+                PrimitiveResolutionStatus::UnknownTable,
+                Some("table not in primitive allowlist".to_string()),
+            )
+            .expect("stub");
+
+        let primitive = store
+            .get_primitive_object("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("primitive")
+            .expect("primitive row");
+        assert_eq!(primitive.table_name, "u_unknown_reference");
+        assert_eq!(
+            primitive.resolution_status,
+            PrimitiveResolutionStatus::UnknownTable
+        );
+        assert_eq!(primitive.display_name, "Unknown Owner");
+    }
+
+    #[test]
+    fn business_application_resource_type_is_canonical_string_with_table_alias() {
+        let store = Store::open_in_memory().expect("store");
+        let record = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "BA:54a4b61b6fe845000ed852a03f3ee4d0",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
+        );
+
+        store
+            .upsert_record(&record, "", "")
+            .expect("insert business app");
+
+        let stored_resource_type: String = store
+            .conn
+            .query_row(
+                "SELECT resource_type FROM records WHERE sys_id = ?1",
+                ["54a4b61b6fe845000ed852a03f3ee4d0"],
+                |row| row.get(0),
+            )
+            .expect("stored resource type");
+        assert_eq!(stored_resource_type, "business_application");
+
+        let loaded = store
+            .get_record_by_number_and_type(
+                "BA:54a4b61b6fe845000ed852a03f3ee4d0",
+                ResourceType::BusinessApplication,
+            )
+            .expect("query")
+            .expect("row");
+        assert_eq!(loaded.resource_type, ResourceType::BusinessApplication);
+        assert_eq!(
+            str_to_resource_type("cmdb_ci_business_app").unwrap(),
+            ResourceType::BusinessApplication
+        );
     }
 
     #[test]
@@ -2832,7 +4731,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate store");
-        assert_eq!(store.schema_version().expect("version"), Some(7));
+        assert_eq!(store.schema_version().expect("version"), Some(8));
         assert!(
             store
                 .table_has_column("fts_records", "tag_tokens")
@@ -2927,7 +4826,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate unversioned legacy kb store");
-        assert_eq!(store.schema_version().expect("version"), Some(7));
+        assert_eq!(store.schema_version().expect("version"), Some(8));
         assert!(
             store
                 .table_has_column("knowledge_articles", "sys_updated_on")

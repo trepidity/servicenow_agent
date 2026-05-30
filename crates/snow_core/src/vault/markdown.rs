@@ -151,6 +151,10 @@ pub fn render_snow_record(record: &SnowRecord) -> String {
     }
 
     out.push_str("---\n\n");
+    if record.resource_type == ResourceType::BusinessApplication {
+        push_business_application_body(&mut out, record);
+        return out;
+    }
     writeln!(
         &mut out,
         "# {}: {}",
@@ -162,6 +166,78 @@ pub fn render_snow_record(record: &SnowRecord) -> String {
     push_journal_section(&mut out, "Work Notes", &record.work_notes);
     push_journal_section(&mut out, "Comments", &record.comments);
     out
+}
+
+fn push_business_application_body(out: &mut String, record: &SnowRecord) {
+    let name = record
+        .fields
+        .get("name")
+        .map(|value| {
+            value
+                .display_value
+                .as_deref()
+                .unwrap_or(value.value.as_str())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(record.short_description.as_str());
+    writeln!(out, "# {}", name).unwrap();
+    out.push('\n');
+
+    out.push_str("## Summary\n\n");
+    writeln!(out, "- Sys ID: {}", record.sys_id).unwrap();
+    writeln!(out, "- Table: {}", record.table).unwrap();
+    writeln!(out, "- State: {}", record.state).unwrap();
+    if !record.description.trim().is_empty() {
+        writeln!(out, "- Description: {}", record.description.trim()).unwrap();
+    }
+    out.push('\n');
+
+    out.push_str("## Ownership\n\n");
+    for field in [
+        "business_owner",
+        "it_application_owner",
+        "managed_by_group",
+        "support_group",
+        "portfolio",
+    ] {
+        if let Some(reference) = record.references.get(field) {
+            writeln!(
+                out,
+                "- {}: {} ({})",
+                field, reference.display_name, reference.sys_id
+            )
+            .unwrap();
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Operational\n\n");
+    for field in ["operational_status", "attested_date", "sys_updated_on"] {
+        if let Some(value) = record.fields.get(field) {
+            writeln!(
+                out,
+                "- {}: {}",
+                field,
+                value
+                    .display_value
+                    .as_deref()
+                    .unwrap_or(value.value.as_str())
+            )
+            .unwrap();
+        }
+    }
+    out.push('\n');
+
+    out.push_str("## Fields\n\n");
+    let fields: BTreeMap<_, _> = record.fields.iter().collect();
+    for (field, value) in fields {
+        let rendered = value
+            .display_value
+            .as_deref()
+            .unwrap_or(value.value.as_str());
+        writeln!(out, "- {}: {}", field, rendered).unwrap();
+    }
+    out.push('\n');
 }
 
 pub fn render_knowledge_article(article: &KnowledgeArticle) -> String {
@@ -619,6 +695,7 @@ fn resource_type_slug(resource_type: &ResourceType) -> &'static str {
         ResourceType::Timecard => "timecard",
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
+        ResourceType::BusinessApplication => "business_application",
     }
 }
 
@@ -639,6 +716,9 @@ fn resource_type_from_slug(slug: &str) -> Result<ResourceType> {
         "timecard" => ResourceType::Timecard,
         "knowledge" => ResourceType::Knowledge,
         "approval" => ResourceType::Approval,
+        "business_application" | "business_app" | "cmdb_ci_business_app" => {
+            ResourceType::BusinessApplication
+        }
         other => bail!("unknown resource_type slug: {other}"),
     })
 }

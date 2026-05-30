@@ -60,9 +60,10 @@ build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 Enabled by default (unless a policy entry disables them). Operate against ServiceNow
 or the local cache; none mutate ServiceNow records.
 
-- **Records:** `get_record`, `search_records`, `user_lookup`, `list_records`, `list_my_tasks`,
-  `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`, `get_work_notes`,
-  `attachment_list`
+- **Records:** `get_record`, `search_records`, `user_lookup`, `business_application_get`,
+  `business_application_search`, `business_application_query`, `business_application_fields`,
+  `list_records`, `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`,
+  `get_children`, `get_work_notes`, `attachment_list`
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,
@@ -76,6 +77,134 @@ or the local cache; none mutate ServiceNow records.
 
 > Local-cache writers (`kb_sync`, `kb_semantic_rebuild`, `rebuild_cache`, `repair_vault`)
 > write only to the local KB vault/cache — **never** to ServiceNow.
+
+---
+
+## Business Applications (read-only primitive)
+
+Business Applications (`cmdb_ci_business_app`) are a first-class local primitive
+with four **read-only** MCP tools. None mutate ServiceNow — there is **no
+create/update/delete/retire surface**. All four are **enabled by default** (they
+are read tools) and are included in the `read_only_agent` role allow-list in
+[`policy.example.toml`](./policy.example.toml).
+
+| Tool | What it does | Live API call? | Persists to vault? |
+|---|---|---|---|
+| `business_application_get` | Fetch one Business Application by `sys_id` or exact `name` | No (serves the local cache/vault) | n/a — reads local |
+| `business_application_search` | Live query `cmdb_ci_business_app` by name/owner/group/portfolio/state | Yes | Yes, by default |
+| `business_application_query` | Local SQLite query/filter/sort across **all** projected BA fields | No | n/a — reads local |
+| `business_application_fields` | List dictionary-enriched BA field metadata merged with per-field observed counts (`refresh_dictionary` triggers a live `sys_dictionary` fetch) | Only when `refresh_dictionary=true` | n/a — reads local |
+
+Hydration behavior (search and the daemon `*_get_fresh` path): full-row fetch (no
+`sysparm_fields`, `sysparm_display_value=all`), persist to
+`business_applications/business_application_<sys_id>_<slug>.md`, project all
+fields into SQLite (schema v8), and hydrate referenced sys_ids — owners, groups,
+portfolio — into local primitive objects (or unresolved/blocked/unknown stubs).
+Reference-resolution failures are **degraded reads**: the BA read still succeeds
+and surfaces diagnostics rather than failing.
+
+### `business_application_get`
+
+Reads a single Business Application from the local cache/vault. Schema is a strict
+union: supply **exactly one** of `sys_id` or `name`.
+
+- **Params:** `sys_id` (32-hex) **xor** `name` (exact match). Hydration knobs
+  `persist` (default `true`), `resolve_references` (default `true`),
+  `reference_depth` (`0`–`2`, default `1`), `refresh_dictionary` (default
+  `false`) are accepted on the foreground schema; the live re-fetch they drive is
+  the daemon `business_application_get_fresh` path.
+- **Returns:** `{ "business_application": <BA>, "markdown": "<rendered markdown>" }`.
+  Not found → JSON-RPC error `-32004`.
+
+### `business_application_search`
+
+Live query against `cmdb_ci_business_app`; **persists every returned BA by
+default** (`persist = true`). Reference filters accept either a sys_id or a
+display-name substring.
+
+- **Filter params (all optional):** `name`, `business_owner`, `is_owner`,
+  `ci_owner_group`, `primary_support_group`, `operational_state`,
+  `operational_state_not`, `primary_portfolio`, `attested_date` (and
+  `attested_date_on_or_after` / `attested_date_on_or_before`, all
+  `YYYY-MM-DD`), `limit` (`1`–`100`, default `20`).
+- **Hydration params:** `persist` (default `true`), `resolve_references` (default
+  `true`), `reference_depth` (`0`–`2`, default `1`), `refresh_dictionary`
+  (default `false`). Empty params produce the default bounded search ordered by
+  `name`.
+- **Returns:** `{ "business_applications": [<BA>...], "records": [<record>...] }`
+  — the `records` array mirrors each BA's `record` field for callers that consume
+  the existing `SnowRecord` shape.
+
+### `business_application_query`
+
+LOCAL SQLite query/filter/sort across all projected BA fields. No live API call;
+materializes from vault first with `raw_json` fallback. Unknown field names are
+allowed (the server sets `allow_unknown_fields`), so newly observed `u_*` /
+custom fields are queryable.
+
+- **Params:** `text` (free-text search), `filters[]` (each
+  `{ field, op, value }`, `op` ∈ `eq, ne, contains, starts_with, in, is_empty,
+  is_not_empty, gt, gte, lt, lte`), `include_tombstoned` (default `false`),
+  `limit` (`1`–`500`, default `20`), `offset` (default `0`), `sort[]` (each
+  `{ field, direction }`, `direction` ∈ `asc, desc`). Filter `field` accepts
+  ServiceNow field names or convenience aliases (`business_owner`, `is_owner`,
+  `ci_owner_group`, `primary_support_group`, `operational_state`,
+  `primary_portfolio`).
+- **Returns:** `{ "business_applications": [<BA>...] }`.
+
+### `business_application_fields`
+
+Reports dictionary-backed field metadata for the BA table and its ancestors,
+merged with the fields observed across the local cache. With
+`refresh_dictionary=true`, the daemon first fetches live `sys_dictionary` rows
+for `cmdb_ci_business_app` and its inherited tables and caches them in
+`business_application_field_dictionary`; entries then carry
+`dictionary_verified=true`. When the dictionary is unreachable, entries fall
+back to observed-only (`dictionary_verified=false`) plus a degraded
+`diagnostic`.
+
+- **Params:** `refresh_dictionary` (default `false`).
+- **Returns:** `{ "fields": [{ "field": "<name>", "observed_count": <n>,
+  "dictionary_verified": <bool>, "label"?, "field_type"?, "reference_table"?,
+  "mandatory"?, "read_only"?, "choice"?, "max_length"?, "sample_value"?,
+  "sample_display_value"?, "diagnostic"? }...] }`. Dictionary-only fields appear
+  with `observed_count = 0`; observed-only fields appear with
+  `dictionary_verified = false`.
+
+### `<BA>` return shape
+
+Each `business_application` object contains:
+
+- `record` — the underlying `SnowRecord` (also carries `browser_url` and
+  `vault_relative_path`).
+- `name`.
+- Typed reference fields when present: `business_owner` (`business_owner` →
+  `sys_user`), `is_owner` (`it_application_owner` → `sys_user`), `ci_owner_group`
+  (`managed_by_group` → `sys_user_group`), `primary_support_group`
+  (`support_group` → `sys_user_group`), `primary_portfolio` (`portfolio`).
+- `operational_state` (from `operational_status`), `attested_date` when present.
+- `fields` — every readable returned field (value + display value).
+- `unresolved_references` — reference-hydration diagnostics. On the foreground
+  server this is an empty array; the daemon-backed path
+  (`business_application_get_fresh`, `business_application_search`) populates it
+  with `DaemonBusinessApplicationDiagnostic` entries
+  (`reference_not_found`, `reference_acl_restricted`, `unknown_reference_table`,
+  `dictionary_unavailable`, `reference_resolution_failed`, etc.).
+- `browser_url`, `vault_relative_path` — when the instance URL and file path are
+  available.
+
+### Policy and bridge notes
+
+- These are **read tools**: no confirmation token, no write-policy enablement,
+  no `requires_kb_evidence`. They still respect normal MCP allow/deny filtering
+  and per-role allow-lists.
+- The daemon bridge forwards all four to the matching daemon JSON-RPC methods and
+  gates them on daemon `contract_info.supported_methods` — they are only
+  advertised/callable when the attached daemon reports support. Search forwards
+  the hydration options (`persist`, `resolve_references`, `reference_depth`,
+  `refresh_dictionary`) to the daemon. The daemon-only
+  `business_application_get_fresh` and `business_application_sync` methods are
+  **not** exposed as foreground MCP tools.
 
 ---
 

@@ -75,6 +75,43 @@ snow tui --daemon
 
 The record detail pane includes a collapsed `Task SLA` heading by default. Press `S` in the browser view to expand or collapse bounded SLA row detail. SLA loading failures render inside that section and do not block the rest of the detail view.
 
+### Business Applications
+
+Business Applications (`cmdb_ci_business_app`) are a first-class local primitive. The canonical local resource type is `business_application`; `cmdb_ci_business_app` is accepted as an input alias for list/query filters.
+
+The `snow business-app` subcommand family is a thin CLI over the daemon JSON-RPC methods (`business_application_get`, `business_application_search`, `business_application_query`, `business_application_fields`, `business_application_sync`); it drives a running daemon and auto-spawns it as needed. There is no Business Application write/create/update surface — every subcommand is a read (`sync`/`search` perform a live ServiceNow read plus a local vault/SQLite write).
+
+```bash
+snow business-app get --sys-id <sys_id> | --name "Epic" [--fresh] [--json] [--full]
+snow business-app search --name Epic --operational-state-not 2 [--limit N] [--json] [--full]
+snow business-app query --field business_owner --contains "Jane" [--limit N] [--json]
+snow business-app query --field u_custom_field --eq "value"
+snow business-app fields [--refresh] [--json]
+snow business-app sync --name Epic [--persist] [--resolve-references] [--reference-depth N] [--refresh-dictionary] [--json]
+```
+
+- `get` reads from the local cache/vault (after hydration); `--fresh` re-fetches the live row and updates the projection. Supply exactly one of `--sys-id` or `--name`.
+- `search` runs a live `cmdb_ci_business_app` query and persists by default.
+- `query` filters/sorts entirely against the local SQLite projection — no API call. `--field` is repeatable and pairs by position with `--contains`/`--eq` (one operator value per field).
+- `fields` lists dictionary-backed field metadata; `--refresh` triggers a live `sys_dictionary` fetch first (see below).
+- `sync` runs a live search+persist and returns a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`). `--persist` defaults on; `--refresh-dictionary` refreshes the dictionary once before syncing.
+
+Default human output shows name, sys_id, owners, groups, portfolio, operational status, attested date, vault path, and unresolved-reference count. `--json` emits the daemon view DTO; `--full` appends the all-fields table.
+
+What a search, sync, or fresh fetch does:
+
+- Fetches the complete readable ServiceNow row — no hand-picked `sysparm_fields`, with `display_value=all` — and maps it to a typed `BusinessApplication`.
+- Persists by default. Each returned Business Application is written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md` (for example `business_applications/business_application_54a4b61b6fe845000ed852a03f3ee4d0_epic.md`). `persist=false` exists only for explicit debug/preview paths.
+- Projects every returned field into local SQLite (schema v8) so `business_application_query` filters and sorts on any observed field locally, without another API call.
+- Resolves reference-valued sys_ids (owners, groups, portfolio) into local primitive objects when the target table is supported, or stores them as unresolved/blocked/unknown reference stubs otherwise. Reference-resolution failures are degraded reads — they do not fail the Business Application read.
+- Returns `browser_url` and `vault_relative_path` in the daemon DTO when the instance URL and file path are available.
+
+`business_application_fields` returns dictionary-enriched metadata. With `--refresh` (or `refresh_dictionary=true`), the daemon fetches live `sys_dictionary` rows for `cmdb_ci_business_app` and its inherited tables, caches them in `business_application_field_dictionary`, and merges label, field type, reference table, mandatory/read-only/choice flags, max length, and `dictionary_verified=true` with the observed per-field counts. When the dictionary is unreachable it falls back to observed-only entries plus a degraded diagnostic. Field aliases (`ci_owner_group`, `primary_portfolio` and its reference target table, `attested_date`) are dictionary-verified when metadata is available and use the hardcoded baseline otherwise.
+
+Business Applications are also exposed as four read-only MCP tools (`get`/`search`/`query`/`fields`) — see `crates/snow_mcp/CAPABILITIES.md`. `business_application_sync` and `business_application_get_fresh` are JSON-RPC + CLI only; they are deliberately not MCP tools.
+
+In the record browser TUI, `cmdb_ci_business_app` records route to a first-class Business Application detail view with typed ownership/operational sections (operational status, business owner, information owner, CI owner group, support group, portfolio, attested date) plus the all-fields table.
+
 ### List change tasks
 
 ```bash

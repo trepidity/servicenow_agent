@@ -95,6 +95,41 @@ impl<'a> DaemonTransport<'a> {
         })
     }
 
+    pub fn business_application(&self, record: &SnowRecord) -> Result<DaemonBusinessApplication> {
+        let record_dto = self.record(record)?;
+        Ok(DaemonBusinessApplication {
+            browser_url: record_dto.browser_url.clone(),
+            vault_relative_path: record_dto.vault_relative_path.clone(),
+            name: business_application_name(record),
+            business_owner: business_application_reference(record, "business_owner", "sys_user"),
+            is_owner: business_application_reference(record, "it_application_owner", "sys_user"),
+            ci_owner_group: business_application_reference(
+                record,
+                "managed_by_group",
+                "sys_user_group",
+            ),
+            primary_support_group: business_application_reference(
+                record,
+                "support_group",
+                "sys_user_group",
+            ),
+            operational_state: record
+                .fields
+                .get("operational_status")
+                .cloned()
+                .map(Into::into),
+            primary_portfolio: business_application_reference(record, "portfolio", ""),
+            attested_date: record
+                .fields
+                .get("attested_date")
+                .map(|field| field.value.clone())
+                .filter(|value| !value.trim().is_empty()),
+            fields: record_dto.fields.clone(),
+            unresolved_references: Vec::new(),
+            record: record_dto,
+        })
+    }
+
     pub fn knowledge_search_hit(
         &self,
         hit: &KnowledgeSearchHit,
@@ -199,6 +234,40 @@ impl<'a> DaemonTransport<'a> {
     }
 }
 
+fn business_application_name(record: &SnowRecord) -> String {
+    record
+        .fields
+        .get("name")
+        .map(|field| field.display_value.as_ref().unwrap_or(&field.value).clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn business_application_reference(
+    record: &SnowRecord,
+    field_name: &str,
+    default_table: &str,
+) -> Option<DaemonReference> {
+    let field = record.fields.get(field_name)?;
+    let sys_id = field.value.trim();
+    if sys_id.is_empty() {
+        return None;
+    }
+    Some(DaemonReference {
+        sys_id: sys_id.to_string(),
+        table: default_table.to_string(),
+        display_name: field
+            .display_value
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| sys_id.to_string()),
+        extra: HashMap::new(),
+    })
+}
+
 fn normalize_instance_url(instance_url: &str) -> Option<String> {
     let trimmed = instance_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -270,6 +339,42 @@ pub struct DaemonApprovalRecord {
     pub requested_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_date: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DaemonBusinessApplication {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_relative_path: Option<String>,
+    pub record: DaemonSnowRecord,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub business_owner: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_owner: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_owner_group: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_support_group: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operational_state: Option<DaemonFieldValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_portfolio: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attested_date: Option<String>,
+    pub fields: HashMap<String, DaemonFieldValue>,
+    pub unresolved_references: Vec<DaemonBusinessApplicationDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DaemonBusinessApplicationDiagnostic {
+    pub field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sys_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    pub diagnostic: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -475,6 +580,7 @@ pub enum DaemonResourceType {
     Timecard,
     Knowledge,
     Approval,
+    BusinessApplication,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -675,6 +781,7 @@ impl From<ResourceType> for DaemonResourceType {
             ResourceType::Timecard => Self::Timecard,
             ResourceType::Knowledge => Self::Knowledge,
             ResourceType::Approval => Self::Approval,
+            ResourceType::BusinessApplication => Self::BusinessApplication,
         }
     }
 }

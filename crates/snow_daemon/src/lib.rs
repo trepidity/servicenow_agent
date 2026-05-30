@@ -346,6 +346,7 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
             url: instance,
             user: username,
             credential,
+            portal: std::env::var("SNOW_PORTAL").unwrap_or_default(),
         },
         vault: core_config::VaultConfig {
             path: default_vault_path(),

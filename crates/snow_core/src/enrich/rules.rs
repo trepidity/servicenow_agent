@@ -284,6 +284,7 @@ fn resource_type_tag(resource_type: ResourceType) -> String {
         ResourceType::Timecard => "timecard",
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
+        ResourceType::BusinessApplication => "business_application",
     }
     .to_string()
 }

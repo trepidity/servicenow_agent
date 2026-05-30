@@ -33,6 +33,7 @@ pub async fn build_fixture_state() -> Result<FixtureState> {
             url: "http://localhost".to_string(),
             user: "tester".to_string(),
             credential: CredentialProvider::Env,
+            portal: String::new(),
         },
         vault: VaultConfig {
             path: vault_path.clone(),

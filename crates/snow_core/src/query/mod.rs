@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
 use crate::cache::store::{KnowledgeBaseSummaryRow, KnowledgeCategorySummaryRow, RecordRow, Store};
-use crate::query::filter::{ApprovalQuery, ListQuery};
+use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
 use crate::query::resolver::ReferenceResolver;
 use crate::vault::VaultManager;
 use servicenow_rs::model::value::parse_servicenow_timestamp;
@@ -187,6 +187,16 @@ impl QueryEngine {
 
     pub async fn my_approvals(&self) -> Result<Vec<ApprovalRecord>> {
         self.approvals(ApprovalQuery::pending()).await
+    }
+
+    pub async fn query_business_applications(
+        &self,
+        query: BusinessApplicationQuery,
+    ) -> Result<Vec<SnowRecord>> {
+        let rows = self.store.query_business_application_records(&query)?;
+        rows.into_iter()
+            .map(|row| self.materialize_record(&row))
+            .collect()
     }
 
     pub async fn approvals(&self, query: ApprovalQuery) -> Result<Vec<ApprovalRecord>> {

@@ -671,3 +671,314 @@ pub fn strip_html(html: &str) -> String {
 
     result.trim().to_string()
 }
+
+use crate::tui_client::{
+    BusinessApplicationDiagnostic, BusinessApplicationFieldValue, BusinessApplicationRef,
+    BusinessApplicationView,
+};
+
+/// Render a reference as `display name (sys_id)`, or `-` when absent.
+fn format_ba_ref(reference: Option<&BusinessApplicationRef>) -> String {
+    match reference {
+        Some(r) if !r.display_name.trim().is_empty() => {
+            format!("{} ({})", r.display_name, r.sys_id)
+        }
+        Some(r) => r.sys_id.clone(),
+        None => "-".to_string(),
+    }
+}
+
+/// Render a field value, preferring the display value when present.
+fn format_ba_field_value(value: &BusinessApplicationFieldValue) -> String {
+    match value.display_value.as_deref() {
+        Some(display) if !display.trim().is_empty() && display != value.value => {
+            format!("{} [{}]", display, value.value)
+        }
+        Some(display) if !display.trim().is_empty() => display.to_string(),
+        _ => value.value.clone(),
+    }
+}
+
+/// Format the human-readable Business Application detail.
+///
+/// Per spec §13 the default view shows name, sys_id, owners, groups, portfolio,
+/// operational status, attested date, vault path, and unresolved-reference
+/// count. `full` appends the all-fields table.
+pub fn format_business_application(app: &BusinessApplicationView, full: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} ({})", app.name.bold(), app.sys_id);
+    if !app.number.trim().is_empty() {
+        let _ = writeln!(out, "{:>22} {}", "number:".dimmed(), app.number);
+    }
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "business owner:".dimmed(),
+        format_ba_ref(app.business_owner.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "information owner:".dimmed(),
+        format_ba_ref(app.is_owner.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "ci owner group:".dimmed(),
+        format_ba_ref(app.ci_owner_group.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "support group:".dimmed(),
+        format_ba_ref(app.primary_support_group.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "portfolio:".dimmed(),
+        format_ba_ref(app.primary_portfolio.as_ref())
+    );
+    let operational = app
+        .operational_state
+        .as_ref()
+        .map(format_ba_field_value)
+        .unwrap_or_else(|| "-".to_string());
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "operational status:".dimmed(),
+        operational
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "attested date:".dimmed(),
+        app.attested_date.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "vault path:".dimmed(),
+        app.vault_relative_path.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "{:>22} {}",
+        "unresolved refs:".dimmed(),
+        app.unresolved_references.len()
+    );
+    if let Some(url) = &app.browser_url {
+        let _ = writeln!(out, "{:>22} {}", "url:".dimmed(), url);
+    }
+
+    // List each unresolved reference so the count is actionable.
+    if !app.unresolved_references.is_empty() {
+        let _ = writeln!(out, "unresolved references:");
+        for diag in &app.unresolved_references {
+            let _ = writeln!(out, "  - {}", format_ba_diagnostic(diag));
+        }
+    }
+
+    if full {
+        let _ = writeln!(out, "fields:");
+        if app.fields.is_empty() {
+            let _ = writeln!(out, "  (none)");
+        }
+        for (key, value) in &app.fields {
+            let _ = writeln!(out, "  {}: {}", key, format_ba_field_value(value));
+        }
+    }
+
+    out
+}
+
+/// One-line description of an unresolved reference diagnostic.
+fn format_ba_diagnostic(diag: &BusinessApplicationDiagnostic) -> String {
+    let mut parts = vec![diag.field.clone()];
+    if let Some(table) = &diag.table {
+        parts.push(format!("table={table}"));
+    }
+    if let Some(sys_id) = &diag.sys_id {
+        parts.push(format!("sys_id={sys_id}"));
+    }
+    parts.push(diag.diagnostic.clone());
+    parts.join(" ")
+}
+
+/// Compact one-line summary used in `business-app search` listings.
+pub fn format_business_application_summary(app: &BusinessApplicationView) -> String {
+    let operational = app
+        .operational_state
+        .as_ref()
+        .map(format_ba_field_value)
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{} ({}) — owner: {} — state: {} — unresolved: {}",
+        app.name.bold(),
+        app.sys_id,
+        format_ba_ref(app.business_owner.as_ref()),
+        operational,
+        app.unresolved_references.len()
+    )
+}
+
+/// Generically render the dictionary `fields` array returned by the daemon.
+///
+/// The backend owns and may enrich the per-field object shape, so this renders
+/// each entry by surfacing a name-ish key (`field`/`name`/`element`/`column`)
+/// followed by all remaining key/value pairs — without hard-binding to a fixed
+/// schema beyond the name key.
+pub fn format_business_application_fields(fields: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let Some(entries) = fields.as_array() else {
+        // Not an array; fall back to pretty JSON so nothing is lost.
+        return serde_json::to_string_pretty(fields).unwrap_or_else(|_| fields.to_string());
+    };
+    if entries.is_empty() {
+        return "No Business Application fields found.\n".to_string();
+    }
+    for entry in entries {
+        match entry {
+            serde_json::Value::Object(map) => {
+                // Pick the first present name-ish key as the heading.
+                let name = ["field", "name", "element", "column", "column_name"]
+                    .iter()
+                    .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+                    .unwrap_or("(field)");
+                let _ = writeln!(out, "{}", name.bold());
+                for (key, value) in map {
+                    if value.as_str() == Some(name) {
+                        continue;
+                    }
+                    let _ = writeln!(out, "  {}: {}", key, render_json_scalar(value));
+                }
+            }
+            other => {
+                let _ = writeln!(out, "{}", render_json_scalar(other));
+            }
+        }
+    }
+    out
+}
+
+/// Generically render a single summary object (e.g. `business-app sync`).
+///
+/// The backend owns this shape, so each top-level key/value pair is printed as a
+/// line rather than binding to specific summary field names.
+pub fn format_business_application_summary_object(summary: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    match summary {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return "(empty summary)\n".to_string();
+            }
+            for (key, value) in map {
+                let _ = writeln!(out, "{}: {}", key, render_json_scalar(value));
+            }
+        }
+        other => {
+            return serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string());
+        }
+    }
+    out
+}
+
+/// Render a JSON value as a compact one-line string for key/value output.
+fn render_json_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "-".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod business_app_tests {
+    use super::*;
+    use crate::tui_client::{BusinessApplicationRef, BusinessApplicationView};
+
+    fn sample_view() -> BusinessApplicationView {
+        BusinessApplicationView {
+            sys_id: "sys123".to_string(),
+            number: "BAPP0001".to_string(),
+            name: "Epic".to_string(),
+            business_owner: Some(BusinessApplicationRef {
+                sys_id: "owner1".to_string(),
+                table: "sys_user".to_string(),
+                display_name: "Jane Doe".to_string(),
+            }),
+            is_owner: None,
+            ci_owner_group: None,
+            primary_support_group: None,
+            operational_state: Some(BusinessApplicationFieldValue {
+                value: "1".to_string(),
+                display_value: Some("Operational".to_string()),
+            }),
+            primary_portfolio: None,
+            attested_date: Some("2026-01-01".to_string()),
+            fields: vec![(
+                "u_custom".to_string(),
+                BusinessApplicationFieldValue {
+                    value: "v".to_string(),
+                    display_value: None,
+                },
+            )],
+            unresolved_references: vec![],
+            browser_url: None,
+            vault_relative_path: Some("business_applications/epic-sys123.md".to_string()),
+        }
+    }
+
+    #[test]
+    fn detail_shows_spec_required_fields() {
+        let out = format_business_application(&sample_view(), false);
+        assert!(out.contains("Epic"));
+        assert!(out.contains("sys123"));
+        assert!(out.contains("Jane Doe"));
+        assert!(out.contains("Operational"));
+        assert!(out.contains("2026-01-01"));
+        assert!(out.contains("business_applications/epic-sys123.md"));
+        assert!(out.contains("unresolved refs:"));
+        // Without --full, the all-fields table is omitted.
+        assert!(!out.contains("u_custom"));
+    }
+
+    #[test]
+    fn full_detail_includes_field_table() {
+        let out = format_business_application(&sample_view(), true);
+        assert!(out.contains("u_custom"));
+    }
+
+    #[test]
+    fn summary_is_one_line_with_owner_and_state() {
+        let out = format_business_application_summary(&sample_view());
+        assert!(out.contains("Epic"));
+        assert!(out.contains("Jane Doe"));
+        assert!(out.contains("Operational"));
+    }
+
+    #[test]
+    fn fields_render_generically_by_name_key() {
+        let json = serde_json::json!([
+            { "field": "business_owner", "type": "reference", "reference": "sys_user" },
+            { "name": "operational_state", "type": "integer" }
+        ]);
+        let out = format_business_application_fields(&json);
+        assert!(out.contains("business_owner"));
+        assert!(out.contains("reference"));
+        assert!(out.contains("operational_state"));
+    }
+
+    #[test]
+    fn summary_object_renders_key_value_lines() {
+        let json = serde_json::json!({ "persisted": 3, "resolved_references": 5 });
+        let out = format_business_application_summary_object(&json);
+        assert!(out.contains("persisted: 3"));
+        assert!(out.contains("resolved_references: 5"));
+    }
+}

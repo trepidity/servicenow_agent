@@ -118,6 +118,25 @@ impl VaultLayout {
             ResourceType::Approval => self
                 .approvals_dir()
                 .join(file_name(&record.number, &record.sys_id)),
+            ResourceType::BusinessApplication => {
+                let display_name = record
+                    .fields
+                    .get("name")
+                    .map(|value| {
+                        value
+                            .display_value
+                            .as_deref()
+                            .unwrap_or(value.value.as_str())
+                    })
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        first_non_empty(&record.short_description, &record.number, &record.sys_id)
+                    });
+                self.root.join("business_applications").join(format!(
+                    "{}.md",
+                    stable_slug("business_application", &record.sys_id, display_name)
+                ))
+            }
         }
     }
 
@@ -183,6 +202,16 @@ fn file_name(primary: &str, fallback: &str) -> String {
         primary
     };
     format!("{base}.md")
+}
+
+fn first_non_empty<'a>(first: &'a str, second: &'a str, fallback: &'a str) -> &'a str {
+    if !first.trim().is_empty() {
+        first
+    } else if !second.trim().is_empty() {
+        second
+    } else {
+        fallback
+    }
 }
 
 fn stable_slug(prefix: &str, sys_id: &str, display_name: &str) -> String {
@@ -298,6 +327,30 @@ mod tests {
             layout.record_path(&record),
             PathBuf::from(
                 "/tmp/vault/knowledge/bases/kb_aabb1122ccdd_it-operations/cat_eeff3344aabb_networking/KB0012345.md"
+            )
+        );
+    }
+
+    #[test]
+    fn builds_business_application_path_from_sys_id_and_name() {
+        let layout = VaultLayout::new("/tmp/vault");
+        let mut record = sample_record(
+            ResourceType::BusinessApplication,
+            "BA:54a4b61b6fe845000ed852a03f3ee4d0",
+        );
+        record.sys_id = "54a4b61b6fe845000ed852a03f3ee4d0".to_string();
+        record.fields.insert(
+            "name".to_string(),
+            crate::FieldValue {
+                value: "Epic".to_string(),
+                display_value: None,
+            },
+        );
+
+        assert_eq!(
+            layout.record_path(&record),
+            PathBuf::from(
+                "/tmp/vault/business_applications/business_application_54a4b61b6fe845000ed852a03f3ee4d0_epic.md"
             )
         );
     }

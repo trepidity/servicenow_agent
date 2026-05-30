@@ -35,6 +35,26 @@ pub fn register(registry: &mut ToolRegistry) {
             user_lookup_arg_schema(),
         ),
         (
+            "business_application_get",
+            "Get a locally cached Business Application by sys_id or exact name",
+            business_application_get_arg_schema(),
+        ),
+        (
+            "business_application_search",
+            "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date; results persist by default when supported by the daemon/core contract",
+            business_application_search_arg_schema(),
+        ),
+        (
+            "business_application_query",
+            "Query locally projected Business Application fields",
+            business_application_query_arg_schema(),
+        ),
+        (
+            "business_application_fields",
+            "List observed Business Application fields from the local projection",
+            business_application_fields_arg_schema(),
+        ),
+        (
             "list_records",
             "List records with optional daemon-side filters",
             json!({"type":"object","properties":{"resource_type":{"type":"string"},"parent_number":{"type":"string"},"assigned_to":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
@@ -131,6 +151,185 @@ fn user_lookup_arg_schema() -> Value {
                 "type": "boolean",
                 "default": true,
                 "description": "Filter by sys_user.active. Omitted means true."
+            }
+        }
+    })
+}
+
+pub fn business_application_get_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Provide exactly one of sys_id or exact Business Application name.",
+        "oneOf": [
+            {
+                "required": ["sys_id"],
+                "not": { "required": ["name"] }
+            },
+            {
+                "required": ["name"],
+                "not": { "required": ["sys_id"] }
+            }
+        ],
+        "properties": {
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$"
+            },
+            "name": {
+                "type": "string"
+            },
+            "persist": {
+                "type": "boolean",
+                "default": true
+            },
+            "resolve_references": {
+                "type": "boolean",
+                "default": true
+            },
+            "reference_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2,
+                "default": 1
+            },
+            "refresh_dictionary": {
+                "type": "boolean",
+                "default": false
+            }
+        }
+    })
+}
+
+pub fn business_application_search_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Search cmdb_ci_business_app. Reference filters accept a sys_id or a display-name substring. Live search persists by default when supported by the daemon/core contract.",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Business Application name substring, for example Epic"
+            },
+            "business_owner": {
+                "type": "string",
+                "description": "Business Owner display-name substring or sys_id"
+            },
+            "is_owner": {
+                "type": "string",
+                "description": "IS Owner / IT Application Owner display-name substring or sys_id"
+            },
+            "ci_owner_group": {
+                "type": "string",
+                "description": "CI owner group display-name substring or sys_id"
+            },
+            "primary_support_group": {
+                "type": "string",
+                "description": "Primary Support Group display-name substring or sys_id"
+            },
+            "operational_state": {
+                "type": "string",
+                "description": "Operational state/status label or raw choice value"
+            },
+            "operational_state_not": {
+                "type": "string",
+                "description": "Operational state/status label or raw choice value to exclude"
+            },
+            "primary_portfolio": {
+                "type": "string",
+                "description": "Primary Portfolio display-name substring or sys_id"
+            },
+            "attested_date": {
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "description": "Exact Attested Date"
+            },
+            "attested_date_on_or_after": {
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "attested_date_on_or_before": {
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20
+            },
+            "persist": {
+                "type": "boolean",
+                "default": true
+            },
+            "resolve_references": {
+                "type": "boolean",
+                "default": true
+            },
+            "reference_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2,
+                "default": 1
+            },
+            "refresh_dictionary": {
+                "type": "boolean",
+                "default": false
+            }
+        }
+    })
+}
+
+pub fn business_application_query_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Query locally projected Business Applications. Filters use ServiceNow field names or convenience aliases such as business_owner, is_owner, ci_owner_group, primary_support_group, operational_state, primary_portfolio.",
+        "properties": {
+            "text": { "type": "string" },
+            "filters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["field", "op"],
+                    "properties": {
+                        "field": { "type": "string" },
+                        "op": {
+                            "type": "string",
+                            "enum": ["eq", "ne", "contains", "starts_with", "in", "is_empty", "is_not_empty", "gt", "gte", "lt", "lte"]
+                        },
+                        "value": {}
+                    }
+                }
+            },
+            "include_tombstoned": { "type": "boolean", "default": false },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20 },
+            "offset": { "type": "integer", "minimum": 0, "default": 0 },
+            "sort": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["field"],
+                    "properties": {
+                        "field": { "type": "string" },
+                        "direction": { "type": "string", "enum": ["asc", "desc"], "default": "asc" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub fn business_application_fields_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "refresh_dictionary": {
+                "type": "boolean",
+                "default": false
             }
         }
     })

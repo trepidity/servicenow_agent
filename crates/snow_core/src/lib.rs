@@ -29,6 +29,12 @@ pub use kb::{
     KnowledgeTagSummary,
 };
 pub(crate) use reference::*;
+pub use resource::business_application::{
+    BusinessApplication, BusinessApplicationFieldAliases, BusinessApplicationFieldValue,
+    BusinessApplicationHydrationOptions, BusinessApplicationLookup, BusinessApplicationSyncSummary,
+    ChoiceValue, ReferencePrimitiveDescriptor, ReferencePrimitiveType,
+    ReferenceResolutionDiagnostic, ReferenceResolutionReason, ReferenceResolutionStatus,
+};
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
 pub use resource::story::{StoryWriteConcurrency, StoryWriteResult};
@@ -55,10 +61,14 @@ use servicenow_rs::prelude::{
     DisplayValue, Error as SnowApiError, FieldValue as SnowFieldValue, Operator, Order, Record,
     ServiceNowClient, child_relation_for_table,
 };
+use servicenow_rs::query::TableApi;
 
-use crate::cache::store::{AliasRow, KeywordRow, RecordRow, TagRow};
+use crate::cache::store::{
+    AliasRow, BusinessApplicationFieldDictionaryRow, KeywordRow, PrimitiveObjectRow,
+    PrimitiveResolutionStatus, ProjectedFieldRow, RecordRow, TagRow,
+};
 use crate::enrich::derive_for_record;
-use crate::query::filter::{ApprovalQuery, ListQuery};
+use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
 use crate::resource::approval::ApprovalResource;
 use crate::semantic::{
     EmbeddingProvider, OllamaEmbeddingProvider, content_hash, cosine_similarity,
@@ -131,6 +141,9 @@ const USER_LOOKUP_FIELDS: &[&str] = &[
     "location",
     "title",
 ];
+const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
+const BUSINESS_APPLICATION_DEFAULT_LIMIT: usize = 20;
+const BUSINESS_APPLICATION_MAX_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserLookupCandidate {
@@ -181,6 +194,7 @@ pub enum ResourceType {
     Timecard,
     Knowledge,
     Approval,
+    BusinessApplication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +217,81 @@ pub struct UserLookup {
     pub sys_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessApplicationSearchParams {
+    /// Substring match against cmdb_ci_business_app.name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Business Owner display name or sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_owner: Option<String>,
+    /// IS Owner / IT Application Owner display name or sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_owner: Option<String>,
+    /// CI owner group display name or sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_owner_group: Option<String>,
+    /// Primary Support Group display name or sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_support_group: Option<String>,
+    /// Operational state/status label or raw choice value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_state: Option<String>,
+    /// Operational state/status label or raw choice value to exclude.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_state_not: Option<String>,
+    /// Primary Portfolio display name or sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_portfolio: Option<String>,
+    /// Exact attested date, YYYY-MM-DD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_date: Option<String>,
+    /// Lower attested date bound, YYYY-MM-DD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_date_on_or_after: Option<String>,
+    /// Upper attested date bound, YYYY-MM-DD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_date_on_or_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl BusinessApplicationSearchParams {
+    pub fn validate(&self) -> Result<()> {
+        self.validated_limit()?;
+        for (name, value) in [
+            ("attested_date", self.attested_date.as_deref()),
+            (
+                "attested_date_on_or_after",
+                self.attested_date_on_or_after.as_deref(),
+            ),
+            (
+                "attested_date_on_or_before",
+                self.attested_date_on_or_before.as_deref(),
+            ),
+        ] {
+            if let Some(value) = non_empty_owned(value)
+                && parse_servicenow_date(Some(&value)).is_none()
+            {
+                anyhow::bail!("`{name}` must be YYYY-MM-DD");
+            }
+        }
+        Ok(())
+    }
+
+    fn validated_limit(&self) -> Result<usize> {
+        let limit = self.limit.unwrap_or(BUSINESS_APPLICATION_DEFAULT_LIMIT);
+        if limit == 0 {
+            anyhow::bail!("`limit` must be at least 1");
+        }
+        if limit > BUSINESS_APPLICATION_MAX_LIMIT {
+            anyhow::bail!("`limit` must be at most {BUSINESS_APPLICATION_MAX_LIMIT}");
+        }
+        Ok(limit)
+    }
 }
 
 impl UserLookup {
@@ -627,8 +716,16 @@ fn matches_semantic_reference_filter(filter: Option<&str>, reference: &Reference
 
 impl SnowRecord {
     pub fn from_servicenow(record: &Record) -> Self {
-        let number = record.get_str("number").unwrap_or_default().to_string();
+        let raw_number = record.get_str("number").unwrap_or_default().to_string();
+        let is_business_application =
+            resource::business_application::is_business_application_alias(&record.table);
+        let number = if is_business_application {
+            resource::business_application::business_application_number(record)
+        } else {
+            raw_number
+        };
         let table = canonical_record_table_for_number(&record.table, &number);
+        let business_application_aliases = BusinessApplicationFieldAliases::baseline_degraded();
         let fields = record
             .fields()
             .iter()
@@ -655,15 +752,30 @@ impl SnowRecord {
             number,
             table: table.clone(),
             resource_type: ResourceType::from_table(&table),
-            state: record.get_str("state").unwrap_or_default().to_string(),
-            short_description: record
-                .get_str("short_description")
-                .unwrap_or_default()
-                .to_string(),
-            description: record
-                .get_str("description")
-                .unwrap_or_default()
-                .to_string(),
+            state: if is_business_application {
+                resource::business_application::business_application_state(
+                    record,
+                    &business_application_aliases,
+                )
+            } else {
+                record.get_str("state").unwrap_or_default().to_string()
+            },
+            short_description: if is_business_application {
+                resource::business_application::business_application_display_name(record)
+            } else {
+                record
+                    .get_str("short_description")
+                    .unwrap_or_default()
+                    .to_string()
+            },
+            description: if is_business_application {
+                resource::business_application::business_application_description(record)
+            } else {
+                record
+                    .get_str("description")
+                    .unwrap_or_default()
+                    .to_string()
+            },
             fields,
             work_notes: record
                 .parse_journal("work_notes")
@@ -703,6 +815,8 @@ impl ResourceType {
             "time_card" => Self::Timecard,
             "kb_knowledge" => Self::Knowledge,
             "sysapproval_approver" => Self::Approval,
+            "cmdb_ci_business_app" => Self::BusinessApplication,
+            "business_application" | "business_app" => Self::BusinessApplication,
             _ => Self::Change,
         }
     }
@@ -710,7 +824,9 @@ impl ResourceType {
 
 pub(crate) fn canonical_record_table(table: &str) -> String {
     let normalized = normalize_table_name(table);
-    if is_change_request_table(&normalized) {
+    if resource::business_application::is_business_application_alias(&normalized) {
+        BUSINESS_APPLICATION_TABLE.to_string()
+    } else if is_change_request_table(&normalized) {
         "change_request".to_string()
     } else {
         normalized
@@ -719,7 +835,9 @@ pub(crate) fn canonical_record_table(table: &str) -> String {
 
 pub(crate) fn canonical_record_table_for_number(table: &str, number: &str) -> String {
     let normalized = normalize_table_name(table);
-    if is_change_request_table(&normalized) || is_change_request_number(number) {
+    if resource::business_application::is_business_application_alias(&normalized) {
+        BUSINESS_APPLICATION_TABLE.to_string()
+    } else if is_change_request_table(&normalized) || is_change_request_number(number) {
         "change_request".to_string()
     } else {
         normalized
@@ -735,7 +853,10 @@ pub fn normalize_record_lookup_sys_id(sys_id: &str) -> Result<String> {
 }
 
 pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
-    let normalized = table.trim().to_ascii_lowercase();
+    let normalized = normalize_table_name(table);
+    if resource::business_application::is_business_application_alias(&normalized) {
+        return Ok(BUSINESS_APPLICATION_TABLE.to_string());
+    }
     if is_record_lookup_table_allowed(&normalized) {
         Ok(normalized)
     } else {
@@ -746,7 +867,13 @@ pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
 pub fn is_record_lookup_table_allowed(table: &str) -> bool {
     matches!(
         table.trim().to_ascii_lowercase().as_str(),
-        "dmn_demand" | "dmn_demand_task" | "resource_plan" | "pm_project"
+        "dmn_demand"
+            | "dmn_demand_task"
+            | "resource_plan"
+            | "pm_project"
+            | "business_application"
+            | "business_app"
+            | "cmdb_ci_business_app"
     )
 }
 
@@ -870,6 +997,9 @@ pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
     "dmn_demand_task",
     "resource_plan",
     "pm_project",
+    "business_application",
+    "business_app",
+    "cmdb_ci_business_app",
 ];
 
 pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {
@@ -931,6 +1061,419 @@ fn non_empty_owned(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn apply_reference_name_or_sys_id_filter(
+    query: TableApi,
+    field: &str,
+    value: Option<&str>,
+) -> Result<TableApi> {
+    let Some(value) = non_empty_owned(value) else {
+        return Ok(query);
+    };
+    if let Ok(sys_id) = normalize_record_lookup_sys_id(&value) {
+        Ok(query.equals(field, &sys_id))
+    } else {
+        Ok(query.contains(&format!("{field}.name"), &value))
+    }
+}
+
+fn normalize_operational_state(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    match normalized.as_str() {
+        "operational" => "1".to_string(),
+        "non operational" | "nonoperational" | "not operational" => "2".to_string(),
+        "repair in progress" => "3".to_string(),
+        "dr standby" | "disaster recovery standby" => "4".to_string(),
+        "ready" => "5".to_string(),
+        "retired" => "6".to_string(),
+        _ => value.trim().to_string(),
+    }
+}
+
+fn is_business_application_reference_table_resolvable(table: &str) -> bool {
+    matches!(table, "sys_user" | "sys_user_group" | "cmdb_ci")
+        || table == BUSINESS_APPLICATION_TABLE
+        || table.contains("portfolio")
+}
+
+/// Build a cached dictionary row from a `sys_dictionary` record.
+///
+/// Returns `None` for rows without a usable `element` (the ServiceNow field
+/// name), which can happen for collection/placeholder dictionary rows. The
+/// `table_name` is the table the query was scoped to so inherited fields are
+/// attributed to the level that defines them.
+fn dictionary_row_from_record(
+    table_name: &str,
+    record: &Record,
+    synced_at: DateTime<Utc>,
+) -> Option<BusinessApplicationFieldDictionaryRow> {
+    let field_name = non_empty_owned(record.get_raw("element"))
+        .or_else(|| non_empty_owned(record.get_str("element")))?;
+    let internal_type = record_field_raw_or_display(record, "internal_type");
+    let reference_table = non_empty_owned(record.get_raw("reference"))
+        .or_else(|| record_field_display_or_raw(record, "reference"));
+    let raw_json = serde_json::json!({
+        "element": field_name,
+        "column_label": record_field_display_or_raw(record, "column_label"),
+        "internal_type": internal_type,
+        "reference": reference_table,
+        "choice": record_field_raw_or_display(record, "choice"),
+        "mandatory": record_field_raw_or_display(record, "mandatory"),
+        "read_only": record_field_raw_or_display(record, "read_only"),
+        "max_length": record_field_raw_or_display(record, "max_length"),
+        "active": record_field_raw_or_display(record, "active"),
+    })
+    .to_string();
+    Some(BusinessApplicationFieldDictionaryRow {
+        table_name: table_name.to_string(),
+        field_name,
+        field_label: record_field_display_or_raw(record, "column_label"),
+        field_type: internal_type,
+        // `choice` in sys_dictionary is a numeric flag ("1"/"3" => choice list);
+        // treat any non-empty, non-zero value as a choice field.
+        reference_table,
+        choice: dictionary_flag_is_set(record, "choice"),
+        mandatory: record_bool(record, "mandatory"),
+        read_only: record_bool(record, "read_only"),
+        max_length: record_field_raw_or_display(record, "max_length")
+            .and_then(|value| value.parse::<i64>().ok()),
+        active: record_bool(record, "active"),
+        synced_at,
+        raw_json,
+    })
+}
+
+/// Interpret a `sys_dictionary` flag field. `choice` is numeric (0/1/2/3); any
+/// non-empty, non-"0" value counts as set. Boolean-style flags ("true") also
+/// count.
+fn dictionary_flag_is_set(record: &Record, field: &str) -> bool {
+    match record_field_raw_or_display(record, field) {
+        Some(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && value != "0" && value != "false" && value != "no"
+        }
+        None => false,
+    }
+}
+
+/// Promote the baseline alias map to dictionary-verified fields.
+///
+/// For each typed product label we keep the baseline ServiceNow field name when
+/// the dictionary confirms it exists, otherwise we keep the baseline (the
+/// dictionary may not expose every field to the authenticated account). The
+/// Primary Portfolio reference target table is taken from the dictionary
+/// `reference` value when present. `dictionary_version` is set to the latest
+/// `synced_at` so callers can tell typed aliases were dictionary-verified.
+fn business_application_aliases_from_dictionary(
+    dictionary: &HashMap<String, BusinessApplicationFieldDictionaryRow>,
+) -> BusinessApplicationFieldAliases {
+    let mut aliases = BusinessApplicationFieldAliases::baseline();
+
+    // Helper: keep the baseline field name if the dictionary knows it; otherwise
+    // fall back to the first dictionary field whose label matches the product
+    // label. This lets instance-specific custom `u_*` fields supersede the baseline.
+    let resolve = |baseline: &str, labels: &[&str]| -> String {
+        if dictionary.contains_key(baseline) {
+            return baseline.to_string();
+        }
+        dictionary
+            .values()
+            .find(|row| {
+                row.field_label
+                    .as_deref()
+                    .map(|label| {
+                        let label = label.trim().to_ascii_lowercase();
+                        labels.iter().any(|candidate| label == *candidate)
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|row| row.field_name.clone())
+            .unwrap_or_else(|| baseline.to_string())
+    };
+
+    aliases.business_owner = resolve("business_owner", &["business owner"]);
+    aliases.is_owner = resolve(
+        "it_application_owner",
+        &["is owner", "it application owner"],
+    );
+    aliases.ci_owner_group = resolve("managed_by_group", &["ci owner group"]);
+    aliases.primary_support_group = resolve("support_group", &["primary support group"]);
+    aliases.operational_state = resolve("operational_status", &["operational state"]);
+    aliases.primary_portfolio = resolve("portfolio", &["primary portfolio"]);
+    aliases.attested_date = resolve("attested_date", &["attested date"]);
+
+    // Discover the Primary Portfolio reference target table from the dictionary.
+    aliases.primary_portfolio_table = dictionary
+        .get(&aliases.primary_portfolio)
+        .and_then(|row| row.reference_table.clone())
+        .filter(|table| !table.is_empty());
+
+    aliases.dictionary_version = dictionary
+        .values()
+        .map(|row| row.synced_at)
+        .max()
+        .map(|synced_at| synced_at.to_rfc3339());
+
+    aliases
+}
+
+fn primitive_resource_type_name(primitive_type: &ReferencePrimitiveType) -> &'static str {
+    match primitive_type {
+        ReferencePrimitiveType::UserPrimitive => "user_primitive",
+        ReferencePrimitiveType::GroupPrimitive => "group_primitive",
+        ReferencePrimitiveType::PortfolioPrimitive => "portfolio_primitive",
+        ReferencePrimitiveType::ConfigurationItemPrimitive => "configuration_item_primitive",
+        ReferencePrimitiveType::ReferencedRecordPrimitive => "referenced_record_primitive",
+    }
+}
+
+fn primitive_status_from_reference_status(
+    status: ReferenceResolutionStatus,
+) -> PrimitiveResolutionStatus {
+    match status {
+        ReferenceResolutionStatus::Resolved => PrimitiveResolutionStatus::Resolved,
+        ReferenceResolutionStatus::Unresolved => PrimitiveResolutionStatus::Unresolved,
+        ReferenceResolutionStatus::UnknownTable => PrimitiveResolutionStatus::UnknownTable,
+        ReferenceResolutionStatus::NotFound => PrimitiveResolutionStatus::NotFound,
+        ReferenceResolutionStatus::AclRestricted => PrimitiveResolutionStatus::AclRestricted,
+        ReferenceResolutionStatus::Error => PrimitiveResolutionStatus::Error,
+    }
+}
+
+fn reason_from_reference_status(status: ReferenceResolutionStatus) -> ReferenceResolutionReason {
+    match status {
+        ReferenceResolutionStatus::UnknownTable => ReferenceResolutionReason::UnknownReferenceTable,
+        ReferenceResolutionStatus::NotFound => ReferenceResolutionReason::ReferenceNotFound,
+        ReferenceResolutionStatus::AclRestricted => {
+            ReferenceResolutionReason::ReferenceAclRestricted
+        }
+        ReferenceResolutionStatus::Error => ReferenceResolutionReason::ReferenceResolutionFailed,
+        ReferenceResolutionStatus::Resolved | ReferenceResolutionStatus::Unresolved => {
+            ReferenceResolutionReason::DictionaryUnavailable
+        }
+    }
+}
+
+fn reference_resolution_status_name(status: ReferenceResolutionStatus) -> &'static str {
+    match status {
+        ReferenceResolutionStatus::Resolved => "resolved",
+        ReferenceResolutionStatus::Unresolved => "unresolved",
+        ReferenceResolutionStatus::UnknownTable => "unknown_table",
+        ReferenceResolutionStatus::NotFound => "not_found",
+        ReferenceResolutionStatus::AclRestricted => "acl_restricted",
+        ReferenceResolutionStatus::Error => "error",
+    }
+}
+
+fn primitive_display_name(record: &Record, descriptor: &ReferencePrimitiveDescriptor) -> String {
+    record_first_value(
+        record,
+        &[
+            "name",
+            "display_name",
+            "number",
+            "user_name",
+            "email",
+            "title",
+            "short_description",
+        ],
+    )
+    .or_else(|| descriptor.display_value.clone())
+    .unwrap_or_else(|| descriptor.reference_sys_id.clone())
+}
+
+fn record_first_value(record: &Record, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        record
+            .get_display(field)
+            .or_else(|| record.get_raw(field))
+            .or_else(|| record.get_str(field))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn reference_primitive_relative_path(
+    descriptor: &ReferencePrimitiveDescriptor,
+    display_name: &str,
+) -> PathBuf {
+    let (dir, prefix) = match descriptor.primitive_type {
+        ReferencePrimitiveType::UserPrimitive => (PathBuf::from("users"), "user".to_string()),
+        ReferencePrimitiveType::GroupPrimitive => (PathBuf::from("groups"), "group".to_string()),
+        ReferencePrimitiveType::PortfolioPrimitive => {
+            (PathBuf::from("portfolios"), "portfolio".to_string())
+        }
+        ReferencePrimitiveType::ConfigurationItemPrimitive => {
+            (PathBuf::from("configuration_items"), "ci".to_string())
+        }
+        ReferencePrimitiveType::ReferencedRecordPrimitive => {
+            let table_slug = vault::layout::slugify(&descriptor.reference_table);
+            (PathBuf::from("references").join(&table_slug), table_slug)
+        }
+    };
+    let display_slug = vault::layout::slugify(display_name);
+    let file_name = if display_slug.is_empty() {
+        format!("{}_{}.md", prefix, descriptor.reference_sys_id)
+    } else {
+        format!(
+            "{}_{}_{}.md",
+            prefix, descriptor.reference_sys_id, display_slug
+        )
+    };
+    dir.join(file_name)
+}
+
+fn render_reference_primitive_markdown(
+    descriptor: &ReferencePrimitiveDescriptor,
+    display_name: &str,
+    status: ReferenceResolutionStatus,
+    raw_json: &Value,
+    diagnostic: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!(
+        "primitive_type: {}\n",
+        yaml_json_string(primitive_resource_type_name(&descriptor.primitive_type))
+    ));
+    out.push_str(&format!(
+        "resource_type: {}\n",
+        yaml_json_string(primitive_resource_type_name(&descriptor.primitive_type))
+    ));
+    out.push_str(&format!(
+        "sys_id: {}\n",
+        yaml_json_string(&descriptor.reference_sys_id)
+    ));
+    out.push_str(&format!(
+        "table: {}\n",
+        yaml_json_string(&descriptor.reference_table)
+    ));
+    out.push_str(&format!(
+        "display_name: {}\n",
+        yaml_json_string(display_name)
+    ));
+    out.push_str(&format!(
+        "source_field: {}\n",
+        yaml_json_string(&descriptor.field)
+    ));
+    out.push_str(&format!(
+        "resolution_status: {}\n",
+        yaml_json_string(reference_resolution_status_name(status))
+    ));
+    if let Some(diagnostic) = diagnostic.filter(|value| !value.trim().is_empty()) {
+        out.push_str(&format!("diagnostic: {}\n", yaml_json_string(diagnostic)));
+    }
+    out.push_str("---\n\n");
+    out.push_str(&format!("# {}\n\n", display_name));
+    out.push_str("```json\n");
+    out.push_str(&serde_json::to_string_pretty(raw_json).unwrap_or_else(|_| raw_json.to_string()));
+    out.push_str("\n```\n");
+    out
+}
+
+fn primitive_projected_field(
+    primitive_sys_id: &str,
+    field_name: &str,
+    raw_value: &Value,
+    updated_at: DateTime<Utc>,
+) -> ProjectedFieldRow {
+    let value_text = json_field_value_text(raw_value);
+    let display_value = raw_value
+        .as_object()
+        .and_then(|map| map.get("display_value"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let reference_sys_id = value_text
+        .as_deref()
+        .filter(|value| looks_like_servicenow_sys_id(value) && display_value.is_some())
+        .map(ToOwned::to_owned);
+    let reference_table = raw_value
+        .as_object()
+        .and_then(|map| map.get("link"))
+        .and_then(Value::as_str)
+        .and_then(reference_table_from_api_link);
+    let number_text = value_text
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    let bool_value =
+        value_text
+            .as_deref()
+            .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            });
+    let date_value = value_text
+        .as_deref()
+        .and_then(|value| value.get(..10))
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .map(|date| date.to_string());
+
+    ProjectedFieldRow {
+        owner_sys_id: primitive_sys_id.to_string(),
+        field_name: field_name.to_string(),
+        field_label: None,
+        field_type: reference_sys_id.as_ref().map(|_| "reference".to_string()),
+        value_text,
+        display_value,
+        value_number: number_text,
+        value_date: date_value,
+        value_bool: bool_value,
+        reference_sys_id,
+        reference_table,
+        raw_json: raw_value.to_string(),
+        updated_at,
+    }
+}
+
+fn json_field_value_text(value: &Value) -> Option<String> {
+    let scalar = value
+        .as_object()
+        .and_then(|map| map.get("value"))
+        .unwrap_or(value);
+    match scalar {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Null => None,
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn reference_table_from_api_link(link: &str) -> Option<String> {
+    let marker = "/api/now/table/";
+    let start = link.find(marker)? + marker.len();
+    let table = link[start..].split('/').next()?.trim();
+    (!table.is_empty()).then(|| table.to_string())
+}
+
+fn looks_like_servicenow_sys_id(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn yaml_json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn push_unique_reference_diagnostic(
+    diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    diagnostic: ReferenceResolutionDiagnostic,
+) {
+    if diagnostics.iter().any(|existing| {
+        existing.field == diagnostic.field
+            && existing.reference_table == diagnostic.reference_table
+            && existing.reference_sys_id == diagnostic.reference_sys_id
+            && existing.reason == diagnostic.reason
+    }) {
+        return;
+    }
+    diagnostics.push(diagnostic);
 }
 
 fn first_non_empty_str<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
@@ -1035,6 +1578,461 @@ impl SnowCore {
         }
 
         Ok(None)
+    }
+
+    pub async fn search_business_applications(
+        &self,
+        params: BusinessApplicationSearchParams,
+    ) -> Result<Vec<SnowRecord>> {
+        Ok(self
+            .search_business_applications_live(
+                params,
+                BusinessApplicationHydrationOptions::default(),
+            )
+            .await?
+            .into_iter()
+            .map(|business_application| business_application.record)
+            .collect())
+    }
+
+    pub async fn get_business_application_fresh(
+        &self,
+        lookup: BusinessApplicationLookup,
+        options: BusinessApplicationHydrationOptions,
+    ) -> Result<Option<BusinessApplication>> {
+        let aliases = self
+            .resolve_business_application_aliases(options.refresh_dictionary)
+            .await;
+        let record = match lookup {
+            BusinessApplicationLookup::SysId(sys_id) => match self
+                .client
+                .table(BUSINESS_APPLICATION_TABLE)
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(&normalize_record_lookup_sys_id(&sys_id)?)
+                .await
+            {
+                Ok(record) => Some(record),
+                Err(err) if matches!(err, SnowApiError::Api { status: 404, .. }) => None,
+                Err(err) => return Err(err.into()),
+            },
+            BusinessApplicationLookup::ExactName(name) => {
+                let name = non_empty_owned(Some(&name))
+                    .ok_or_else(|| anyhow::anyhow!("Business Application name cannot be empty"))?;
+                let records = self
+                    .client
+                    .table(BUSINESS_APPLICATION_TABLE)
+                    .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+                    .equals("name", &name)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .limit(2)
+                    .execute()
+                    .await?
+                    .records;
+                if records.len() > 1 {
+                    anyhow::bail!("multiple Business Applications matched name={name}");
+                }
+                records.into_iter().next()
+            }
+        };
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let mut business_application = BusinessApplication::from_servicenow(&record, &aliases)?;
+        if options.persist {
+            self.persist_record(&record)?;
+            self.persist_business_application_reference_primitives(
+                &mut business_application,
+                &options,
+            )
+            .await?;
+        }
+        Ok(Some(business_application))
+    }
+
+    pub async fn search_business_applications_live(
+        &self,
+        params: BusinessApplicationSearchParams,
+        options: BusinessApplicationHydrationOptions,
+    ) -> Result<Vec<BusinessApplication>> {
+        params.validate()?;
+        let aliases = self
+            .resolve_business_application_aliases(options.refresh_dictionary)
+            .await;
+
+        let mut query = self
+            .client
+            .table(BUSINESS_APPLICATION_TABLE)
+            .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(params.validated_limit()? as u32)
+            .order_by("name", Order::Asc);
+
+        if let Some(name) = non_empty_owned(params.name.as_deref()) {
+            query = query.contains("name", &name);
+        }
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            &aliases.business_owner,
+            params.business_owner.as_deref(),
+        )?;
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            &aliases.is_owner,
+            params.is_owner.as_deref(),
+        )?;
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            &aliases.ci_owner_group,
+            params.ci_owner_group.as_deref(),
+        )?;
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            &aliases.primary_support_group,
+            params.primary_support_group.as_deref(),
+        )?;
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            &aliases.primary_portfolio,
+            params.primary_portfolio.as_deref(),
+        )?;
+        if let Some(status) = non_empty_owned(params.operational_state.as_deref()) {
+            query = query.equals(
+                &aliases.operational_state,
+                &normalize_operational_state(&status),
+            );
+        }
+        if let Some(status) = non_empty_owned(params.operational_state_not.as_deref()) {
+            query = query.not_equals(
+                &aliases.operational_state,
+                &normalize_operational_state(&status),
+            );
+        }
+        if let Some(date) = non_empty_owned(params.attested_date.as_deref()) {
+            query = query.equals(&aliases.attested_date, &date);
+        }
+        if let Some(date) = non_empty_owned(params.attested_date_on_or_after.as_deref()) {
+            query = query.filter(&aliases.attested_date, Operator::GreaterThanOrEqual, &date);
+        }
+        if let Some(date) = non_empty_owned(params.attested_date_on_or_before.as_deref()) {
+            query = query.filter(&aliases.attested_date, Operator::LessThanOrEqual, &date);
+        }
+
+        let records = query.execute().await?.records;
+        let mut business_applications = Vec::with_capacity(records.len());
+        for record in records {
+            let mut business_application = BusinessApplication::from_servicenow(&record, &aliases)?;
+            if options.persist {
+                self.persist_record(&record)?;
+                self.persist_business_application_reference_primitives(
+                    &mut business_application,
+                    &options,
+                )
+                .await?;
+            }
+            business_applications.push(business_application);
+        }
+        Ok(business_applications)
+    }
+
+    pub async fn query_business_applications(
+        &self,
+        query: BusinessApplicationQuery,
+    ) -> Result<Vec<SnowRecord>> {
+        self.query.query_business_applications(query).await
+    }
+
+    /// Run a live Business Application search+persist and aggregate a sync summary.
+    ///
+    /// Reuses [`Self::search_business_applications_live`] for the actual fetch and
+    /// persistence (honoring `options.persist`), then rolls up reference
+    /// resolution and dictionary-degradation status across the returned
+    /// applications. `params` is optional; `None` produces the default bounded
+    /// Business Application search ordered by `name`.
+    ///
+    /// This is a degraded-tolerant read: unresolved references and an
+    /// unavailable dictionary are reported in the summary, never errors.
+    pub async fn sync_business_applications(
+        &self,
+        params: Option<BusinessApplicationSearchParams>,
+        options: BusinessApplicationHydrationOptions,
+    ) -> Result<BusinessApplicationSyncSummary> {
+        let params = params.unwrap_or_default();
+        // When the caller explicitly asks for a dictionary refresh, attempt it
+        // up front so degraded status reflects the freshest metadata. The fetch
+        // is best-effort: a failure leaves us in baseline/degraded mode. We do
+        // the refresh here (and clear the flag for the live search) so it runs
+        // exactly once per sync.
+        let mut dictionary_refreshed = false;
+        let mut live_options = options.clone();
+        if options.refresh_dictionary {
+            dictionary_refreshed = self.refresh_business_application_dictionary().await.is_ok();
+            live_options.refresh_dictionary = false;
+        }
+
+        let applications = self
+            .search_business_applications_live(params, live_options)
+            .await?;
+
+        let mut summary = BusinessApplicationSyncSummary {
+            total_applications: applications.len(),
+            persisted: if options.persist {
+                applications.len()
+            } else {
+                0
+            },
+            dictionary_refreshed,
+            ..Default::default()
+        };
+
+        for application in &applications {
+            // Resolved references are tracked on the descriptors; unresolved ones
+            // surface as diagnostics. Count each independently so the totals stay
+            // meaningful even when a reference appears in both lists.
+            summary.references_resolved += application
+                .references
+                .iter()
+                .filter(|descriptor| {
+                    descriptor.resolution_status == ReferenceResolutionStatus::Resolved
+                })
+                .count();
+            for diagnostic in &application.unresolved_references {
+                summary.references_unresolved += 1;
+                *summary
+                    .degraded_reasons
+                    .entry(diagnostic.reason.as_key().to_string())
+                    .or_insert(0) += 1;
+                if diagnostic.reason.is_dictionary_unavailable() {
+                    summary.dictionary_degraded = true;
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    async fn persist_business_application_reference_primitives(
+        &self,
+        business_application: &mut BusinessApplication,
+        options: &BusinessApplicationHydrationOptions,
+    ) -> Result<()> {
+        if !options.persist {
+            return Ok(());
+        }
+
+        let mut diagnostics = Vec::new();
+        let max_direct_references = 100usize;
+        let total_references = business_application.references.len();
+
+        for descriptor in business_application
+            .references
+            .iter_mut()
+            .take(max_direct_references)
+        {
+            let can_resolve = options.resolve_references
+                && options.reference_depth > 0
+                && is_business_application_reference_table_resolvable(
+                    descriptor.reference_table.as_str(),
+                );
+
+            if !can_resolve {
+                if descriptor.resolution_status == ReferenceResolutionStatus::Resolved {
+                    descriptor.resolution_status =
+                        if is_business_application_reference_table_resolvable(
+                            descriptor.reference_table.as_str(),
+                        ) {
+                            ReferenceResolutionStatus::Unresolved
+                        } else {
+                            ReferenceResolutionStatus::UnknownTable
+                        };
+                }
+                let diagnostic = self.persist_reference_primitive_stub(descriptor, None)?;
+                diagnostics.push(diagnostic);
+                continue;
+            }
+
+            match self
+                .client
+                .table(descriptor.reference_table.as_str())
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(descriptor.reference_sys_id.as_str())
+                .await
+            {
+                Ok(record) => {
+                    descriptor.resolution_status = ReferenceResolutionStatus::Resolved;
+                    descriptor.diagnostic = None;
+                    self.persist_resolved_reference_primitive(descriptor, &record)?;
+                }
+                Err(SnowApiError::Api { status: 404, .. }) => {
+                    descriptor.resolution_status = ReferenceResolutionStatus::NotFound;
+                    descriptor.diagnostic = Some("referenced record was not found".to_string());
+                    diagnostics.push(self.persist_reference_primitive_stub(descriptor, None)?);
+                }
+                Err(err) => {
+                    descriptor.resolution_status = ReferenceResolutionStatus::Error;
+                    let message = err.to_string();
+                    descriptor.diagnostic = Some(message.clone());
+                    diagnostics
+                        .push(self.persist_reference_primitive_stub(descriptor, Some(message))?);
+                }
+            }
+        }
+
+        if total_references > max_direct_references {
+            diagnostics.push(ReferenceResolutionDiagnostic {
+                field: "*".to_string(),
+                reference_table: "*".to_string(),
+                reference_sys_id: business_application.record.sys_id.clone(),
+                display_value: Some(business_application.name.clone()),
+                reason: ReferenceResolutionReason::FanoutLimitExceeded,
+                message: Some(format!(
+                    "resolved first {max_direct_references} Business Application references out of {total_references}"
+                )),
+            });
+        }
+
+        for diagnostic in diagnostics {
+            push_unique_reference_diagnostic(
+                &mut business_application.unresolved_references,
+                diagnostic,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn persist_resolved_reference_primitive(
+        &self,
+        descriptor: &ReferencePrimitiveDescriptor,
+        record: &Record,
+    ) -> Result<()> {
+        let raw_json = serialize_record_document(record);
+        let display_name = primitive_display_name(record, descriptor);
+        let relative_path = self.persist_reference_primitive_markdown(
+            descriptor,
+            &display_name,
+            ReferenceResolutionStatus::Resolved,
+            &raw_json,
+            None,
+        )?;
+        let synced_at = Utc::now();
+        self.query
+            .store()
+            .upsert_primitive_object(&PrimitiveObjectRow {
+                sys_id: descriptor.reference_sys_id.clone(),
+                table_name: descriptor.reference_table.clone(),
+                resource_type: primitive_resource_type_name(&descriptor.primitive_type).to_string(),
+                display_name,
+                number: record_first_value(record, &["number", "user_name"]).or_else(|| {
+                    record
+                        .get_raw("number")
+                        .or_else(|| record.get_display("number"))
+                        .map(ToOwned::to_owned)
+                }),
+                file_path: Some(relative_path.to_string_lossy().into_owned()),
+                raw_json: raw_json.to_string(),
+                synced_at,
+                sys_updated_on: record
+                    .get_raw("sys_updated_on")
+                    .or_else(|| record.get_display("sys_updated_on"))
+                    .or_else(|| record.get_str("sys_updated_on"))
+                    .map(ToOwned::to_owned),
+                resolution_status: PrimitiveResolutionStatus::Resolved,
+                last_error: None,
+            })?;
+
+        if let Some(raw_map) = raw_json.as_object() {
+            for (field_name, raw_value) in raw_map {
+                let field = primitive_projected_field(
+                    &descriptor.reference_sys_id,
+                    field_name,
+                    raw_value,
+                    synced_at,
+                );
+                self.query
+                    .store()
+                    .upsert_primitive_object_field(&descriptor.reference_sys_id, &field)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_reference_primitive_stub(
+        &self,
+        descriptor: &ReferencePrimitiveDescriptor,
+        last_error: Option<String>,
+    ) -> Result<ReferenceResolutionDiagnostic> {
+        let status = descriptor.resolution_status;
+        let display_name = descriptor
+            .display_value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(descriptor.reference_sys_id.as_str())
+            .to_string();
+        let raw_json = serde_json::json!({
+            "sys_id": descriptor.reference_sys_id,
+            "table": descriptor.reference_table,
+            "display_value": display_name,
+            "source_field": descriptor.field,
+            "resolution_status": reference_resolution_status_name(status),
+            "diagnostic": descriptor.diagnostic.as_deref().or(last_error.as_deref()),
+        });
+        let relative_path = self.persist_reference_primitive_markdown(
+            descriptor,
+            &display_name,
+            status,
+            &raw_json,
+            descriptor.diagnostic.as_deref().or(last_error.as_deref()),
+        )?;
+        self.query
+            .store()
+            .upsert_primitive_object(&PrimitiveObjectRow {
+                sys_id: descriptor.reference_sys_id.clone(),
+                table_name: descriptor.reference_table.clone(),
+                resource_type: primitive_resource_type_name(&descriptor.primitive_type).to_string(),
+                display_name: display_name.clone(),
+                number: None,
+                file_path: Some(relative_path.to_string_lossy().into_owned()),
+                raw_json: raw_json.to_string(),
+                synced_at: Utc::now(),
+                sys_updated_on: None,
+                resolution_status: primitive_status_from_reference_status(status),
+                last_error,
+            })?;
+
+        Ok(ReferenceResolutionDiagnostic {
+            field: descriptor.field.clone(),
+            reference_table: descriptor.reference_table.clone(),
+            reference_sys_id: descriptor.reference_sys_id.clone(),
+            display_value: descriptor.display_value.clone(),
+            reason: reason_from_reference_status(status),
+            message: descriptor.diagnostic.clone(),
+        })
+    }
+
+    fn persist_reference_primitive_markdown(
+        &self,
+        descriptor: &ReferencePrimitiveDescriptor,
+        display_name: &str,
+        status: ReferenceResolutionStatus,
+        raw_json: &Value,
+        diagnostic: Option<&str>,
+    ) -> Result<PathBuf> {
+        let relative_path = reference_primitive_relative_path(descriptor, display_name);
+        let absolute_path = self.vault_path.join(&relative_path);
+        let contents = render_reference_primitive_markdown(
+            descriptor,
+            display_name,
+            status,
+            raw_json,
+            diagnostic,
+        );
+        let persisted = self.vault.write_markdown_file(absolute_path, &contents)?;
+        Ok(persisted.relative_path)
     }
 
     /// Look up a record by number, checking the in-memory L1 cache first
@@ -1150,19 +2148,24 @@ impl SnowCore {
         if record.sys_id.eq_ignore_ascii_case(sys_id) {
             record.sys_id = sys_id.to_string();
         }
-        let number = record
-            .get_raw("number")
-            .or_else(|| record.get_str("number"))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "fresh {} row {} did not include a record number",
-                    table,
-                    sys_id
-                )
-            })?
-            .to_string();
+        let number = if resource::business_application::is_business_application_alias(&record.table)
+        {
+            resource::business_application::business_application_number(&record)
+        } else {
+            record
+                .get_raw("number")
+                .or_else(|| record.get_str("number"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fresh {} row {} did not include a record number",
+                        table,
+                        sys_id
+                    )
+                })?
+                .to_string()
+        };
 
         if let Err(err) = self.enrich_record_journals(&mut record).await {
             eprintln!("snow_core: journal enrichment failed for {number}: {err}");
@@ -2998,6 +4001,7 @@ impl SnowCore {
             item_sys_id.clone(),
             raw_result,
             self.client.base_url(),
+            &self.config.instance.portal,
         );
 
         if let (Some(table), Some(sys_id)) = (result.table.as_deref(), result.sys_id.as_deref()) {
@@ -3040,6 +4044,7 @@ impl SnowCore {
             result.request_item_number = ritm_number;
             result.browser_url = Some(catalog_browser_url(
                 self.client.base_url(),
+                &self.config.instance.portal,
                 "sc_req_item",
                 &ritm_sys_id,
             ));
@@ -3325,7 +4330,16 @@ impl SnowCore {
             _ => {
                 let mut snow_record = SnowRecord::from_servicenow(record);
                 snow_record.parent = parent_record_ref(record);
-                snow_record.references = collect_record_references(record);
+                snow_record.references =
+                    if resource::business_application::is_business_application_alias(&record.table)
+                    {
+                        resource::business_application::collect_business_application_references(
+                            record,
+                            &BusinessApplicationFieldAliases::baseline_degraded(),
+                        )
+                    } else {
+                        collect_record_references(record)
+                    };
                 let persisted = self.vault.persist_record(&snow_record)?;
                 Ok(PersistedRuntimeDocument::Record {
                     record: snow_record,
@@ -3343,6 +4357,9 @@ impl SnowCore {
         store.replace_references(&projection.references.into_values().collect::<Vec<_>>())?;
         if let Some(article) = &projection.knowledge_article {
             store.upsert_knowledge_article(article)?;
+        }
+        if document.record().resource_type == ResourceType::BusinessApplication {
+            store.upsert_business_application_projection(document.record(), None)?;
         }
         Ok(())
     }
@@ -3546,6 +4563,102 @@ impl SnowCore {
         }
 
         Ok(ancestors)
+    }
+
+    /// The Business Application table and all of its inherited tables, most
+    /// derived first. Used to scope `sys_dictionary` queries and dictionary
+    /// cache lookups. Inheritance traversal is bounded to 8 levels by
+    /// [`Self::table_ancestors`].
+    async fn business_application_dictionary_tables(&self) -> Result<Vec<String>> {
+        let mut tables = vec![BUSINESS_APPLICATION_TABLE.to_string()];
+        tables.extend(self.table_ancestors(BUSINESS_APPLICATION_TABLE).await?);
+        Ok(tables)
+    }
+
+    /// Fetch live `sys_dictionary` metadata for `cmdb_ci_business_app` and its
+    /// inherited tables, then upsert the active rows into the
+    /// `business_application_field_dictionary` cache.
+    ///
+    /// Returns the number of dictionary rows persisted. A failure to reach the
+    /// dictionary (or an empty result) is surfaced as an error/zero so callers
+    /// can stay in degraded-read mode; it must never abort a normal BA read.
+    pub async fn refresh_business_application_dictionary(&self) -> Result<usize> {
+        let tables = self.business_application_dictionary_tables().await?;
+        let synced_at = Utc::now();
+        let mut persisted = 0usize;
+        for table in &tables {
+            // One query per table keeps each `name=<table>` scoped and lets a
+            // single failing table degrade independently of the others.
+            let records = self
+                .client
+                .table("sys_dictionary")
+                .equals("name", table)
+                .equals("active", "true")
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .limit(2000)
+                .execute()
+                .await?
+                .records;
+            for record in records {
+                let Some(row) = dictionary_row_from_record(table, &record, synced_at) else {
+                    continue;
+                };
+                self.query
+                    .store()
+                    .upsert_business_application_field_dictionary(&row)?;
+                persisted += 1;
+            }
+        }
+        Ok(persisted)
+    }
+
+    /// Read the cached, dictionary-verified field metadata for the Business
+    /// Application table and its ancestors, keyed by ServiceNow field name.
+    ///
+    /// Returns an empty map on a dictionary cache miss (degraded-read mode).
+    pub async fn business_application_dictionary(
+        &self,
+    ) -> Result<HashMap<String, BusinessApplicationFieldDictionaryRow>> {
+        let tables = self.business_application_dictionary_tables().await?;
+        Ok(self
+            .query
+            .store()
+            .business_application_dictionary_for_tables(&tables)?)
+    }
+
+    /// Build the typed alias map for the Business Application primitive,
+    /// promoting baseline aliases to dictionary-verified fields when cached
+    /// `sys_dictionary` metadata is present.
+    ///
+    /// On a dictionary cache miss this returns
+    /// [`BusinessApplicationFieldAliases::baseline_degraded`], which carries a
+    /// `DictionaryUnavailable` diagnostic so the degradation is never silent.
+    pub async fn business_application_aliases(&self) -> Result<BusinessApplicationFieldAliases> {
+        let dictionary = self.business_application_dictionary().await?;
+        if dictionary.is_empty() {
+            return Ok(BusinessApplicationFieldAliases::baseline_degraded());
+        }
+        Ok(business_application_aliases_from_dictionary(&dictionary))
+    }
+
+    /// Resolve the Business Application alias map for a hydration run, optionally
+    /// refreshing the dictionary first.
+    ///
+    /// When `refresh_dictionary` is set, a best-effort live dictionary fetch runs
+    /// before resolving so freshly verified instance field names take effect. A
+    /// failure to refresh or an empty cache yields the degraded baseline aliases
+    /// (carrying a `DictionaryUnavailable` diagnostic) so reads never fail.
+    async fn resolve_business_application_aliases(
+        &self,
+        refresh_dictionary: bool,
+    ) -> BusinessApplicationFieldAliases {
+        if refresh_dictionary {
+            let _ = self.refresh_business_application_dictionary().await;
+        }
+        self.business_application_aliases()
+            .await
+            .unwrap_or_else(|_| BusinessApplicationFieldAliases::baseline_degraded())
     }
 
     async fn resolve_user_sys_id(&self, user: &str) -> Result<String> {
@@ -3893,6 +5006,7 @@ fn catalog_submit_result_from_response(
     item_sys_id: String,
     raw_result: Value,
     base_url: &str,
+    portal: &str,
 ) -> CatalogSubmitResult {
     let request_item = first_result_item(&raw_result);
     let request_item_sys_id = request_item.and_then(|item| string_at(item, &["sys_id"]));
@@ -3930,7 +5044,7 @@ fn catalog_submit_result_from_response(
     let browser_url = result_table
         .as_ref()
         .zip(result_sys_id.as_ref())
-        .map(|(table, sys_id)| catalog_browser_url(base_url, table, sys_id));
+        .map(|(table, sys_id)| catalog_browser_url(base_url, portal, table, sys_id));
 
     CatalogSubmitResult {
         item_sys_id,
@@ -3947,9 +5061,13 @@ fn catalog_submit_result_from_response(
     }
 }
 
-fn catalog_browser_url(base_url: &str, table: &str, sys_id: &str) -> String {
+fn catalog_browser_url(base_url: &str, portal: &str, table: &str, sys_id: &str) -> String {
+    // The portal slug is instance-specific; fall back to the out-of-box `sp`
+    // Service Portal when none is configured so the URL stays valid.
+    let portal = portal.trim();
+    let portal = if portal.is_empty() { "sp" } else { portal };
     format!(
-        "{}/sp?id=ticket&table={table}&sys_id={sys_id}&view=sp",
+        "{}/{portal}?id=ticket&table={table}&sys_id={sys_id}&view=sp",
         base_url.trim_end_matches('/')
     )
 }
@@ -4274,6 +5392,506 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn business_application_search_builds_supported_filters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "name": "Epic",
+                    "short_description": "Epic",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "business_owner": { "value": "owner-sys", "display_value": "Jane Owner" },
+                    "it_application_owner": { "value": "is-owner-sys", "display_value": "Alex IS" },
+                    "managed_by_group": { "value": "ci-group-sys", "display_value": "CI Owners" },
+                    "support_group": { "value": "support-group-sys", "display_value": "App Support" },
+                    "operational_status": { "value": "1", "display_value": "Operational" },
+                    "portfolio": { "value": "portfolio-sys", "display_value": "Clinical" },
+                    "attested_date": "2026-05-01",
+                    "u_custom_field": { "value": "raw-custom", "display_value": "Custom Display" },
+                    "u_json_blob": { "value": { "kept": true }, "display_value": "Kept" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let records = core
+            .search_business_applications(BusinessApplicationSearchParams {
+                name: Some("Epic".to_string()),
+                business_owner: Some("Jane Owner".to_string()),
+                is_owner: Some("Alex IS".to_string()),
+                ci_owner_group: Some("CI Owners".to_string()),
+                primary_support_group: Some("App Support".to_string()),
+                operational_state_not: Some("non-operational".to_string()),
+                primary_portfolio: Some("Clinical".to_string()),
+                attested_date: Some("2026-05-01".to_string()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("business applications");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].number, "BA:54a4b61b6fe845000ed852a03f3ee4d0");
+        assert_eq!(records[0].table, "cmdb_ci_business_app");
+        assert_eq!(records[0].resource_type, ResourceType::BusinessApplication);
+        assert_eq!(records[0].fields["name"].value, "Epic");
+        assert_eq!(records[0].fields["u_custom_field"].value, "raw-custom");
+        assert_eq!(records[0].fields["u_json_blob"].value, "{\"kept\":true}");
+        assert!(
+            tempdir
+                .path()
+                .join("vault/business_applications/business_application_54a4b61b6fe845000ed852a03f3ee4d0_epic.md")
+                .exists()
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/now/table/cmdb_ci_business_app")
+            .expect("business app request");
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("sysparm_query").map(|value| value.as_ref()),
+            Some(
+                "sys_class_name=cmdb_ci_business_app^nameLIKEEpic^business_owner.nameLIKEJane Owner^it_application_owner.nameLIKEAlex IS^managed_by_group.nameLIKECI Owners^support_group.nameLIKEApp Support^portfolio.nameLIKEClinical^operational_status!=2^attested_date=2026-05-01^ORDERBYname"
+            )
+        );
+        assert_eq!(
+            query.get("sysparm_fields").map(|value| value.as_ref()),
+            None
+        );
+        assert_eq!(
+            query
+                .get("sysparm_display_value")
+                .map(|value| value.as_ref()),
+            Some("all")
+        );
+        assert_eq!(
+            query
+                .get("sysparm_exclude_reference_link")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("sysparm_limit").map(|value| value.as_ref()),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn business_application_search_persists_resolved_reference_primitives() {
+        let server = MockServer::start().await;
+        let owner_sys_id = "6816f79cc0a8016401c5a33be04be441";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "name": "Epic",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "business_owner": {
+                        "value": owner_sys_id,
+                        "display_value": "Jane Owner"
+                    },
+                    "operational_status": { "value": "1", "display_value": "Operational" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/sys_user/{owner_sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": owner_sys_id,
+                    "name": "Jane Owner",
+                    "user_name": "jowner",
+                    "email": "jane.owner@example.invalid",
+                    "active": { "value": "true", "display_value": "true" },
+                    "sys_updated_on": "2026-05-30 12:00:00"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let applications = core
+            .search_business_applications_live(
+                BusinessApplicationSearchParams {
+                    name: Some("Epic".to_string()),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                BusinessApplicationHydrationOptions::default(),
+            )
+            .await
+            .expect("business applications");
+
+        assert_eq!(applications.len(), 1);
+        assert!(
+            applications[0]
+                .unresolved_references
+                .iter()
+                .all(|diagnostic| { diagnostic.reference_sys_id != owner_sys_id })
+        );
+        let primitive = core
+            .query
+            .store()
+            .get_primitive_object(owner_sys_id)
+            .expect("primitive lookup")
+            .expect("primitive object");
+        assert_eq!(primitive.table_name, "sys_user");
+        assert_eq!(primitive.resource_type, "user_primitive");
+        assert_eq!(primitive.display_name, "Jane Owner");
+        assert_eq!(
+            primitive.resolution_status,
+            PrimitiveResolutionStatus::Resolved
+        );
+        let file_path = primitive.file_path.expect("primitive vault path");
+        assert!(file_path.starts_with("users/user_6816f79cc0a8016401c5a33be04be441_jane-owner.md"));
+        assert!(tempdir.path().join("vault").join(file_path).exists());
+    }
+
+    #[tokio::test]
+    async fn business_application_fresh_get_omits_sysparm_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/now/table/cmdb_ci_business_app/54a4b61b6fe845000ed852a03f3ee4d0",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "name": "Epic",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "operational_status": { "value": "1", "display_value": "Operational" },
+                    "u_observed": "yes"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let business_application = core
+            .get_business_application_fresh(
+                BusinessApplicationLookup::sys_id("54A4B61B6FE845000ED852A03F3EE4D0").unwrap(),
+                BusinessApplicationHydrationOptions::default(),
+            )
+            .await
+            .expect("fresh get")
+            .expect("business application");
+
+        assert_eq!(business_application.name, "Epic");
+        assert_eq!(
+            business_application.record.number,
+            "BA:54a4b61b6fe845000ed852a03f3ee4d0"
+        );
+        assert_eq!(
+            business_application.fields["u_observed"].value,
+            serde_json::json!("yes")
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests
+            .iter()
+            .find(|request| {
+                request.url.path()
+                    == "/api/now/table/cmdb_ci_business_app/54a4b61b6fe845000ed852a03f3ee4d0"
+            })
+            .expect("business app get request");
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("sysparm_fields"), None);
+        assert_eq!(
+            query
+                .get("sysparm_display_value")
+                .map(|value| value.as_ref()),
+            Some("all")
+        );
+        assert_eq!(
+            query
+                .get("sysparm_exclude_reference_link")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+    }
+
+    /// Mount a `sys_db_object` response so `table_ancestors` terminates with no
+    /// parent (the Business Application table is treated as its own root).
+    async fn mount_no_table_ancestors(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_db_object"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "name": BUSINESS_APPLICATION_TABLE, "super_class": "" }]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn business_application_dictionary_refresh_caches_metadata_and_promotes_aliases() {
+        let server = MockServer::start().await;
+        mount_no_table_ancestors(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_dictionary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "name": BUSINESS_APPLICATION_TABLE,
+                        "element": "portfolio",
+                        "column_label": "Primary Portfolio",
+                        "internal_type": { "value": "reference", "display_value": "Reference" },
+                        "reference": { "value": "pm_portfolio", "display_value": "Portfolio" },
+                        "choice": "0",
+                        "mandatory": "false",
+                        "read_only": "false",
+                        "max_length": "32",
+                        "active": "true"
+                    },
+                    {
+                        "name": BUSINESS_APPLICATION_TABLE,
+                        "element": "operational_status",
+                        "column_label": "Operational State",
+                        "internal_type": { "value": "choice", "display_value": "Choice" },
+                        "reference": "",
+                        "choice": "1",
+                        "mandatory": "false",
+                        "read_only": "false",
+                        "max_length": "40",
+                        "active": "true"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let persisted = core
+            .refresh_business_application_dictionary()
+            .await
+            .expect("dictionary refresh");
+        assert_eq!(persisted, 2);
+
+        let dictionary = core
+            .business_application_dictionary()
+            .await
+            .expect("dictionary read");
+        assert_eq!(
+            dictionary
+                .get("portfolio")
+                .and_then(|row| row.reference_table.clone()),
+            Some("pm_portfolio".to_string())
+        );
+        assert_eq!(
+            dictionary
+                .get("operational_status")
+                .map(|row| row.field_type.clone()),
+            Some(Some("choice".to_string()))
+        );
+        assert!(dictionary["operational_status"].choice);
+
+        let aliases = core.business_application_aliases().await.expect("aliases");
+        // Dictionary-verified: portfolio target table discovered, version set,
+        // and no DictionaryUnavailable diagnostic.
+        assert_eq!(aliases.primary_portfolio, "portfolio");
+        assert_eq!(
+            aliases.primary_portfolio_table,
+            Some("pm_portfolio".to_string())
+        );
+        assert!(aliases.dictionary_version.is_some());
+        assert!(aliases.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn business_application_aliases_degrade_without_dictionary() {
+        let server = MockServer::start().await;
+        mount_no_table_ancestors(&server).await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let aliases = core.business_application_aliases().await.expect("aliases");
+        // Cache miss => baseline degraded with a DictionaryUnavailable diagnostic.
+        assert_eq!(aliases.primary_portfolio, "portfolio");
+        assert!(aliases.dictionary_version.is_none());
+        assert!(aliases.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason == ReferenceResolutionReason::DictionaryUnavailable
+        }));
+    }
+
+    #[tokio::test]
+    async fn business_application_sync_summarizes_run() {
+        let server = MockServer::start().await;
+        mount_no_table_ancestors(&server).await;
+        let owner_sys_id = "6816f79cc0a8016401c5a33be04be441";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "name": "Epic",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "business_owner": { "value": owner_sys_id, "display_value": "Jane Owner" },
+                    "portfolio": { "value": "portfolio-sys-id-000000000000000", "display_value": "Clinical" },
+                    "operational_status": { "value": "1", "display_value": "Operational" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/sys_user/{owner_sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": owner_sys_id,
+                    "name": "Jane Owner",
+                    "user_name": "jowner",
+                    "email": "jane.owner@example.invalid",
+                    "active": { "value": "true", "display_value": "true" },
+                    "sys_updated_on": "2026-05-30 12:00:00"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let summary = core
+            .sync_business_applications(
+                Some(BusinessApplicationSearchParams {
+                    name: Some("Epic".to_string()),
+                    limit: Some(5),
+                    ..Default::default()
+                }),
+                BusinessApplicationHydrationOptions::default(),
+            )
+            .await
+            .expect("sync summary");
+
+        assert_eq!(summary.total_applications, 1);
+        assert_eq!(summary.persisted, 1);
+        // Owner reference resolves; the portfolio reference is degraded because
+        // no dictionary was loaded for this run.
+        assert!(summary.references_resolved >= 1);
+        assert!(summary.dictionary_degraded);
+        assert!(!summary.dictionary_refreshed);
+        assert!(
+            summary
+                .degraded_reasons
+                .contains_key("dictionary_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn business_application_sync_non_persistent_reports_zero_persisted() {
+        let server = MockServer::start().await;
+        mount_no_table_ancestors(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "name": "Epic",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "operational_status": { "value": "1", "display_value": "Operational" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let summary = core
+            .sync_business_applications(
+                None,
+                BusinessApplicationHydrationOptions {
+                    persist: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("sync summary");
+
+        assert_eq!(summary.total_applications, 1);
+        assert_eq!(summary.persisted, 0);
+    }
+
+    #[test]
+    fn business_application_resource_type_accepts_aliases() {
+        assert_eq!(
+            ResourceType::from_table("business_application"),
+            ResourceType::BusinessApplication
+        );
+        assert_eq!(
+            ResourceType::from_table("business-app"),
+            ResourceType::BusinessApplication
+        );
+        assert_eq!(
+            normalize_record_lookup_table("cmdb_ci_business_app").unwrap(),
+            "cmdb_ci_business_app"
+        );
+        assert_eq!(
+            normalize_record_lookup_table("business_application").unwrap(),
+            "cmdb_ci_business_app"
+        );
+    }
+
+    #[test]
+    fn business_application_reference_discovery_uses_known_map() {
+        let record = Record::from_json(
+            BUSINESS_APPLICATION_TABLE,
+            &serde_json::json!({
+                "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                "name": "Epic",
+                "business_owner": {
+                    "value": "6816f79cc0a8016401c5a33be04be441",
+                    "display_value": "Jane Owner"
+                },
+                "support_group": {
+                    "value": "287ebd7da9fe198100f92cc8d1d2154e",
+                    "display_value": "App Support"
+                },
+                "portfolio": {
+                    "value": "46d44a23a9fe19810012d100cca80666",
+                    "display_value": "Clinical"
+                }
+            }),
+            DisplayValue::Both,
+        )
+        .expect("record");
+
+        let business_application = BusinessApplication::from_servicenow(
+            &record,
+            &BusinessApplicationFieldAliases::baseline_degraded(),
+        )
+        .expect("business application");
+
+        assert_eq!(
+            business_application
+                .business_owner
+                .as_ref()
+                .map(|reference| reference.table.as_str()),
+            Some("sys_user")
+        );
+        assert_eq!(
+            business_application
+                .primary_support_group
+                .as_ref()
+                .map(|reference| reference.table.as_str()),
+            Some("sys_user_group")
+        );
+        assert!(
+            business_application
+                .references
+                .iter()
+                .any(|reference| reference.field == "portfolio"
+                    && reference.reference_table == "pm_portfolio"
+                    && reference.resolution_status == ReferenceResolutionStatus::Resolved)
+        );
     }
 
     #[tokio::test]
@@ -6545,6 +8163,7 @@ mod tests {
             url: server.uri(),
             user: "test_user".to_string(),
             credential: crate::CredentialProvider::Env,
+            portal: String::new(),
         };
         config.vault = config::VaultConfig {
             path: tempdir.path().join("vault"),

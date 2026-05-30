@@ -1,0 +1,662 @@
+use std::collections::{BTreeMap, HashMap};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use servicenow_rs::prelude::Record;
+
+use crate::{
+    CacheSource, FieldValue, Reference, SnowRecord, normalize_record_lookup_sys_id,
+    reference::choose_reference_display_name,
+};
+
+pub const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
+pub const BUSINESS_APPLICATION_RESOURCE_TYPE: &str = "business_application";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplication {
+    pub record: SnowRecord,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_owner: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_owner: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_owner_group: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_support_group: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_state: Option<ChoiceValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_portfolio: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_dictionary_version: Option<String>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, BusinessApplicationFieldValue>,
+    #[serde(default)]
+    pub references: Vec<ReferencePrimitiveDescriptor>,
+    #[serde(default)]
+    pub unresolved_references: Vec<ReferenceResolutionDiagnostic>,
+}
+
+impl BusinessApplication {
+    pub fn from_servicenow(
+        record: &Record,
+        aliases: &BusinessApplicationFieldAliases,
+    ) -> Result<Self> {
+        let mut snow_record = SnowRecord::from_servicenow(record);
+        snow_record.references = collect_business_application_references(record, aliases);
+        snow_record.source = CacheSource::Api;
+
+        let name = business_application_display_name(record);
+        let fields = business_application_fields(record, aliases);
+        let references = business_application_reference_descriptors(record, aliases, &fields);
+        let mut unresolved_references = aliases.diagnostics.clone();
+        unresolved_references.extend(
+            references
+                .iter()
+                .filter(|reference| {
+                    reference.resolution_status != ReferenceResolutionStatus::Resolved
+                })
+                .map(|reference| ReferenceResolutionDiagnostic {
+                    field: reference.field.clone(),
+                    reference_table: reference.reference_table.clone(),
+                    reference_sys_id: reference.reference_sys_id.clone(),
+                    display_value: reference.display_value.clone(),
+                    reason: match reference.resolution_status {
+                        ReferenceResolutionStatus::UnknownTable => {
+                            ReferenceResolutionReason::UnknownReferenceTable
+                        }
+                        ReferenceResolutionStatus::Unresolved => {
+                            ReferenceResolutionReason::DictionaryUnavailable
+                        }
+                        ReferenceResolutionStatus::Resolved => {
+                            ReferenceResolutionReason::ReferenceResolutionFailed
+                        }
+                        ReferenceResolutionStatus::NotFound => {
+                            ReferenceResolutionReason::ReferenceNotFound
+                        }
+                        ReferenceResolutionStatus::AclRestricted => {
+                            ReferenceResolutionReason::ReferenceAclRestricted
+                        }
+                        ReferenceResolutionStatus::Error => {
+                            ReferenceResolutionReason::ReferenceResolutionFailed
+                        }
+                    },
+                    message: reference.diagnostic.clone(),
+                }),
+        );
+
+        Ok(Self {
+            business_owner: snow_record.references.get(&aliases.business_owner).cloned(),
+            is_owner: snow_record.references.get(&aliases.is_owner).cloned(),
+            ci_owner_group: snow_record.references.get(&aliases.ci_owner_group).cloned(),
+            primary_support_group: snow_record
+                .references
+                .get(&aliases.primary_support_group)
+                .cloned(),
+            operational_state: choice_value(record, &aliases.operational_state),
+            primary_portfolio: snow_record
+                .references
+                .get(&aliases.primary_portfolio)
+                .cloned(),
+            attested_date: record
+                .get_raw(&aliases.attested_date)
+                .or_else(|| record.get_display(&aliases.attested_date))
+                .or_else(|| record.get_str(&aliases.attested_date))
+                .map(ToOwned::to_owned),
+            field_dictionary_version: aliases.dictionary_version.clone(),
+            fields,
+            references,
+            unresolved_references,
+            name,
+            record: snow_record,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BusinessApplicationLookup {
+    SysId(String),
+    ExactName(String),
+}
+
+impl BusinessApplicationLookup {
+    pub fn sys_id(sys_id: impl AsRef<str>) -> Result<Self> {
+        Ok(Self::SysId(normalize_record_lookup_sys_id(
+            sys_id.as_ref(),
+        )?))
+    }
+
+    pub fn exact_name(name: impl Into<String>) -> Self {
+        Self::ExactName(name.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationHydrationOptions {
+    pub persist: bool,
+    pub resolve_references: bool,
+    pub reference_depth: usize,
+    pub refresh_dictionary: bool,
+}
+
+impl Default for BusinessApplicationHydrationOptions {
+    fn default() -> Self {
+        Self {
+            persist: true,
+            resolve_references: true,
+            reference_depth: 1,
+            refresh_dictionary: false,
+        }
+    }
+}
+
+/// Aggregate result of a Business Application sync run.
+///
+/// A sync runs a live ServiceNow search (and persistence, when enabled) and then
+/// rolls up how many applications were processed, how their reference fields
+/// resolved, and whether dictionary metadata was available. The CLI/daemon expose
+/// this serialized as the `summary` object of `business_application_sync`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BusinessApplicationSyncSummary {
+    /// Total Business Applications returned by the live search.
+    pub total_applications: usize,
+    /// Number of applications persisted to vault/cache during the run.
+    ///
+    /// Equals `total_applications` when `persist` is enabled; `0` for a
+    /// non-persistent preview run.
+    pub persisted: usize,
+    /// Total reference fields across all synced applications that resolved to a
+    /// local primitive object.
+    pub references_resolved: usize,
+    /// Total reference fields that could not be resolved (unknown table, ACL
+    /// restriction, not found, dictionary-degraded inference, etc.). These are
+    /// degraded reads, not failures.
+    pub references_unresolved: usize,
+    /// Whether the sync ran in dictionary-degraded mode (baseline aliases used
+    /// because verified `sys_dictionary` metadata was unavailable).
+    pub dictionary_degraded: bool,
+    /// Per-reason counts of unresolved references, keyed by the snake_case
+    /// `ReferenceResolutionReason` (e.g. `dictionary_unavailable`,
+    /// `unknown_reference_table`). Useful for surfacing why a sync degraded.
+    pub degraded_reasons: BTreeMap<String, usize>,
+    /// Whether the run requested (and attempted) a live dictionary refresh.
+    pub dictionary_refreshed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChoiceValue {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationFieldValue {
+    pub field: String,
+    pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_table: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReferencePrimitiveDescriptor {
+    pub field: String,
+    pub reference_table: String,
+    pub reference_sys_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
+    pub primitive_type: ReferencePrimitiveType,
+    pub resolution_status: ReferenceResolutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferencePrimitiveType {
+    UserPrimitive,
+    GroupPrimitive,
+    PortfolioPrimitive,
+    ConfigurationItemPrimitive,
+    ReferencedRecordPrimitive,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceResolutionStatus {
+    Resolved,
+    Unresolved,
+    UnknownTable,
+    NotFound,
+    AclRestricted,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReferenceResolutionDiagnostic {
+    pub field: String,
+    pub reference_table: String,
+    pub reference_sys_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
+    pub reason: ReferenceResolutionReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceResolutionReason {
+    DictionaryUnavailable,
+    UnknownReferenceTable,
+    ReferenceNotFound,
+    ReferenceAclRestricted,
+    ReferenceResolutionFailed,
+    CycleDetected,
+    FanoutLimitExceeded,
+}
+
+impl ReferenceResolutionReason {
+    /// Stable snake_case key matching the serde representation. Used to key the
+    /// degraded-reason counts in [`BusinessApplicationSyncSummary`].
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            Self::DictionaryUnavailable => "dictionary_unavailable",
+            Self::UnknownReferenceTable => "unknown_reference_table",
+            Self::ReferenceNotFound => "reference_not_found",
+            Self::ReferenceAclRestricted => "reference_acl_restricted",
+            Self::ReferenceResolutionFailed => "reference_resolution_failed",
+            Self::CycleDetected => "cycle_detected",
+            Self::FanoutLimitExceeded => "fanout_limit_exceeded",
+        }
+    }
+
+    /// True when this diagnostic signals the dictionary itself was unavailable,
+    /// which puts the whole sync into dictionary-degraded mode.
+    pub fn is_dictionary_unavailable(&self) -> bool {
+        matches!(self, Self::DictionaryUnavailable)
+    }
+}
+
+/// Typed field alias map for the Business Application primitive.
+///
+/// Field names are owned `String`s so that dictionary-verified instance field names
+/// (which may be custom `u_*` fields) can override the hardcoded baseline at
+/// runtime. `dictionary_version` is populated only when the aliases were
+/// resolved from cached `sys_dictionary` metadata; on a dictionary cache miss
+/// the baseline map is used and a `DictionaryUnavailable` diagnostic is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessApplicationFieldAliases {
+    pub business_owner: String,
+    pub is_owner: String,
+    pub ci_owner_group: String,
+    pub primary_support_group: String,
+    pub operational_state: String,
+    pub primary_portfolio: String,
+    /// Dictionary-discovered target table for the Primary Portfolio reference,
+    /// when known. Falls back to `pm_portfolio` during table inference.
+    pub primary_portfolio_table: Option<String>,
+    pub attested_date: String,
+    pub dictionary_version: Option<String>,
+    pub diagnostics: Vec<ReferenceResolutionDiagnostic>,
+}
+
+impl BusinessApplicationFieldAliases {
+    pub fn baseline_degraded() -> Self {
+        let mut aliases = Self::baseline();
+        aliases.diagnostics.push(ReferenceResolutionDiagnostic {
+            field: "cmdb_ci_business_app".to_string(),
+            reference_table: "sys_dictionary".to_string(),
+            reference_sys_id: String::new(),
+            display_value: None,
+            reason: ReferenceResolutionReason::DictionaryUnavailable,
+            message: Some(
+                "using baseline Business Application alias map; dictionary verification unavailable"
+                    .to_string(),
+            ),
+        });
+        aliases
+    }
+
+    pub fn baseline() -> Self {
+        Self {
+            business_owner: "business_owner".to_string(),
+            is_owner: "it_application_owner".to_string(),
+            ci_owner_group: "managed_by_group".to_string(),
+            primary_support_group: "support_group".to_string(),
+            operational_state: "operational_status".to_string(),
+            primary_portfolio: "portfolio".to_string(),
+            primary_portfolio_table: None,
+            attested_date: "attested_date".to_string(),
+            dictionary_version: None,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+pub fn is_business_application_alias(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_")
+            .as_str(),
+        BUSINESS_APPLICATION_RESOURCE_TYPE | "business_app" | BUSINESS_APPLICATION_TABLE
+    )
+}
+
+pub fn business_application_number(record: &Record) -> String {
+    record
+        .get_raw("number")
+        .or_else(|| record.get_display("number"))
+        .or_else(|| record.get_str("number"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("BA:{}", record.sys_id))
+}
+
+pub fn business_application_display_name(record: &Record) -> String {
+    first_record_value(record, &["name", "short_description"])
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+pub fn business_application_state(
+    record: &Record,
+    aliases: &BusinessApplicationFieldAliases,
+) -> String {
+    record
+        .get_display(&aliases.operational_state)
+        .or_else(|| record.get_raw(&aliases.operational_state))
+        .or_else(|| record.get_str(&aliases.operational_state))
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub fn business_application_description(record: &Record) -> String {
+    first_record_value(record, &["short_description", "description"]).unwrap_or_default()
+}
+
+pub fn collect_business_application_references(
+    record: &Record,
+    aliases: &BusinessApplicationFieldAliases,
+) -> HashMap<String, Reference> {
+    let mut references = HashMap::new();
+    for field_name in known_reference_fields(aliases) {
+        if let Some(reference) =
+            reference_from_business_application_field(record, &field_name, aliases)
+        {
+            references.insert(field_name, reference);
+        }
+    }
+
+    for (field_name, value) in record.fields() {
+        if references.contains_key(field_name) {
+            continue;
+        }
+        if value.display_value.is_some()
+            && value
+                .value
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(looks_like_sys_id)
+        {
+            if let Some(reference) =
+                reference_from_business_application_field(record, field_name, aliases)
+            {
+                references.insert(field_name.clone(), reference);
+            }
+        }
+    }
+
+    references
+}
+
+pub fn business_application_reference_descriptors(
+    record: &Record,
+    aliases: &BusinessApplicationFieldAliases,
+    fields: &BTreeMap<String, BusinessApplicationFieldValue>,
+) -> Vec<ReferencePrimitiveDescriptor> {
+    collect_business_application_references(record, aliases)
+        .into_iter()
+        .map(|(field, reference)| {
+            let reference_table = reference.table.clone();
+            let primitive_type = primitive_type_for_table(&reference_table);
+            let resolution_status = if matches!(
+                primitive_type,
+                ReferencePrimitiveType::ReferencedRecordPrimitive
+            ) && !is_known_reference_table(&reference_table)
+            {
+                ReferenceResolutionStatus::UnknownTable
+            } else {
+                ReferenceResolutionStatus::Resolved
+            };
+            let diagnostic = if resolution_status == ReferenceResolutionStatus::UnknownTable {
+                Some(
+                    "reference table is not in the Business Application primitive allowlist"
+                        .to_string(),
+                )
+            } else if fields
+                .get(&field)
+                .and_then(|field| field.reference_table.as_deref())
+                .is_none()
+            {
+                Some(
+                    "reference table came from baseline/shape inference, not dictionary metadata"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            ReferencePrimitiveDescriptor {
+                field,
+                reference_table,
+                reference_sys_id: reference.sys_id,
+                display_value: (!reference.display_name.is_empty())
+                    .then_some(reference.display_name),
+                primitive_type,
+                resolution_status,
+                diagnostic,
+            }
+        })
+        .collect()
+}
+
+fn business_application_fields(
+    record: &Record,
+    aliases: &BusinessApplicationFieldAliases,
+) -> BTreeMap<String, BusinessApplicationFieldValue> {
+    let mut fields = BTreeMap::new();
+    for (field_name, field_value) in record.fields() {
+        let raw = field_value.value.clone().unwrap_or(Value::Null);
+        let normalized_text = field_value
+            .display_value
+            .as_deref()
+            .or_else(|| raw.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        let reference_table = reference_table_for_field(field_name, field_value, aliases);
+        let field_type = if reference_table.is_some() {
+            Some("reference".to_string())
+        } else if field_name == &aliases.operational_state {
+            Some("choice".to_string())
+        } else {
+            None
+        };
+        fields.insert(
+            field_name.clone(),
+            BusinessApplicationFieldValue {
+                field: field_name.clone(),
+                value: raw,
+                display_value: field_value.display_value.clone(),
+                normalized_text,
+                field_type,
+                reference_table,
+            },
+        );
+    }
+    fields
+}
+
+fn reference_from_business_application_field(
+    record: &Record,
+    field_name: &str,
+    aliases: &BusinessApplicationFieldAliases,
+) -> Option<Reference> {
+    let field_value = record.get(field_name)?;
+    let sys_id = field_value
+        .value
+        .as_ref()
+        .and_then(Value::as_str)
+        .or_else(|| record.get_raw(field_name))
+        .filter(|value| looks_like_sys_id(value))?
+        .to_string();
+    let table = reference_table_for_field(field_name, field_value, aliases)
+        .unwrap_or_else(|| "unknown".to_string());
+    let display_name = choose_reference_display_name([
+        field_value.display_value.as_deref(),
+        record.get_str(&format!("{field_name}.name")),
+        record.get_str(&format!("{field_name}.number")),
+        record.get_str(&format!("{field_name}.user_name")),
+        Some(sys_id.as_str()),
+    ]);
+    Some(Reference {
+        sys_id,
+        table,
+        display_name,
+        extra: HashMap::new(),
+    })
+}
+
+fn choice_value(record: &Record, field_name: &str) -> Option<ChoiceValue> {
+    let field = record.get(field_name)?;
+    Some(ChoiceValue {
+        value: field
+            .value
+            .as_ref()
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default(),
+        display_value: field.display_value.clone(),
+    })
+}
+
+fn first_record_value(record: &Record, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        record
+            .get_display(field)
+            .or_else(|| record.get_raw(field))
+            .or_else(|| record.get_str(field))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn known_reference_fields(aliases: &BusinessApplicationFieldAliases) -> Vec<String> {
+    let mut fields = vec![
+        aliases.business_owner.clone(),
+        aliases.is_owner.clone(),
+        aliases.ci_owner_group.clone(),
+        aliases.primary_support_group.clone(),
+        aliases.primary_portfolio.clone(),
+        "cmdb_ci".to_string(),
+        "owned_by".to_string(),
+        "managed_by".to_string(),
+        "assignment_group".to_string(),
+    ];
+    fields.sort_unstable();
+    fields.dedup();
+    fields
+}
+
+fn reference_table_for_field(
+    field_name: &str,
+    field_value: &servicenow_rs::prelude::FieldValue,
+    aliases: &BusinessApplicationFieldAliases,
+) -> Option<String> {
+    if let Some(table) = reference_table_from_link(field_value.link.as_deref()) {
+        return Some(table);
+    }
+    // The Primary Portfolio target table is dictionary-discovered; fall back to
+    // the baseline portfolio table only when the dictionary did not supply one.
+    if field_name == aliases.primary_portfolio.as_str() {
+        return Some(
+            aliases
+                .primary_portfolio_table
+                .clone()
+                .unwrap_or_else(|| "pm_portfolio".to_string()),
+        );
+    }
+    Some(
+        match field_name {
+            field if field == aliases.business_owner.as_str() => "sys_user",
+            field if field == aliases.is_owner.as_str() => "sys_user",
+            field if field == aliases.ci_owner_group.as_str() => "sys_user_group",
+            field if field == aliases.primary_support_group.as_str() => "sys_user_group",
+            "cmdb_ci" => "cmdb_ci",
+            "owned_by" => "sys_user",
+            "managed_by" => "sys_user",
+            "assignment_group" => "sys_user_group",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn reference_table_from_link(link: Option<&str>) -> Option<String> {
+    let link = link?;
+    let marker = "/api/now/table/";
+    let start = link.find(marker)? + marker.len();
+    let rest = &link[start..];
+    let table = rest.split('/').next()?.trim();
+    (!table.is_empty()).then(|| table.to_string())
+}
+
+fn primitive_type_for_table(table: &str) -> ReferencePrimitiveType {
+    match table {
+        "sys_user" => ReferencePrimitiveType::UserPrimitive,
+        "sys_user_group" => ReferencePrimitiveType::GroupPrimitive,
+        "cmdb_ci" | "cmdb_ci_business_app" => ReferencePrimitiveType::ConfigurationItemPrimitive,
+        "unknown" => ReferencePrimitiveType::ReferencedRecordPrimitive,
+        table if table.contains("portfolio") => ReferencePrimitiveType::PortfolioPrimitive,
+        _ => ReferencePrimitiveType::ReferencedRecordPrimitive,
+    }
+}
+
+fn is_known_reference_table(table: &str) -> bool {
+    matches!(
+        table,
+        "sys_user" | "sys_user_group" | "cmdb_ci" | "cmdb_ci_business_app"
+    ) || table.contains("portfolio")
+}
+
+fn looks_like_sys_id(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[allow(dead_code)]
+fn _field_value_from_business_field(field: &BusinessApplicationFieldValue) -> FieldValue {
+    FieldValue {
+        value: match &field.value {
+            Value::String(text) => text.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        },
+        display_value: field.display_value.clone(),
+    }
+}

@@ -55,6 +55,7 @@ async fn build_fixture_state_with_config_instance(
             url: config_instance_url.to_string(),
             user: "tester".to_string(),
             credential: CredentialProvider::Env,
+            portal: String::new(),
         },
         vault: VaultConfig {
             path: vault_path.clone(),

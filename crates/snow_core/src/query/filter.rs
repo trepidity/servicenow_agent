@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::ResourceType;
 
@@ -15,6 +16,104 @@ pub struct SortField {
     pub field: String,
     #[serde(default)]
     pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusinessApplicationQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub filters: Vec<FieldFilter>,
+    #[serde(default)]
+    pub include_tombstoned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub sort: Vec<SortField>,
+    #[serde(default)]
+    pub allow_unknown_fields: bool,
+}
+
+impl Default for BusinessApplicationQuery {
+    fn default() -> Self {
+        Self {
+            text: None,
+            filters: Vec::new(),
+            include_tombstoned: false,
+            limit: Some(20),
+            offset: None,
+            sort: Vec::new(),
+            allow_unknown_fields: false,
+        }
+    }
+}
+
+impl BusinessApplicationQuery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.text = Some(text.into());
+        self
+    }
+
+    pub fn filter(mut self, field: impl Into<String>, op: FieldOperator, value: Value) -> Self {
+        self.filters.push(FieldFilter {
+            field: field.into(),
+            op,
+            value,
+        });
+        self
+    }
+
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: usize) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn sort_by(mut self, field: impl Into<String>, direction: SortDirection) -> Self {
+        self.sort.push(SortField {
+            field: field.into(),
+            direction,
+        });
+        self
+    }
+
+    pub fn allow_unknown_fields(mut self, allow: bool) -> Self {
+        self.allow_unknown_fields = allow;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldFilter {
+    pub field: String,
+    pub op: FieldOperator,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldOperator {
+    Eq,
+    Ne,
+    Contains,
+    StartsWith,
+    In,
+    IsEmpty,
+    IsNotEmpty,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
 }
 
 impl SortField {

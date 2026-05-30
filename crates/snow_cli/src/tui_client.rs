@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use snow_core::{
     ApprovalRecord, AttachmentMetadata, CacheSource, FieldChoice, FieldValue, JournalEntry,
@@ -609,6 +609,143 @@ impl DaemonRpcClient {
         Ok(summary.into())
     }
 
+    /// Get one Business Application by sys_id or exact name.
+    ///
+    /// `fresh` selects the live `business_application_get_fresh` variant over the
+    /// cache-first `business_application_get`. Returns `None` when the daemon
+    /// reports the record is missing.
+    pub async fn business_application_get(
+        &self,
+        sys_id: Option<&str>,
+        name: Option<&str>,
+        fresh: bool,
+    ) -> Result<Option<BusinessApplicationView>, SnowError> {
+        let method = if fresh {
+            "business_application_get_fresh"
+        } else {
+            "business_application_get"
+        };
+        let mut params = serde_json::Map::new();
+        if let Some(sys_id) = sys_id {
+            params.insert("sys_id".to_string(), json!(sys_id));
+        }
+        if let Some(name) = name {
+            params.insert("name".to_string(), json!(name));
+        }
+        let app: Option<DaemonBusinessApplication> = self
+            .call_optional_wrapped(method, Some(Value::Object(params)), "business_application")
+            .await?;
+        Ok(app.map(Into::into))
+    }
+
+    /// Search Business Applications by name and operational-state exclusion.
+    pub async fn business_application_search(
+        &self,
+        name: Option<&str>,
+        operational_state_not: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<BusinessApplicationView>, SnowError> {
+        let mut params = serde_json::Map::new();
+        if let Some(name) = name {
+            params.insert("name".to_string(), json!(name));
+        }
+        if let Some(state) = operational_state_not {
+            params.insert("operational_state_not".to_string(), json!(state));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".to_string(), json!(limit));
+        }
+        let apps: Vec<DaemonBusinessApplication> = self
+            .call_wrapped(
+                "business_application_search",
+                Some(Value::Object(params)),
+                "business_applications",
+            )
+            .await?;
+        Ok(apps.into_iter().map(Into::into).collect())
+    }
+
+    /// Run a local all-field query. Returns the raw daemon JSON so the CLI stays
+    /// decoupled from the backend's evolving record/projection shape.
+    pub async fn business_application_query(
+        &self,
+        filters: &[BusinessApplicationQueryFilter],
+        limit: Option<usize>,
+    ) -> Result<Value, SnowError> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "filters".to_string(),
+            json!(
+                filters
+                    .iter()
+                    .map(|f| json!({
+                        "field": f.field,
+                        "operator": f.operator,
+                        "value": f.value,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if let Some(limit) = limit {
+            params.insert("limit".to_string(), json!(limit));
+        }
+        // The daemon may key results under "business_applications" or "records";
+        // unwrap either, falling back to the whole payload.
+        let raw: Value = self
+            .call_wrapped(
+                "business_application_query",
+                Some(Value::Object(params)),
+                "business_applications",
+            )
+            .await?;
+        Ok(raw)
+    }
+
+    /// List the dictionary-backed Business Application fields. Returns the raw
+    /// JSON array; the CLI renders it generically because the backend owns and
+    /// may enrich the per-field shape.
+    pub async fn business_application_fields(&self, refresh: bool) -> Result<Value, SnowError> {
+        let params = if refresh {
+            Some(json!({ "refresh_dictionary": true }))
+        } else {
+            None
+        };
+        self.call_wrapped("business_application_fields", params, "fields")
+            .await
+    }
+
+    /// Sync Business Applications into the local vault/cache with optional
+    /// hydration. Returns the raw summary object; the CLI renders it generically.
+    pub async fn business_application_sync(
+        &self,
+        name: Option<&str>,
+        operational_state_not: Option<&str>,
+        persist: bool,
+        resolve_references: bool,
+        reference_depth: Option<u32>,
+        refresh_dictionary: bool,
+    ) -> Result<Value, SnowError> {
+        let mut params = serde_json::Map::new();
+        if let Some(name) = name {
+            params.insert("name".to_string(), json!(name));
+        }
+        if let Some(state) = operational_state_not {
+            params.insert("operational_state_not".to_string(), json!(state));
+        }
+        params.insert("persist".to_string(), json!(persist));
+        params.insert("resolve_references".to_string(), json!(resolve_references));
+        if let Some(depth) = reference_depth {
+            params.insert("reference_depth".to_string(), json!(depth));
+        }
+        params.insert("refresh_dictionary".to_string(), json!(refresh_dictionary));
+        self.call_wrapped(
+            "business_application_sync",
+            Some(Value::Object(params)),
+            "summary",
+        )
+        .await
+    }
+
     pub async fn list_knowledge_bases(&self) -> Result<Vec<KnowledgeBaseSummary>, SnowError> {
         self.call_wrapped("list_knowledge_bases", None, "bases")
             .await
@@ -1031,6 +1168,152 @@ struct DaemonKnowledgeArticle {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct DaemonBusinessApplication {
+    record: DaemonSnowRecord,
+    name: String,
+    business_owner: Option<DaemonReference>,
+    is_owner: Option<DaemonReference>,
+    ci_owner_group: Option<DaemonReference>,
+    primary_support_group: Option<DaemonReference>,
+    operational_state: Option<DaemonFieldValue>,
+    primary_portfolio: Option<DaemonReference>,
+    attested_date: Option<String>,
+    fields: std::collections::HashMap<String, DaemonFieldValue>,
+    unresolved_references: Vec<DaemonBusinessApplicationDiagnostic>,
+    browser_url: Option<String>,
+    vault_relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct DaemonBusinessApplicationDiagnostic {
+    field: String,
+    sys_id: Option<String>,
+    table: Option<String>,
+    diagnostic: String,
+}
+
+/// One field/operator/value filter passed to `business_application_query`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BusinessApplicationQueryFilter {
+    pub field: String,
+    /// Operator token understood by the daemon query layer (e.g. "contains", "eq").
+    pub operator: String,
+    pub value: String,
+}
+
+/// Public, daemon-decoupled view of a Business Application reference target.
+///
+/// The CLI display layer renders these instead of the private daemon DTOs so
+/// `display.rs` does not depend on the daemon transport types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BusinessApplicationRef {
+    pub sys_id: String,
+    pub table: String,
+    pub display_name: String,
+}
+
+impl From<DaemonReference> for BusinessApplicationRef {
+    fn from(value: DaemonReference) -> Self {
+        Self {
+            sys_id: value.sys_id,
+            table: value.table,
+            display_name: value.display_name,
+        }
+    }
+}
+
+/// A single dictionary/runtime field value rendered in the all-fields table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BusinessApplicationFieldValue {
+    pub value: String,
+    pub display_value: Option<String>,
+}
+
+impl From<DaemonFieldValue> for BusinessApplicationFieldValue {
+    fn from(value: DaemonFieldValue) -> Self {
+        Self {
+            value: value.value,
+            display_value: value.display_value,
+        }
+    }
+}
+
+/// Diagnostic describing a reference that could not be resolved locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BusinessApplicationDiagnostic {
+    pub field: String,
+    pub sys_id: Option<String>,
+    pub table: Option<String>,
+    pub diagnostic: String,
+}
+
+impl From<DaemonBusinessApplicationDiagnostic> for BusinessApplicationDiagnostic {
+    fn from(value: DaemonBusinessApplicationDiagnostic) -> Self {
+        Self {
+            field: value.field,
+            sys_id: value.sys_id,
+            table: value.table,
+            diagnostic: value.diagnostic,
+        }
+    }
+}
+
+/// Public Business Application view consumed by the CLI display helpers.
+///
+/// This mirrors `DaemonBusinessApplication` but drops the daemon-internal
+/// `record`/transport coupling, exposing only what the CLI needs to render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BusinessApplicationView {
+    pub sys_id: String,
+    pub number: String,
+    pub name: String,
+    pub business_owner: Option<BusinessApplicationRef>,
+    pub is_owner: Option<BusinessApplicationRef>,
+    pub ci_owner_group: Option<BusinessApplicationRef>,
+    pub primary_support_group: Option<BusinessApplicationRef>,
+    pub operational_state: Option<BusinessApplicationFieldValue>,
+    pub primary_portfolio: Option<BusinessApplicationRef>,
+    pub attested_date: Option<String>,
+    /// All projected fields, sorted by key for stable rendering.
+    pub fields: Vec<(String, BusinessApplicationFieldValue)>,
+    pub unresolved_references: Vec<BusinessApplicationDiagnostic>,
+    pub browser_url: Option<String>,
+    pub vault_relative_path: Option<String>,
+}
+
+impl From<DaemonBusinessApplication> for BusinessApplicationView {
+    fn from(value: DaemonBusinessApplication) -> Self {
+        // Sort fields by key so human output is deterministic.
+        let mut fields: Vec<(String, BusinessApplicationFieldValue)> = value
+            .fields
+            .into_iter()
+            .map(|(key, val)| (key, val.into()))
+            .collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            sys_id: value.record.sys_id,
+            number: value.record.number,
+            name: value.name,
+            business_owner: value.business_owner.map(Into::into),
+            is_owner: value.is_owner.map(Into::into),
+            ci_owner_group: value.ci_owner_group.map(Into::into),
+            primary_support_group: value.primary_support_group.map(Into::into),
+            operational_state: value.operational_state.map(Into::into),
+            primary_portfolio: value.primary_portfolio.map(Into::into),
+            attested_date: value.attested_date,
+            fields,
+            unresolved_references: value
+                .unresolved_references
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            browser_url: value.browser_url,
+            vault_relative_path: value.vault_relative_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct DaemonContractInfo {
     environment: Option<DaemonContractEnvironment>,
 }
@@ -1150,8 +1433,10 @@ enum DaemonResourceType {
     ResourcePlan,
     Story,
     ScrumTask,
+    Timecard,
     Knowledge,
     Approval,
+    BusinessApplication,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1365,8 +1650,10 @@ impl From<DaemonResourceType> for ResourceType {
             DaemonResourceType::ResourcePlan => Self::ResourcePlan,
             DaemonResourceType::Story => Self::Story,
             DaemonResourceType::ScrumTask => Self::ScrumTask,
+            DaemonResourceType::Timecard => Self::Timecard,
             DaemonResourceType::Knowledge => Self::Knowledge,
             DaemonResourceType::Approval => Self::Approval,
+            DaemonResourceType::BusinessApplication => Self::BusinessApplication,
         }
     }
 }

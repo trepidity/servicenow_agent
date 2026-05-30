@@ -1699,6 +1699,7 @@ pub(super) fn entity_kind_for_table(table: &str) -> Option<EntityKind> {
         "sc_req_item" => Some(EntityKind::RequestItem),
         "sc_task" => Some(EntityKind::CatalogTask),
         "incident" => Some(EntityKind::Incident),
+        "cmdb_ci_business_app" => Some(EntityKind::BusinessApplication),
         _ => None,
     }
 }
@@ -1776,7 +1777,8 @@ pub(super) fn child_relation(kind: EntityKind) -> ChildRelation {
         | EntityKind::ChangeTask
         | EntityKind::ScrumTask
         | EntityKind::CatalogTask
-        | EntityKind::Incident => ChildRelation {
+        | EntityKind::Incident
+        | EntityKind::BusinessApplication => ChildRelation {
             parent_kind: kind,
             child_kind: None,
             child_table: None,
@@ -1797,7 +1799,10 @@ pub(super) fn lifecycle_field(kind: EntityKind) -> &'static str {
         | EntityKind::ScrumTask
         | EntityKind::RequestItem
         | EntityKind::CatalogTask
-        | EntityKind::Incident => "state",
+        | EntityKind::Incident
+        // Business Applications use the operational status field as their
+        // lifecycle indicator in list/detail routing.
+        | EntityKind::BusinessApplication => "state",
     }
 }
 
@@ -2077,6 +2082,37 @@ fn detail_page_model(kind: EntityKind) -> DetailPageModel {
             ],
             section_specs: Vec::new(),
             sections_title: "Details",
+            child_summary: None,
+        },
+        // Business Applications surface typed ownership and operational fields
+        // first; the generic all-fields table follows via the standard record
+        // detail flow (no BA-specific fetch path required).
+        EntityKind::BusinessApplication => DetailPageModel {
+            title: "Business Application Details",
+            field_specs: vec![
+                field(
+                    "Operational Status",
+                    &["operational_status", "install_status"],
+                ),
+                field("Business Owner", &["business_owner", "owned_by"]),
+                field("Information Owner", &["it_application_owner", "is_owner"]),
+                field("CI Owner Group", &["ci_owner_group", "u_ci_owner_group"]),
+                field(
+                    "Support Group",
+                    &[
+                        "support_group",
+                        "u_primary_support_group",
+                        "primary_support_group",
+                    ],
+                ),
+                field("Portfolio", &["primary_portfolio", "u_primary_portfolio"]),
+                field("Attested", &["attested_date", "attestation_date"]),
+            ],
+            section_specs: vec![
+                section("Description", "short_description"),
+                section("Comments", "comments"),
+            ],
+            sections_title: "Business Application Detail",
             child_summary: None,
         },
     }
@@ -2515,6 +2551,14 @@ mod tests {
         assert_eq!(
             entity_kind_for_table("change_request_normal"),
             Some(EntityKind::ChangeRequest)
+        );
+    }
+
+    #[test]
+    fn business_app_table_maps_to_business_application_kind() {
+        assert_eq!(
+            entity_kind_for_table("cmdb_ci_business_app"),
+            Some(EntityKind::BusinessApplication)
         );
     }
 

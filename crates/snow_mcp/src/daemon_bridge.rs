@@ -39,6 +39,10 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("catalog_submit_request", "catalog_submit_request"),
     ("search_records", "search_records"),
     ("user_lookup", "user_lookup"),
+    ("business_application_get", "business_application_get"),
+    ("business_application_search", "business_application_search"),
+    ("business_application_query", "business_application_query"),
+    ("business_application_fields", "business_application_fields"),
     ("list_records", "list_records"),
     ("list_my_tasks", "list_my_tasks"),
     ("list_my_approvals", "list_my_approvals"),
@@ -1087,6 +1091,81 @@ mod tests {
             .and_then(Value::as_array)
             .expect("write tools array");
         assert!(writes.contains(&json!("story_task_apply_update")));
+    }
+
+    #[tokio::test]
+    async fn business_application_tools_are_gated_by_daemon_contract() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec![
+            "business_application_get",
+            "business_application_search",
+            "business_application_query",
+            "business_application_fields",
+        ]));
+        let bridge =
+            DaemonBackedMcpBridge::new(daemon, McpConfig::default(), DEFAULT_CONTRACT_VERSION);
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/list".to_string(),
+                params: json!({}),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"business_application_get"));
+        assert!(names.contains(&"business_application_search"));
+        assert!(names.contains(&"business_application_query"));
+        assert!(names.contains(&"business_application_fields"));
+        assert!(!names.contains(&"get_record"));
+    }
+
+    #[tokio::test]
+    async fn business_application_search_forwards_hydration_options() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec![
+            "business_application_search",
+        ]));
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "business_application_search",
+                    "arguments": {
+                        "name": "Epic",
+                        "persist": false,
+                        "resolve_references": false,
+                        "reference_depth": 2,
+                        "refresh_dictionary": true
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls[0].0, "business_application_search");
+        assert_eq!(calls[0].1["persist"], json!(false));
+        assert_eq!(calls[0].1["resolve_references"], json!(false));
+        assert_eq!(calls[0].1["reference_depth"], json!(2));
+        assert_eq!(calls[0].1["refresh_dictionary"], json!(true));
     }
 
     #[tokio::test]

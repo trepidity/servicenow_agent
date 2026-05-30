@@ -158,6 +158,14 @@ impl McpServer {
             "get_children" => self.call_get_children(id, params).await,
             "search_records" => self.call_search(id, params, SearchScope::All).await,
             "user_lookup" => self.call_user_lookup(id, params).await,
+            "business_application_get" => self.call_business_application_get(id, params).await,
+            "business_application_search" => {
+                self.call_business_application_search(id, params).await
+            }
+            "business_application_query" => self.call_business_application_query(id, params).await,
+            "business_application_fields" => {
+                self.call_business_application_fields(id, params).await
+            }
             "search_knowledge" => self.call_search_knowledge(id, params).await,
             "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
             "get_article" => self.call_get_article(id, params).await,
@@ -407,6 +415,170 @@ impl McpServer {
             Ok(None) => JsonRpcResponse::error(id, -32004, "user not found", None),
             Err(err) => service_failure(id, err),
         }
+    }
+
+    async fn call_business_application_search(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let search_arguments = strip_business_application_hydration(arguments);
+        let parsed: snow_core::BusinessApplicationSearchParams =
+            match serde_json::from_value(search_arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+
+        match self.state.core.search_business_applications(parsed).await {
+            Ok(records) => {
+                let mut applications = Vec::with_capacity(records.len());
+                let mut record_dtos = Vec::with_capacity(records.len());
+                for record in records {
+                    match transport.business_application(&record) {
+                        Ok(application) => {
+                            record_dtos.push(application.record.clone());
+                            applications.push(application);
+                        }
+                        Err(err) => return service_failure(id, err),
+                    }
+                }
+                JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "business_applications": applications,
+                        "records": record_dtos
+                    }),
+                )
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_business_application_get(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let Value::Object(map) = arguments else {
+            return invalid_params(id, "arguments must be an object");
+        };
+        let sys_id = map.get("sys_id").and_then(Value::as_str).map(str::trim);
+        let name = map.get("name").and_then(Value::as_str).map(str::trim);
+        let records = match self
+            .state
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::BusinessApplication))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let record = match (
+            sys_id.filter(|value| !value.is_empty()),
+            name.filter(|value| !value.is_empty()),
+        ) {
+            (Some(sys_id), None) => match snow_core::normalize_record_lookup_sys_id(sys_id) {
+                Ok(sys_id) => records
+                    .into_iter()
+                    .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id)),
+                Err(err) => return invalid_params(id, err),
+            },
+            (None, Some(name)) => records
+                .into_iter()
+                .find(|record| business_application_name(record) == name),
+            (Some(_), Some(_)) => return invalid_params(id, "provide exactly one of sys_id or name"),
+            (None, None) => return invalid_params(id, "missing required lookup: sys_id or name"),
+        };
+        match record {
+            Some(record) => match transport.business_application(&record) {
+                Ok(application) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "business_application": application,
+                        "markdown": render_snow_record(&record),
+                    }),
+                ),
+                Err(err) => service_failure(id, err),
+            },
+            None => JsonRpcResponse::error(id, -32004, "business application not found", None),
+        }
+    }
+
+    async fn call_business_application_query(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let mut query: snow_core::query::filter::BusinessApplicationQuery =
+            match serde_json::from_value(arguments) {
+                Ok(query) => query,
+                Err(err) => return invalid_params(id, err),
+            };
+        if query.limit == Some(0) || query.limit.unwrap_or(20) > 500 {
+            return invalid_params(id, "`limit` must be between 1 and 500");
+        }
+        query.allow_unknown_fields = true;
+        let records = match self.state.core.query_business_applications(query).await {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut applications = Vec::new();
+        for record in records {
+            match transport.business_application(&record) {
+                Ok(application) => applications.push(application),
+                Err(err) => return service_failure(id, err),
+            }
+        }
+        JsonRpcResponse::ok(id, json!({ "business_applications": applications }))
+    }
+
+    async fn call_business_application_fields(
+        &self,
+        id: Option<Value>,
+        _params: &Value,
+    ) -> JsonRpcResponse {
+        let records = match self
+            .state
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::BusinessApplication))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut fields = std::collections::BTreeMap::<String, usize>::new();
+        for record in records {
+            for name in record.fields.keys() {
+                *fields.entry(name.clone()).or_default() += 1;
+            }
+        }
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "fields": fields
+                    .into_iter()
+                    .map(|(field, observed_count)| json!({ "field": field, "observed_count": observed_count }))
+                    .collect::<Vec<_>>()
+            }),
+        )
     }
 
     async fn call_search_knowledge(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
@@ -934,6 +1106,32 @@ impl McpServer {
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
+                name: "business_application_get".to_string(),
+                description: "Get a locally cached Business Application by sys_id or exact name"
+                    .to_string(),
+                input_schema: snow_mcp::tools::records::business_application_get_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "business_application_search".to_string(),
+                description: "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date; results persist by default when supported by the daemon/core contract".to_string(),
+                input_schema: snow_mcp::tools::records::business_application_search_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "business_application_query".to_string(),
+                description: "Query locally projected Business Application fields".to_string(),
+                input_schema: snow_mcp::tools::records::business_application_query_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "business_application_fields".to_string(),
+                description: "List observed Business Application fields from the local projection"
+                    .to_string(),
+                input_schema: snow_mcp::tools::records::business_application_fields_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
                 name: "search_knowledge".to_string(),
                 description: "Search knowledge articles".to_string(),
                 input_schema: json!({
@@ -1225,6 +1423,9 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),
         "knowledge" | "kb_knowledge" => Ok(ResourceType::Knowledge),
         "approval" | "sysapproval_approver" => Ok(ResourceType::Approval),
+        "business_application" | "business_app" | "cmdb_ci_business_app" => {
+            Ok(ResourceType::BusinessApplication)
+        }
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }
@@ -1235,6 +1436,34 @@ fn parse_search_scope(scope: &str) -> SearchScope {
         "work_notes" => SearchScope::WorkNotes,
         _ => SearchScope::All,
     }
+}
+
+fn strip_business_application_hydration(mut arguments: Value) -> Value {
+    if let Value::Object(map) = &mut arguments {
+        map.remove("persist");
+        map.remove("resolve_references");
+        map.remove("reference_depth");
+        map.remove("refresh_dictionary");
+    }
+    arguments
+}
+
+fn business_application_name(record: &SnowRecord) -> String {
+    record
+        .fields
+        .get("name")
+        .and_then(|field| {
+            field
+                .display_value
+                .as_ref()
+                .or(Some(&field.value))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
 }
 
 async fn get_record_cached_or_fresh(core: &SnowCore, number: &str) -> Result<Option<SnowRecord>> {

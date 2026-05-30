@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod business_application;
 pub mod catalog;
 pub mod change;
 pub mod incident;

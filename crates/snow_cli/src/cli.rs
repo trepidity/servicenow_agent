@@ -121,6 +121,12 @@ pub enum Command {
         #[arg(long)]
         fresh: bool,
     },
+    /// Business Application lookup, search, query, dictionary, and sync commands
+    BusinessApp {
+        /// Business Application subcommand.
+        #[command(subcommand)]
+        action: BusinessAppCommand,
+    },
     /// Show an approval through the typed runtime path
     Approval {
         /// Approval number
@@ -354,6 +360,97 @@ pub enum KnowledgeSemanticCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum BusinessAppCommand {
+    /// Get a single Business Application by sys_id or exact name
+    Get {
+        /// Business Application sys_id
+        #[arg(long = "sys-id")]
+        sys_id: Option<String>,
+        /// Business Application name (exact match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Fetch a fresh copy from ServiceNow instead of the local cache
+        #[arg(long)]
+        fresh: bool,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+        /// Include the full all-fields table in human output
+        #[arg(long)]
+        full: bool,
+    },
+    /// Search Business Applications by name and operational state
+    Search {
+        /// Filter by name (contains match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Exclude rows whose operational_state equals this value
+        #[arg(long = "operational-state-not")]
+        operational_state_not: Option<String>,
+        /// Maximum number of results to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+        /// Include the full all-fields table for each result
+        #[arg(long)]
+        full: bool,
+    },
+    /// Run a local all-field query using repeatable field/operator/value filters
+    Query {
+        /// Field name to filter on. Repeatable; paired by position with operator values.
+        #[arg(long = "field")]
+        field: Vec<String>,
+        /// "contains" operator value. Repeatable.
+        #[arg(long = "contains")]
+        contains: Vec<String>,
+        /// "equals" operator value. Repeatable.
+        #[arg(long = "eq")]
+        eq: Vec<String>,
+        /// Maximum number of results to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the dictionary-backed Business Application fields
+    Fields {
+        /// Refresh the dictionary from ServiceNow before listing
+        #[arg(long)]
+        refresh: bool,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sync Business Applications into the local vault/cache with optional hydration
+    Sync {
+        /// Filter by name (contains match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Exclude rows whose operational_state equals this value
+        #[arg(long = "operational-state-not")]
+        operational_state_not: Option<String>,
+        /// Persist results to the local vault/cache
+        #[arg(long, default_value_t = true)]
+        persist: bool,
+        /// Resolve direct references during hydration
+        #[arg(long = "resolve-references")]
+        resolve_references: bool,
+        /// Maximum reference resolution depth
+        #[arg(long = "reference-depth")]
+        reference_depth: Option<u32>,
+        /// Refresh the dictionary before syncing
+        #[arg(long = "refresh-dictionary")]
+        refresh_dictionary: bool,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +629,138 @@ mod tests {
 
         let cli = Cli::parse_from(["snow", "approval", "APR001"]);
         assert!(matches!(cli.command, Command::Approval { number } if number == "APR001"));
+    }
+
+    #[test]
+    fn parses_business_app_commands() {
+        let cli = Cli::parse_from(["snow", "business-app", "get", "--name", "Epic", "--full"]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Get {
+                    sys_id: None,
+                    name: Some(name),
+                    fresh: false,
+                    json: false,
+                    full: true,
+                },
+            } if name == "Epic"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "get",
+            "--sys-id",
+            "abc123",
+            "--fresh",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Get {
+                    sys_id: Some(sys_id),
+                    name: None,
+                    fresh: true,
+                    json: true,
+                    full: false,
+                },
+            } if sys_id == "abc123"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "search",
+            "--name",
+            "Epic",
+            "--operational-state-not",
+            "2",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Search {
+                    name: Some(name),
+                    operational_state_not: Some(state),
+                    ..
+                },
+            } if name == "Epic" && state == "2"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "query",
+            "--field",
+            "business_owner",
+            "--contains",
+            "Jane",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Query {
+                    field,
+                    contains,
+                    eq,
+                    ..
+                },
+            } if field == vec!["business_owner".to_string()]
+                && contains == vec!["Jane".to_string()]
+                && eq.is_empty()
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "query",
+            "--field",
+            "u_custom_field",
+            "--eq",
+            "value",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Query { field, eq, .. },
+            } if field == vec!["u_custom_field".to_string()]
+                && eq == vec!["value".to_string()]
+        ));
+
+        let cli = Cli::parse_from(["snow", "business-app", "fields", "--refresh"]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Fields {
+                    refresh: true,
+                    json: false,
+                },
+            }
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "sync",
+            "--name",
+            "Epic",
+            "--resolve-references",
+            "--reference-depth",
+            "1",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Sync {
+                    name: Some(name),
+                    resolve_references: true,
+                    reference_depth: Some(1),
+                    ..
+                },
+            } if name == "Epic"
+        ));
     }
 
     #[test]

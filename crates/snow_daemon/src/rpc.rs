@@ -20,11 +20,13 @@ use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 
 use crate::transport::{
-    DaemonKnowledgeSemanticStatus, DaemonKnowledgeStatus, DaemonKnowledgeSyncOutcome,
-    DaemonKnowledgeTagSummary, DaemonSemanticIndexSummary,
+    DaemonBusinessApplicationDiagnostic, DaemonKnowledgeSemanticStatus, DaemonKnowledgeStatus,
+    DaemonKnowledgeSyncOutcome, DaemonKnowledgeTagSummary, DaemonSemanticIndexSummary,
 };
 use crate::{DaemonState, transport::DaemonTransport};
-use snow_core::vault::markdown::{render_approval_record, render_knowledge_article};
+use snow_core::vault::markdown::{
+    render_approval_record, render_knowledge_article, render_snow_record,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,12 @@ pub enum RpcMethod {
     KbSemanticSearch,
     SearchRecords,
     UserLookup,
+    BusinessApplicationGet,
+    BusinessApplicationGetFresh,
+    BusinessApplicationSearch,
+    BusinessApplicationQuery,
+    BusinessApplicationSync,
+    BusinessApplicationFields,
     ListKnowledgeBases,
     ListCategories,
     ListKnowledgeArticles,
@@ -167,6 +175,12 @@ impl RpcMethod {
             "kb_semantic_search" => Self::KbSemanticSearch,
             "search_records" => Self::SearchRecords,
             "user_lookup" => Self::UserLookup,
+            "business_application_get" => Self::BusinessApplicationGet,
+            "business_application_get_fresh" => Self::BusinessApplicationGetFresh,
+            "business_application_search" => Self::BusinessApplicationSearch,
+            "business_application_query" => Self::BusinessApplicationQuery,
+            "business_application_sync" => Self::BusinessApplicationSync,
+            "business_application_fields" => Self::BusinessApplicationFields,
             "list_knowledge_bases" => Self::ListKnowledgeBases,
             "list_categories" => Self::ListCategories,
             "list_knowledge_articles" => Self::ListKnowledgeArticles,
@@ -667,6 +681,174 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
+        RpcMethod::BusinessApplicationGet => {
+            match extract_business_application_lookup_params(&request.params) {
+                Ok(lookup) => match get_business_application_cached(state.core.as_ref(), &lookup)
+                    .await
+                {
+                    Ok(Some(record)) => match transport.business_application(&record) {
+                        Ok(business_application) => {
+                            let record_dto = business_application.record.clone();
+                            JsonRpcResponse::ok(
+                                id,
+                                json!({
+                                    "business_application": business_application,
+                                    "record": record_dto,
+                                    "markdown": render_snow_record(&record),
+                                }),
+                            )
+                        }
+                        Err(err) => internal_error(id, err),
+                    },
+                    Ok(None) => {
+                        JsonRpcResponse::error(id, -32004, "business application not found", None)
+                    }
+                    Err(err) => internal_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationGetFresh => {
+            match extract_business_application_lookup_params(&request.params) {
+                Ok(lookup) => match extract_business_application_hydration_options(&request.params)
+                {
+                    Ok(options) => {
+                        let core_lookup = match lookup {
+                            BusinessApplicationLookup::SysId(sys_id) => {
+                                match snow_core::BusinessApplicationLookup::sys_id(sys_id) {
+                                    Ok(lookup) => lookup,
+                                    Err(err) => return invalid_params(id, err),
+                                }
+                            }
+                            BusinessApplicationLookup::Name(name) => {
+                                snow_core::BusinessApplicationLookup::exact_name(name)
+                            }
+                        };
+                        match state
+                            .core
+                            .get_business_application_fresh(core_lookup, options.clone().into())
+                            .await
+                        {
+                            Ok(Some(application)) => {
+                                match transport.business_application(&application.record) {
+                                    Ok(mut business_application) => {
+                                        business_application.unresolved_references =
+                                            business_application_diagnostics(
+                                                &application.unresolved_references,
+                                            );
+                                        let record_dto = business_application.record.clone();
+                                        JsonRpcResponse::ok(
+                                            id,
+                                            json!({
+                                                "business_application": business_application,
+                                                "record": record_dto,
+                                                "markdown": render_snow_record(&application.record),
+                                                "hydration": options,
+                                            }),
+                                        )
+                                    }
+                                    Err(err) => internal_error(id, err),
+                                }
+                            }
+                            Ok(None) => JsonRpcResponse::error(
+                                id,
+                                -32004,
+                                "business application not found",
+                                None,
+                            ),
+                            Err(err) => internal_error(id, err),
+                        }
+                    }
+                    Err(err) => invalid_params(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationSearch => {
+            match extract_business_application_search_params(&request.params) {
+                Ok((params, options)) => {
+                    match state
+                        .core
+                        .search_business_applications_live(params, options.clone().into())
+                        .await
+                    {
+                        Ok(business_applications) => {
+                            let mut applications = Vec::with_capacity(business_applications.len());
+                            let mut record_dtos = Vec::new();
+                            for application in business_applications {
+                                match transport.business_application(&application.record) {
+                                    Ok(mut application_dto) => {
+                                        application_dto.unresolved_references =
+                                            business_application_diagnostics(
+                                                &application.unresolved_references,
+                                            );
+                                        record_dtos.push(application_dto.record.clone());
+                                        applications.push(application_dto);
+                                    }
+                                    Err(err) => return internal_error(id, err),
+                                }
+                            }
+                            JsonRpcResponse::ok(
+                                id,
+                                json!({
+                                    "business_applications": applications,
+                                    "records": record_dtos,
+                                    "hydration": options,
+                                }),
+                            )
+                        }
+                        Err(err) => internal_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationQuery => {
+            match extract_business_application_query_params(&request.params) {
+                Ok(params) => match query_business_applications_local(state.core.as_ref(), &params)
+                    .await
+                {
+                    Ok(records) => {
+                        let mut applications = Vec::with_capacity(records.len());
+                        for record in records {
+                            match transport.business_application(&record) {
+                                Ok(application) => applications.push(application),
+                                Err(err) => return internal_error(id, err),
+                            }
+                        }
+                        JsonRpcResponse::ok(id, json!({ "business_applications": applications }))
+                    }
+                    Err(err) => internal_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationSync => {
+            match extract_business_application_sync_params(&request.params) {
+                Ok((params, options)) => {
+                    match state
+                        .core
+                        .sync_business_applications(params, options.into())
+                        .await
+                    {
+                        Ok(summary) => JsonRpcResponse::ok(id, json!({ "summary": summary })),
+                        Err(err) => internal_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationFields => {
+            match extract_business_application_fields_params(&request.params) {
+                Ok(params) => {
+                    match business_application_fields(state.core.as_ref(), params).await {
+                        Ok(fields) => JsonRpcResponse::ok(id, json!({ "fields": fields })),
+                        Err(err) => internal_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
         RpcMethod::ListKnowledgeBases => match state.core.list_knowledge_bases() {
             Ok(bases) => JsonRpcResponse::ok(
                 id,
@@ -1247,6 +1429,12 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "task_sla_status_for_tasks",
     "search_records",
     "user_lookup",
+    "business_application_get",
+    "business_application_get_fresh",
+    "business_application_search",
+    "business_application_query",
+    "business_application_sync",
+    "business_application_fields",
     "search_knowledge",
     "kb_semantic_search",
     "list_knowledge_bases",
@@ -1585,6 +1773,126 @@ struct ListRecordsParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BusinessApplicationLookup {
+    SysId(String),
+    Name(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BusinessApplicationHydrationOptions {
+    #[serde(default = "default_true")]
+    persist: bool,
+    #[serde(default = "default_true")]
+    resolve_references: bool,
+    #[serde(default = "default_reference_depth")]
+    reference_depth: usize,
+    #[serde(default)]
+    refresh_dictionary: bool,
+}
+
+impl Default for BusinessApplicationHydrationOptions {
+    fn default() -> Self {
+        Self {
+            persist: true,
+            resolve_references: true,
+            reference_depth: 1,
+            refresh_dictionary: false,
+        }
+    }
+}
+
+impl From<BusinessApplicationHydrationOptions> for snow_core::BusinessApplicationHydrationOptions {
+    fn from(options: BusinessApplicationHydrationOptions) -> Self {
+        Self {
+            persist: options.persist,
+            resolve_references: options.resolve_references,
+            reference_depth: options.reference_depth,
+            refresh_dictionary: options.refresh_dictionary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BusinessApplicationQueryParams {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    filters: Vec<BusinessApplicationFieldFilter>,
+    #[serde(default)]
+    include_tombstoned: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    sort: Vec<BusinessApplicationSortField>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BusinessApplicationFieldFilter {
+    field: String,
+    op: String,
+    #[serde(default)]
+    value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BusinessApplicationSortField {
+    field: String,
+    #[serde(default)]
+    direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BusinessApplicationFieldsParams {
+    #[serde(default)]
+    refresh_dictionary: bool,
+}
+
+/// One entry of the `business_application_fields` response.
+///
+/// `observed_count`/`sample_*` come from the locally projected Business
+/// Application records. When dictionary metadata is present the `label`,
+/// `field_type`, `reference_table`, `mandatory`, `read_only`, `choice`, and
+/// `max_length` fields are merged in and `dictionary_verified` is `true`;
+/// otherwise those remain `None`/`false` and the entry falls back to
+/// observed-only behavior.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct BusinessApplicationFieldSummary {
+    field: String,
+    observed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_display_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mandatory: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    choice: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_length: Option<i64>,
+    dictionary_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reference_depth() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct ListKnowledgeArticlesParams {
     #[serde(default)]
@@ -1623,6 +1931,350 @@ fn extract_user_lookup_params(params: &Value) -> Result<snow_core::UserLookup> {
     let params: snow_core::UserLookup = serde_json::from_value(params.clone())?;
     params.validate_selector()?;
     Ok(params)
+}
+
+fn extract_business_application_search_params(
+    params: &Value,
+) -> Result<(
+    snow_core::BusinessApplicationSearchParams,
+    BusinessApplicationHydrationOptions,
+)> {
+    let mut search_params = params.clone();
+    let mut options = BusinessApplicationHydrationOptions::default();
+    if let Value::Object(map) = &mut search_params {
+        if let Some(value) = map.remove("persist").and_then(|value| value.as_bool()) {
+            options.persist = value;
+        }
+        if let Some(value) = map
+            .remove("resolve_references")
+            .and_then(|value| value.as_bool())
+        {
+            options.resolve_references = value;
+        }
+        if let Some(value) = map
+            .remove("reference_depth")
+            .and_then(|value| value.as_u64())
+        {
+            if value > 2 {
+                return Err(anyhow!("`reference_depth` must be 0, 1, or 2"));
+            }
+            options.reference_depth = value as usize;
+        }
+        if let Some(value) = map
+            .remove("refresh_dictionary")
+            .and_then(|value| value.as_bool())
+        {
+            options.refresh_dictionary = value;
+        }
+    }
+    let params: snow_core::BusinessApplicationSearchParams = serde_json::from_value(search_params)?;
+    params.validate()?;
+    Ok((params, options))
+}
+
+/// Parse `business_application_sync` params: optional search params plus
+/// hydration options. Unlike search, the search params are optional; when no
+/// search field is supplied we pass `None` so core runs the default bounded
+/// Business Application search.
+fn extract_business_application_sync_params(
+    params: &Value,
+) -> Result<(
+    Option<snow_core::BusinessApplicationSearchParams>,
+    BusinessApplicationHydrationOptions,
+)> {
+    let (search_params, options) = extract_business_application_search_params(params)?;
+    // Treat an all-default params object (no filters set) as "no search params".
+    let has_filter = search_params != snow_core::BusinessApplicationSearchParams::default();
+    Ok((has_filter.then_some(search_params), options))
+}
+
+fn extract_business_application_hydration_options(
+    params: &Value,
+) -> Result<BusinessApplicationHydrationOptions> {
+    let mut options = BusinessApplicationHydrationOptions::default();
+    let Value::Object(map) = params else {
+        return Ok(options);
+    };
+    if let Some(value) = map.get("persist").and_then(Value::as_bool) {
+        options.persist = value;
+    }
+    if let Some(value) = map.get("resolve_references").and_then(Value::as_bool) {
+        options.resolve_references = value;
+    }
+    if let Some(value) = map.get("reference_depth").and_then(Value::as_u64) {
+        if value > 2 {
+            return Err(anyhow!("`reference_depth` must be 0, 1, or 2"));
+        }
+        options.reference_depth = value as usize;
+    }
+    if let Some(value) = map.get("refresh_dictionary").and_then(Value::as_bool) {
+        options.refresh_dictionary = value;
+    }
+    Ok(options)
+}
+
+fn extract_business_application_lookup_params(params: &Value) -> Result<BusinessApplicationLookup> {
+    let Value::Object(map) = params else {
+        return Err(anyhow!("expected object params"));
+    };
+    let sys_id = map.get("sys_id").and_then(Value::as_str).map(str::trim);
+    let name = map.get("name").and_then(Value::as_str).map(str::trim);
+    match (
+        sys_id.filter(|value| !value.is_empty()),
+        name.filter(|value| !value.is_empty()),
+    ) {
+        (Some(sys_id), None) => Ok(BusinessApplicationLookup::SysId(
+            snow_core::normalize_record_lookup_sys_id(sys_id)?,
+        )),
+        (None, Some(name)) => Ok(BusinessApplicationLookup::Name(name.to_string())),
+        (Some(_), Some(_)) => Err(anyhow!("provide exactly one of `sys_id` or `name`")),
+        (None, None) => Err(anyhow!(
+            "missing required lookup: provide `sys_id` or `name`"
+        )),
+    }
+}
+
+fn extract_business_application_query_params(
+    params: &Value,
+) -> Result<BusinessApplicationQueryParams> {
+    let query: BusinessApplicationQueryParams = serde_json::from_value(params.clone())?;
+    if query.limit == Some(0) {
+        return Err(anyhow!("`limit` must be at least 1"));
+    }
+    if query.limit.unwrap_or(20) > 500 {
+        return Err(anyhow!("`limit` must be at most 500"));
+    }
+    Ok(query)
+}
+
+fn extract_business_application_fields_params(
+    params: &Value,
+) -> Result<BusinessApplicationFieldsParams> {
+    Ok(serde_json::from_value(params.clone())?)
+}
+
+async fn get_business_application_cached(
+    core: &SnowCore,
+    lookup: &BusinessApplicationLookup,
+) -> Result<Option<SnowRecord>> {
+    let records = core
+        .list_records_query(
+            ListQuery::new()
+                .resource_type(ResourceType::BusinessApplication)
+                .include_tombstoned(false),
+        )
+        .await?;
+    Ok(records.into_iter().find(|record| match lookup {
+        BusinessApplicationLookup::SysId(sys_id) => record.sys_id.eq_ignore_ascii_case(sys_id),
+        BusinessApplicationLookup::Name(name) => business_application_name(record) == name.trim(),
+    }))
+}
+
+async fn query_business_applications_local(
+    core: &SnowCore,
+    params: &BusinessApplicationQueryParams,
+) -> Result<Vec<SnowRecord>> {
+    core.query_business_applications(core_business_application_query(params)?)
+        .await
+}
+
+fn core_business_application_query(
+    params: &BusinessApplicationQueryParams,
+) -> Result<snow_core::query::filter::BusinessApplicationQuery> {
+    let filters = params
+        .filters
+        .iter()
+        .map(|filter| {
+            Ok(snow_core::query::filter::FieldFilter {
+                field: filter.field.clone(),
+                op: core_field_operator(filter.op.as_str())?,
+                value: filter.value.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sort = params
+        .sort
+        .iter()
+        .map(|field| snow_core::query::filter::SortField {
+            field: field.field.clone(),
+            direction: if field
+                .direction
+                .as_deref()
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("desc"))
+            {
+                snow_core::query::filter::SortDirection::Desc
+            } else {
+                snow_core::query::filter::SortDirection::Asc
+            },
+        })
+        .collect();
+
+    Ok(snow_core::query::filter::BusinessApplicationQuery {
+        text: params.text.clone(),
+        filters,
+        include_tombstoned: params.include_tombstoned,
+        limit: params.limit,
+        offset: params.offset,
+        sort,
+        allow_unknown_fields: true,
+    })
+}
+
+fn core_field_operator(op: &str) -> Result<snow_core::query::filter::FieldOperator> {
+    Ok(match op.trim().to_ascii_lowercase().as_str() {
+        "eq" => snow_core::query::filter::FieldOperator::Eq,
+        "ne" => snow_core::query::filter::FieldOperator::Ne,
+        "contains" => snow_core::query::filter::FieldOperator::Contains,
+        "starts_with" | "startswith" => snow_core::query::filter::FieldOperator::StartsWith,
+        "in" => snow_core::query::filter::FieldOperator::In,
+        "is_empty" => snow_core::query::filter::FieldOperator::IsEmpty,
+        "is_not_empty" => snow_core::query::filter::FieldOperator::IsNotEmpty,
+        "gt" => snow_core::query::filter::FieldOperator::Gt,
+        "gte" => snow_core::query::filter::FieldOperator::Gte,
+        "lt" => snow_core::query::filter::FieldOperator::Lt,
+        "lte" => snow_core::query::filter::FieldOperator::Lte,
+        other => {
+            return Err(anyhow!(
+                "unsupported Business Application field operator `{other}`"
+            ));
+        }
+    })
+}
+
+async fn business_application_fields(
+    core: &SnowCore,
+    params: BusinessApplicationFieldsParams,
+) -> Result<Vec<BusinessApplicationFieldSummary>> {
+    // When requested, refresh the live dictionary before reading. Best-effort:
+    // a refresh failure leaves us with whatever cached/observed data exists.
+    if params.refresh_dictionary {
+        let _ = core.refresh_business_application_dictionary().await;
+    }
+
+    // Load cached dictionary metadata (empty map => degraded/observed-only mode).
+    let dictionary = core
+        .business_application_dictionary()
+        .await
+        .unwrap_or_default();
+
+    let records = core
+        .list_records_query(ListQuery::new().resource_type(ResourceType::BusinessApplication))
+        .await?;
+    let mut fields: std::collections::BTreeMap<String, BusinessApplicationFieldSummary> =
+        std::collections::BTreeMap::new();
+
+    // Seed entries from the dictionary so verified fields appear even when no
+    // record has yet been observed locally.
+    for (name, row) in &dictionary {
+        fields
+            .entry(name.clone())
+            .or_insert_with(|| dictionary_field_summary(name, row));
+    }
+
+    for record in records {
+        for (name, value) in record.fields {
+            let entry = fields.entry(name.clone()).or_insert_with(|| {
+                // No dictionary row for this observed field: fall back to the
+                // observed-only summary, attaching a degraded diagnostic when a
+                // dictionary was expected but is unavailable.
+                BusinessApplicationFieldSummary {
+                    field: name.clone(),
+                    observed_count: 0,
+                    sample_value: None,
+                    sample_display_value: None,
+                    label: None,
+                    field_type: None,
+                    reference_table: None,
+                    mandatory: None,
+                    read_only: None,
+                    choice: None,
+                    max_length: None,
+                    dictionary_verified: false,
+                    diagnostic: (params.refresh_dictionary && dictionary.is_empty()).then(|| {
+                        "dictionary unavailable; field metadata is observed-only".to_string()
+                    }),
+                }
+            });
+            entry.observed_count += 1;
+            if entry.sample_value.is_none() && !value.value.trim().is_empty() {
+                entry.sample_value = Some(value.value);
+            }
+            if entry.sample_display_value.is_none() {
+                entry.sample_display_value = value
+                    .display_value
+                    .filter(|display| !display.trim().is_empty());
+            }
+        }
+    }
+    Ok(fields.into_values().collect())
+}
+
+/// Build an enriched field summary from a cached dictionary row.
+fn dictionary_field_summary(
+    name: &str,
+    row: &snow_core::cache::store::BusinessApplicationFieldDictionaryRow,
+) -> BusinessApplicationFieldSummary {
+    BusinessApplicationFieldSummary {
+        field: name.to_string(),
+        observed_count: 0,
+        sample_value: None,
+        sample_display_value: None,
+        label: row.field_label.clone(),
+        field_type: row.field_type.clone(),
+        reference_table: row.reference_table.clone(),
+        mandatory: Some(row.mandatory),
+        read_only: Some(row.read_only),
+        choice: Some(row.choice),
+        max_length: row.max_length,
+        dictionary_verified: true,
+        diagnostic: None,
+    }
+}
+
+fn business_application_diagnostics(
+    diagnostics: &[snow_core::ReferenceResolutionDiagnostic],
+) -> Vec<DaemonBusinessApplicationDiagnostic> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| DaemonBusinessApplicationDiagnostic {
+            field: diagnostic.field.clone(),
+            sys_id: (!diagnostic.reference_sys_id.is_empty())
+                .then(|| diagnostic.reference_sys_id.clone()),
+            table: (!diagnostic.reference_table.is_empty())
+                .then(|| diagnostic.reference_table.clone()),
+            diagnostic: diagnostic.message.clone().unwrap_or_else(|| {
+                format!("{:?}", diagnostic.reason)
+                    .chars()
+                    .enumerate()
+                    .flat_map(|(idx, ch)| {
+                        if idx > 0 && ch.is_ascii_uppercase() {
+                            vec!['_', ch.to_ascii_lowercase()]
+                        } else {
+                            vec![ch.to_ascii_lowercase()]
+                        }
+                    })
+                    .collect()
+            }),
+        })
+        .collect()
+}
+
+fn business_application_name(record: &SnowRecord) -> String {
+    record
+        .fields
+        .get("name")
+        .and_then(|field| {
+            field
+                .display_value
+                .as_ref()
+                .or(Some(&field.value))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
 }
 
 fn extract_list_records_params(params: &Value) -> Result<ListRecordsParams> {
@@ -1665,6 +2317,9 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "scrum_task" | "rm_scrum_task" => Ok(ResourceType::ScrumTask),
         "knowledge" | "kb_knowledge" => Ok(ResourceType::Knowledge),
         "approval" | "sysapproval_approver" => Ok(ResourceType::Approval),
+        "business_application" | "business_app" | "cmdb_ci_business_app" => {
+            Ok(ResourceType::BusinessApplication)
+        }
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }
@@ -1862,6 +2517,30 @@ mod tests {
             RpcMethod::SearchRecords
         );
         assert_eq!(RpcMethod::from_method("user_lookup"), RpcMethod::UserLookup);
+        assert_eq!(
+            RpcMethod::from_method("business_application_get"),
+            RpcMethod::BusinessApplicationGet
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_get_fresh"),
+            RpcMethod::BusinessApplicationGetFresh
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_search"),
+            RpcMethod::BusinessApplicationSearch
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_query"),
+            RpcMethod::BusinessApplicationQuery
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_sync"),
+            RpcMethod::BusinessApplicationSync
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_fields"),
+            RpcMethod::BusinessApplicationFields
+        );
         assert_eq!(RpcMethod::from_method("vault_path"), RpcMethod::VaultPath);
         assert_eq!(
             RpcMethod::from_method("search_knowledge"),
@@ -2558,6 +3237,70 @@ story_board_id = "board-sys"
         assert_eq!(filters.knowledge_base.as_deref(), Some("kb-base"));
         assert_eq!(filters.category.as_deref(), Some("Access"));
         assert_eq!(filters.limit, Some(10));
+    }
+
+    #[test]
+    fn business_application_search_params_accept_hydration_options() {
+        let (params, options) = extract_business_application_search_params(&json!({
+            "name": "Epic",
+            "persist": false,
+            "resolve_references": false,
+            "reference_depth": 2,
+            "refresh_dictionary": true
+        }))
+        .expect("business application params");
+        assert_eq!(params.name.as_deref(), Some("Epic"));
+        assert!(!options.persist);
+        assert!(!options.resolve_references);
+        assert_eq!(options.reference_depth, 2);
+        assert!(options.refresh_dictionary);
+    }
+
+    #[test]
+    fn business_application_sync_params_are_optional() {
+        // Only hydration options, no search filters => params should be None so
+        // core runs the default bounded search.
+        let (params, options) = extract_business_application_sync_params(&json!({
+            "refresh_dictionary": true
+        }))
+        .expect("sync params");
+        assert!(params.is_none());
+        assert!(options.refresh_dictionary);
+
+        // A search filter is present => params should be Some.
+        let (params, _options) =
+            extract_business_application_sync_params(&json!({ "name": "Epic" }))
+                .expect("sync params");
+        assert_eq!(
+            params.and_then(|params| params.name),
+            Some("Epic".to_string())
+        );
+
+        // Empty object => params None.
+        let (params, _options) =
+            extract_business_application_sync_params(&json!({})).expect("sync params");
+        assert!(params.is_none());
+    }
+
+    #[test]
+    fn business_application_lookup_requires_exactly_one_selector() {
+        assert!(matches!(
+            extract_business_application_lookup_params(
+                &json!({ "sys_id": "54A4B61B6FE845000ED852A03F3EE4D0" })
+            ),
+            Ok(BusinessApplicationLookup::SysId(_))
+        ));
+        assert!(matches!(
+            extract_business_application_lookup_params(&json!({ "name": "Epic" })),
+            Ok(BusinessApplicationLookup::Name(_))
+        ));
+        assert!(
+            extract_business_application_lookup_params(&json!({
+                "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                "name": "Epic"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -23,6 +23,17 @@ pub struct InstanceConfig {
     pub url: String,
     pub user: String,
     pub credential: CredentialProvider,
+    /// Service Portal page slug used to build human-facing record URLs
+    /// (e.g. `<instance>/<portal>?id=ticket&...`). Instance-specific; leave
+    /// empty to fall back to the out-of-box `sp` portal. Set the real value
+    /// via the `SNOW_PORTAL` env var or `[instance] portal = "..."` in config.
+    pub portal: String,
+}
+
+/// Out-of-box ServiceNow Service Portal page slug, used when no
+/// instance-specific portal is configured.
+pub fn default_service_portal() -> String {
+    "sp".to_string()
 }
 
 impl<'de> Deserialize<'de> for InstanceConfig {
@@ -37,6 +48,8 @@ impl<'de> Deserialize<'de> for InstanceConfig {
             user: String,
             #[serde(default)]
             credential: CredentialProvider,
+            #[serde(default)]
+            portal: String,
             #[serde(default)]
             op_item_id: Option<String>,
         }
@@ -53,6 +66,7 @@ impl<'de> Deserialize<'de> for InstanceConfig {
             url: raw.url,
             user: raw.user,
             credential: raw.credential,
+            portal: raw.portal,
         })
     }
 }
@@ -93,6 +107,9 @@ impl SnowConfig {
     }
 
     pub fn apply_defaults(&mut self) {
+        if self.instance.portal.trim().is_empty() {
+            self.instance.portal = default_service_portal();
+        }
         if self.refresh.max_concurrent_requests == 0 {
             self.refresh.max_concurrent_requests = 6;
         }
