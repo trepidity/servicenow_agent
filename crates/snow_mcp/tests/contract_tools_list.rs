@@ -80,6 +80,7 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "get_approval",
         "search_records",
         "user_lookup",
+        "user_search",
         "search_knowledge",
         "get_article",
         "kb_semantic_search",
@@ -216,6 +217,45 @@ fn user_lookup_schema_advertises_exact_user_selectors() {
         tool.input_schema["properties"]["active"]["default"],
         json!(true)
     );
+}
+
+#[test]
+fn user_search_schema_advertises_multi_user_filters() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "user_search")
+        .expect("user_search registered");
+
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert!(tool.input_schema.get("required").is_none());
+    for field in ["first_name", "last_name", "name_contains", "email_contains"] {
+        assert_eq!(
+            tool.input_schema["properties"][field]["type"],
+            json!("string")
+        );
+    }
+    assert_eq!(
+        tool.input_schema["properties"]["limit"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["limit"]["maximum"],
+        json!(100)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["limit"]["default"],
+        json!(20)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["active"]["default"],
+        json!(true)
+    );
+    assert!(tool.default_enabled);
+    assert!(!tool.requires_confirmation);
 }
 
 #[test]

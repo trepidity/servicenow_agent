@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::cache::policy::{DEFAULT_STABLE_REFERENCE_CACHE_TTL, DEFAULT_WORK_RECORD_CACHE_TTL};
 use crate::credential::CredentialProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -124,6 +125,12 @@ impl SnowConfig {
         }
         if self.cache.memory.ttl_closed.is_empty() {
             self.cache.memory.ttl_closed = "7d".to_string();
+        }
+        if self.cache.policy.stable_reference_ttl.is_empty() {
+            self.cache.policy.stable_reference_ttl = DEFAULT_STABLE_REFERENCE_CACHE_TTL.to_string();
+        }
+        if self.cache.policy.work_record_ttl.is_empty() {
+            self.cache.policy.work_record_ttl = DEFAULT_WORK_RECORD_CACHE_TTL.to_string();
         }
         if self.kb.max_auto_tags == 0 {
             self.kb.max_auto_tags = 5;
@@ -324,7 +331,10 @@ fn ensure_resource_defaults(resources: &mut BTreeMap<String, ResourceRefreshConf
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CacheConfig {
+    #[serde(default)]
     pub memory: MemoryCacheConfig,
+    #[serde(default)]
+    pub policy: CachePolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -333,6 +343,12 @@ pub struct MemoryCacheConfig {
     pub ttl_active: String,
     pub ttl_resolved: String,
     pub ttl_closed: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CachePolicyConfig {
+    pub stable_reference_ttl: String,
+    pub work_record_ttl: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -396,11 +412,19 @@ pub struct DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::policy::CacheTtlPolicy;
+    use chrono::Duration;
     use std::sync::{Mutex, MutexGuard};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct InstanceWrapper {
         instance: InstanceConfig,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+    struct CacheWrapper {
+        #[serde(default)]
+        cache: CacheConfig,
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -510,5 +534,50 @@ op_item_id = "legacy-item"
         let err = toml::from_str::<InstanceWrapper>(input).expect_err("legacy rejection");
 
         assert!(err.to_string().contains("instance.op_item_id"));
+    }
+
+    #[test]
+    fn cache_policy_defaults_fill_ttl_strings() {
+        let mut config = SnowConfig::default();
+        config.apply_defaults();
+
+        assert_eq!(config.cache.policy.stable_reference_ttl, "7d");
+        assert_eq!(config.cache.policy.work_record_ttl, "60m");
+    }
+
+    #[test]
+    fn cache_policy_toml_overrides_are_parseable() {
+        let input = r#"
+[cache.policy]
+stable_reference_ttl = "14d"
+work_record_ttl = "90m"
+"#;
+
+        let mut parsed: CacheWrapper = toml::from_str(input).expect("parse cache policy");
+        let mut config = SnowConfig {
+            cache: std::mem::take(&mut parsed.cache),
+            ..Default::default()
+        };
+        config.apply_defaults();
+
+        let policy = CacheTtlPolicy::from_ttl_strings(
+            &config.cache.policy.stable_reference_ttl,
+            &config.cache.policy.work_record_ttl,
+        )
+        .expect("cache policy");
+
+        assert_eq!(policy.stable_reference_ttl(), Duration::days(14));
+        assert_eq!(policy.work_record_ttl(), Duration::minutes(90));
+    }
+
+    #[test]
+    fn cache_policy_rejects_stable_reference_ttl_below_minimum() {
+        let err = CacheTtlPolicy::from_ttl_strings("6d", "60m").expect_err("minimum enforced");
+
+        assert!(
+            err.to_string()
+                .contains("cache.policy.stable_reference_ttl must be at least 7d"),
+            "{err}"
+        );
     }
 }

@@ -155,6 +155,7 @@ impl McpServer {
             "get_children" => self.call_get_children(id, params).await,
             "search_records" => self.call_search(id, params, SearchScope::All).await,
             "user_lookup" => self.call_user_lookup(id, params).await,
+            "user_search" => self.call_user_search(id, params).await,
             "business_application_get" => self.call_business_application_get(id, params).await,
             "business_application_search" => {
                 self.call_business_application_search(id, params).await
@@ -459,6 +460,25 @@ impl McpServer {
         match self.core.lookup_user(parsed).await {
             Ok(Some(result)) => JsonRpcResponse::ok(id, json!(result)),
             Ok(None) => JsonRpcResponse::error(id, -32004, "user not found", None),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_user_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::UserSearch = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+
+        match self.core.search_users(parsed).await {
+            Ok(users) => JsonRpcResponse::ok(id, json!({ "users": users })),
             Err(err) => service_failure(id, err),
         }
     }

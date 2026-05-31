@@ -413,6 +413,7 @@ async fn build_core(
                 ttl_resolved: "24h".to_string(),
                 ttl_closed: "7d".to_string(),
             },
+            ..Default::default()
         },
         daemon: CoreDaemonConfig {
             socket_path: paths.socket,

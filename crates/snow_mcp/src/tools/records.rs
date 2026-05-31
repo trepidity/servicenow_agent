@@ -35,6 +35,11 @@ pub fn register(registry: &mut ToolRegistry) {
             user_lookup_arg_schema(),
         ),
         (
+            "user_search",
+            "Live-search active ServiceNow users by first name, last name, name substring, or email substring",
+            user_search_arg_schema(),
+        ),
+        (
             "business_application_get",
             "Get a locally cached Business Application by sys_id or exact name",
             business_application_get_arg_schema(),
@@ -146,6 +151,43 @@ fn user_lookup_arg_schema() -> Value {
                 "type": "string",
                 "pattern": "^[0-9a-fA-F]{32}$",
                 "description": "Exact sys_user sys_id"
+            },
+            "active": {
+                "type": "boolean",
+                "default": true,
+                "description": "Filter by sys_user.active. Omitted means true."
+            }
+        }
+    })
+}
+
+pub fn user_search_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Provide at least one of first_name, last_name, name_contains, or email_contains. active defaults to true.",
+        "properties": {
+            "first_name": {
+                "type": "string",
+                "description": "Exact sys_user.first_name value"
+            },
+            "last_name": {
+                "type": "string",
+                "description": "Exact sys_user.last_name value"
+            },
+            "name_contains": {
+                "type": "string",
+                "description": "Substring match against sys_user.name"
+            },
+            "email_contains": {
+                "type": "string",
+                "description": "Substring match against sys_user.email"
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20
             },
             "active": {
                 "type": "boolean",

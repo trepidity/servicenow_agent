@@ -677,6 +677,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "record_get",
                     "record_search",
                     "user_lookup",
+                    "user_search",
                     "attachment_list",
                     "get_work_notes",
                     "work_note_plan_add",
@@ -684,6 +685,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "story_get",
                     "story_tasks_list",
                     "user_lookup",
+                    "user_search",
                     "story_plan_create",
                     "story_plan_update",
                     "story_task_plan_create",
@@ -720,7 +722,12 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
         (
             "timecard_writer".to_string(),
             role(
-                &["timecard_list", "timecard_plan_set_hours", "user_lookup"],
+                &[
+                    "timecard_list",
+                    "timecard_plan_set_hours",
+                    "user_lookup",
+                    "user_search",
+                ],
                 &["timecard_apply_set_hours"],
             ),
         ),
@@ -732,6 +739,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "get_children",
                     "get_work_notes",
                     "user_lookup",
+                    "user_search",
                     "attachment_list",
                     "change_request_plan_create",
                     "change_request_plan_update",

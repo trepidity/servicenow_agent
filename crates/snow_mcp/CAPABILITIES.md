@@ -60,7 +60,24 @@ build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 Enabled by default (unless a policy entry disables them). Operate against ServiceNow
 or the local cache; none mutate ServiceNow records.
 
-- **Records:** `get_record`, `search_records`, `user_lookup`, `business_application_get`,
+Read cache policy is data-class based:
+
+- Stable reference primitives, including `sys_user` lookup/search results, use
+  a seven-day TTL before the daemon refreshes them from ServiceNow.
+- Work records returned by `get_record` use a sixty-minute TTL before refresh.
+- Explicit live/fresh paths still bypass the read cache where the tool contract
+  says they do.
+
+The defaults can be overridden in the core ServiceNow config TOML, not in the
+MCP authorization policy TOML:
+
+```toml
+[cache.policy]
+stable_reference_ttl = "7d" # minimum 7d; longer values are allowed
+work_record_ttl = "60m"
+```
+
+- **Records:** `get_record`, `search_records`, `user_lookup`, `user_search`, `business_application_get`,
   `business_application_search`, `business_application_query`, `business_application_fields`,
   `list_records`, `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`,
   `get_children`, `get_work_notes`, `attachment_list`
@@ -77,6 +94,29 @@ or the local cache; none mutate ServiceNow records.
 
 > Local-cache writers (`kb_sync`, `kb_semantic_rebuild`, `rebuild_cache`, `repair_vault`)
 > write only to the local KB vault/cache — **never** to ServiceNow.
+
+---
+
+## Users (read-only primitive)
+
+User reads are cache-backed ServiceNow `sys_user` queries with a seven-day TTL.
+They are **read-only** and enabled by default.
+
+| Tool | What it does | Live API call? | Returns |
+|---|---|---|---|
+| `user_lookup` | Resolve one user by exact login, email, employee number, sys_id, or inferred query | On cache miss/stale | One lookup result or `-32004 user not found` |
+| `user_search` | Search users by first name, last name, name substring, or email substring | On cache miss/stale | `{ "users": [<user>...] }` |
+
+### `user_search`
+
+- **Params:** at least one of `first_name`, `last_name`, `name_contains`, or
+  `email_contains`; optional `limit` (`1`-`100`, default `20`) and `active`
+  (default `true`).
+- **Returns:** `{ "users": [<user>...] }`, where each `<user>` is the typed
+  `UserRecord` shape returned by `snow_core`.
+- **Daemon bridge:** MCP forwards this tool to daemon JSON-RPC method
+  `user_search`; the bridge only advertises it when `contract_info` reports that
+  method as supported.
 
 ---
 

@@ -1,5 +1,6 @@
+use super::policy::stable_reference_ttl;
 use crate::{FieldValue, KnowledgeEmbeddingCoverage, ResourceType, SnowRecord};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -7,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -346,6 +347,32 @@ pub struct PrimitiveObjectRow {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedUserRow {
+    pub sys_id: String,
+    pub user_name: Option<String>,
+    pub name: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub email: Option<String>,
+    pub employee_number: Option<String>,
+    pub active: Option<bool>,
+    pub department: Option<String>,
+    pub location: Option<String>,
+    pub title: Option<String>,
+    pub raw_json: String,
+    pub synced_at: DateTime<Utc>,
+    pub sys_updated_on: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedUserQueryRow {
+    pub query_key: String,
+    pub result_sys_ids: Vec<String>,
+    pub synced_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 pub struct Store {
     path: PathBuf,
     conn: Connection,
@@ -410,6 +437,9 @@ impl Store {
         }
         if self.needs_v8_migration(schema_version)? {
             self.migrate_to_v8()?;
+        }
+        if self.needs_v9_migration(schema_version)? {
+            self.migrate_to_v9()?;
         }
         self.create_post_migration_indexes()?;
         self.set_schema_version(SCHEMA_VERSION)?;
@@ -660,6 +690,30 @@ impl Store {
                 PRIMARY KEY(primitive_sys_id, field_name)
             );
 
+            CREATE TABLE IF NOT EXISTS cached_users (
+                sys_id TEXT PRIMARY KEY,
+                user_name TEXT,
+                name TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                email TEXT,
+                employee_number TEXT,
+                active INTEGER CHECK (active IN (0, 1)),
+                department TEXT,
+                location TEXT,
+                title TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                synced_at INTEGER NOT NULL,
+                sys_updated_on TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS cached_user_queries (
+                query_key TEXT PRIMARY KEY,
+                result_sys_ids_json TEXT NOT NULL DEFAULT '[]',
+                synced_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_records_number ON records(number);
             CREATE INDEX IF NOT EXISTS idx_records_table_scope ON records(table_name, in_scope, number);
             CREATE INDEX IF NOT EXISTS idx_records_parent ON records(parent_id);
@@ -717,6 +771,18 @@ impl Store {
                 ON primitive_object_fields(field_name, value_number);
             CREATE INDEX IF NOT EXISTS idx_primitive_fields_ref
                 ON primitive_object_fields(field_name, reference_table, reference_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_user_name
+                ON cached_users(user_name);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_email
+                ON cached_users(email);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_employee_number
+                ON cached_users(employee_number);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_name
+                ON cached_users(name);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_first_last
+                ON cached_users(first_name, last_name);
+            CREATE INDEX IF NOT EXISTS idx_cached_user_queries_expires
+                ON cached_user_queries(expires_at);
             "#,
         )?;
         self.conn
@@ -1011,6 +1077,35 @@ impl Store {
             || !self.index_exists("idx_primitive_fields_ref")?)
     }
 
+    fn migrate_to_v9(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.create_v9_schema_objects();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn needs_v9_migration(&self, schema_version: i64) -> Result<bool> {
+        if schema_version > 0 && schema_version < 9 {
+            return Ok(true);
+        }
+        Ok(!self.table_exists("cached_users")?
+            || !self.table_exists("cached_user_queries")?
+            || !self.index_exists("idx_cached_users_user_name")?
+            || !self.index_exists("idx_cached_users_email")?
+            || !self.index_exists("idx_cached_users_employee_number")?
+            || !self.index_exists("idx_cached_users_name")?
+            || !self.index_exists("idx_cached_users_first_last")?
+            || !self.index_exists("idx_cached_user_queries_expires")?)
+    }
+
     fn create_v8_schema_objects(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -1145,6 +1240,50 @@ impl Store {
                 ON primitive_object_fields(field_name, value_number);
             CREATE INDEX IF NOT EXISTS idx_primitive_fields_ref
                 ON primitive_object_fields(field_name, reference_table, reference_sys_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn create_v9_schema_objects(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cached_users (
+                sys_id TEXT PRIMARY KEY,
+                user_name TEXT,
+                name TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                email TEXT,
+                employee_number TEXT,
+                active INTEGER CHECK (active IN (0, 1)),
+                department TEXT,
+                location TEXT,
+                title TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                synced_at INTEGER NOT NULL,
+                sys_updated_on TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS cached_user_queries (
+                query_key TEXT PRIMARY KEY,
+                result_sys_ids_json TEXT NOT NULL DEFAULT '[]',
+                synced_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cached_users_user_name
+                ON cached_users(user_name);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_email
+                ON cached_users(email);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_employee_number
+                ON cached_users(employee_number);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_name
+                ON cached_users(name);
+            CREATE INDEX IF NOT EXISTS idx_cached_users_first_last
+                ON cached_users(first_name, last_name);
+            CREATE INDEX IF NOT EXISTS idx_cached_user_queries_expires
+                ON cached_user_queries(expires_at);
             "#,
         )?;
         Ok(())
@@ -2070,6 +2209,149 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn upsert_cached_user(&self, user: &CachedUserRow) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO cached_users (
+                sys_id, user_name, name, first_name, last_name, email, employee_number,
+                active, department, location, title, raw_json, synced_at, sys_updated_on
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14
+            )
+            ON CONFLICT(sys_id) DO UPDATE SET
+                user_name = excluded.user_name,
+                name = excluded.name,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                email = excluded.email,
+                employee_number = excluded.employee_number,
+                active = excluded.active,
+                department = excluded.department,
+                location = excluded.location,
+                title = excluded.title,
+                raw_json = excluded.raw_json,
+                synced_at = excluded.synced_at,
+                sys_updated_on = excluded.sys_updated_on
+            "#,
+            params![
+                &user.sys_id,
+                &user.user_name,
+                &user.name,
+                &user.first_name,
+                &user.last_name,
+                &user.email,
+                &user.employee_number,
+                user.active.map(bool_to_i64),
+                &user.department,
+                &user.location,
+                &user.title,
+                &user.raw_json,
+                to_ts(user.synced_at),
+                &user.sys_updated_on,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_cached_user(&self, sys_id: &str) -> Result<Option<CachedUserRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT sys_id, user_name, name, first_name, last_name, email, employee_number,
+                       active, department, location, title, raw_json, synced_at, sys_updated_on
+                FROM cached_users
+                WHERE sys_id = ?1
+                "#,
+                params![sys_id],
+                row_to_cached_user,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_cached_users_by_sys_ids(&self, sys_ids: &[String]) -> Result<Vec<CachedUserRow>> {
+        let mut users = Vec::new();
+        for sys_id in sys_ids {
+            if let Some(user) = self.get_cached_user(sys_id)? {
+                users.push(user);
+            }
+        }
+        Ok(users)
+    }
+
+    pub fn put_cached_user_query_result(
+        &self,
+        query_key: &str,
+        result_sys_ids: &[String],
+        synced_at: DateTime<Utc>,
+    ) -> Result<CachedUserQueryRow> {
+        self.put_cached_user_query_result_with_ttl(
+            query_key,
+            result_sys_ids,
+            synced_at,
+            cached_user_query_ttl(),
+        )
+    }
+
+    pub fn put_cached_user_query_result_with_ttl(
+        &self,
+        query_key: &str,
+        result_sys_ids: &[String],
+        synced_at: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<CachedUserQueryRow> {
+        let row = CachedUserQueryRow {
+            query_key: query_key.to_string(),
+            result_sys_ids: result_sys_ids.to_vec(),
+            synced_at,
+            expires_at: synced_at + ttl,
+        };
+        self.upsert_cached_user_query_result(&row)?;
+        Ok(row)
+    }
+
+    pub fn upsert_cached_user_query_result(&self, row: &CachedUserQueryRow) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO cached_user_queries (
+                query_key, result_sys_ids_json, synced_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(query_key) DO UPDATE SET
+                result_sys_ids_json = excluded.result_sys_ids_json,
+                synced_at = excluded.synced_at,
+                expires_at = excluded.expires_at
+            "#,
+            params![
+                &row.query_key,
+                serde_json::to_string(&row.result_sys_ids)?,
+                to_ts(row.synced_at),
+                to_ts(row.expires_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_cached_user_query_result(
+        &self,
+        query_key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CachedUserQueryRow>> {
+        let row = self
+            .conn
+            .query_row(
+                r#"
+                SELECT query_key, result_sys_ids_json, synced_at, expires_at
+                FROM cached_user_queries
+                WHERE query_key = ?1
+                "#,
+                params![query_key],
+                row_to_cached_user_query,
+            )
+            .optional()?;
+        Ok(row.filter(|row| row.expires_at > now))
     }
 
     fn upsert_business_application_projection_row(
@@ -3681,6 +3963,38 @@ fn row_to_projected_field(row: &rusqlite::Row<'_>) -> rusqlite::Result<Projected
     })
 }
 
+fn row_to_cached_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedUserRow> {
+    Ok(CachedUserRow {
+        sys_id: row.get(0)?,
+        user_name: row.get(1)?,
+        name: row.get(2)?,
+        first_name: row.get(3)?,
+        last_name: row.get(4)?,
+        email: row.get(5)?,
+        employee_number: row.get(6)?,
+        active: row.get::<_, Option<i64>>(7)?.map(i64_to_bool),
+        department: row.get(8)?,
+        location: row.get(9)?,
+        title: row.get(10)?,
+        raw_json: row.get(11)?,
+        synced_at: from_ts(row.get(12)?).map_err(to_sqlite_err)?,
+        sys_updated_on: row.get(13)?,
+    })
+}
+
+fn row_to_cached_user_query(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedUserQueryRow> {
+    let raw_ids: String = row.get(1)?;
+    let result_sys_ids = serde_json::from_str::<Vec<String>>(&raw_ids).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(CachedUserQueryRow {
+        query_key: row.get(0)?,
+        result_sys_ids,
+        synced_at: from_ts(row.get(2)?).map_err(to_sqlite_err)?,
+        expires_at: from_ts(row.get(3)?).map_err(to_sqlite_err)?,
+    })
+}
+
 fn business_application_projection_from_fields(
     record: &SnowRecord,
     fields: &[ProjectedFieldRow],
@@ -4234,6 +4548,10 @@ fn to_ts(value: DateTime<Utc>) -> i64 {
     value.timestamp()
 }
 
+fn cached_user_query_ttl() -> Duration {
+    stable_reference_ttl()
+}
+
 fn opt_ts(value: Option<DateTime<Utc>>) -> Option<i64> {
     value.map(|dt| dt.timestamp())
 }
@@ -4469,16 +4787,18 @@ mod tests {
     }
 
     #[test]
-    fn initializes_schema_v8_business_application_projection_tables() {
+    fn initializes_schema_v9_business_application_projection_and_user_cache_tables() {
         let store = Store::open_in_memory().expect("store");
 
-        assert_eq!(store.schema_version().expect("version"), Some(8));
+        assert_eq!(store.schema_version().expect("version"), Some(9));
         for table in [
             "business_applications",
             "business_application_fields",
             "business_application_field_dictionary",
             "primitive_objects",
             "primitive_object_fields",
+            "cached_users",
+            "cached_user_queries",
         ] {
             assert!(store.table_exists(table).expect("table exists"), "{table}");
         }
@@ -4486,9 +4806,83 @@ mod tests {
             "idx_ba_name",
             "idx_ba_fields_ref",
             "idx_primitive_fields_ref",
+            "idx_cached_users_user_name",
+            "idx_cached_users_email",
+            "idx_cached_users_employee_number",
+            "idx_cached_users_name",
+            "idx_cached_users_first_last",
+            "idx_cached_user_queries_expires",
         ] {
             assert!(store.index_exists(index).expect("index exists"), "{index}");
         }
+    }
+
+    #[test]
+    fn cached_users_round_trip_and_list_by_ids() {
+        let store = Store::open_in_memory().expect("store");
+        let synced_at = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let user = CachedUserRow {
+            sys_id: "6816f79cc0a8016401c5a33be04be441".to_string(),
+            user_name: Some("jowner".to_string()),
+            name: Some("Jane Owner".to_string()),
+            first_name: Some("Jane".to_string()),
+            last_name: Some("Owner".to_string()),
+            email: Some("jane.owner@example.test".to_string()),
+            employee_number: Some("12345".to_string()),
+            active: Some(true),
+            department: Some("IT".to_string()),
+            location: Some("Dallas".to_string()),
+            title: Some("Director".to_string()),
+            raw_json: serde_json::json!({
+                "sys_id": "6816f79cc0a8016401c5a33be04be441",
+                "user_name": "jowner"
+            })
+            .to_string(),
+            synced_at,
+            sys_updated_on: Some("2026-05-31 12:34:56".to_string()),
+        };
+
+        store.upsert_cached_user(&user).expect("upsert user");
+
+        let loaded = store
+            .get_cached_user(&user.sys_id)
+            .expect("get user")
+            .expect("cached user");
+        assert_eq!(loaded, user);
+
+        let listed = store
+            .list_cached_users_by_sys_ids(&[
+                "missing".to_string(),
+                "6816f79cc0a8016401c5a33be04be441".to_string(),
+            ])
+            .expect("list users");
+        assert_eq!(listed, vec![user]);
+    }
+
+    #[test]
+    fn cached_user_query_results_use_seven_day_ttl() {
+        let store = Store::open_in_memory().expect("store");
+        let synced_at = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let ids = vec![
+            "6816f79cc0a8016401c5a33be04be441".to_string(),
+            "8a4d2e0ec3577e5433b2b643e4013100".to_string(),
+        ];
+
+        let stored = store
+            .put_cached_user_query_result("active:name=Jane", &ids, synced_at)
+            .expect("put query");
+        assert_eq!(stored.expires_at, synced_at + cached_user_query_ttl());
+
+        let fresh = store
+            .get_cached_user_query_result("active:name=Jane", synced_at + Duration::days(6))
+            .expect("get fresh query")
+            .expect("fresh query");
+        assert_eq!(fresh.result_sys_ids, ids);
+
+        let expired = store
+            .get_cached_user_query_result("active:name=Jane", synced_at + Duration::days(7))
+            .expect("get expired query");
+        assert!(expired.is_none());
     }
 
     #[test]
@@ -4731,7 +5125,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate store");
-        assert_eq!(store.schema_version().expect("version"), Some(8));
+        assert_eq!(store.schema_version().expect("version"), Some(9));
         assert!(
             store
                 .table_has_column("fts_records", "tag_tokens")
@@ -4826,7 +5220,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate unversioned legacy kb store");
-        assert_eq!(store.schema_version().expect("version"), Some(8));
+        assert_eq!(store.schema_version().expect("version"), Some(9));
         assert!(
             store
                 .table_has_column("knowledge_articles", "sys_updated_on")

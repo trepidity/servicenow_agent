@@ -21,6 +21,10 @@ pub mod vault;
 
 // Re-export extracted functions so existing callers in this file (and tests
 // that use `super::*`) continue to work without path changes.
+pub use cache::policy::{
+    CacheTtlPolicy, STABLE_REFERENCE_CACHE_TTL_DAYS, WORK_RECORD_CACHE_TTL_MINUTES,
+    stable_reference_ttl, work_record_ttl,
+};
 pub(crate) use convert::*;
 pub use credential::{CredentialError, CredentialProvider};
 pub(crate) use helpers::*;
@@ -64,7 +68,7 @@ use servicenow_rs::prelude::{
 use servicenow_rs::query::TableApi;
 
 use crate::cache::store::{
-    AliasRow, BusinessApplicationFieldDictionaryRow, KeywordRow, PrimitiveObjectRow,
+    AliasRow, BusinessApplicationFieldDictionaryRow, CachedUserRow, KeywordRow, PrimitiveObjectRow,
     PrimitiveResolutionStatus, ProjectedFieldRow, RecordRow, TagRow,
 };
 use crate::enrich::derive_for_record;
@@ -134,6 +138,8 @@ const USER_LOOKUP_FIELDS: &[&str] = &[
     "sys_id",
     "user_name",
     "name",
+    "first_name",
+    "last_name",
     "email",
     "employee_number",
     "active",
@@ -141,6 +147,8 @@ const USER_LOOKUP_FIELDS: &[&str] = &[
     "location",
     "title",
 ];
+const USER_SEARCH_DEFAULT_LIMIT: usize = 20;
+const USER_SEARCH_MAX_LIMIT: usize = 100;
 const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
 const BUSINESS_APPLICATION_DEFAULT_LIMIT: usize = 20;
 const BUSINESS_APPLICATION_MAX_LIMIT: usize = 100;
@@ -175,6 +183,22 @@ pub struct SnowRecord {
     pub references: HashMap<String, Reference>,
     pub synced_at: DateTime<Utc>,
     pub source: CacheSource,
+}
+
+fn work_record_cache_is_fresh(
+    record: &SnowRecord,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> bool {
+    now.signed_duration_since(record.synced_at) <= ttl
+}
+
+fn stable_reference_cache_is_fresh(
+    synced_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    ttl: chrono::Duration,
+) -> bool {
+    now.signed_duration_since(synced_at) <= ttl
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +239,23 @@ pub struct UserLookup {
     pub employee_number: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sys_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UserSearch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<bool>,
 }
@@ -320,6 +361,38 @@ impl UserLookup {
     }
 }
 
+impl UserSearch {
+    pub fn validate(&self) -> Result<()> {
+        self.validated_limit()?;
+        let count = [
+            self.first_name.as_deref(),
+            self.last_name.as_deref(),
+            self.name_contains.as_deref(),
+            self.email_contains.as_deref(),
+        ]
+        .into_iter()
+        .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+        .count();
+        if count == 0 {
+            anyhow::bail!(
+                "missing required user search: provide at least one of first_name, last_name, name_contains, or email_contains"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validated_limit(&self) -> Result<usize> {
+        let limit = self.limit.unwrap_or(USER_SEARCH_DEFAULT_LIMIT);
+        if limit == 0 {
+            anyhow::bail!("`limit` must be at least 1");
+        }
+        if limit > USER_SEARCH_MAX_LIMIT {
+            anyhow::bail!("`limit` must be at most {USER_SEARCH_MAX_LIMIT}");
+        }
+        Ok(limit)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserLookupResult {
     pub matched_by: String,
@@ -334,6 +407,10 @@ pub struct UserRecord {
     pub user_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -958,6 +1035,8 @@ fn user_record_from_record(record: &Record) -> UserRecord {
         table: "sys_user".to_string(),
         user_name: non_empty_owned(record.get_str("user_name")),
         name: non_empty_owned(record.get_str("name")),
+        first_name: non_empty_owned(record.get_str("first_name")),
+        last_name: non_empty_owned(record.get_str("last_name")),
         email: non_empty_owned(record.get_str("email")),
         employee_number: non_empty_owned(record.get_str("employee_number")),
         active: bool_field(record, "active"),
@@ -966,6 +1045,86 @@ fn user_record_from_record(record: &Record) -> UserRecord {
         title: non_empty_owned(record.get_str("title")),
         display,
     }
+}
+
+fn user_record_from_cached_row(row: &CachedUserRow) -> UserRecord {
+    let display = first_non_empty_str([
+        row.name.as_deref(),
+        row.user_name.as_deref(),
+        row.email.as_deref(),
+    ])
+    .unwrap_or(row.sys_id.as_str())
+    .to_string();
+
+    UserRecord {
+        sys_id: row.sys_id.clone(),
+        table: "sys_user".to_string(),
+        user_name: row.user_name.clone(),
+        name: row.name.clone(),
+        first_name: row.first_name.clone(),
+        last_name: row.last_name.clone(),
+        email: row.email.clone(),
+        employee_number: row.employee_number.clone(),
+        active: row.active,
+        department: row.department.clone(),
+        location: row.location.clone(),
+        title: row.title.clone(),
+        display,
+    }
+}
+
+fn cached_user_row_from_record(record: &Record, synced_at: DateTime<Utc>) -> CachedUserRow {
+    CachedUserRow {
+        sys_id: record.sys_id.clone(),
+        user_name: non_empty_owned(record.get_str("user_name")),
+        name: non_empty_owned(record.get_str("name")),
+        first_name: non_empty_owned(record.get_str("first_name")),
+        last_name: non_empty_owned(record.get_str("last_name")),
+        email: non_empty_owned(record.get_str("email")),
+        employee_number: non_empty_owned(record.get_str("employee_number")),
+        active: bool_field(record, "active"),
+        department: non_empty_owned(record.get_str("department")),
+        location: non_empty_owned(record.get_str("location")),
+        title: non_empty_owned(record.get_str("title")),
+        raw_json: serialize_record_document(record).to_string(),
+        synced_at,
+        sys_updated_on: record
+            .get_raw("sys_updated_on")
+            .or_else(|| record.get_str("sys_updated_on"))
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn cache_key_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn user_lookup_cache_key(field: &str, value: &str, active: bool) -> String {
+    format!(
+        "lookup|active={}|{}={}",
+        active,
+        field,
+        cache_key_value(value)
+    )
+}
+
+fn user_search_cache_key(params: &UserSearch) -> Result<String> {
+    params.validate()?;
+    let mut parts = vec![format!("active={}", params.active.unwrap_or(true))];
+    if let Some(value) = non_empty_owned(params.first_name.as_deref()) {
+        parts.push(format!("first_name={}", cache_key_value(&value)));
+    }
+    if let Some(value) = non_empty_owned(params.last_name.as_deref()) {
+        parts.push(format!("last_name={}", cache_key_value(&value)));
+    }
+    if let Some(value) = non_empty_owned(params.name_contains.as_deref()) {
+        parts.push(format!("name_contains={}", cache_key_value(&value)));
+    }
+    if let Some(value) = non_empty_owned(params.email_contains.as_deref()) {
+        parts.push(format!("email_contains={}", cache_key_value(&value)));
+    }
+    parts.push(format!("limit={}", params.validated_limit()?));
+    Ok(format!("search|{}", parts.join("|")))
 }
 
 fn bool_field(record: &Record, field: &str) -> Option<bool> {
@@ -1523,6 +1682,7 @@ pub struct SnowCore {
     vault: VaultManager,
     query: Arc<query::QueryEngine>,
     cache: cache::CacheManager,
+    cache_policy: CacheTtlPolicy,
 }
 
 impl SnowCore {
@@ -1542,12 +1702,95 @@ impl SnowCore {
         &self.vault_path
     }
 
+    fn cached_users_for_query_key(
+        &self,
+        query_key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<UserRecord>>> {
+        let Some(query_row) = self
+            .query
+            .store()
+            .get_cached_user_query_result(query_key, now)?
+        else {
+            return Ok(None);
+        };
+        if query_row.result_sys_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let cached_rows = self
+            .query
+            .store()
+            .list_cached_users_by_sys_ids(&query_row.result_sys_ids)?;
+        if cached_rows.len() != query_row.result_sys_ids.len()
+            || cached_rows.iter().any(|row| {
+                !stable_reference_cache_is_fresh(
+                    row.synced_at,
+                    now,
+                    self.cache_policy.stable_reference_ttl(),
+                )
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            cached_rows
+                .iter()
+                .map(user_record_from_cached_row)
+                .collect(),
+        ))
+    }
+
+    fn persist_user_query_cache(
+        &self,
+        query_key: &str,
+        records: &[Record],
+        synced_at: DateTime<Utc>,
+    ) -> Result<Vec<UserRecord>> {
+        let mut users = Vec::with_capacity(records.len());
+        let mut sys_ids = Vec::with_capacity(records.len());
+        for record in records {
+            let user = user_record_from_record(record);
+            self.query
+                .store()
+                .upsert_cached_user(&cached_user_row_from_record(record, synced_at))?;
+            sys_ids.push(user.sys_id.clone());
+            users.push(user);
+        }
+        self.query.store().put_cached_user_query_result_with_ttl(
+            query_key,
+            &sys_ids,
+            synced_at,
+            self.cache_policy.stable_reference_ttl(),
+        )?;
+        Ok(users)
+    }
+
     pub async fn lookup_user(&self, lookup: UserLookup) -> Result<Option<UserLookupResult>> {
         lookup.validate_selector()?;
         let candidates = user_lookup_candidates(&lookup)?;
         let active = lookup.active.unwrap_or(true);
+        let now = Utc::now();
 
         for candidate in candidates {
+            let query_key = user_lookup_cache_key(candidate.field, &candidate.value, active);
+            if let Some(users) = self.cached_users_for_query_key(&query_key, now)? {
+                match users.as_slice() {
+                    [] => continue,
+                    [user] => {
+                        return Ok(Some(UserLookupResult {
+                            matched_by: candidate.field.to_string(),
+                            user: user.clone(),
+                        }));
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "multiple cached sys_user records matched {}={}",
+                            candidate.field,
+                            candidate.value
+                        )
+                    }
+                }
+            }
             let response = self
                 .client
                 .table("sys_user")
@@ -1560,6 +1803,7 @@ impl SnowCore {
                 .await?;
 
             if response.records.is_empty() {
+                self.persist_user_query_cache(&query_key, &[], Utc::now())?;
                 continue;
             }
             if response.records.len() > 1 {
@@ -1570,7 +1814,11 @@ impl SnowCore {
                 );
             }
 
-            let user = user_record_from_record(&response.records[0]);
+            let mut users =
+                self.persist_user_query_cache(&query_key, &response.records, Utc::now())?;
+            let user = users
+                .pop()
+                .expect("single user persisted after non-empty response");
             return Ok(Some(UserLookupResult {
                 matched_by: candidate.field.to_string(),
                 user,
@@ -1578,6 +1826,46 @@ impl SnowCore {
         }
 
         Ok(None)
+    }
+
+    pub async fn search_users(&self, params: UserSearch) -> Result<Vec<UserRecord>> {
+        params.validate()?;
+        let query_key = user_search_cache_key(&params)?;
+        let now = Utc::now();
+        if let Some(users) = self.cached_users_for_query_key(&query_key, now)? {
+            return Ok(users);
+        }
+        let mut query = self
+            .client
+            .table("sys_user")
+            .equals(
+                "active",
+                if params.active.unwrap_or(true) {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .fields(USER_LOOKUP_FIELDS)
+            .display_value(DisplayValue::Both)
+            .limit(params.validated_limit()? as u32)
+            .order_by("name", Order::Asc);
+
+        if let Some(first_name) = non_empty_owned(params.first_name.as_deref()) {
+            query = query.equals("first_name", &first_name);
+        }
+        if let Some(last_name) = non_empty_owned(params.last_name.as_deref()) {
+            query = query.equals("last_name", &last_name);
+        }
+        if let Some(name) = non_empty_owned(params.name_contains.as_deref()) {
+            query = query.contains("name", &name);
+        }
+        if let Some(email) = non_empty_owned(params.email_contains.as_deref()) {
+            query = query.contains("email", &email);
+        }
+
+        let records = query.execute().await?.records;
+        self.persist_user_query_cache(&query_key, &records, Utc::now())
     }
 
     pub async fn search_business_applications(
@@ -2037,12 +2325,25 @@ impl SnowCore {
 
     /// Look up a record by number, checking the in-memory L1 cache first
     /// and falling through to the SQLite-backed query engine on a miss.
+    ///
+    /// Cached work records are only served when their projection was synced
+    /// within the local TTL. Stale cached rows are refreshed through the same
+    /// live path as [`get_record_fresh`], which also persists the refreshed
+    /// projection back into the cache.
     pub async fn get_record(&self, number: &str) -> Result<Option<SnowRecord>> {
+        let now = Utc::now();
         if let Some(record) = self.cache.get(number) {
-            return Ok(Some(record));
+            if work_record_cache_is_fresh(&record, now, self.cache_policy.work_record_ttl()) {
+                return Ok(Some(record));
+            }
+            self.cache.invalidate(number);
+            return self.get_record_fresh(number).await;
         }
         let record = self.query.get_record(number).await?;
         if let Some(ref record) = record {
+            if !work_record_cache_is_fresh(record, now, self.cache_policy.work_record_ttl()) {
+                return self.get_record_fresh(number).await;
+            }
             self.cache.put(record.clone());
         }
         Ok(record)
@@ -5164,6 +5465,10 @@ impl SnowCoreBuilder {
         let vault = VaultManager::new(&vault_path);
         let query = Arc::new(query::QueryEngine::open_with_vault(&db_path, &vault_path)?);
         let cache = cache::CacheManager::open(&db_path, config.cache.memory.capacity)?;
+        let cache_policy = CacheTtlPolicy::from_ttl_strings(
+            &config.cache.policy.stable_reference_ttl,
+            &config.cache.policy.work_record_ttl,
+        )?;
 
         Ok(SnowCore {
             config,
@@ -5172,6 +5477,7 @@ impl SnowCoreBuilder {
             vault,
             query,
             cache,
+            cache_policy,
         })
     }
 }
@@ -5484,6 +5790,82 @@ mod tests {
         assert_eq!(
             query.get("sysparm_limit").map(|value| value.as_ref()),
             Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn user_search_builds_live_first_and_last_name_filters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "fedcba9876543210fedcba9876543210",
+                    "user_name": "JXJ1234",
+                    "name": "Jared Jennings",
+                    "first_name": "Jared",
+                    "last_name": "Jennings",
+                    "email": "jared.jennings@example.com",
+                    "employee_number": "1234",
+                    "active": "true",
+                    "department": "IAM",
+                    "location": "Main Street",
+                    "title": "Engineer"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let users = core
+            .search_users(UserSearch {
+                first_name: Some("Jared".to_string()),
+                last_name: Some("Jennings".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("users");
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].first_name.as_deref(), Some("Jared"));
+        assert_eq!(users[0].last_name.as_deref(), Some("Jennings"));
+
+        let cached_users = core
+            .search_users(UserSearch {
+                first_name: Some("Jared".to_string()),
+                last_name: Some("Jennings".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("cached users");
+        assert_eq!(cached_users, users);
+
+        let requests = server.received_requests().await.expect("requests");
+        let user_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/now/table/sys_user")
+            .collect::<Vec<_>>();
+        assert_eq!(user_requests.len(), 1);
+        let request = user_requests[0];
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("sysparm_query").map(|value| value.as_ref()),
+            Some("active=true^first_name=Jared^last_name=Jennings^ORDERBYname")
+        );
+        assert_eq!(
+            query.get("sysparm_limit").map(|value| value.as_ref()),
+            Some("10")
+        );
+        assert_eq!(
+            query
+                .get("sysparm_display_value")
+                .map(|value| value.as_ref()),
+            Some("all")
         );
     }
 
@@ -6449,6 +6831,29 @@ mod tests {
             .expect("project runtime document");
     }
 
+    fn seed_projected_record(core: &SnowCore, record: &SnowRecord) {
+        let document = VaultDocument::Record(record.clone());
+        let persisted = core
+            .persist_runtime_document(&document)
+            .expect("persist runtime document");
+        let row = record_row_from_runtime_record(
+            record,
+            Some(persisted.relative_path.clone()),
+            serialize_vault_document(&document).to_string(),
+        );
+        core.query
+            .store()
+            .upsert_record_with_tags(
+                &row,
+                &document_work_notes(record),
+                &document_content(&document),
+                &document_tag_tokens(&document),
+            )
+            .expect("upsert record");
+        core.project_runtime_document(&document)
+            .expect("project runtime document");
+    }
+
     #[test]
     fn record_row_uses_remote_metadata_and_parent_linkage() {
         let row = record_row_from_servicenow(&sample_change_task_record()).expect("row");
@@ -6607,6 +7012,70 @@ mod tests {
                 && row.rel_type == "reference"
                 && row.field_name == "assigned_to"
         }));
+    }
+
+    #[tokio::test]
+    async fn get_record_refreshes_stale_cached_work_record() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param("sysparm_query", "number=INC002"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "inc-projected",
+                    "number": "INC002",
+                    "short_description": "Live incident title",
+                    "description": "Live incident body",
+                    "state": "In Progress",
+                    "assigned_to": {
+                        "value": "user-sys",
+                        "display_value": "Casey User"
+                    },
+                    "sys_updated_on": "2026-04-09 10:11:12",
+                    "sys_mod_count": "8",
+                    "work_notes": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "incident", "inc-projected").await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let mut cached = sample_projected_record();
+        cached.synced_at =
+            Utc::now() - chrono::Duration::minutes(WORK_RECORD_CACHE_TTL_MINUTES + 1);
+        cached.short_description = "Stale cached title".to_string();
+        seed_projected_record(&core, &cached);
+
+        let record = core
+            .get_record("INC002")
+            .await
+            .expect("record lookup")
+            .expect("record");
+
+        assert_eq!(record.short_description, "Live incident title");
+        assert_eq!(record.description, "Live incident body");
+        assert!(work_record_cache_is_fresh(
+            &record,
+            Utc::now(),
+            work_record_ttl()
+        ));
+
+        let persisted = core
+            .query
+            .store()
+            .get_record_by_number("INC002")
+            .expect("persisted row")
+            .expect("persisted row");
+        assert_eq!(persisted.short_desc.as_deref(), Some("Live incident title"));
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/api/now/table/incident")
+        );
     }
 
     #[tokio::test]
@@ -7445,7 +7914,8 @@ mod tests {
     async fn rebuild_cache_from_vault_rehydrates_sqlite_projection() {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
-        let record = sample_projected_record();
+        let mut record = sample_projected_record();
+        record.synced_at = Utc::now();
         core.vault
             .persist_record(&record)
             .expect("persist vault record");

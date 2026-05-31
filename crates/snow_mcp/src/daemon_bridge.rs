@@ -39,6 +39,7 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("catalog_submit_request", "catalog_submit_request"),
     ("search_records", "search_records"),
     ("user_lookup", "user_lookup"),
+    ("user_search", "user_search"),
     ("business_application_get", "business_application_get"),
     ("business_application_search", "business_application_search"),
     ("business_application_query", "business_application_query"),
@@ -1166,6 +1167,46 @@ mod tests {
         assert_eq!(calls[0].1["resolve_references"], json!(false));
         assert_eq!(calls[0].1["reference_depth"], json!(2));
         assert_eq!(calls[0].1["refresh_dictionary"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn user_search_forwards_to_daemon_method() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec!["user_search"]));
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "user_search",
+                    "arguments": {
+                        "name_contains": "Smith",
+                        "email_contains": "@example.com",
+                        "limit": 5,
+                        "active": false
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls[0].0, "user_search");
+        assert_eq!(
+            calls[0].1,
+            json!({
+                "name_contains": "Smith",
+                "email_contains": "@example.com",
+                "limit": 5,
+                "active": false
+            })
+        );
     }
 
     #[tokio::test]

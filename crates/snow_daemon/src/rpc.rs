@@ -75,6 +75,7 @@ pub enum RpcMethod {
     KbSemanticSearch,
     SearchRecords,
     UserLookup,
+    UserSearch,
     BusinessApplicationGet,
     BusinessApplicationGetFresh,
     BusinessApplicationSearch,
@@ -175,6 +176,7 @@ impl RpcMethod {
             "kb_semantic_search" => Self::KbSemanticSearch,
             "search_records" => Self::SearchRecords,
             "user_lookup" => Self::UserLookup,
+            "user_search" => Self::UserSearch,
             "business_application_get" => Self::BusinessApplicationGet,
             "business_application_get_fresh" => Self::BusinessApplicationGetFresh,
             "business_application_search" => Self::BusinessApplicationSearch,
@@ -677,6 +679,13 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             Ok(params) => match state.core.lookup_user(params).await {
                 Ok(Some(result)) => JsonRpcResponse::ok(id, json!(result)),
                 Ok(None) => JsonRpcResponse::error(id, -32004, "user not found", None),
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::UserSearch => match extract_user_search_params(&request.params) {
+            Ok(params) => match state.core.search_users(params).await {
+                Ok(users) => JsonRpcResponse::ok(id, json!({ "users": users })),
                 Err(err) => internal_error(id, err),
             },
             Err(err) => invalid_params(id, err),
@@ -1429,6 +1438,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "task_sla_status_for_tasks",
     "search_records",
     "user_lookup",
+    "user_search",
     "business_application_get",
     "business_application_get_fresh",
     "business_application_search",
@@ -1930,6 +1940,12 @@ fn extract_search_records_params(params: &Value) -> Result<SearchRecordsParams> 
 fn extract_user_lookup_params(params: &Value) -> Result<snow_core::UserLookup> {
     let params: snow_core::UserLookup = serde_json::from_value(params.clone())?;
     params.validate_selector()?;
+    Ok(params)
+}
+
+fn extract_user_search_params(params: &Value) -> Result<snow_core::UserSearch> {
+    let params: snow_core::UserSearch = serde_json::from_value(params.clone())?;
+    params.validate()?;
     Ok(params)
 }
 
@@ -2517,6 +2533,7 @@ mod tests {
             RpcMethod::SearchRecords
         );
         assert_eq!(RpcMethod::from_method("user_lookup"), RpcMethod::UserLookup);
+        assert_eq!(RpcMethod::from_method("user_search"), RpcMethod::UserSearch);
         assert_eq!(
             RpcMethod::from_method("business_application_get"),
             RpcMethod::BusinessApplicationGet
@@ -4136,6 +4153,67 @@ story_board_id = "board-sys"
         let request_line = request_rx.await.expect("request line");
         assert!(request_line.contains("/api/now/table/sys_user"));
         assert!(request_line.contains("user_name%3DJOW2145"));
+        assert!(request_line.contains("active%3Dtrue"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_user_search_fetches_active_users_by_first_and_last_name() {
+        let sys_id = "fedcba9876543210fedcba9876543210";
+        let response = json!({
+            "result": [
+                {
+                    "sys_id": sys_id,
+                    "user_name": "JXJ1234",
+                    "name": "Jared Jennings",
+                    "first_name": "Jared",
+                    "last_name": "Jennings",
+                    "email": "jared.jennings@example.com",
+                    "employee_number": "1234",
+                    "active": "true",
+                    "department": "IAM",
+                    "location": "Main Street",
+                    "title": "Engineer"
+                }
+            ]
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "user_search".to_string(),
+                params: json!({ "first_name": "Jared", "last_name": "Jennings", "limit": 10 }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.expect("user search result");
+        let users = result
+            .get("users")
+            .and_then(Value::as_array)
+            .expect("users");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].get("sys_id").and_then(Value::as_str), Some(sys_id));
+        assert_eq!(
+            users[0].get("first_name").and_then(Value::as_str),
+            Some("Jared")
+        );
+        assert_eq!(
+            users[0].get("last_name").and_then(Value::as_str),
+            Some("Jennings")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/sys_user"));
+        assert!(request_line.contains("first_name%3DJared"));
+        assert!(request_line.contains("last_name%3DJennings"));
         assert!(request_line.contains("active%3Dtrue"));
     }
 
