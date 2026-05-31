@@ -58,13 +58,13 @@ async fn run_loop(
         .map_err(|e| SnowError::Api(e.to_string()))?;
 
     while !app.should_quit {
-        if event::poll(TICK_RATE).map_err(|e| SnowError::Api(e.to_string()))? {
-            if let Event::Key(key) = event::read().map_err(|e| SnowError::Api(e.to_string()))? {
-                app.handle_key(key).await?;
-                terminal
-                    .draw(|frame| app.render(frame))
-                    .map_err(|e| SnowError::Api(e.to_string()))?;
-            }
+        if event::poll(TICK_RATE).map_err(|e| SnowError::Api(e.to_string()))?
+            && let Event::Key(key) = event::read().map_err(|e| SnowError::Api(e.to_string()))?
+        {
+            app.handle_key(key).await?;
+            terminal
+                .draw(|frame| app.render(frame))
+                .map_err(|e| SnowError::Api(e.to_string()))?;
         }
         tokio::task::yield_now().await;
     }

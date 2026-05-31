@@ -283,17 +283,16 @@ impl PolicyConfig {
             });
         }
 
-        if is_production_environment(label) {
-            if !policy
+        if is_production_environment(label)
+            && !policy
                 .environments
                 .iter()
                 .any(|env| is_production_environment(env))
-            {
-                return Err(BoardPolicyError::ProductionToolEnvironmentNotAllowed {
-                    tool: tool.to_string(),
-                    board_id: "timecard".to_string(),
-                });
-            }
+        {
+            return Err(BoardPolicyError::ProductionToolEnvironmentNotAllowed {
+                tool: tool.to_string(),
+                board_id: "timecard".to_string(),
+            });
         }
 
         Ok(())

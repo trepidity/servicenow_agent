@@ -1184,10 +1184,7 @@ fn fingerprint_timecard(card: &TimeCard) -> TimecardFingerprint {
         task_sys_id,
         task_display,
         category: card.category.clone(),
-        project_time_category: card
-            .project_time_category
-            .clone()
-            .unwrap_or_else(String::new),
+        project_time_category: card.project_time_category.clone().unwrap_or_default(),
         week_starts_on: card.week_starts_on.clone(),
     }
 }

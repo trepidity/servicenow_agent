@@ -981,6 +981,7 @@ async fn apply_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt_for_write(
     plan: &OperationPlan,
     tool: &str,

@@ -410,12 +410,10 @@ pub fn collect_business_application_references(
                 .as_ref()
                 .and_then(Value::as_str)
                 .is_some_and(looks_like_sys_id)
-        {
-            if let Some(reference) =
+            && let Some(reference) =
                 reference_from_business_application_field(record, field_name, aliases)
-            {
-                references.insert(field_name.clone(), reference);
-            }
+        {
+            references.insert(field_name.clone(), reference);
         }
     }
 

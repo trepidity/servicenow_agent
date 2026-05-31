@@ -4106,7 +4106,7 @@ fn projected_fields_from_json(
             .or_else(|| known_business_application_reference_table(field_name).map(str::to_string));
         let reference_sys_id = reference_table
             .as_ref()
-            .and_then(|_| value_text.as_deref())
+            .and(value_text.as_deref())
             .filter(|value| is_sys_id(value))
             .map(str::to_string);
         let value_number = value_text

@@ -1149,13 +1149,11 @@ async fn resolve_actor_sys_user_sys_id(actor: &StoryActor, state: &DaemonState) 
         .as_deref()
         .map(str::trim)
         .filter(|email| !email.is_empty())
-    {
-        if let [sys_id] = find_active_user_sys_ids(state, "email", email)
+        && let [sys_id] = find_active_user_sys_ids(state, "email", email)
             .await
             .as_slice()
-        {
-            return Some(sys_id.clone());
-        }
+    {
+        return Some(sys_id.clone());
     }
 
     let subject = actor.subject.trim();

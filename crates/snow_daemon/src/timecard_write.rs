@@ -774,7 +774,7 @@ fn hours_param(params: &Value) -> Option<String> {
         value
             .as_str()
             .map(ToOwned::to_owned)
-            .or_else(|| value.as_f64().map(|number| trim_decimal(number)))
+            .or_else(|| value.as_f64().map(trim_decimal))
     })
 }
 
@@ -808,7 +808,7 @@ fn preview_total_after(card: &TimeCard, day: Weekday, to: &str) -> Result<String
 
 fn parse_hours_f64(value: &str) -> Result<f64> {
     let parsed = value.trim().parse::<f64>()?;
-    if parsed < 0.0 || parsed > 24.0 {
+    if !(0.0..=24.0).contains(&parsed) {
         return Err(anyhow!("value_constrained"));
     }
     Ok(parsed)
@@ -988,6 +988,7 @@ async fn resolve_actor_user_sys_id(state: &DaemonState, actor: &str) -> Result<S
     ))
 }
 
+#[allow(clippy::result_large_err)]
 fn reject_non_day_field(
     id: Option<Value>,
     state: &DaemonState,

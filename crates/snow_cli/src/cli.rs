@@ -177,6 +177,7 @@ pub enum DaemonCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum TimecardCommand {
     /// List your existing time cards for a week
     List {

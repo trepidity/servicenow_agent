@@ -793,6 +793,7 @@ async fn append_confirmation_audit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_audit_event(
     state: &DaemonState,
     audit_id: &str,

@@ -1901,7 +1901,7 @@ impl SnowCore {
                 .await
             {
                 Ok(record) => Some(record),
-                Err(err) if matches!(err, SnowApiError::Api { status: 404, .. }) => None,
+                Err(SnowApiError::Api { status: 404, .. }) => None,
                 Err(err) => return Err(err.into()),
             },
             BusinessApplicationLookup::ExactName(name) => {
