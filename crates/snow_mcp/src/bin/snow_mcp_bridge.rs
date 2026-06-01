@@ -9,6 +9,7 @@ use snow_mcp::daemon_bridge::{
 };
 
 const DEFAULT_CONTRACT_VERSION: &str = "daemon-json-rpc-v1";
+const DEFAULT_DAEMON_ENV: &str = "prd";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -162,18 +163,18 @@ fn snow_exe_name() -> String {
 
 fn bridge_config(endpoint: &DaemonEndpoint) -> snow_mcp::McpConfig {
     let mut config = snow_mcp::McpConfig::default();
-    if let Some(label) = std::env::var("SNOW_ENV")
-        .ok()
-        .or_else(|| daemon_status_value(endpoint, "environment"))
-    {
-        config.environment =
-            snow_mcp::McpEnvironment::snow_env(label, config.environment.instance_timezone);
-    }
+    let label = bridge_environment(endpoint);
+    config.environment =
+        snow_mcp::McpEnvironment::snow_env(label.clone(), config.environment.instance_timezone);
 
     let policy_path = std::env::var_os("SNOW_MCP_POLICY_PATH")
         .map(PathBuf::from)
         .or_else(|| {
             daemon_env_file(endpoint)
+                .and_then(|path| env_file_value(&path, "SNOW_MCP_POLICY_PATH").map(PathBuf::from))
+        })
+        .or_else(|| {
+            bridge_env_file_for_label(&label)
                 .and_then(|path| env_file_value(&path, "SNOW_MCP_POLICY_PATH").map(PathBuf::from))
         });
     if let Some(path) = policy_path {
@@ -194,6 +195,47 @@ fn bridge_config(endpoint: &DaemonEndpoint) -> snow_mcp::McpConfig {
     }
 
     config
+}
+
+fn bridge_environment(endpoint: &DaemonEndpoint) -> String {
+    std::env::var("SNOW_ENV")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| daemon_status_value(endpoint, "environment"))
+        .or_else(persisted_env_selection)
+        .unwrap_or_else(|| DEFAULT_DAEMON_ENV.to_string())
+}
+
+fn persisted_env_selection() -> Option<String> {
+    snow_core::ipc::resolve_config_dir()
+        .ok()
+        .and_then(|config_dir| fs::read_to_string(config_dir.join("env")).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn bridge_env_file_for_label(label: &str) -> Option<PathBuf> {
+    bridge_env_file_candidates(label)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn bridge_env_file_candidates(label: &str) -> Vec<PathBuf> {
+    let filename = format!(".env.{}", label.trim());
+    let mut paths = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        paths.push(dir.join(&filename));
+    }
+    if let Ok(config_dir) = snow_core::ipc::resolve_config_dir() {
+        paths.push(config_dir.join(&filename));
+        paths.push(config_dir.join(".env"));
+    }
+    paths.push(PathBuf::from(filename));
+
+    paths
 }
 
 fn daemon_env_file(endpoint: &DaemonEndpoint) -> Option<PathBuf> {

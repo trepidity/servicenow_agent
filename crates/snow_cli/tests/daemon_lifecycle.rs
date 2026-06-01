@@ -2,9 +2,9 @@
 //!
 //! Marked `#[ignore]` because `snow_daemon::run_blocking_rpc_only` builds a
 //! real `SnowCore`, which requires:
-//!   - `SNOW_INSTANCE` (or `SERVICENOW_INSTANCE`)
-//!   - `SNOW_USER` (or `SERVICENOW_USERNAME`)
-//!   - `SNOW_PASSWORD` (or `SERVICENOW_PASSWORD`), OR `OP_ITEM_ID` plus a
+//!   - `SERVICENOW_INSTANCE`
+//!   - `SERVICENOW_USERNAME`
+//!   - `SERVICENOW_PASSWORD`, OR `OP_ITEM_ID` plus a
 //!     working `op` CLI session that can fetch the password.
 //!
 //! These cannot be assumed in CI or unconfigured developer machines, and
@@ -16,8 +16,8 @@
 //! The test overrides `HOME` to a tempdir so pidfile/socket/log all live
 //! under `<tmp>/.config/snow/`. The spawned daemon inherits the same `HOME`
 //! and reads `.env.prd` etc. from `<tmp>/.config/snow/`, so to run this
-//! standalone you'd need to plant a `.env` there or export the SNOW_* vars
-//! into the test environment.
+//! standalone you'd need to plant a `.env` there or export the `SERVICENOW_*`
+//! vars into the test environment.
 
 use std::process::Command;
 use std::time::{Duration, Instant};

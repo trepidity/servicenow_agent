@@ -926,7 +926,8 @@ impl DaemonRpcClient {
     pub fn browser_url_by_id(&self, table: &str, sys_id: &str) -> Result<String, SnowError> {
         let Some(instance_url) = self.instance_url.as_deref() else {
             return Err(SnowError::Api(
-                "Browser open is unavailable in daemon mode without SNOW_INSTANCE.".to_string(),
+                "Browser open is unavailable in daemon mode without SERVICENOW_INSTANCE."
+                    .to_string(),
             ));
         };
         let base = normalize_instance_url(instance_url);

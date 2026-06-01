@@ -63,8 +63,8 @@ fn render_actions(f: &mut Frame, area: Rect) {
 }
 
 fn password_env_set() -> bool {
-    std::env::var("SNOW_PASSWORD")
-        .or_else(|_| std::env::var("SERVICENOW_PASSWORD"))
+    std::env::var("SERVICENOW_PASSWORD")
+        .or_else(|_| std::env::var("SNOW_PASSWORD"))
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }

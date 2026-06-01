@@ -440,6 +440,7 @@ mod tests {
             };
             // SAFETY: tests serialize process-env mutation with ENV_LOCK.
             unsafe {
+                std::env::remove_var("SERVICENOW_PASSWORD");
                 std::env::remove_var("SNOW_PASSWORD");
             }
             guard
@@ -457,6 +458,7 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: tests serialize process-env mutation with ENV_LOCK.
             unsafe {
+                std::env::remove_var("SERVICENOW_PASSWORD");
                 std::env::remove_var("SNOW_PASSWORD");
             }
         }
@@ -481,6 +483,7 @@ field = "api-password"
             CredentialProvider::OnePassword {
                 item_id: "item-123".to_string(),
                 field: "api-password".to_string(),
+                vault: None,
             }
         );
 
@@ -523,7 +526,7 @@ op_item_id = "legacy-item"
     #[test]
     fn legacy_op_item_id_with_ambient_password_is_not_silently_defaulted() {
         let env = EnvGuard::new();
-        env.set("SNOW_PASSWORD", "ambient-secret");
+        env.set("SERVICENOW_PASSWORD", "ambient-secret");
         let input = r#"
 [instance]
 url = "https://example.service-now.com"

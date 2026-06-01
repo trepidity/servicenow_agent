@@ -152,9 +152,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         && (*daemon || socket_path.is_some())
     {
         let paths = runtime_paths();
-        let instance_url = std::env::var("SNOW_INSTANCE")
-            .or_else(|_| std::env::var("SERVICENOW_INSTANCE"))
-            .ok();
+        let instance_url = runtime_instance_url();
         let endpoint = socket_path
             .clone()
             .map(|path| snow_core::ipc::IpcEndpoint::Filesystem { path })
@@ -181,9 +179,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
     // are dispatched here before local-credential setup.
     if let Command::BusinessApp { action } = cli.command {
         let paths = runtime_paths();
-        let instance_url = std::env::var("SNOW_INSTANCE")
-            .or_else(|_| std::env::var("SERVICENOW_INSTANCE"))
-            .ok();
+        let instance_url = runtime_instance_url();
         let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root);
         let client =
             DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
@@ -372,10 +368,11 @@ fn load_auth_context(cli: &Cli) -> Result<AuthContext, SnowError> {
         ))
     })?;
 
-    let instance = std::env::var("SNOW_INSTANCE")
-        .map_err(|_| SnowError::Api("SNOW_INSTANCE not set in .env file".to_string()))?;
-    let username = std::env::var("SNOW_USER")
-        .map_err(|_| SnowError::Api("SNOW_USER not set in .env file".to_string()))?;
+    let instance = std::env::var("SERVICENOW_INSTANCE")
+        .or_else(|_| std::env::var("SNOW_INSTANCE"))
+        .map_err(|_| SnowError::Api("SERVICENOW_INSTANCE not set in .env file".to_string()))?;
+    let username = auth::resolve_username_from_runtime_env()
+        .map_err(|err| SnowError::AuthFailed(err.to_string()))?;
     let credential = auth::CredentialProvider::from_runtime_env();
     let password = credential
         .resolve()
@@ -388,6 +385,12 @@ fn load_auth_context(cli: &Cli) -> Result<AuthContext, SnowError> {
         credential,
         password,
     })
+}
+
+fn runtime_instance_url() -> Option<String> {
+    std::env::var("SERVICENOW_INSTANCE")
+        .or_else(|_| std::env::var("SNOW_INSTANCE"))
+        .ok()
 }
 
 async fn build_core(

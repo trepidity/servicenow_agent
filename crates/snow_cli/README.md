@@ -21,14 +21,21 @@ A Rust CLI for ServiceNow change management. View change requests, list tasks, a
 
 3. Configure the instance, user, and credential provider:
    ```
-   SNOW_INSTANCE=https://your-instance.service-now.com
-   SNOW_USER=your_username
+   SERVICENOW_INSTANCE=https://your-instance.service-now.com
+   SERVICENOW_USERNAME=your_username
 
    # Default: inject a resolved password from your shell or vault.
-   SNOW_PASSWORD=replace_with_runtime_secret
+   SERVICENOW_PASSWORD=replace_with_runtime_secret
 
-   # Optional 1Password compatibility path. Leave SNOW_PASSWORD unset when using it.
-   # OP_ITEM_ID=your_1password_item_id
+   # Optional 1Password compatibility path. Leave SERVICENOW_PASSWORD unset when using it.
+   # Plain item IDs use `op item get`; op://vault/item references use `op read`.
+   # Use OP_VAULT with plain item IDs when `op` is authenticated by service account.
+   # Set OP_SERVICE_ACCOUNT_TOKEN in the parent environment, or point
+   # OP_SERVICE_ACCOUNT_TOKEN_FILE at an ignored local file containing it.
+   # If SERVICENOW_USERNAME is unset, the username field is read from the same item.
+   # OP_ITEM_ID=op://vault/item
+   # OP_VAULT=vault
+   # OP_SERVICE_ACCOUNT_TOKEN_FILE=/path/to/ignored/op-service-account-token
    ```
 
 4. Copy the env file next to the binary when running the release binary directly:
@@ -161,7 +168,7 @@ Use the native `snow daemon`, `snow tui --daemon`, and `snow admin` commands. Th
 
 ## Authentication
 
-By default, provide the ServiceNow password through `SNOW_PASSWORD` or `SERVICENOW_PASSWORD`. This supports any external vault that can inject an environment variable at runtime. 1Password remains optional through `OP_ITEM_ID` for environments that use the `op` CLI. Do not commit real `.env.test`, `.env.prd`, passwords, vault item IDs, cookies, or session tokens.
+By default, provide ServiceNow connection settings through `SERVICENOW_INSTANCE`, `SERVICENOW_USERNAME`, and `SERVICENOW_PASSWORD`. This supports any external vault that can inject environment variables at runtime. 1Password remains optional through `OP_ITEM_ID` for environments that use the `op` CLI. Plain item IDs use `op item get`; `op://vault/item` references use `op read op://vault/item/password`. When authenticating `op` with a service account, export `OP_SERVICE_ACCOUNT_TOKEN` in the parent environment or set `OP_SERVICE_ACCOUNT_TOKEN_FILE` to an ignored local token file, and set `OP_VAULT` for plain item IDs. If `SERVICENOW_USERNAME` is unset, `snow` reads the `username` field from the same 1Password item. Do not commit real `.env.test`, `.env.prd`, passwords, vault item IDs, cookies, service account tokens, or session tokens.
 
 ## Guarded Task SLA smoke
 
@@ -174,4 +181,4 @@ SNOW_SMOKE_ALLOWED_INSTANCE=https://example.service-now.com \
 python3 scripts/task_sla_training_smoke.py --check
 ```
 
-The smoke harness loads `.env.test` and refuses to continue unless the normalized `SNOW_INSTANCE` exactly matches the separate `SNOW_SMOKE_ALLOWED_INSTANCE` value or `--allowed-instance`. Live mode runs an already-built `snow` binary; build first with `cargo build -p snow_cli` or pass `--snow-bin`. `--check` validates the guard without resolving credentials, invoking the CLI, or contacting ServiceNow.
+The smoke harness loads `.env.test` and refuses to continue unless the normalized `SERVICENOW_INSTANCE` exactly matches the separate `SNOW_SMOKE_ALLOWED_INSTANCE` value or `--allowed-instance`. Live mode runs an already-built `snow` binary; build first with `cargo build -p snow_cli` or pass `--snow-bin`. `--check` validates the guard without resolving credentials, invoking the CLI, or contacting ServiceNow.

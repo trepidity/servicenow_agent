@@ -186,9 +186,9 @@ fn mcp_config_from_env() -> snow_mcp::McpConfig {
 /// `current_thread` tokio runtime and `LocalSet` because `SnowCore` is `!Send`.
 ///
 /// Loads `.env` from the current directory plus the selected snow config env
-/// file, builds [`SnowCore`] from environment variables (`SNOW_INSTANCE`,
-/// `SNOW_USER`, and the shared credential provider precedence), constructs a
-/// [`DaemonState`], and launches the RPC + MCP servers.
+/// file, builds [`SnowCore`] from environment variables (`SERVICENOW_INSTANCE`,
+/// `SERVICENOW_USERNAME`, and the shared credential provider precedence),
+/// constructs a [`DaemonState`], and launches the RPC + MCP servers.
 pub fn run_blocking(socket: &Path) -> Result<()> {
     let config = daemon_config_from_socket_path(socket, Some(snow_mcp::McpTransport::Stdio));
     run_blocking_with_config(config)
@@ -328,8 +328,8 @@ fn daemon_env_paths(env_name: &str) -> Vec<PathBuf> {
 
 async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let instance =
-        std::env::var("SNOW_INSTANCE").or_else(|_| std::env::var("SERVICENOW_INSTANCE"))?;
-    let username = std::env::var("SNOW_USER").or_else(|_| std::env::var("SERVICENOW_USERNAME"))?;
+        std::env::var("SERVICENOW_INSTANCE").or_else(|_| std::env::var("SNOW_INSTANCE"))?;
+    let username = snow_core::credential::resolve_username_from_runtime_env()?;
     let credential = CredentialProvider::from_runtime_env();
     let password = credential.resolve()?;
     let auth = BasicAuth::new(&username, password.as_str()).without_session();

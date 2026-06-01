@@ -12,7 +12,7 @@ use std::process::Command;
 use super::confirm::{ConfirmAction, PendingConfirm};
 use super::rpc_client::AdminRpc;
 use super::tabs::{Tab, cache_vault, config, daemon, sync};
-use crate::auth::{CredentialProvider, strip_secret_env};
+use crate::auth::{CredentialProvider, prepare_one_password_command};
 
 /// Marker passed into [`AdminApp::tick`] each interval.
 pub struct Tick;
@@ -374,7 +374,9 @@ impl AdminApp {
                 CredentialProvider::OnePassword { .. } => {
                     let mut command = Command::new("op");
                     command.arg("whoami");
-                    let _ = strip_secret_env(&mut command).status();
+                    if prepare_one_password_command(&mut command).is_ok() {
+                        let _ = command.status();
+                    }
                 }
             },
             _ => {}

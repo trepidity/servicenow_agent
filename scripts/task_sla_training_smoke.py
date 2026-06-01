@@ -21,15 +21,26 @@ from urllib.parse import urlsplit
 
 ALLOWED_INSTANCE_ENV = "SNOW_SMOKE_ALLOWED_INSTANCE"
 ENV_FILENAME = ".env.test"
-PASSWORD_ENV_KEYS = ("SNOW_PASSWORD", "SERVICENOW_PASSWORD")
+PASSWORD_ENV_KEYS = ("SERVICENOW_PASSWORD", "SNOW_PASSWORD")
+USER_ENV_KEYS = ("SERVICENOW_USERNAME", "SERVICENOW_USER", "SNOW_USER")
+INSTANCE_ENV_KEYS = ("SERVICENOW_INSTANCE", "SNOW_INSTANCE")
+OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV = "OP_SERVICE_ACCOUNT_TOKEN_FILE"
 SECRET_ENV_KEYS = (
-    "SNOW_PASSWORD",
     "SERVICENOW_PASSWORD",
+    "SNOW_PASSWORD",
     "SNOW_CLIENT_SECRET",
     "SERVICENOW_CLIENT_SECRET",
     "SNOW_OAUTH_TOKEN",
     "SERVICENOW_OAUTH_TOKEN",
     "OP_ITEM_ID",
+    "OP_VAULT",
+    "OP_SERVICE_ACCOUNT_TOKEN",
+    OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV,
+    "OP_CONNECT_TOKEN",
+    "OP_CONNECT_HOST",
+    "ONEPASSWORD_CONNECT_TOKEN",
+)
+ONEPASSWORD_CLI_AUTH_ENV_KEYS = (
     "OP_SERVICE_ACCOUNT_TOKEN",
     "OP_CONNECT_TOKEN",
     "OP_CONNECT_HOST",
@@ -181,9 +192,9 @@ def verify_allowed_instance(
     environ: dict[str, str] | None = None,
 ) -> str:
     environ = environ if environ is not None else os.environ
-    raw = environ.get("SNOW_INSTANCE") or environ.get("SERVICENOW_INSTANCE")
+    raw = next((environ.get(key) for key in INSTANCE_ENV_KEYS if environ.get(key)), None)
     if raw is None:
-        raise SmokeError("SNOW_INSTANCE is not set after loading .env.test", code=2)
+        raise SmokeError("SERVICENOW_INSTANCE is not set after loading .env.test", code=2)
     allowed_raw = args.allowed_instance or environ.get(ALLOWED_INSTANCE_ENV)
     if allowed_raw is None:
         raise SmokeError(
@@ -199,7 +210,7 @@ def verify_allowed_instance(
 
     if normalized != allowed:
         raise SmokeError(
-            "refusing live smoke: normalized SNOW_INSTANCE "
+            "refusing live smoke: normalized SERVICENOW_INSTANCE "
             f"{normalized!r} does not match explicit allow target {allowed!r}",
             code=2,
         )
@@ -228,9 +239,26 @@ def non_service_now_child_env(environ: dict[str, str] | None = None) -> dict[str
     return child_env
 
 
+def one_password_child_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    source = environ if environ is not None else os.environ
+    child_env = non_service_now_child_env(source)
+    for key in ONEPASSWORD_CLI_AUTH_ENV_KEYS:
+        value = source.get(key)
+        if value:
+            child_env[key] = value
+    token = one_password_service_account_token(source)
+    if token:
+        child_env["OP_SERVICE_ACCOUNT_TOKEN"] = token
+    for key, value in source.items():
+        if value and (key == "OP_SESSION" or key.startswith("OP_SESSION_")):
+            child_env[key] = value
+    return child_env
+
+
 def service_now_child_env(
     *,
     password: str,
+    username: str,
     normalized_instance: str,
     environ: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -240,13 +268,16 @@ def service_now_child_env(
         for key in SAFE_CHILD_ENV_KEYS
         if key in source and source[key]
     }
-    for key in ("SNOW_USER", "SERVICENOW_USER", "SNOW_ENV"):
+    for key in ("SNOW_ENV",):
         if source.get(key):
             child_env[key] = source[key]
-    child_env["SNOW_INSTANCE"] = normalized_instance
+    child_env["SERVICENOW_USERNAME"] = username
+    child_env["SERVICENOW_USER"] = username
+    child_env["SNOW_USER"] = username
     child_env["SERVICENOW_INSTANCE"] = normalized_instance
-    child_env["SNOW_PASSWORD"] = password
+    child_env["SNOW_INSTANCE"] = normalized_instance
     child_env["SERVICENOW_PASSWORD"] = password
+    child_env["SNOW_PASSWORD"] = password
     return child_env
 
 
@@ -266,31 +297,43 @@ def resolve_password(environ: dict[str, str] | None = None) -> str:
             password = value.strip()
             pop_password_env(environ)
             return password
-    return fetch_password(environ.get("OP_ITEM_ID", ""), environ=environ)
+    return fetch_one_password_field(
+        environ.get("OP_ITEM_ID", ""), "password", environ=environ
+    )
 
 
 def fetch_password(op_item_id: str, environ: dict[str, str] | None = None) -> str:
+    return fetch_one_password_field(op_item_id, "password", environ=environ)
+
+
+def resolve_username(environ: dict[str, str] | None = None) -> str:
+    environ = environ if environ is not None else os.environ
+    for key in USER_ENV_KEYS:
+        value = environ.get(key)
+        if value and value.strip():
+            return value.strip()
+    return fetch_one_password_field(
+        environ.get("OP_ITEM_ID", ""), "username", environ=environ
+    )
+
+
+def fetch_one_password_field(
+    op_item_id: str, field: str, environ: dict[str, str] | None = None
+) -> str:
     if not op_item_id.strip():
         raise SmokeError(
-            "set SNOW_PASSWORD/SERVICENOW_PASSWORD or OP_ITEM_ID after loading .env.test",
+            "set SERVICENOW_PASSWORD or OP_ITEM_ID after loading .env.test",
             code=2,
         )
 
-    command = [
-        "op",
-        "item",
-        "get",
-        op_item_id.strip(),
-        "--fields",
-        "label=password",
-        "--reveal",
-    ]
+    source = environ if environ is not None else os.environ
+    command = op_password_command(op_item_id, field=field, vault=source.get("OP_VAULT"))
     try:
         result = subprocess.run(
             command,
             text=True,
             capture_output=True,
-            env=non_service_now_child_env(environ),
+            env=one_password_child_env(environ),
             check=False,
         )
     except FileNotFoundError as exc:
@@ -299,12 +342,47 @@ def fetch_password(op_item_id: str, environ: dict[str, str] | None = None) -> st
     if result.returncode != 0:
         stderr = result.stderr.strip()
         detail = f": {stderr}" if stderr else ""
-        raise SmokeError(f"failed to fetch password from 1Password{detail}", code=1)
+        raise SmokeError(
+            f"failed to fetch {field} from 1Password{detail}", code=1
+        )
 
-    password = result.stdout.strip()
-    if not password:
-        raise SmokeError("1Password returned an empty password", code=1)
-    return password
+    value = result.stdout.strip()
+    if not value:
+        raise SmokeError(f"1Password returned an empty {field}", code=1)
+    return value
+
+
+def one_password_service_account_token(source: dict[str, str]) -> str | None:
+    token = source.get("OP_SERVICE_ACCOUNT_TOKEN")
+    if token and token.strip():
+        return token.strip()
+    token_file = source.get(OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV)
+    if not token_file or not token_file.strip():
+        return None
+    path = Path(token_file).expanduser()
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SmokeError(
+            f"failed to read {OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV}: {exc}", code=1
+        ) from exc
+    if not token:
+        raise SmokeError(f"{OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV} is empty", code=1)
+    return token
+
+
+def op_password_command(
+    op_item_id: str, field: str = "password", vault: str | None = None
+) -> list[str]:
+    item = op_item_id.strip()
+    field = field.strip()
+    if item.startswith("op://"):
+        return ["op", "read", f"{item.rstrip('/')}/{field}"]
+    command = ["op", "item", "get", item]
+    if vault and vault.strip():
+        command.extend(["--vault", vault.strip()])
+    command.extend(["--fields", f"label={field}", "--reveal"])
+    return command
 
 
 def repo_root(script_path: Path | None = None) -> Path:
@@ -353,6 +431,7 @@ def is_unavailable_command_error(output: str) -> bool:
 def run_sla_command(
     number: str,
     password: str,
+    username: str,
     normalized_instance: str,
     snow_bin: str,
     environ: dict[str, str] | None = None,
@@ -360,6 +439,7 @@ def run_sla_command(
     command = snow_sla_command(snow_bin, number)
     env = service_now_child_env(
         password=password,
+        username=username,
         normalized_instance=normalized_instance,
         environ=environ,
     )
@@ -430,9 +510,9 @@ def run_self_tests() -> None:
             raise AssertionError(f"expected normalization failure for {raw!r}")
 
     env: dict[str, str] = {}
-    parsed = parse_dotenv_line("export SNOW_INSTANCE='example.service-now.com'")
-    assert parsed == ("SNOW_INSTANCE", "example.service-now.com")
-    env["SNOW_INSTANCE"] = "https://example.service-now.com"
+    parsed = parse_dotenv_line("export SERVICENOW_INSTANCE='example.service-now.com'")
+    assert parsed == ("SERVICENOW_INSTANCE", "example.service-now.com")
+    env["SERVICENOW_INSTANCE"] = "https://example.service-now.com"
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable_dir = root / "target" / "debug"
@@ -455,19 +535,19 @@ def run_self_tests() -> None:
         ]
 
         dotenv = root / ENV_FILENAME
-        dotenv.write_text("SNOW_INSTANCE=example.service-now.com\n", encoding="utf-8")
+        dotenv.write_text("SERVICENOW_INSTANCE=example.service-now.com\n", encoding="utf-8")
         load_env_file(dotenv, env)
-    assert env["SNOW_INSTANCE"] == "https://example.service-now.com"
+    assert env["SERVICENOW_INSTANCE"] == "https://example.service-now.com"
     guard_args = argparse.Namespace(allowed_instance=None, snow_bin=None)
     assert verify_allowed_instance(
         guard_args,
         {
-            "SNOW_INSTANCE": "https://example.service-now.com",
+            "SERVICENOW_INSTANCE": "https://example.service-now.com",
             ALLOWED_INSTANCE_ENV: "EXAMPLE.service-now.com",
         },
     ) == example_instance
     try:
-        verify_allowed_instance(guard_args, {"SNOW_INSTANCE": example_instance})
+        verify_allowed_instance(guard_args, {"SERVICENOW_INSTANCE": example_instance})
     except SmokeError:
         pass
     else:
@@ -476,7 +556,7 @@ def run_self_tests() -> None:
         verify_allowed_instance(
             guard_args,
             {
-                "SNOW_INSTANCE": example_instance,
+                "SERVICENOW_INSTANCE": example_instance,
                 ALLOWED_INSTANCE_ENV: "other.example.com",
             },
         )
@@ -486,20 +566,48 @@ def run_self_tests() -> None:
         raise AssertionError("expected mismatched allow target to fail closed")
     password_env = {
         "PATH": "/bin",
-        "SNOW_PASSWORD": "redacted-password",
         "SERVICENOW_PASSWORD": "redacted-password",
+        "SERVICENOW_USERNAME": "redacted-user",
+        "SNOW_PASSWORD": "redacted-password",
         "SNOW_CLIENT_SECRET": "redacted-secret",
+        "OP_SERVICE_ACCOUNT_TOKEN": "redacted-op-token",
+        OP_SERVICE_ACCOUNT_TOKEN_FILE_ENV: "/tmp/redacted-op-token",
+        "OP_SESSION_test": "redacted-session",
     }
     non_service_env = non_service_now_child_env(password_env)
     for key in SECRET_ENV_KEYS:
         assert key not in non_service_env
+    assert "OP_SESSION_test" not in non_service_env
+    op_env = one_password_child_env(password_env)
+    assert "SERVICENOW_PASSWORD" not in op_env
+    assert "SNOW_CLIENT_SECRET" not in op_env
+    assert op_env["OP_SERVICE_ACCOUNT_TOKEN"] == "redacted-op-token"
+    assert op_env["OP_SESSION_test"] == "redacted-session"
+    assert op_password_command("op://vault/item") == [
+        "op",
+        "read",
+        "op://vault/item/password",
+    ]
+    assert op_password_command("item-123", field="api-password", vault="shared") == [
+        "op",
+        "item",
+        "get",
+        "item-123",
+        "--vault",
+        "shared",
+        "--fields",
+        "label=api-password",
+        "--reveal",
+    ]
     service_env = service_now_child_env(
         password="redacted-password",
+        username="redacted-user",
         normalized_instance=example_instance,
         environ=password_env,
     )
-    assert service_env["SNOW_PASSWORD"] == "redacted-password"
     assert service_env["SERVICENOW_PASSWORD"] == "redacted-password"
+    assert service_env["SNOW_PASSWORD"] == "redacted-password"
+    assert service_env["SERVICENOW_USERNAME"] == "redacted-user"
     assert is_unavailable_command_error("error: unrecognized subcommand 'sla'")
     assert not is_unavailable_command_error("error: request timed out")
 
@@ -531,9 +639,10 @@ def main(argv: list[str]) -> int:
         return 0
 
     assert number is not None
+    username = resolve_username()
     password = resolve_password()
     snow_bin = resolve_snow_binary(args)
-    return run_sla_command(number, password, normalized_instance, snow_bin)
+    return run_sla_command(number, password, username, normalized_instance, snow_bin)
 
 
 if __name__ == "__main__":
