@@ -41,6 +41,10 @@ pub use resource::business_application::{
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
+pub use resource::server::{
+    LINUX_SERVER_TABLE, SERVER_RESOURCE_TYPE, SERVER_TABLE, SERVER_TABLES, Server, ServerLookup,
+    ServerQuery, ServerSearchParams, WINDOWS_SERVER_TABLE,
+};
 pub use resource::story::{StoryWriteConcurrency, StoryWriteResult};
 pub use resource::timecard::{
     CardSelector, SetMode, SimpleRef, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector,
@@ -74,6 +78,7 @@ use crate::cache::store::{
 use crate::enrich::derive_for_record;
 use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
 use crate::resource::approval::ApprovalResource;
+use crate::resource::server::{SERVER_LEAF_TABLES, canonical_server_class};
 use crate::semantic::{
     EmbeddingProvider, OllamaEmbeddingProvider, content_hash, cosine_similarity,
     maybe_exact_kb_identifier, normalize_title_match, reciprocal_rank_fusion_score,
@@ -219,6 +224,7 @@ pub enum ResourceType {
     Knowledge,
     Approval,
     BusinessApplication,
+    Server,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -796,8 +802,11 @@ impl SnowRecord {
         let raw_number = record.get_str("number").unwrap_or_default().to_string();
         let is_business_application =
             resource::business_application::is_business_application_alias(&record.table);
+        let is_server = resource::server::is_server_table(&record.table);
         let number = if is_business_application {
             resource::business_application::business_application_number(record)
+        } else if is_server {
+            resource::server::server_number(record)
         } else {
             raw_number
         };
@@ -834,11 +843,15 @@ impl SnowRecord {
                     record,
                     &business_application_aliases,
                 )
+            } else if is_server {
+                resource::server::server_state(record)
             } else {
                 record.get_str("state").unwrap_or_default().to_string()
             },
             short_description: if is_business_application {
                 resource::business_application::business_application_display_name(record)
+            } else if is_server {
+                resource::server::server_display_name(record)
             } else {
                 record
                     .get_str("short_description")
@@ -847,6 +860,8 @@ impl SnowRecord {
             },
             description: if is_business_application {
                 resource::business_application::business_application_description(record)
+            } else if is_server {
+                resource::server::server_description(record)
             } else {
                 record
                     .get_str("description")
@@ -894,6 +909,9 @@ impl ResourceType {
             "sysapproval_approver" => Self::Approval,
             "cmdb_ci_business_app" => Self::BusinessApplication,
             "business_application" | "business_app" => Self::BusinessApplication,
+            "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
+                Self::Server
+            }
             _ => Self::Change,
         }
     }
@@ -903,6 +921,11 @@ pub(crate) fn canonical_record_table(table: &str) -> String {
     let normalized = normalize_table_name(table);
     if resource::business_application::is_business_application_alias(&normalized) {
         BUSINESS_APPLICATION_TABLE.to_string()
+    } else if resource::server::is_server_alias(&normalized) {
+        match resource::server::canonical_server_table_alias(&normalized).as_str() {
+            SERVER_RESOURCE_TYPE => SERVER_TABLE.to_string(),
+            table => table.to_string(),
+        }
     } else if is_change_request_table(&normalized) {
         "change_request".to_string()
     } else {
@@ -934,6 +957,14 @@ pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
     if resource::business_application::is_business_application_alias(&normalized) {
         return Ok(BUSINESS_APPLICATION_TABLE.to_string());
     }
+    if resource::server::is_server_alias(&normalized) {
+        return Ok(
+            match resource::server::canonical_server_table_alias(&normalized).as_str() {
+                SERVER_RESOURCE_TYPE => SERVER_TABLE.to_string(),
+                table => table.to_string(),
+            },
+        );
+    }
     if is_record_lookup_table_allowed(&normalized) {
         Ok(normalized)
     } else {
@@ -951,6 +982,11 @@ pub fn is_record_lookup_table_allowed(table: &str) -> bool {
             | "business_application"
             | "business_app"
             | "cmdb_ci_business_app"
+            | "server"
+            | "servers"
+            | "cmdb_ci_server"
+            | "cmdb_ci_linux_server"
+            | "cmdb_ci_win_server"
     )
 }
 
@@ -1159,6 +1195,10 @@ pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
     "business_application",
     "business_app",
     "cmdb_ci_business_app",
+    "server",
+    "cmdb_ci_server",
+    "cmdb_ci_linux_server",
+    "cmdb_ci_win_server",
 ];
 
 pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {
@@ -2031,6 +2071,122 @@ impl SnowCore {
         query: BusinessApplicationQuery,
     ) -> Result<Vec<SnowRecord>> {
         self.query.query_business_applications(query).await
+    }
+
+    pub async fn get_server_fresh(&self, lookup: ServerLookup) -> Result<Option<Server>> {
+        let record = match lookup {
+            ServerLookup::SysId(sys_id) => match self
+                .client
+                .table(SERVER_TABLE)
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(&normalize_record_lookup_sys_id(&sys_id)?)
+                .await
+            {
+                Ok(record) => Some(record),
+                Err(SnowApiError::Api { status: 404, .. }) => None,
+                Err(err) => return Err(err.into()),
+            },
+            ServerLookup::ExactName(name) => {
+                let name = non_empty_owned(Some(&name))
+                    .ok_or_else(|| anyhow::anyhow!("server name cannot be empty"))?;
+                let records = self
+                    .server_base_query(ServerSearchParams {
+                        limit: Some(2),
+                        ..Default::default()
+                    })?
+                    .equals("name", &name)
+                    .execute()
+                    .await?
+                    .records;
+                if records.len() > 1 {
+                    anyhow::bail!("multiple servers matched name={name}");
+                }
+                records.into_iter().next()
+            }
+            ServerLookup::IpAddress(ip_address) => {
+                let ip_address = non_empty_owned(Some(&ip_address))
+                    .ok_or_else(|| anyhow::anyhow!("server IP address cannot be empty"))?;
+                let records = self
+                    .server_base_query(ServerSearchParams {
+                        limit: Some(2),
+                        ..Default::default()
+                    })?
+                    .equals("ip_address", &ip_address)
+                    .execute()
+                    .await?
+                    .records;
+                if records.len() > 1 {
+                    anyhow::bail!("multiple servers matched ip_address={ip_address}");
+                }
+                records.into_iter().next()
+            }
+        };
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let server = Server::from_servicenow(&record)?;
+        self.persist_record(&record)?;
+        Ok(Some(server))
+    }
+
+    pub async fn search_servers(&self, params: ServerSearchParams) -> Result<Vec<SnowRecord>> {
+        Ok(self
+            .search_servers_live(params)
+            .await?
+            .into_iter()
+            .map(|server| server.record)
+            .collect())
+    }
+
+    pub async fn search_servers_live(&self, params: ServerSearchParams) -> Result<Vec<Server>> {
+        params.validate()?;
+        let records = self.server_base_query(params)?.execute().await?.records;
+        let mut servers = Vec::with_capacity(records.len());
+        for record in records {
+            let server = Server::from_servicenow(&record)?;
+            self.persist_record(&record)?;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
+        self.query.query_servers(query).await
+    }
+
+    fn server_base_query(&self, params: ServerSearchParams) -> Result<TableApi> {
+        let mut query = self
+            .client
+            .table(SERVER_TABLE)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(params.validated_limit()? as u32)
+            .order_by("name", Order::Asc);
+
+        if let Some(class) = non_empty_owned(params.class.as_deref()) {
+            let class = canonical_server_class(&class)?;
+            if class != SERVER_TABLE {
+                query = query.equals("sys_class_name", class);
+            } else {
+                query = query.in_list("sys_class_name", SERVER_LEAF_TABLES);
+            }
+        } else {
+            query = query.in_list("sys_class_name", SERVER_LEAF_TABLES);
+        }
+        if let Some(name) = non_empty_owned(params.name.as_deref()) {
+            query = query.contains("name", &name);
+        }
+        if let Some(ip_address) = non_empty_owned(params.ip_address.as_deref()) {
+            query = query.equals("ip_address", &ip_address);
+        }
+        query = apply_reference_name_or_sys_id_filter(
+            query,
+            "managed_by_group",
+            params.ci_owner_group.as_deref(),
+        )?;
+        Ok(query)
     }
 
     /// Run a live Business Application search+persist and aggregate a sync summary.
@@ -4638,6 +4794,8 @@ impl SnowCore {
                             record,
                             &BusinessApplicationFieldAliases::baseline_degraded(),
                         )
+                    } else if resource::server::is_server_table(&record.table) {
+                        resource::server::collect_server_references(record)
                     } else {
                         collect_record_references(record)
                     };
@@ -5794,6 +5952,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_search_builds_supported_filters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "name": "app01.example.internal",
+                    "ip_address": "192.0.2.10",
+                    "sys_class_name": "cmdb_ci_linux_server",
+                    "managed_by_group": {
+                        "value": "11111111111111111111111111111111",
+                        "display_value": "Platform Operations"
+                    },
+                    "support_group": {
+                        "value": "22222222222222222222222222222222",
+                        "display_value": "Server Support"
+                    },
+                    "operational_status": { "value": "1", "display_value": "Operational" },
+                    "short_description": "Linux application server"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let records = core
+            .search_servers(ServerSearchParams {
+                name: Some("app01".to_string()),
+                ip_address: Some("192.0.2.10".to_string()),
+                ci_owner_group: Some("Platform Operations".to_string()),
+                class: Some("linux".to_string()),
+                limit: Some(3),
+            })
+            .await
+            .expect("servers");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].number, "SERVER:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(records[0].table, "cmdb_ci_server");
+        assert_eq!(records[0].resource_type, ResourceType::Server);
+        assert_eq!(records[0].fields["name"].value, "app01.example.internal");
+        assert_eq!(records[0].fields["ip_address"].value, "192.0.2.10");
+        assert_eq!(
+            records[0].references["managed_by_group"].display_name,
+            "Platform Operations"
+        );
+        let cached = core
+            .query_servers(ServerQuery {
+                ci_owner_group: Some("Platform Operations".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached server query by CI owner group");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].sys_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(
+            tempdir
+                .path()
+                .join("vault/servers/server_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_app01-example-internal.md")
+                .exists()
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/now/table/cmdb_ci_server")
+            .expect("server request");
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("sysparm_query").map(|value| value.as_ref()),
+            Some(
+                "sys_class_name=cmdb_ci_linux_server^nameLIKEapp01^ip_address=192.0.2.10^managed_by_group.nameLIKEPlatform Operations^ORDERBYname"
+            )
+        );
+        assert_eq!(
+            query.get("sysparm_fields").map(|value| value.as_ref()),
+            None
+        );
+        assert_eq!(
+            query
+                .get("sysparm_display_value")
+                .map(|value| value.as_ref()),
+            Some("all")
+        );
+        assert_eq!(
+            query
+                .get("sysparm_exclude_reference_link")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("sysparm_limit").map(|value| value.as_ref()),
+            Some("3")
+        );
+    }
+
+    #[tokio::test]
     async fn user_search_builds_live_first_and_last_name_filters() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -6219,6 +6478,31 @@ mod tests {
         assert_eq!(
             normalize_record_lookup_table("business_application").unwrap(),
             "cmdb_ci_business_app"
+        );
+    }
+
+    #[test]
+    fn server_resource_type_accepts_aliases() {
+        assert_eq!(ResourceType::from_table("server"), ResourceType::Server);
+        assert_eq!(
+            ResourceType::from_table("cmdb_ci_linux_server"),
+            ResourceType::Server
+        );
+        assert_eq!(
+            ResourceType::from_table("cmdb_ci_win_server"),
+            ResourceType::Server
+        );
+        assert_eq!(
+            normalize_record_lookup_table("server").unwrap(),
+            "cmdb_ci_server"
+        );
+        assert_eq!(
+            normalize_record_lookup_table("linux_server").unwrap(),
+            "cmdb_ci_linux_server"
+        );
+        assert_eq!(
+            normalize_record_lookup_table("windows_server").unwrap(),
+            "cmdb_ci_win_server"
         );
     }
 

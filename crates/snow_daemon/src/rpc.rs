@@ -82,6 +82,11 @@ pub enum RpcMethod {
     BusinessApplicationQuery,
     BusinessApplicationSync,
     BusinessApplicationFields,
+    ServerGet,
+    ServerGetFresh,
+    ServerSearch,
+    ServerQuery,
+    ServerFields,
     ListKnowledgeBases,
     ListCategories,
     ListKnowledgeArticles,
@@ -183,6 +188,11 @@ impl RpcMethod {
             "business_application_query" => Self::BusinessApplicationQuery,
             "business_application_sync" => Self::BusinessApplicationSync,
             "business_application_fields" => Self::BusinessApplicationFields,
+            "server_get" => Self::ServerGet,
+            "server_get_fresh" => Self::ServerGetFresh,
+            "server_search" => Self::ServerSearch,
+            "server_query" => Self::ServerQuery,
+            "server_fields" => Self::ServerFields,
             "list_knowledge_bases" => Self::ListKnowledgeBases,
             "list_categories" => Self::ListCategories,
             "list_knowledge_articles" => Self::ListKnowledgeArticles,
@@ -858,6 +868,100 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 Err(err) => invalid_params(id, err),
             }
         }
+        RpcMethod::ServerGet => match extract_server_lookup_params(&request.params) {
+            Ok(lookup) => match get_server_cached(state.core.as_ref(), &lookup).await {
+                Ok(Some(record)) => match transport.server(&record) {
+                    Ok(server) => {
+                        let record_dto = server.record.clone();
+                        JsonRpcResponse::ok(
+                            id,
+                            json!({
+                                "server": server,
+                                "record": record_dto,
+                                "markdown": render_snow_record(&record),
+                            }),
+                        )
+                    }
+                    Err(err) => internal_error(id, err),
+                },
+                Ok(None) => JsonRpcResponse::error(id, -32004, "server not found", None),
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::ServerGetFresh => match extract_server_lookup_params(&request.params) {
+            Ok(lookup) => match core_server_lookup(lookup) {
+                Ok(lookup) => match state.core.get_server_fresh(lookup).await {
+                    Ok(Some(server)) => match transport.server(&server.record) {
+                        Ok(server_dto) => {
+                            let record_dto = server_dto.record.clone();
+                            JsonRpcResponse::ok(
+                                id,
+                                json!({
+                                    "server": server_dto,
+                                    "record": record_dto,
+                                    "markdown": render_snow_record(&server.record),
+                                }),
+                            )
+                        }
+                        Err(err) => internal_error(id, err),
+                    },
+                    Ok(None) => JsonRpcResponse::error(id, -32004, "server not found", None),
+                    Err(err) => internal_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::ServerSearch => match extract_server_search_params(&request.params) {
+            Ok(params) => match state.core.search_servers_live(params).await {
+                Ok(servers) => {
+                    let mut server_dtos = Vec::with_capacity(servers.len());
+                    let mut record_dtos = Vec::with_capacity(servers.len());
+                    for server in servers {
+                        match transport.server(&server.record) {
+                            Ok(server_dto) => {
+                                record_dtos.push(server_dto.record.clone());
+                                server_dtos.push(server_dto);
+                            }
+                            Err(err) => return internal_error(id, err),
+                        }
+                    }
+                    JsonRpcResponse::ok(
+                        id,
+                        json!({
+                            "servers": server_dtos,
+                            "records": record_dtos,
+                        }),
+                    )
+                }
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::ServerQuery => match extract_server_query_params(&request.params) {
+            Ok(params) => match state.core.query_servers(params).await {
+                Ok(records) => {
+                    let mut servers = Vec::with_capacity(records.len());
+                    for record in records {
+                        match transport.server(&record) {
+                            Ok(server) => servers.push(server),
+                            Err(err) => return internal_error(id, err),
+                        }
+                    }
+                    JsonRpcResponse::ok(id, json!({ "servers": servers }))
+                }
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
+        RpcMethod::ServerFields => match extract_server_fields_params(&request.params) {
+            Ok(params) => match server_fields(state.core.as_ref(), params).await {
+                Ok(fields) => JsonRpcResponse::ok(id, json!({ "fields": fields })),
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
         RpcMethod::ListKnowledgeBases => match state.core.list_knowledge_bases() {
             Ok(bases) => JsonRpcResponse::ok(
                 id,
@@ -1445,6 +1549,11 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_query",
     "business_application_sync",
     "business_application_fields",
+    "server_get",
+    "server_get_fresh",
+    "server_search",
+    "server_query",
+    "server_fields",
     "search_knowledge",
     "kb_semantic_search",
     "list_knowledge_bases",
@@ -1789,6 +1898,13 @@ enum BusinessApplicationLookup {
     Name(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerLookup {
+    SysId(String),
+    Name(String),
+    IpAddress(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct BusinessApplicationHydrationOptions {
     #[serde(default = "default_true")]
@@ -1858,6 +1974,19 @@ struct BusinessApplicationSortField {
 struct BusinessApplicationFieldsParams {
     #[serde(default)]
     refresh_dictionary: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ServerFieldsParams {}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ServerFieldSummary {
+    field: String,
+    observed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_display_value: Option<String>,
 }
 
 /// One entry of the `business_application_fields` response.
@@ -2069,6 +2198,56 @@ fn extract_business_application_fields_params(
     Ok(serde_json::from_value(params.clone())?)
 }
 
+fn extract_server_lookup_params(params: &Value) -> Result<ServerLookup> {
+    let Value::Object(map) = params else {
+        return Err(anyhow!("expected object params"));
+    };
+    let sys_id = map.get("sys_id").and_then(Value::as_str).map(str::trim);
+    let name = map.get("name").and_then(Value::as_str).map(str::trim);
+    let ip_address = map.get("ip_address").and_then(Value::as_str).map(str::trim);
+    match (
+        sys_id.filter(|value| !value.is_empty()),
+        name.filter(|value| !value.is_empty()),
+        ip_address.filter(|value| !value.is_empty()),
+    ) {
+        (Some(sys_id), None, None) => Ok(ServerLookup::SysId(
+            snow_core::normalize_record_lookup_sys_id(sys_id)?,
+        )),
+        (None, Some(name), None) => Ok(ServerLookup::Name(name.to_string())),
+        (None, None, Some(ip_address)) => Ok(ServerLookup::IpAddress(ip_address.to_string())),
+        (None, None, None) => Err(anyhow!(
+            "missing required lookup: provide `sys_id`, `name`, or `ip_address`"
+        )),
+        _ => Err(anyhow!(
+            "provide exactly one of `sys_id`, `name`, or `ip_address`"
+        )),
+    }
+}
+
+fn core_server_lookup(lookup: ServerLookup) -> Result<snow_core::ServerLookup> {
+    Ok(match lookup {
+        ServerLookup::SysId(sys_id) => snow_core::ServerLookup::sys_id(sys_id)?,
+        ServerLookup::Name(name) => snow_core::ServerLookup::exact_name(name),
+        ServerLookup::IpAddress(ip_address) => snow_core::ServerLookup::ip_address(ip_address),
+    })
+}
+
+fn extract_server_search_params(params: &Value) -> Result<snow_core::ServerSearchParams> {
+    let params: snow_core::ServerSearchParams = serde_json::from_value(params.clone())?;
+    params.validate()?;
+    Ok(params)
+}
+
+fn extract_server_query_params(params: &Value) -> Result<snow_core::ServerQuery> {
+    let params: snow_core::ServerQuery = serde_json::from_value(params.clone())?;
+    params.validate()?;
+    Ok(params)
+}
+
+fn extract_server_fields_params(params: &Value) -> Result<ServerFieldsParams> {
+    Ok(serde_json::from_value(params.clone())?)
+}
+
 async fn get_business_application_cached(
     core: &SnowCore,
     lookup: &BusinessApplicationLookup,
@@ -2083,6 +2262,22 @@ async fn get_business_application_cached(
     Ok(records.into_iter().find(|record| match lookup {
         BusinessApplicationLookup::SysId(sys_id) => record.sys_id.eq_ignore_ascii_case(sys_id),
         BusinessApplicationLookup::Name(name) => business_application_name(record) == name.trim(),
+    }))
+}
+
+async fn get_server_cached(core: &SnowCore, lookup: &ServerLookup) -> Result<Option<SnowRecord>> {
+    let records = core
+        .list_records_query(
+            ListQuery::new()
+                .resource_type(ResourceType::Server)
+                .include_tombstoned(false),
+        )
+        .await?;
+    Ok(records.into_iter().find(|record| match lookup {
+        ServerLookup::SysId(sys_id) => record.sys_id.eq_ignore_ascii_case(sys_id),
+        ServerLookup::Name(name) => server_name(record) == name.trim(),
+        ServerLookup::IpAddress(ip_address) => server_field(record, "ip_address")
+            .is_some_and(|value| value.eq_ignore_ascii_case(ip_address.trim())),
     }))
 }
 
@@ -2225,6 +2420,36 @@ async fn business_application_fields(
     Ok(fields.into_values().collect())
 }
 
+async fn server_fields(
+    core: &SnowCore,
+    _params: ServerFieldsParams,
+) -> Result<Vec<ServerFieldSummary>> {
+    let records = core
+        .list_records_query(ListQuery::new().resource_type(ResourceType::Server))
+        .await?;
+    let mut fields = std::collections::BTreeMap::<String, ServerFieldSummary>::new();
+    for record in records {
+        for (name, value) in record.fields {
+            let entry = fields.entry(name.clone()).or_insert(ServerFieldSummary {
+                field: name,
+                observed_count: 0,
+                sample_value: None,
+                sample_display_value: None,
+            });
+            entry.observed_count += 1;
+            if entry.sample_value.is_none() && !value.value.trim().is_empty() {
+                entry.sample_value = Some(value.value);
+            }
+            if entry.sample_display_value.is_none() {
+                entry.sample_display_value = value
+                    .display_value
+                    .filter(|display| !display.trim().is_empty());
+            }
+        }
+    }
+    Ok(fields.into_values().collect())
+}
+
 /// Build an enriched field summary from a cached dictionary row.
 fn dictionary_field_summary(
     name: &str,
@@ -2293,6 +2518,24 @@ fn business_application_name(record: &SnowRecord) -> String {
         .unwrap_or_else(|| record.sys_id.clone())
 }
 
+fn server_name(record: &SnowRecord) -> String {
+    server_field(record, "name")
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_field(record: &SnowRecord, field: &str) -> Option<String> {
+    record.fields.get(field).and_then(|value| {
+        value
+            .display_value
+            .clone()
+            .or_else(|| Some(value.value.clone()))
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
 fn extract_list_records_params(params: &Value) -> Result<ListRecordsParams> {
     Ok(serde_json::from_value(params.clone())?)
 }
@@ -2336,6 +2579,13 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "business_application" | "business_app" | "cmdb_ci_business_app" => {
             Ok(ResourceType::BusinessApplication)
         }
+        "server"
+        | "servers"
+        | "cmdb_ci_server"
+        | "cmdb_ci_linux_server"
+        | "cmdb_ci_win_server"
+        | "linux_server"
+        | "windows_server" => Ok(ResourceType::Server),
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }

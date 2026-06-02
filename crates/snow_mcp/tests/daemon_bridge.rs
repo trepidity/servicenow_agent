@@ -670,6 +670,18 @@ async fn bridge_filters_tools_against_daemon_contract() {
         .iter()
         .find(|tool| tool["name"] == "get_record")
         .expect("get_record advertised");
+    assert!(
+        get_record["description"]
+            .as_str()
+            .expect("get_record description")
+            .contains("APM0002456")
+    );
+    assert!(
+        get_record["inputSchema"]["properties"]["number"]["description"]
+            .as_str()
+            .expect("get_record number description")
+            .contains("business_application_query")
+    );
     assert_eq!(
         get_record["inputSchema"]["properties"]["table"]["enum"],
         json!([
@@ -679,7 +691,11 @@ async fn bridge_filters_tools_against_daemon_contract() {
             "pm_project",
             "business_application",
             "business_app",
-            "cmdb_ci_business_app"
+            "cmdb_ci_business_app",
+            "server",
+            "cmdb_ci_server",
+            "cmdb_ci_linux_server",
+            "cmdb_ci_win_server"
         ])
     );
 }

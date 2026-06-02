@@ -5,6 +5,7 @@ pub mod change;
 pub mod incident;
 pub mod knowledge;
 pub mod request;
+pub mod server;
 pub mod story;
 pub mod timecard;
 

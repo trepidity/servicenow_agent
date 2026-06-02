@@ -696,6 +696,7 @@ fn resource_type_slug(resource_type: &ResourceType) -> &'static str {
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
         ResourceType::BusinessApplication => "business_application",
+        ResourceType::Server => "server",
     }
 }
 
@@ -718,6 +719,9 @@ fn resource_type_from_slug(slug: &str) -> Result<ResourceType> {
         "approval" => ResourceType::Approval,
         "business_application" | "business_app" | "cmdb_ci_business_app" => {
             ResourceType::BusinessApplication
+        }
+        "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
+            ResourceType::Server
         }
         other => bail!("unknown resource_type slug: {other}"),
     })

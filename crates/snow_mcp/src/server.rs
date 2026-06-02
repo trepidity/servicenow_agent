@@ -164,6 +164,10 @@ impl McpServer {
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
+            "server_get" => self.call_server_get(id, params).await,
+            "server_search" => self.call_server_search(id, params).await,
+            "server_query" => self.call_server_query(id, params).await,
+            "server_fields" => self.call_server_fields(id, params).await,
             "search_knowledge" | "knowledge_search" => self.call_search_knowledge(id, params).await,
             "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
             "get_article" | "knowledge_fetch" => self.call_get_article(id, params).await,
@@ -623,6 +627,148 @@ impl McpServer {
         let records = match self
             .core
             .list_records_query(ListQuery::new().resource_type(ResourceType::BusinessApplication))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut fields = std::collections::BTreeMap::<String, usize>::new();
+        for record in records {
+            for name in record.fields.keys() {
+                *fields.entry(name.clone()).or_default() += 1;
+            }
+        }
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "fields": fields
+                    .into_iter()
+                    .map(|(field, observed_count)| json!({ "field": field, "observed_count": observed_count }))
+                    .collect::<Vec<_>>()
+            }),
+        )
+    }
+
+    async fn call_server_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::ServerSearchParams = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+        match self.core.search_servers(parsed).await {
+            Ok(records) => {
+                let mut servers = Vec::new();
+                let mut record_values = Vec::new();
+                for record in records {
+                    match self.server_json(&record) {
+                        Ok(server) => {
+                            if let Some(record_value) = server.get("record").cloned() {
+                                record_values.push(record_value);
+                            }
+                            servers.push(server);
+                        }
+                        Err(err) => return service_failure(id, err),
+                    }
+                }
+                JsonRpcResponse::ok(id, json!({ "servers": servers, "records": record_values }))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_server_get(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let Value::Object(map) = arguments else {
+            return invalid_params(id, "arguments must be an object");
+        };
+        let sys_id = map.get("sys_id").and_then(Value::as_str).map(str::trim);
+        let name = map.get("name").and_then(Value::as_str).map(str::trim);
+        let ip_address = map.get("ip_address").and_then(Value::as_str).map(str::trim);
+        let records = match self
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::Server))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let record = match (
+            sys_id.filter(|value| !value.is_empty()),
+            name.filter(|value| !value.is_empty()),
+            ip_address.filter(|value| !value.is_empty()),
+        ) {
+            (Some(sys_id), None, None) => match snow_core::normalize_record_lookup_sys_id(sys_id) {
+                Ok(sys_id) => records
+                    .into_iter()
+                    .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id)),
+                Err(err) => return invalid_params(id, err),
+            },
+            (None, Some(name), None) => records
+                .into_iter()
+                .find(|record| server_name(record) == name),
+            (None, None, Some(ip_address)) => records.into_iter().find(|record| {
+                server_field(record, "ip_address")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
+            }),
+            (None, None, None) => {
+                return invalid_params(id, "missing required lookup: sys_id, name, or ip_address");
+            }
+            _ => return invalid_params(id, "provide exactly one of sys_id, name, or ip_address"),
+        };
+        match record {
+            Some(record) => match self.server_json(&record) {
+                Ok(server) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "server": server,
+                        "markdown": render_snow_record(&record),
+                    }),
+                ),
+                Err(err) => service_failure(id, err),
+            },
+            None => JsonRpcResponse::error(id, -32004, "server not found", None),
+        }
+    }
+
+    async fn call_server_query(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let query: snow_core::ServerQuery = match serde_json::from_value(arguments) {
+            Ok(query) => query,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = query.validate() {
+            return invalid_params(id, err);
+        }
+        let records = match self.core.query_servers(query).await {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut servers = Vec::new();
+        for record in records {
+            match self.server_json(&record) {
+                Ok(server) => servers.push(server),
+                Err(err) => return service_failure(id, err),
+            }
+        }
+        JsonRpcResponse::ok(id, json!({ "servers": servers }))
+    }
+
+    async fn call_server_fields(&self, id: Option<Value>, _params: &Value) -> JsonRpcResponse {
+        let records = match self
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::Server))
             .await
         {
             Ok(records) => records,
@@ -1308,6 +1454,47 @@ impl McpServer {
         Ok(Value::Object(application))
     }
 
+    fn server_json(&self, record: &SnowRecord) -> Result<Value> {
+        let mut server = Map::new();
+        let record_json = self.record_json(record)?;
+        server.insert("record".to_string(), record_json.clone());
+        server.insert("name".to_string(), Value::String(server_name(record)));
+        if let Some(value) = server_field(record, "ip_address") {
+            server.insert("ip_address".to_string(), Value::String(value));
+        }
+        if let Some(value) = server_field(record, "sys_class_name") {
+            server.insert("class_name".to_string(), Value::String(value));
+        }
+        for (json_name, field_name, table) in [
+            ("ci_owner_group", "managed_by_group", "sys_user_group"),
+            ("support_group", "support_group", "sys_user_group"),
+        ] {
+            if let Some(reference) = server_reference_json(record, field_name, table) {
+                server.insert(json_name.to_string(), reference);
+            }
+        }
+        if let Some(field) = record.fields.get("operational_status") {
+            server.insert("operational_status".to_string(), field_value_json(field));
+        }
+        server.insert(
+            "fields".to_string(),
+            Value::Object(
+                record
+                    .fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), field_value_json(value)))
+                    .collect(),
+            ),
+        );
+        if let Some(browser_url) = record_json.get("browser_url").cloned() {
+            server.insert("browser_url".to_string(), browser_url);
+        }
+        if let Some(path) = record_json.get("vault_relative_path").cloned() {
+            server.insert("vault_relative_path".to_string(), path);
+        }
+        Ok(Value::Object(server))
+    }
+
     fn browser_url(&self, table: &str, sys_id: &str) -> Option<String> {
         let base = normalize_instance_url(&self.core.config().instance.url)?;
         Some(format!("{base}/nav_to.do?uri={table}.do?sys_id={sys_id}"))
@@ -1387,6 +1574,13 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "business_application" | "business_app" | "cmdb_ci_business_app" => {
             Ok(ResourceType::BusinessApplication)
         }
+        "server"
+        | "servers"
+        | "cmdb_ci_server"
+        | "cmdb_ci_linux_server"
+        | "cmdb_ci_win_server"
+        | "linux_server"
+        | "windows_server" => Ok(ResourceType::Server),
         _ => Err(Error::InvalidParams(format!(
             "unsupported resource_type `{resource_type}`"
         ))),
@@ -1473,6 +1667,38 @@ fn business_application_reference_json(
     }))
 }
 
+fn server_name(record: &SnowRecord) -> String {
+    server_field(record, "name")
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_field(record: &SnowRecord, field_name: &str) -> Option<String> {
+    record.fields.get(field_name).and_then(|field| {
+        field
+            .display_value
+            .as_ref()
+            .or(Some(&field.value))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn server_reference_json(record: &SnowRecord, field_name: &str, table: &str) -> Option<Value> {
+    if let Some(reference) = record.references.get(field_name) {
+        return Some(json!({
+            "sys_id": reference.sys_id,
+            "table": reference.table,
+            "display_name": reference.display_name,
+            "extra": reference.extra,
+        }));
+    }
+    business_application_reference_json(record, field_name, table)
+}
+
 fn field_value_json(value: &FieldValue) -> Value {
     let mut field = Map::new();
     field.insert("value".to_string(), Value::String(value.value.clone()));
@@ -1543,6 +1769,7 @@ fn resource_type_json(resource_type: &ResourceType) -> &'static str {
         ResourceType::Knowledge => "knowledge",
         ResourceType::Approval => "approval",
         ResourceType::BusinessApplication => "business_application",
+        ResourceType::Server => "server",
     }
 }
 

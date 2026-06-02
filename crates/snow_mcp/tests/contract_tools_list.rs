@@ -181,12 +181,123 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
             "pm_project",
             "business_application",
             "business_app",
-            "cmdb_ci_business_app"
+            "cmdb_ci_business_app",
+            "server",
+            "cmdb_ci_server",
+            "cmdb_ci_linux_server",
+            "cmdb_ci_win_server"
         ])
     );
     assert_eq!(
         tool.input_schema["properties"]["sys_id"]["pattern"],
         json!("^[0-9a-fA-F]{32}$")
+    );
+}
+
+#[test]
+fn generic_record_tools_warn_away_from_apm_business_application_numbers() {
+    let registry = ToolRegistry::new();
+    let get_record = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "get_record")
+        .expect("get_record registered");
+    let search_records = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "search_records")
+        .expect("search_records registered");
+
+    for text in [
+        get_record.description.as_str(),
+        get_record.input_schema["description"]
+            .as_str()
+            .expect("get_record schema description"),
+        get_record.input_schema["properties"]["number"]["description"]
+            .as_str()
+            .expect("get_record number description"),
+        search_records.description.as_str(),
+        search_records.input_schema["description"]
+            .as_str()
+            .expect("search_records schema description"),
+        search_records.input_schema["properties"]["query"]["description"]
+            .as_str()
+            .expect("search_records query description"),
+    ] {
+        assert!(text.contains("APM0002456"), "{text}");
+        assert!(
+            text.contains("business_application_query")
+                || text.contains("business_application_search"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn business_application_schemas_advertise_apm_number_routing() {
+    let registry = ToolRegistry::new();
+    let tool = |name: &str| {
+        registry
+            .metadata()
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
+
+    let get = tool("business_application_get");
+    assert!(get.description.contains("APM0002456"));
+    assert!(
+        get.input_schema["properties"].get("number").is_none(),
+        "business_application_get does not accept APM number directly"
+    );
+    assert!(
+        get.input_schema["description"]
+            .as_str()
+            .expect("BA get schema description")
+            .contains("business_application_query")
+    );
+    assert!(
+        get.input_schema["properties"]["name"]["description"]
+            .as_str()
+            .expect("BA get name description")
+            .contains("APM0002456")
+    );
+
+    let search = tool("business_application_search");
+    assert!(search.description.contains("APM0002456"));
+    assert!(
+        search.input_schema["properties"]["name"]["description"]
+            .as_str()
+            .expect("BA search name description")
+            .contains("business_application_query")
+    );
+
+    let query = tool("business_application_query");
+    assert!(query.description.contains("APM0002456"));
+    assert!(
+        query.input_schema["properties"]["filters"]["description"]
+            .as_str()
+            .expect("BA query filters description")
+            .contains("owner for APM0002456")
+    );
+    assert_eq!(
+        query.input_schema["properties"]["filters"]["items"]["properties"]["field"]["description"],
+        json!("ServiceNow field name or alias. Use number for APM identifiers such as APM0002456.")
+    );
+    assert!(
+        query.input_schema["properties"]["filters"]["items"]["properties"]["value"]["description"]
+            .as_str()
+            .expect("BA query filter value description")
+            .contains("APM0002456")
+    );
+
+    let fields = tool("business_application_fields");
+    assert!(fields.description.contains("owner-related fields"));
+    assert!(
+        fields.input_schema["description"]
+            .as_str()
+            .expect("BA fields schema description")
+            .contains("owner-field mapping")
     );
 }
 

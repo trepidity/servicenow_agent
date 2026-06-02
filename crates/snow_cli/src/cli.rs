@@ -127,6 +127,12 @@ pub enum Command {
         #[command(subcommand)]
         action: BusinessAppCommand,
     },
+    /// Server lookup, live search, local query, and field commands
+    Server {
+        /// Server subcommand.
+        #[command(subcommand)]
+        action: ServerCommand,
+    },
     /// Show an approval through the typed runtime path
     Approval {
         /// Approval number
@@ -452,6 +458,88 @@ pub enum BusinessAppCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ServerCommand {
+    /// Get one cached Server by sys_id, exact name, or IP address
+    Get {
+        /// Server sys_id
+        #[arg(long = "sys-id")]
+        sys_id: Option<String>,
+        /// Server name (exact match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Server IP address (exact match)
+        #[arg(long = "ip-address")]
+        ip_address: Option<String>,
+        /// Fetch a fresh copy from ServiceNow instead of the local cache
+        #[arg(long)]
+        fresh: bool,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+        /// Include the full all-fields table in human output
+        #[arg(long)]
+        full: bool,
+    },
+    /// Live-search Windows and Linux Servers
+    Search {
+        /// Filter by name (contains match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Filter by IP address (exact match)
+        #[arg(long = "ip-address")]
+        ip_address: Option<String>,
+        /// Filter by CI owner group display-name substring or sys_id
+        #[arg(long = "ci-owner-group")]
+        ci_owner_group: Option<String>,
+        /// Filter by class: linux, windows, cmdb_ci_linux_server, or cmdb_ci_win_server
+        #[arg(long)]
+        class: Option<String>,
+        /// Maximum number of results to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+        /// Include the full all-fields table for each result
+        #[arg(long)]
+        full: bool,
+    },
+    /// Query cached Windows and Linux Servers
+    Query {
+        /// Text search across cached server name, IP, class, and groups
+        #[arg(long)]
+        text: Option<String>,
+        /// Filter by name (contains match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Filter by IP address (exact match)
+        #[arg(long = "ip-address")]
+        ip_address: Option<String>,
+        /// Filter by CI owner group display-name substring or sys_id
+        #[arg(long = "ci-owner-group")]
+        ci_owner_group: Option<String>,
+        /// Filter by class: linux, windows, cmdb_ci_linux_server, or cmdb_ci_win_server
+        #[arg(long)]
+        class: Option<String>,
+        /// Maximum number of results to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+        /// Include the full all-fields table for each result
+        #[arg(long)]
+        full: bool,
+    },
+    /// List observed Server fields
+    Fields {
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +849,98 @@ mod tests {
                     ..
                 },
             } if name == "Epic"
+        ));
+    }
+
+    #[test]
+    fn parses_server_commands() {
+        let cli = Cli::parse_from(["snow", "server", "get", "--name", "app01.example.internal"]);
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                action: ServerCommand::Get {
+                    sys_id: None,
+                    name: Some(name),
+                    ip_address: None,
+                    fresh: false,
+                    json: false,
+                    full: false,
+                },
+            } if name == "app01.example.internal"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "server",
+            "get",
+            "--ip-address",
+            "192.0.2.10",
+            "--fresh",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                action: ServerCommand::Get {
+                    sys_id: None,
+                    name: None,
+                    ip_address: Some(ip_address),
+                    fresh: true,
+                    json: true,
+                    full: false,
+                },
+            } if ip_address == "192.0.2.10"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "server",
+            "search",
+            "--ci-owner-group",
+            "Platform Operations",
+            "--class",
+            "linux",
+            "--limit",
+            "10",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                action: ServerCommand::Search {
+                    ci_owner_group: Some(ci_owner_group),
+                    class: Some(class),
+                    limit: Some(10),
+                    ..
+                },
+            } if ci_owner_group == "Platform Operations" && class == "linux"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "server",
+            "query",
+            "--text",
+            "db",
+            "--ci-owner-group",
+            "Platform Operations",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                action: ServerCommand::Query {
+                    text: Some(text),
+                    ci_owner_group: Some(ci_owner_group),
+                    ..
+                },
+            } if text == "db" && ci_owner_group == "Platform Operations"
+        ));
+
+        let cli = Cli::parse_from(["snow", "server", "fields"]);
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                action: ServerCommand::Fields { json: false },
+            }
         ));
     }
 

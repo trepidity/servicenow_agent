@@ -19,7 +19,7 @@ use servicenow_rs::model::value::parse_servicenow_timestamp;
 use crate::{
     ApprovalRecord, CacheSource, DegradedReadDiagnostic, DegradedReadReason, FieldValue,
     JournalEntry, KnowledgeArticle, KnowledgeSearchFilters, MatchField, RecordRef, Reference,
-    ResourceType, SearchMatchReason, SearchResult, SearchScope, SnowRecord,
+    ResourceType, SearchMatchReason, SearchResult, SearchScope, ServerQuery, SnowRecord,
     choose_reference_display_name, normalize_knowledge_article,
 };
 
@@ -197,6 +197,22 @@ impl QueryEngine {
         rows.into_iter()
             .map(|row| self.materialize_record(&row))
             .collect()
+    }
+
+    pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
+        query.validate()?;
+        let rows = self.store.list_active_records(Some(ResourceType::Server))?;
+        let mut records = rows
+            .into_iter()
+            .map(|row| self.materialize_record(&row))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|record| server_matches_query(record, &query))
+            .collect::<Vec<_>>();
+        records.sort_by_key(server_name);
+        let offset = query.offset.unwrap_or(0).min(records.len());
+        let limit = query.limit.unwrap_or(20);
+        Ok(records.into_iter().skip(offset).take(limit).collect())
     }
 
     pub async fn approvals(&self, query: ApprovalQuery) -> Result<Vec<ApprovalRecord>> {
@@ -849,6 +865,93 @@ fn matches_scope(record: &SnowRecord, scope: &SearchScope) -> bool {
         SearchScope::Knowledge => record.resource_type == ResourceType::Knowledge,
         SearchScope::WorkNotes => !record.work_notes.is_empty(),
     }
+}
+
+fn server_matches_query(record: &SnowRecord, query: &ServerQuery) -> bool {
+    server_class_matches(record, query.class.as_deref())
+        && optional_contains(server_name(record), query.name.as_deref())
+        && optional_eq(
+            server_field_text(record, "ip_address"),
+            query.ip_address.as_deref(),
+        )
+        && optional_contains(
+            server_reference_text(record, "managed_by_group"),
+            query.ci_owner_group.as_deref(),
+        )
+        && optional_contains(server_search_text(record), query.text.as_deref())
+}
+
+fn server_name(record: &SnowRecord) -> String {
+    server_field_text(record, "name")
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_search_text(record: &SnowRecord) -> String {
+    [
+        Some(server_name(record)),
+        server_field_text(record, "ip_address"),
+        server_field_text(record, "fqdn"),
+        server_field_text(record, "sys_class_name"),
+        server_reference_text(record, "managed_by_group"),
+        server_reference_text(record, "support_group"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn server_class_matches(record: &SnowRecord, class: Option<&str>) -> bool {
+    let Some(class) = class.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let Ok(class) = crate::resource::server::canonical_server_class(class) else {
+        return false;
+    };
+    class == crate::SERVER_TABLE
+        || record.table == class
+        || server_field_text(record, "sys_class_name").as_deref() == Some(class)
+}
+
+fn server_reference_text(record: &SnowRecord, field: &str) -> Option<String> {
+    record
+        .references
+        .get(field)
+        .map(|reference| format!("{} {}", reference.sys_id, reference.display_name))
+        .or_else(|| server_field_text(record, field))
+}
+
+fn server_field_text(record: &SnowRecord, field: &str) -> Option<String> {
+    record.fields.get(field).and_then(|value| {
+        value
+            .display_value
+            .as_deref()
+            .or(Some(value.value.as_str()))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn optional_contains(haystack: impl Into<Option<String>>, needle: Option<&str>) -> bool {
+    let Some(needle) = needle.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    haystack.into().is_some_and(|haystack| {
+        haystack
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    })
+}
+
+fn optional_eq(value: Option<String>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
 }
 
 fn matches_knowledge_filters(article: &KnowledgeArticle, filters: &KnowledgeSearchFilters) -> bool {

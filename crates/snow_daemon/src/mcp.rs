@@ -166,6 +166,10 @@ impl McpServer {
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
+            "server_get" => self.call_server_get(id, params).await,
+            "server_search" => self.call_server_search(id, params).await,
+            "server_query" => self.call_server_query(id, params).await,
+            "server_fields" => self.call_server_fields(id, params).await,
             "search_knowledge" => self.call_search_knowledge(id, params).await,
             "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
             "get_article" => self.call_get_article(id, params).await,
@@ -559,6 +563,149 @@ impl McpServer {
             .state
             .core
             .list_records_query(ListQuery::new().resource_type(ResourceType::BusinessApplication))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut fields = std::collections::BTreeMap::<String, usize>::new();
+        for record in records {
+            for name in record.fields.keys() {
+                *fields.entry(name.clone()).or_default() += 1;
+            }
+        }
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "fields": fields
+                    .into_iter()
+                    .map(|(field, observed_count)| json!({ "field": field, "observed_count": observed_count }))
+                    .collect::<Vec<_>>()
+            }),
+        )
+    }
+
+    async fn call_server_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::ServerSearchParams = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+        match self.state.core.search_servers(parsed).await {
+            Ok(records) => {
+                let mut servers = Vec::with_capacity(records.len());
+                let mut record_dtos = Vec::with_capacity(records.len());
+                for record in records {
+                    match transport.server(&record) {
+                        Ok(server) => {
+                            record_dtos.push(server.record.clone());
+                            servers.push(server);
+                        }
+                        Err(err) => return service_failure(id, err),
+                    }
+                }
+                JsonRpcResponse::ok(id, json!({ "servers": servers, "records": record_dtos }))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_server_get(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let Value::Object(map) = arguments else {
+            return invalid_params(id, "arguments must be an object");
+        };
+        let sys_id = map.get("sys_id").and_then(Value::as_str).map(str::trim);
+        let name = map.get("name").and_then(Value::as_str).map(str::trim);
+        let ip_address = map.get("ip_address").and_then(Value::as_str).map(str::trim);
+        let records = match self
+            .state
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::Server))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let record = match (
+            sys_id.filter(|value| !value.is_empty()),
+            name.filter(|value| !value.is_empty()),
+            ip_address.filter(|value| !value.is_empty()),
+        ) {
+            (Some(sys_id), None, None) => match snow_core::normalize_record_lookup_sys_id(sys_id) {
+                Ok(sys_id) => records
+                    .into_iter()
+                    .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id)),
+                Err(err) => return invalid_params(id, err),
+            },
+            (None, Some(name), None) => records.into_iter().find(|record| server_name(record) == name),
+            (None, None, Some(ip_address)) => records.into_iter().find(|record| {
+                server_field(record, "ip_address")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
+            }),
+            (None, None, None) => {
+                return invalid_params(id, "missing required lookup: sys_id, name, or ip_address");
+            }
+            _ => return invalid_params(id, "provide exactly one of sys_id, name, or ip_address"),
+        };
+        match record {
+            Some(record) => match transport.server(&record) {
+                Ok(server) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "server": server,
+                        "markdown": render_snow_record(&record),
+                    }),
+                ),
+                Err(err) => service_failure(id, err),
+            },
+            None => JsonRpcResponse::error(id, -32004, "server not found", None),
+        }
+    }
+
+    async fn call_server_query(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let query: snow_core::ServerQuery = match serde_json::from_value(arguments) {
+            Ok(query) => query,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = query.validate() {
+            return invalid_params(id, err);
+        }
+        let records = match self.state.core.query_servers(query).await {
+            Ok(records) => records,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut servers = Vec::new();
+        for record in records {
+            match transport.server(&record) {
+                Ok(server) => servers.push(server),
+                Err(err) => return service_failure(id, err),
+            }
+        }
+        JsonRpcResponse::ok(id, json!({ "servers": servers }))
+    }
+
+    async fn call_server_fields(&self, id: Option<Value>, _params: &Value) -> JsonRpcResponse {
+        let records = match self
+            .state
+            .core
+            .list_records_query(ListQuery::new().resource_type(ResourceType::Server))
             .await
         {
             Ok(records) => records,
@@ -1065,8 +1212,18 @@ impl McpServer {
         vec![
             McpTool {
                 name: "get_record".to_string(),
-                description: "Retrieve a ServiceNow record by number".to_string(),
-                input_schema: json!({"type":"object","properties":{"number":{"type":"string"}},"required":["number"]}),
+                description: "Retrieve a generic ServiceNow record by number. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.".to_string(),
+                input_schema: json!({
+                    "type":"object",
+                    "description":"Generic ServiceNow record lookup. Do not use for APM Business Application numbers such as APM0002456; use business_application_query with field=number.",
+                    "properties":{
+                        "number":{
+                            "type":"string",
+                            "description":"Generic ServiceNow work-record number, for example TASK3497879. Not for APM Business Application identifiers such as APM0002456; route those to business_application_query/search."
+                        }
+                    },
+                    "required":["number"]
+                }),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1077,16 +1234,8 @@ impl McpServer {
             },
             McpTool {
                 name: "search_records".to_string(),
-                description: "Full-text search across records".to_string(),
-                input_schema: json!({
-                    "type":"object",
-                    "properties":{
-                        "query":{"type":"string"},
-                        "scope":{"type":"string","enum":["all","knowledge","work_notes"]},
-                        "limit":{"type":"integer","minimum":1}
-                    },
-                    "required":["query"]
-                }),
+                description: "Full-text search across generic records. Do not use for APM Business Application numbers such as APM0002456; use business_application_query/search for Business Application routing.".to_string(),
+                input_schema: snow_mcp::tools::records::search_records_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1107,28 +1256,52 @@ impl McpServer {
             },
             McpTool {
                 name: "business_application_get".to_string(),
-                description: "Get a locally cached Business Application by sys_id or exact name"
+                description: "Get a locally cached Business Application by sys_id or exact name. For an APM number such as APM0002456, use business_application_query with a number filter."
                     .to_string(),
                 input_schema: snow_mcp::tools::records::business_application_get_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
                 name: "business_application_search".to_string(),
-                description: "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date; results persist by default when supported by the daemon/core contract".to_string(),
+                description: "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date. For exact APM numbers such as APM0002456, prefer business_application_query with field=number.".to_string(),
                 input_schema: snow_mcp::tools::records::business_application_search_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
                 name: "business_application_query".to_string(),
-                description: "Query locally projected Business Application fields".to_string(),
+                description: "Query locally projected Business Application fields. Use this for APM identifiers such as APM0002456 by filtering field=number, op=eq, value=APM0002456.".to_string(),
                 input_schema: snow_mcp::tools::records::business_application_query_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
                 name: "business_application_fields".to_string(),
-                description: "List observed Business Application fields from the local projection"
+                description: "List observed Business Application fields from the local projection, including owner-related fields when field mapping for an APM lookup is unclear."
                     .to_string(),
                 input_schema: snow_mcp::tools::records::business_application_fields_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "server_get".to_string(),
+                description: "Get a cached Server by sys_id, exact name, or IP address".to_string(),
+                input_schema: snow_mcp::tools::records::server_get_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "server_search".to_string(),
+                description: "Live-search Windows and Linux Servers by name, IP address, CI owner group, or class".to_string(),
+                input_schema: snow_mcp::tools::records::server_search_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "server_query".to_string(),
+                description: "Query cached Windows and Linux Servers".to_string(),
+                input_schema: snow_mcp::tools::records::server_query_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "server_fields".to_string(),
+                description: "List observed Server fields from the local cache".to_string(),
+                input_schema: snow_mcp::tools::records::server_fields_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1426,6 +1599,8 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         "business_application" | "business_app" | "cmdb_ci_business_app" => {
             Ok(ResourceType::BusinessApplication)
         }
+        "server" | "servers" | "cmdb_ci_server" | "cmdb_ci_linux_server"
+        | "cmdb_ci_win_server" | "linux_server" | "windows_server" => Ok(ResourceType::Server),
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }
@@ -1464,6 +1639,26 @@ fn business_application_name(record: &SnowRecord) -> String {
             (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
         })
         .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_name(record: &SnowRecord) -> String {
+    server_field(record, "name")
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_field(record: &SnowRecord, field: &str) -> Option<String> {
+    record.fields.get(field).and_then(|value| {
+        value
+            .display_value
+            .as_ref()
+            .or(Some(&value.value))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 async fn get_record_cached_or_fresh(core: &SnowCore, number: &str) -> Result<Option<SnowRecord>> {

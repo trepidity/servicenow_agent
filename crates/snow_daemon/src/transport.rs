@@ -130,6 +130,26 @@ impl<'a> DaemonTransport<'a> {
         })
     }
 
+    pub fn server(&self, record: &SnowRecord) -> Result<DaemonServer> {
+        let record_dto = self.record(record)?;
+        Ok(DaemonServer {
+            browser_url: record_dto.browser_url.clone(),
+            vault_relative_path: record_dto.vault_relative_path.clone(),
+            record: record_dto.clone(),
+            name: server_name(record),
+            ip_address: server_field(record, "ip_address"),
+            class_name: server_field(record, "sys_class_name"),
+            ci_owner_group: server_reference(record, "managed_by_group", "sys_user_group"),
+            support_group: server_reference(record, "support_group", "sys_user_group"),
+            operational_status: record
+                .fields
+                .get("operational_status")
+                .cloned()
+                .map(Into::into),
+            fields: record_dto.fields.clone(),
+        })
+    }
+
     pub fn knowledge_search_hit(
         &self,
         hit: &KnowledgeSearchHit,
@@ -268,6 +288,36 @@ fn business_application_reference(
     })
 }
 
+fn server_name(record: &SnowRecord) -> String {
+    server_field(record, "name")
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
+}
+
+fn server_field(record: &SnowRecord, field_name: &str) -> Option<String> {
+    record.fields.get(field_name).and_then(|field| {
+        field
+            .display_value
+            .clone()
+            .or_else(|| Some(field.value.clone()))
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn server_reference(
+    record: &SnowRecord,
+    field_name: &str,
+    default_table: &str,
+) -> Option<DaemonReference> {
+    record
+        .references
+        .get(field_name)
+        .map(|reference| reference.clone().into())
+        .or_else(|| business_application_reference(record, field_name, default_table))
+}
+
 fn normalize_instance_url(instance_url: &str) -> Option<String> {
     let trimmed = instance_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -375,6 +425,27 @@ pub struct DaemonBusinessApplicationDiagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
     pub diagnostic: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DaemonServer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_relative_path: Option<String>,
+    pub record: DaemonSnowRecord,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_owner_group: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_group: Option<DaemonReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operational_status: Option<DaemonFieldValue>,
+    pub fields: HashMap<String, DaemonFieldValue>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -581,6 +652,7 @@ pub enum DaemonResourceType {
     Knowledge,
     Approval,
     BusinessApplication,
+    Server,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -782,6 +854,7 @@ impl From<ResourceType> for DaemonResourceType {
             ResourceType::Knowledge => Self::Knowledge,
             ResourceType::Approval => Self::Approval,
             ResourceType::BusinessApplication => Self::BusinessApplication,
+            ResourceType::Server => Self::Server,
         }
     }
 }

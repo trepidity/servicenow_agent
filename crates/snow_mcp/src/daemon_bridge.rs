@@ -44,6 +44,10 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("business_application_search", "business_application_search"),
     ("business_application_query", "business_application_query"),
     ("business_application_fields", "business_application_fields"),
+    ("server_get", "server_get"),
+    ("server_search", "server_search"),
+    ("server_query", "server_query"),
+    ("server_fields", "server_fields"),
     ("list_records", "list_records"),
     ("list_my_tasks", "list_my_tasks"),
     ("list_my_approvals", "list_my_approvals"),
@@ -1129,6 +1133,29 @@ mod tests {
         assert!(names.contains(&"business_application_query"));
         assert!(names.contains(&"business_application_fields"));
         assert!(!names.contains(&"get_record"));
+
+        let get = tools
+            .iter()
+            .find(|tool| tool["name"] == "business_application_get")
+            .expect("business_application_get advertised");
+        assert!(
+            get["description"]
+                .as_str()
+                .expect("business_application_get description")
+                .contains("APM0002456")
+        );
+        assert!(get["inputSchema"]["properties"].get("number").is_none());
+
+        let query = tools
+            .iter()
+            .find(|tool| tool["name"] == "business_application_query")
+            .expect("business_application_query advertised");
+        assert!(
+            query["inputSchema"]["properties"]["filters"]["description"]
+                .as_str()
+                .expect("business_application_query filters description")
+                .contains("owner for APM0002456")
+        );
     }
 
     #[tokio::test]

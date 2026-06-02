@@ -4517,6 +4517,7 @@ fn resource_type_to_str(resource_type: &ResourceType) -> &'static str {
         ResourceType::Knowledge => "kb_knowledge",
         ResourceType::Approval => "sysapproval_approver",
         ResourceType::BusinessApplication => "business_application",
+        ResourceType::Server => "server",
     }
 }
 
@@ -4539,6 +4540,9 @@ fn str_to_resource_type(input: &str) -> std::result::Result<ResourceType, StoreE
         "sysapproval_approver" => ResourceType::Approval,
         "business_application" | "business_app" | "cmdb_ci_business_app" => {
             ResourceType::BusinessApplication
+        }
+        "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
+            ResourceType::Server
         }
         other => return Err(StoreError::InvalidResourceType(other.to_string())),
     })

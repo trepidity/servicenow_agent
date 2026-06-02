@@ -674,7 +674,7 @@ pub fn strip_html(html: &str) -> String {
 
 use crate::tui_client::{
     BusinessApplicationDiagnostic, BusinessApplicationFieldValue, BusinessApplicationRef,
-    BusinessApplicationView,
+    BusinessApplicationView, ServerFieldValue, ServerRef, ServerView,
 };
 
 /// Render a reference as `display name (sys_id)`, or `-` when absent.
@@ -825,6 +825,107 @@ pub fn format_business_application_summary(app: &BusinessApplicationView) -> Str
     )
 }
 
+/// Render a server reference as `display name (sys_id)`, or `-` when absent.
+fn format_server_ref(reference: Option<&ServerRef>) -> String {
+    match reference {
+        Some(r) if !r.display_name.trim().is_empty() => {
+            format!("{} ({})", r.display_name, r.sys_id)
+        }
+        Some(r) => r.sys_id.clone(),
+        None => "-".to_string(),
+    }
+}
+
+/// Render a server field value, preferring the display value when present.
+fn format_server_field_value(value: &ServerFieldValue) -> String {
+    match value.display_value.as_deref() {
+        Some(display) if !display.trim().is_empty() && display != value.value => {
+            format!("{} [{}]", display, value.value)
+        }
+        Some(display) if !display.trim().is_empty() => display.to_string(),
+        _ => value.value.clone(),
+    }
+}
+
+/// Format a human-readable Server detail.
+pub fn format_server(server: &ServerView, full: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} ({})", server.name.bold(), server.sys_id);
+    if !server.number.trim().is_empty() {
+        let _ = writeln!(out, "{:>18} {}", "number:".dimmed(), server.number);
+    }
+    let _ = writeln!(
+        out,
+        "{:>18} {}",
+        "class:".dimmed(),
+        server.class_name.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "{:>18} {}",
+        "ip address:".dimmed(),
+        server.ip_address.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "{:>18} {}",
+        "ci owner group:".dimmed(),
+        format_server_ref(server.ci_owner_group.as_ref())
+    );
+    let _ = writeln!(
+        out,
+        "{:>18} {}",
+        "support group:".dimmed(),
+        format_server_ref(server.support_group.as_ref())
+    );
+    let status = server
+        .operational_status
+        .as_ref()
+        .map(format_server_field_value)
+        .unwrap_or_else(|| "-".to_string());
+    let _ = writeln!(out, "{:>18} {}", "status:".dimmed(), status);
+    let _ = writeln!(
+        out,
+        "{:>18} {}",
+        "vault path:".dimmed(),
+        server.vault_relative_path.as_deref().unwrap_or("-")
+    );
+    if let Some(url) = &server.browser_url {
+        let _ = writeln!(out, "{:>18} {}", "url:".dimmed(), url);
+    }
+
+    if full {
+        let _ = writeln!(out, "fields:");
+        if server.fields.is_empty() {
+            let _ = writeln!(out, "  (none)");
+        }
+        for (key, value) in &server.fields {
+            let _ = writeln!(out, "  {}: {}", key, format_server_field_value(value));
+        }
+    }
+
+    out
+}
+
+/// Compact one-line summary used in `server search` and `server query` listings.
+pub fn format_server_summary(server: &ServerView) -> String {
+    let status = server
+        .operational_status
+        .as_ref()
+        .map(format_server_field_value)
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{} ({}) - ip: {} - class: {} - ci owner group: {} - status: {}",
+        server.name.bold(),
+        server.sys_id,
+        server.ip_address.as_deref().unwrap_or("-"),
+        server.class_name.as_deref().unwrap_or("-"),
+        format_server_ref(server.ci_owner_group.as_ref()),
+        status
+    )
+}
+
 /// Generically render the dictionary `fields` array returned by the daemon.
 ///
 /// The backend owns and may enrich the per-field object shape, so this renders
@@ -832,6 +933,15 @@ pub fn format_business_application_summary(app: &BusinessApplicationView) -> Str
 /// followed by all remaining key/value pairs — without hard-binding to a fixed
 /// schema beyond the name key.
 pub fn format_business_application_fields(fields: &serde_json::Value) -> String {
+    format_observed_fields(fields, "No Business Application fields found.\n")
+}
+
+/// Generically render the Server dictionary/observed fields array.
+pub fn format_server_fields(fields: &serde_json::Value) -> String {
+    format_observed_fields(fields, "No Server fields found.\n")
+}
+
+fn format_observed_fields(fields: &serde_json::Value, empty_message: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let Some(entries) = fields.as_array() else {
@@ -839,7 +949,7 @@ pub fn format_business_application_fields(fields: &serde_json::Value) -> String 
         return serde_json::to_string_pretty(fields).unwrap_or_else(|_| fields.to_string());
     };
     if entries.is_empty() {
-        return "No Business Application fields found.\n".to_string();
+        return empty_message.to_string();
     }
     for entry in entries {
         match entry {
@@ -980,5 +1090,70 @@ mod business_app_tests {
         let out = format_business_application_summary_object(&json);
         assert!(out.contains("persisted: 3"));
         assert!(out.contains("resolved_references: 5"));
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::tui_client::{ServerFieldValue, ServerRef, ServerView};
+
+    fn sample_server() -> ServerView {
+        ServerView {
+            sys_id: "server123".to_string(),
+            number: "SERVER:server123".to_string(),
+            name: "app01.example.internal".to_string(),
+            ip_address: Some("192.0.2.10".to_string()),
+            class_name: Some("cmdb_ci_linux_server".to_string()),
+            ci_owner_group: Some(ServerRef {
+                sys_id: "group1".to_string(),
+                table: "sys_user_group".to_string(),
+                display_name: "Platform Operations".to_string(),
+            }),
+            support_group: None,
+            operational_status: Some(ServerFieldValue {
+                value: "1".to_string(),
+                display_value: Some("Operational".to_string()),
+            }),
+            fields: vec![(
+                "u_custom".to_string(),
+                ServerFieldValue {
+                    value: "v".to_string(),
+                    display_value: None,
+                },
+            )],
+            browser_url: None,
+            vault_relative_path: Some(
+                "servers/server_server123_app01-example-internal.md".to_string(),
+            ),
+        }
+    }
+
+    #[test]
+    fn server_detail_renders_core_fields() {
+        let out = format_server(&sample_server(), false);
+        assert!(out.contains("app01.example.internal"));
+        assert!(out.contains("192.0.2.10"));
+        assert!(out.contains("cmdb_ci_linux_server"));
+        assert!(out.contains("Platform Operations"));
+        assert!(out.contains("Operational"));
+        assert!(!out.contains("u_custom"));
+    }
+
+    #[test]
+    fn full_server_detail_includes_field_table() {
+        let out = format_server(&sample_server(), true);
+        assert!(out.contains("u_custom"));
+    }
+
+    #[test]
+    fn server_fields_render_generically_by_name_key() {
+        let json = serde_json::json!([
+            { "field": "managed_by_group", "type": "reference", "reference": "sys_user_group" },
+            { "name": "ip_address", "type": "string" }
+        ]);
+        let out = format_server_fields(&json);
+        assert!(out.contains("managed_by_group"));
+        assert!(out.contains("ip_address"));
     }
 }

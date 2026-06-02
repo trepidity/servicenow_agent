@@ -44,10 +44,10 @@ use snow_core::{
 
 use cli::{
     AttachmentCommand, BusinessAppCommand, Cli, Command, KnowledgeCommand, KnowledgeSearchModeArg,
-    KnowledgeSemanticCommand, KnowledgeTagLayer, TimecardCommand,
+    KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand, TimecardCommand,
 };
 use error::SnowError;
-use tui_client::{BusinessApplicationQueryFilter, DaemonRpcClient, TuiClient};
+use tui_client::{BusinessApplicationQueryFilter, DaemonRpcClient, ServerQueryArgs, TuiClient};
 
 struct AuthContext {
     env_name: String,
@@ -174,7 +174,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         .await;
     }
 
-    // Business Application commands talk to the backend exclusively over the
+    // First-class CMDB primitive commands talk to the backend exclusively over the
     // daemon JSON-RPC interface (auto-spawning the daemon if needed), so they
     // are dispatched here before local-credential setup.
     if let Command::BusinessApp { action } = cli.command {
@@ -184,6 +184,14 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         let client =
             DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
         return cmd_business_app(&client, action).await;
+    }
+    if let Command::Server { action } = cli.command {
+        let paths = runtime_paths();
+        let instance_url = runtime_instance_url();
+        let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root);
+        let client =
+            DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
+        return cmd_server(&client, action).await;
     }
 
     let AuthContext {
@@ -281,6 +289,9 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         Command::BusinessApp { .. } => {
             unreachable!("business-app is dispatched before local-credential setup")
         }
+        Command::Server { .. } => {
+            unreachable!("server is dispatched before local-credential setup")
+        }
         Command::Daemon { .. } | Command::Admin => {
             unreachable!("daemon and admin are dispatched before auth setup")
         }
@@ -328,17 +339,21 @@ fn command_uses_daemon_auto_spawn(command: &Command) -> bool {
             socket_path,
             ..
         } if *daemon || socket_path.is_some()
-    ) || matches!(command, Command::BusinessApp { .. })
+    ) || matches!(
+        command,
+        Command::BusinessApp { .. } | Command::Server { .. }
+    )
 }
 
 fn command_uses_local_credentials(command: &Command) -> bool {
     match command {
-        // Business Application commands go through the daemon (auto-spawned),
+        // First-class CMDB primitive commands go through the daemon (auto-spawned),
         // so the CLI process itself does not load local credentials.
         Command::Daemon { .. }
         | Command::Admin
         | Command::CacheInfo
-        | Command::BusinessApp { .. } => false,
+        | Command::BusinessApp { .. }
+        | Command::Server { .. } => false,
         Command::Tui {
             daemon,
             socket_path,
@@ -1673,6 +1688,132 @@ async fn cmd_business_app(
                     "{}",
                     display::format_business_application_summary_object(&summary)
                 );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Dispatch the `snow server` subcommand family over the daemon client.
+async fn cmd_server(client: &DaemonRpcClient, action: ServerCommand) -> Result<(), SnowError> {
+    match action {
+        ServerCommand::Get {
+            sys_id,
+            name,
+            ip_address,
+            fresh,
+            json,
+            full,
+        } => {
+            let selector_count = [sys_id.is_some(), name.is_some(), ip_address.is_some()]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count();
+            if selector_count != 1 {
+                return Err(SnowError::Api(
+                    "server get requires exactly one of --sys-id, --name, or --ip-address"
+                        .to_string(),
+                ));
+            }
+            let server = client
+                .server_get(
+                    sys_id.as_deref(),
+                    name.as_deref(),
+                    ip_address.as_deref(),
+                    fresh,
+                )
+                .await?;
+            match server {
+                Some(server) => {
+                    if json {
+                        print_json(&server)?;
+                    } else {
+                        print!("{}", display::format_server(&server, full));
+                    }
+                }
+                None => println!("Server not found."),
+            }
+            Ok(())
+        }
+        ServerCommand::Search {
+            name,
+            ip_address,
+            ci_owner_group,
+            class,
+            limit,
+            json,
+            full,
+        } => {
+            let servers = client
+                .server_search(ServerQueryArgs {
+                    text: None,
+                    name: name.as_deref(),
+                    ip_address: ip_address.as_deref(),
+                    ci_owner_group: ci_owner_group.as_deref(),
+                    class: class.as_deref(),
+                    limit,
+                })
+                .await?;
+            if json {
+                return print_json(&servers);
+            }
+            if servers.is_empty() {
+                println!("No Servers found.");
+                return Ok(());
+            }
+            for server in &servers {
+                if full {
+                    print!("{}", display::format_server(server, true));
+                } else {
+                    println!("{}", display::format_server_summary(server));
+                }
+                println!();
+            }
+            Ok(())
+        }
+        ServerCommand::Query {
+            text,
+            name,
+            ip_address,
+            ci_owner_group,
+            class,
+            limit,
+            json,
+            full,
+        } => {
+            let servers = client
+                .server_query(ServerQueryArgs {
+                    text: text.as_deref(),
+                    name: name.as_deref(),
+                    ip_address: ip_address.as_deref(),
+                    ci_owner_group: ci_owner_group.as_deref(),
+                    class: class.as_deref(),
+                    limit,
+                })
+                .await?;
+            if json {
+                return print_json(&servers);
+            }
+            if servers.is_empty() {
+                println!("No Servers found.");
+                return Ok(());
+            }
+            for server in &servers {
+                if full {
+                    print!("{}", display::format_server(server, true));
+                } else {
+                    println!("{}", display::format_server_summary(server));
+                }
+                println!();
+            }
+            Ok(())
+        }
+        ServerCommand::Fields { json } => {
+            let fields = client.server_fields().await?;
+            if json {
+                print_full_dump_or_inline(&fields);
+            } else {
+                print!("{}", display::format_server_fields(&fields));
             }
             Ok(())
         }

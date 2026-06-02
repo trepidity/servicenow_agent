@@ -714,6 +714,60 @@ impl DaemonRpcClient {
             .await
     }
 
+    pub async fn server_get(
+        &self,
+        sys_id: Option<&str>,
+        name: Option<&str>,
+        ip_address: Option<&str>,
+        fresh: bool,
+    ) -> Result<Option<ServerView>, SnowError> {
+        let method = if fresh {
+            "server_get_fresh"
+        } else {
+            "server_get"
+        };
+        let mut params = serde_json::Map::new();
+        if let Some(sys_id) = sys_id {
+            params.insert("sys_id".to_string(), json!(sys_id));
+        }
+        if let Some(name) = name {
+            params.insert("name".to_string(), json!(name));
+        }
+        if let Some(ip_address) = ip_address {
+            params.insert("ip_address".to_string(), json!(ip_address));
+        }
+        let server: Option<DaemonServer> = self
+            .call_optional_wrapped(method, Some(Value::Object(params)), "server")
+            .await?;
+        Ok(server.map(Into::into))
+    }
+
+    pub async fn server_search(
+        &self,
+        args: ServerQueryArgs<'_>,
+    ) -> Result<Vec<ServerView>, SnowError> {
+        let params = server_params(args);
+        let servers: Vec<DaemonServer> = self
+            .call_wrapped("server_search", Some(Value::Object(params)), "servers")
+            .await?;
+        Ok(servers.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn server_query(
+        &self,
+        args: ServerQueryArgs<'_>,
+    ) -> Result<Vec<ServerView>, SnowError> {
+        let params = server_params(args);
+        let servers: Vec<DaemonServer> = self
+            .call_wrapped("server_query", Some(Value::Object(params)), "servers")
+            .await?;
+        Ok(servers.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn server_fields(&self) -> Result<Value, SnowError> {
+        self.call_wrapped("server_fields", None, "fields").await
+    }
+
     /// Sync Business Applications into the local vault/cache with optional
     /// hydration. Returns the raw summary object; the CLI renders it generically.
     pub async fn business_application_sync(
@@ -1186,6 +1240,20 @@ struct DaemonBusinessApplication {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct DaemonServer {
+    record: DaemonSnowRecord,
+    name: String,
+    ip_address: Option<String>,
+    class_name: Option<String>,
+    ci_owner_group: Option<DaemonReference>,
+    support_group: Option<DaemonReference>,
+    operational_status: Option<DaemonFieldValue>,
+    fields: HashMap<String, DaemonFieldValue>,
+    browser_url: Option<String>,
+    vault_relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct DaemonBusinessApplicationDiagnostic {
     field: String,
     sys_id: Option<String>,
@@ -1200,6 +1268,40 @@ pub struct BusinessApplicationQueryFilter {
     /// Operator token understood by the daemon query layer (e.g. "contains", "eq").
     pub operator: String,
     pub value: String,
+}
+
+/// Filter bag passed to `server_search` and `server_query`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerQueryArgs<'a> {
+    pub text: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub ip_address: Option<&'a str>,
+    pub ci_owner_group: Option<&'a str>,
+    pub class: Option<&'a str>,
+    pub limit: Option<usize>,
+}
+
+fn server_params(args: ServerQueryArgs<'_>) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(text) = args.text {
+        params.insert("text".to_string(), json!(text));
+    }
+    if let Some(name) = args.name {
+        params.insert("name".to_string(), json!(name));
+    }
+    if let Some(ip_address) = args.ip_address {
+        params.insert("ip_address".to_string(), json!(ip_address));
+    }
+    if let Some(ci_owner_group) = args.ci_owner_group {
+        params.insert("ci_owner_group".to_string(), json!(ci_owner_group));
+    }
+    if let Some(class) = args.class {
+        params.insert("class".to_string(), json!(class));
+    }
+    if let Some(limit) = args.limit {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    params
 }
 
 /// Public, daemon-decoupled view of a Business Application reference target.
@@ -1308,6 +1410,81 @@ impl From<DaemonBusinessApplication> for BusinessApplicationView {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            browser_url: value.browser_url,
+            vault_relative_path: value.vault_relative_path,
+        }
+    }
+}
+
+/// Public, daemon-decoupled server reference target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerRef {
+    pub sys_id: String,
+    pub table: String,
+    pub display_name: String,
+}
+
+impl From<DaemonReference> for ServerRef {
+    fn from(value: DaemonReference) -> Self {
+        Self {
+            sys_id: value.sys_id,
+            table: value.table,
+            display_name: value.display_name,
+        }
+    }
+}
+
+/// A projected server field value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerFieldValue {
+    pub value: String,
+    pub display_value: Option<String>,
+}
+
+impl From<DaemonFieldValue> for ServerFieldValue {
+    fn from(value: DaemonFieldValue) -> Self {
+        Self {
+            value: value.value,
+            display_value: value.display_value,
+        }
+    }
+}
+
+/// Public server view consumed by CLI display helpers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerView {
+    pub sys_id: String,
+    pub number: String,
+    pub name: String,
+    pub ip_address: Option<String>,
+    pub class_name: Option<String>,
+    pub ci_owner_group: Option<ServerRef>,
+    pub support_group: Option<ServerRef>,
+    pub operational_status: Option<ServerFieldValue>,
+    /// All projected fields, sorted by key for stable rendering.
+    pub fields: Vec<(String, ServerFieldValue)>,
+    pub browser_url: Option<String>,
+    pub vault_relative_path: Option<String>,
+}
+
+impl From<DaemonServer> for ServerView {
+    fn from(value: DaemonServer) -> Self {
+        let mut fields: Vec<(String, ServerFieldValue)> = value
+            .fields
+            .into_iter()
+            .map(|(key, val)| (key, val.into()))
+            .collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            sys_id: value.record.sys_id,
+            number: value.record.number,
+            name: value.name,
+            ip_address: value.ip_address,
+            class_name: value.class_name,
+            ci_owner_group: value.ci_owner_group.map(Into::into),
+            support_group: value.support_group.map(Into::into),
+            operational_status: value.operational_status.map(Into::into),
+            fields,
             browser_url: value.browser_url,
             vault_relative_path: value.vault_relative_path,
         }
@@ -1438,6 +1615,7 @@ enum DaemonResourceType {
     Knowledge,
     Approval,
     BusinessApplication,
+    Server,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1655,6 +1833,7 @@ impl From<DaemonResourceType> for ResourceType {
             DaemonResourceType::Knowledge => Self::Knowledge,
             DaemonResourceType::Approval => Self::Approval,
             DaemonResourceType::BusinessApplication => Self::BusinessApplication,
+            DaemonResourceType::Server => Self::Server,
         }
     }
 }

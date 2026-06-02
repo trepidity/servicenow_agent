@@ -137,6 +137,25 @@ impl VaultLayout {
                     stable_slug("business_application", &record.sys_id, display_name)
                 ))
             }
+            ResourceType::Server => {
+                let display_name = record
+                    .fields
+                    .get("name")
+                    .map(|value| {
+                        value
+                            .display_value
+                            .as_deref()
+                            .unwrap_or(value.value.as_str())
+                    })
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        first_non_empty(&record.short_description, &record.number, &record.sys_id)
+                    });
+                self.root.join("servers").join(format!(
+                    "{}.md",
+                    stable_slug("server", &record.sys_id, display_name)
+                ))
+            }
         }
     }
 

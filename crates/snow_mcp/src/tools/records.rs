@@ -16,7 +16,7 @@ pub fn register(registry: &mut ToolRegistry) {
     for (name, description, input_schema) in [
         (
             "get_record",
-            "Retrieve a ServiceNow record by number or allowed table/sys_id",
+            "Retrieve a generic ServiceNow record by number or allowed table/sys_id. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.",
             record_lookup_arg_schema(RECORD_LOOKUP_ALLOWED_TABLES),
         ),
         (
@@ -26,8 +26,8 @@ pub fn register(registry: &mut ToolRegistry) {
         ),
         (
             "search_records",
-            "Full-text search across records",
-            json!({"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"string","enum":["all","knowledge","work_notes"]},"limit":{"type":"integer","minimum":1}},"required":["query"]}),
+            "Full-text search across generic records. Do not use for APM Business Application numbers such as APM0002456; use business_application_query/search for Business Application routing.",
+            search_records_arg_schema(),
         ),
         (
             "user_lookup",
@@ -41,23 +41,43 @@ pub fn register(registry: &mut ToolRegistry) {
         ),
         (
             "business_application_get",
-            "Get a locally cached Business Application by sys_id or exact name",
+            "Get a locally cached Business Application by sys_id or exact name. For an APM number such as APM0002456, use business_application_query with a number filter.",
             business_application_get_arg_schema(),
         ),
         (
             "business_application_search",
-            "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date; results persist by default when supported by the daemon/core contract",
+            "Live-search Business Applications by name, owner, support group, portfolio, operational state, or attested date. For exact APM numbers such as APM0002456, prefer business_application_query with field=number.",
             business_application_search_arg_schema(),
         ),
         (
             "business_application_query",
-            "Query locally projected Business Application fields",
+            "Query locally projected Business Application fields. Use this for APM identifiers such as APM0002456 by filtering field=number, op=eq, value=APM0002456.",
             business_application_query_arg_schema(),
         ),
         (
             "business_application_fields",
-            "List observed Business Application fields from the local projection",
+            "List observed Business Application fields from the local projection, including owner-related fields when field mapping for an APM lookup is unclear.",
             business_application_fields_arg_schema(),
+        ),
+        (
+            "server_get",
+            "Get a cached Server by sys_id, exact name, or IP address",
+            server_get_arg_schema(),
+        ),
+        (
+            "server_search",
+            "Live-search Windows and Linux Servers by name, IP address, CI owner group, or class",
+            server_search_arg_schema(),
+        ),
+        (
+            "server_query",
+            "Query cached Windows and Linux Servers by name, IP address, CI owner group, class, or text",
+            server_query_arg_schema(),
+        ),
+        (
+            "server_fields",
+            "List observed Server fields from the local cache",
+            server_fields_arg_schema(),
         ),
         (
             "list_records",
@@ -104,11 +124,11 @@ pub fn register(registry: &mut ToolRegistry) {
 pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {
     json!({
         "type": "object",
-        "description": "Provide either number, or table and sys_id together. Runtime validation rejects missing, mixed, or partial lookup modes.",
+        "description": "Provide either number, or table and sys_id together. Runtime validation rejects missing, mixed, or partial lookup modes. Do not use this generic lookup for APM Business Application numbers such as APM0002456; use business_application_query with field=number.",
         "properties": {
             "number": {
                 "type": "string",
-                "description": "ServiceNow record number, for example TASK3497879"
+                "description": "Generic ServiceNow work-record number, for example TASK3497879. Not for APM Business Application identifiers such as APM0002456; route those to business_application_query/search."
             },
             "table": {
                 "type": "string",
@@ -121,6 +141,29 @@ pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {
                 "description": "32-character ServiceNow sys_id; must be paired with table"
             }
         },
+        "additionalProperties": false
+    })
+}
+
+pub fn search_records_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Generic full-text record search. Do not use for APM Business Application identifiers such as APM0002456; route APM lookups to business_application_query or business_application_search.",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search text for generic records. Not for exact APM Business Application numbers such as APM0002456; use business_application_query filters instead."
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["all", "knowledge", "work_notes"]
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "required": ["query"],
         "additionalProperties": false
     })
 }
@@ -202,24 +245,16 @@ pub fn business_application_get_arg_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Provide exactly one of sys_id or exact Business Application name.",
-        "oneOf": [
-            {
-                "required": ["sys_id"],
-                "not": { "required": ["name"] }
-            },
-            {
-                "required": ["name"],
-                "not": { "required": ["sys_id"] }
-            }
-        ],
+        "description": "Provide exactly one of sys_id or exact Business Application name. APM numbers such as APM0002456 are Business Application identifiers but are not accepted by this get schema; use business_application_query with filters[{field:\"number\",op:\"eq\",value:\"APM0002456\"}]. Runtime validation enforces the exactly-one rule.",
         "properties": {
             "sys_id": {
                 "type": "string",
-                "pattern": "^[0-9a-fA-F]{32}$"
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "32-character cmdb_ci_business_app sys_id."
             },
             "name": {
-                "type": "string"
+                "type": "string",
+                "description": "Exact Business Application name, not an APM number. For APM0002456-style identifiers, use business_application_query field=number."
             },
             "persist": {
                 "type": "boolean",
@@ -247,11 +282,11 @@ pub fn business_application_search_arg_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Search cmdb_ci_business_app. Reference filters accept a sys_id or a display-name substring. Live search persists by default when supported by the daemon/core contract.",
+        "description": "Search cmdb_ci_business_app. Reference filters accept a sys_id or a display-name substring. For exact APM numbers such as APM0002456, use business_application_query with field=number, op=eq. Live search persists by default when supported by the daemon/core contract.",
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Business Application name substring, for example Epic"
+                "description": "Business Application name substring, not the APM number. For APM0002456-style identifiers, use business_application_query field=number."
             },
             "business_owner": {
                 "type": "string",
@@ -326,22 +361,32 @@ pub fn business_application_query_arg_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Query locally projected Business Applications. Filters use ServiceNow field names or convenience aliases such as business_owner, is_owner, ci_owner_group, primary_support_group, operational_state, primary_portfolio.",
+        "description": "Query locally projected Business Applications. Use this for APM identifiers such as APM0002456 by filtering the ServiceNow number field. Filters use ServiceNow field names or convenience aliases such as business_owner, is_owner, ci_owner_group, primary_support_group, operational_state, primary_portfolio.",
         "properties": {
-            "text": { "type": "string" },
+            "text": {
+                "type": "string",
+                "description": "Free-text Business Application query. For exact APM numbers such as APM0002456, prefer filters with field=number and op=eq."
+            },
             "filters": {
                 "type": "array",
+                "description": "Business Application field filters. For user requests like owner for APM0002456, use [{\"field\":\"number\",\"op\":\"eq\",\"value\":\"APM0002456\"}] before reading owner-related fields.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["field", "op"],
                     "properties": {
-                        "field": { "type": "string" },
+                        "field": {
+                            "type": "string",
+                            "description": "ServiceNow field name or alias. Use number for APM identifiers such as APM0002456."
+                        },
                         "op": {
                             "type": "string",
-                            "enum": ["eq", "ne", "contains", "starts_with", "in", "is_empty", "is_not_empty", "gt", "gte", "lt", "lte"]
+                            "enum": ["eq", "ne", "contains", "starts_with", "in", "is_empty", "is_not_empty", "gt", "gte", "lt", "lte"],
+                            "description": "Comparison operator. Use eq for exact APM number matches."
                         },
-                        "value": {}
+                        "value": {
+                            "description": "Filter value. For APM number lookups, provide the identifier such as APM0002456."
+                        }
                     }
                 }
             },
@@ -368,12 +413,90 @@ pub fn business_application_fields_arg_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
+        "description": "List Business Application field metadata. Use this when an APM lookup succeeds but owner-field mapping is unclear.",
         "properties": {
             "refresh_dictionary": {
                 "type": "boolean",
-                "default": false
+                "default": false,
+                "description": "Refresh dictionary metadata to clarify owner-related fields such as business_owner, is_owner, ci_owner_group, and primary_support_group."
             }
         }
+    })
+}
+
+pub fn server_get_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Provide exactly one of sys_id, exact Server name, or IP address. Runtime validation enforces that exactly-one rule.",
+        "properties": {
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$"
+            },
+            "name": { "type": "string" },
+            "ip_address": { "type": "string" }
+        }
+    })
+}
+
+pub fn server_search_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Search cmdb_ci_server for Windows and Linux server classes. CI owner group accepts a sys_id or display-name substring. Live search persists returned records.",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Server name substring"
+            },
+            "ip_address": {
+                "type": "string",
+                "description": "Exact server IP address"
+            },
+            "ci_owner_group": {
+                "type": "string",
+                "description": "CI owner group display-name substring or sys_id"
+            },
+            "class": {
+                "type": "string",
+                "enum": ["linux", "windows", "cmdb_ci_linux_server", "cmdb_ci_win_server", "cmdb_ci_server"]
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20
+            }
+        }
+    })
+}
+
+pub fn server_query_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Query cached Windows and Linux Servers. Use ci_owner_group to list all cached servers owned by a group.",
+        "properties": {
+            "text": { "type": "string" },
+            "name": { "type": "string" },
+            "ip_address": { "type": "string" },
+            "ci_owner_group": { "type": "string" },
+            "class": {
+                "type": "string",
+                "enum": ["linux", "windows", "cmdb_ci_linux_server", "cmdb_ci_win_server", "cmdb_ci_server"]
+            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20 },
+            "offset": { "type": "integer", "minimum": 0, "default": 0 }
+        }
+    })
+}
+
+pub fn server_fields_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
     })
 }
 
