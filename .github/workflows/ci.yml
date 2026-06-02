@@ -34,6 +34,11 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: MCP schema contract
+        run: |
+          cargo test -p snow_mcp --test contract_tools_list
+          cargo test -p snow_mcp --test daemon_bridge bridge_filters_tools_against_daemon_contract
+
   windows-daemon-tests:
     name: windows daemon tests
     runs-on: windows-latest

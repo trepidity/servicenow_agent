@@ -149,6 +149,21 @@ Search/sync/fresh-fetch persists by default: each Business Application is fetche
 
 `snow business-app fields` returns dictionary-enriched metadata. `--refresh` triggers a live `sys_dictionary` fetch for `cmdb_ci_business_app` and its inherited tables (cached in `business_application_field_dictionary`); each entry then merges label, field type, reference table, mandatory/read-only/choice flags, max length, and `dictionary_verified=true` with observed per-field counts. When the dictionary is unreachable, entries fall back to observed-only plus a degraded diagnostic. See `crates/snow_mcp/CAPABILITIES.md` for the MCP tools — `sync` is JSON-RPC + CLI only and is deliberately not an MCP tool.
 
+### Servers
+
+Servers are a first-class read-only CMDB primitive for Linux and Windows CIs. The canonical local resource type is `server`; `cmdb_ci_server`, `cmdb_ci_linux_server`, `cmdb_ci_win_server`, `linux`, and `windows` are accepted aliases where a table/class selector is supported.
+
+The `snow server` subcommand family is a thin CLI over daemon JSON-RPC methods and auto-spawns the daemon as needed:
+
+```bash
+snow server get --sys-id <sys_id> | --name "app01.example.internal" | --ip-address 192.0.2.10 [--fresh] [--json] [--full]
+snow server search --name app01 --ip-address 192.0.2.10 --ci-owner-group "Platform Operations" --class linux [--limit N] [--json] [--full]
+snow server query --ci-owner-group "Platform Operations" [--text app] [--class windows] [--limit N] [--json] [--full]
+snow server fields [--json]
+```
+
+`get` accepts exactly one selector (`--sys-id`, `--name`, or `--ip-address`). `search` is live, bounded, Linux/Windows-only, and persists returned rows to `servers/server_<sys_id>_<slug>.md`; `query` reads the local SQLite projection and supports the same name/IP/class/CI-owner-group filters. Human output shows name, sys_id, class, IP address, CI owner group, support group, operational status, vault path, and URL when available; `--full` adds the all-fields table.
+
 ## Daemon and TUI
 
 ```bash

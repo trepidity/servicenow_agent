@@ -79,8 +79,9 @@ work_record_ttl = "60m"
 
 - **Records:** `get_record`, `search_records`, `user_lookup`, `user_search`, `business_application_get`,
   `business_application_search`, `business_application_query`, `business_application_fields`,
-  `list_records`, `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`,
-  `get_children`, `get_work_notes`, `attachment_list`
+  `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
+  `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
+  `get_work_notes`, `attachment_list`
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,
@@ -132,7 +133,7 @@ are read tools) and are included in the `read_only_agent` role allow-list in
 |---|---|---|---|
 | `business_application_get` | Fetch one Business Application by `sys_id` or exact `name` | No (serves the local cache/vault) | n/a — reads local |
 | `business_application_search` | Live query `cmdb_ci_business_app` by name/owner/group/portfolio/state | Yes | Yes, by default |
-| `business_application_query` | Local SQLite query/filter/sort across **all** projected BA fields | No | n/a — reads local |
+| `business_application_query` | Local SQLite query/filter/sort across **all** projected BA fields, including APM `number` values | No | n/a — reads local |
 | `business_application_fields` | List dictionary-enriched BA field metadata merged with per-field observed counts (`refresh_dictionary` triggers a live `sys_dictionary` fetch) | Only when `refresh_dictionary=true` | n/a — reads local |
 
 Hydration behavior (search and the daemon `*_get_fresh` path): full-row fetch (no
@@ -143,10 +144,19 @@ portfolio — into local primitive objects (or unresolved/blocked/unknown stubs)
 Reference-resolution failures are **degraded reads**: the BA read still succeeds
 and surfaces diagnostics rather than failing.
 
+Routing note for agents: APM identifiers such as `APM0002456` are Business
+Application numbers. Do **not** route those requests through generic
+`get_record` or `search_records`. For exact APM-number lookup, call
+`business_application_query` with a `number` equality filter, then read
+owner-related fields from the returned BA. Use `business_application_fields` if
+the owner field mapping is unclear.
+
 ### `business_application_get`
 
 Reads a single Business Application from the local cache/vault. Schema is a strict
-union: supply **exactly one** of `sys_id` or `name`.
+runtime lookup: supply **exactly one** of `sys_id` or `name`. It does not accept
+APM `number` values such as `APM0002456`; use `business_application_query` for
+those identifiers.
 
 - **Params:** `sys_id` (32-hex) **xor** `name` (exact match). Hydration knobs
   `persist` (default `true`), `resolve_references` (default `true`),
@@ -191,6 +201,32 @@ custom fields are queryable.
   `ci_owner_group`, `primary_support_group`, `operational_state`,
   `primary_portfolio`).
 - **Returns:** `{ "business_applications": [<BA>...] }`.
+
+### Routing example
+
+User asks: `owner for APM0002456`.
+
+Expected route:
+
+1. Call `business_application_query`:
+
+   ```json
+   {
+     "filters": [
+       { "field": "number", "op": "eq", "value": "APM0002456" }
+     ],
+     "limit": 1
+   }
+   ```
+
+2. Read owner-related fields from the returned Business Application:
+   `business_owner`, `is_owner`, `ci_owner_group`, or `primary_support_group`
+   depending on the requested owner type and available fields.
+3. If the owner field mapping is unclear, call `business_application_fields`
+   and inspect owner/reference metadata.
+
+Do not use `get_record` or `search_records` for this APM Business Application
+number route.
 
 ### `business_application_fields`
 
@@ -245,6 +281,69 @@ Each `business_application` object contains:
   `refresh_dictionary`) to the daemon. The daemon-only
   `business_application_get_fresh` and `business_application_sync` methods are
   **not** exposed as foreground MCP tools.
+
+---
+
+## Servers (read-only primitive)
+
+Servers are first-class local CMDB primitives for Linux and Windows CIs. The
+canonical local resource type is `server`; supported ServiceNow classes are
+`cmdb_ci_server`, `cmdb_ci_linux_server`, and `cmdb_ci_win_server`.
+
+| Tool | What it does | Live API call? | Persists to vault? |
+|---|---|---|---|
+| `server_get` | Fetch one Server by `sys_id`, exact `name`, or exact `ip_address` | No (serves the local cache/vault) | n/a — reads local |
+| `server_search` | Live query Linux/Windows servers by name, IP, CI owner group, and class | Yes | Yes |
+| `server_query` | Local SQLite query across projected Server records | No | n/a — reads local |
+| `server_fields` | List observed Server field metadata from the local projection | No | n/a — reads local |
+
+Hydration behavior (`server_search` and daemon `server_get_fresh`): full-row
+fetch from `cmdb_ci_server` with `sys_class_name` restricted to Linux/Windows
+subclasses, `sysparm_display_value=all`, no hand-picked `sysparm_fields`, then
+persist to `servers/server_<sys_id>_<slug>.md` and project every readable field
+into SQLite.
+
+### `server_get`
+
+Reads a single Server from the local cache/vault. Schema is a strict union:
+supply **exactly one** of `sys_id`, `name`, or `ip_address`.
+
+- **Params:** `sys_id` (32-hex) **xor** `name` (exact match) **xor**
+  `ip_address` (exact match).
+- **Returns:** `{ "server": <Server>, "record": <record>, "markdown":
+  "<rendered markdown>" }`. Not found → JSON-RPC error `-32004`.
+
+### `server_search`
+
+Live query against `cmdb_ci_server`, restricted to Linux and Windows subclasses.
+Reference filters accept either a sys_id or a display-name substring.
+
+- **Filter params (all optional):** `name` (contains), `ip_address` (exact),
+  `ci_owner_group` (display-name substring or sys_id), `class` (`linux`,
+  `windows`, `cmdb_ci_linux_server`, `cmdb_ci_win_server`, or `cmdb_ci_server`),
+  `limit` (`1`-`100`, default `20`).
+- **Returns:** `{ "servers": [<Server>...], "records": [<record>...] }`.
+
+### `server_query`
+
+LOCAL SQLite query against projected Server records. Use this for cached
+inventory questions such as all servers owned by a CI owner group after the
+relevant records have been hydrated.
+
+- **Params:** `text`, `name`, `ip_address`, `ci_owner_group`, `class`, `limit`
+  (`1`-`500`, default `20`), `offset` (default `0`).
+- **Returns:** `{ "servers": [<Server>...] }`.
+
+### `server_fields`
+
+- **Params:** none.
+- **Returns:** `{ "fields": [{ "field": "<name>", "observed_count": <n>,
+  "sample_value"?, "sample_display_value"? }...] }`.
+
+Each `server` object contains the underlying `record`, `name`, optional
+`ip_address`, `class_name`, `ci_owner_group`, `support_group`,
+`operational_status`, every observed `fields` value, and `browser_url` /
+`vault_relative_path` when available.
 
 ---
 

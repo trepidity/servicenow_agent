@@ -119,6 +119,26 @@ Business Applications are also exposed as four read-only MCP tools (`get`/`searc
 
 In the record browser TUI, `cmdb_ci_business_app` records route to a first-class Business Application detail view with typed ownership/operational sections (operational status, business owner, information owner, CI owner group, support group, portfolio, attested date) plus the all-fields table.
 
+### Servers
+
+Servers are a first-class read-only CMDB primitive for Windows and Linux CIs. The canonical local resource type is `server`; `cmdb_ci_server`, `cmdb_ci_linux_server`, `cmdb_ci_win_server`, `linux`, and `windows` are accepted as input aliases where a table/class selector is supported.
+
+The `snow server` subcommand family is a thin CLI over daemon JSON-RPC methods (`server_get`, `server_get_fresh`, `server_search`, `server_query`, `server_fields`) and auto-spawns the daemon as needed. There is no Server write/create/update surface.
+
+```bash
+snow server get --sys-id <sys_id> | --name "app01.example.internal" | --ip-address 192.0.2.10 [--fresh] [--json] [--full]
+snow server search --name app01 --ip-address 192.0.2.10 --ci-owner-group "Platform Operations" --class linux [--limit N] [--json] [--full]
+snow server query --ci-owner-group "Platform Operations" [--text app] [--class windows] [--limit N] [--json] [--full]
+snow server fields [--json]
+```
+
+- `get` reads from the local cache/vault by `sys_id`, exact `name`, or exact `ip_address`; `--fresh` re-fetches the live row and updates the projection.
+- `search` runs a live bounded `cmdb_ci_server` query restricted to Linux/Windows subclasses, supports `name` contains, exact `ip_address`, `ci_owner_group` display-name/sys_id, and class filters, then persists returned rows.
+- `query` filters entirely against the local SQLite projection with the same primitive filters, so CI owner group inventory queries do not need another API call after hydration.
+- `fields` lists observed local Server fields.
+
+Default human output shows name, sys_id, class, IP address, CI owner group, support group, operational status, vault path, and URL when available. `--json` emits the daemon view DTO; `--full` appends the all-fields table.
+
 ### List change tasks
 
 ```bash
