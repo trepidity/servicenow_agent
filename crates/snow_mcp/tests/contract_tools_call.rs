@@ -72,6 +72,8 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         "work_note_apply_add",
         "catalog_plan_request",
         "catalog_submit_request",
+        "approval_approve",
+        "approval_reject",
     ]
     .iter()
     .enumerate()

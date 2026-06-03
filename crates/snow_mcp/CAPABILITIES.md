@@ -27,6 +27,8 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 |---|---|---|---|---|---|
 | Catalog request (`sc_req_item`) | `catalog_submit_request` | **Create** | ✅ (test/training) | yes | requires KB evidence |
 | Catalog request (`sc_req_item`) | `catalog_cancel_request` | **Delete** (cancel) | ❌ | yes | |
+| Approval (`sysapproval_approver`) | `approval_approve` | **Update** | ❌ | yes | target record number; daemon required |
+| Approval (`sysapproval_approver`) | `approval_reject` | **Update** | ❌ | yes | target record number plus reason; daemon required |
 | Work note / journal | `work_note_apply_add` | **Create** | ✅ (test/training) | yes | `work_notes` only |
 | Story (`rm_story`) | `story_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |

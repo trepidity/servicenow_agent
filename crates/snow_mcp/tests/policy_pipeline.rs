@@ -247,6 +247,9 @@ fn is_write_tool_classifies_story_apply() {
     for tool in STORY_APPLY_TOOL_NAMES {
         assert!(is_write_tool(tool), "{tool} should be classified as write");
     }
+    for tool in ["approval_approve", "approval_reject"] {
+        assert!(is_write_tool(tool), "{tool} should be classified as write");
+    }
 
     for tool in STORY_PLAN_TOOL_NAMES {
         assert!(
@@ -452,6 +455,24 @@ fn default_timecard_tool_policies_match_spec_posture() {
                 "wednesday".to_string(),
             ])
         );
+        assert!(is_write_tool(tool), "{tool}");
+    }
+}
+
+#[test]
+fn default_approval_action_tool_policies_match_write_posture() {
+    let cfg = PolicyConfig::default();
+
+    for tool in ["approval_approve", "approval_reject"] {
+        let policy = cfg.tools.get(tool).expect("approval action policy");
+        assert!(!policy.enabled);
+        assert!(policy.requires_confirmation);
+        assert!(!policy.requires_kb_evidence);
+        assert_eq!(
+            policy.environments,
+            vec!["test".to_string(), "training".to_string()]
+        );
+        assert!(policy.field_allowlist.is_empty());
         assert!(is_write_tool(tool), "{tool}");
     }
 }

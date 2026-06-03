@@ -550,6 +550,59 @@ async fn bridge_forwards_work_note_plan_and_apply_tools() {
 }
 
 #[tokio::test]
+async fn bridge_forwards_approval_actions_to_daemon_policy_methods() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "approval_approve",
+        "approval_reject",
+    ]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "approval_approve",
+                "arguments": {
+                    "number": "RITM0010001"
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()["structuredContent"]["method"],
+        json!("approval_approve")
+    );
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "approval_reject",
+                "arguments": {
+                    "number": "RITM0010001",
+                    "reason": "Insufficient justification."
+                }
+            }),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.unwrap()["structuredContent"]["method"],
+        json!("approval_reject")
+    );
+    assert_eq!(
+        daemon.method_names().await,
+        vec![
+            "contract_info".to_string(),
+            "approval_approve".to_string(),
+            "approval_reject".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn bridge_forwards_catalog_plan_and_submit_tools() {
     let daemon = MockDaemon::new(contract(&[
         "contract_info",

@@ -119,6 +119,8 @@ pub enum RpcMethod {
     FieldChoices,
     Approve,
     Reject,
+    ApprovalApprove,
+    ApprovalReject,
     GetDegradedReads,
     CacheInfo,
     RepairVault,
@@ -225,6 +227,8 @@ impl RpcMethod {
             "field_choices" => Self::FieldChoices,
             "approve" => Self::Approve,
             "reject" => Self::Reject,
+            "approval_approve" => Self::ApprovalApprove,
+            "approval_reject" => Self::ApprovalReject,
             "get_degraded_reads" => Self::GetDegradedReads,
             "cache_info" => Self::CacheInfo,
             "repair_vault" => Self::RepairVault,
@@ -1253,6 +1257,9 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
+        RpcMethod::ApprovalApprove => {
+            handle_approval_approve(id, &request.params, state, &transport).await
+        }
         RpcMethod::Reject => match (
             extract_number(&request.params),
             extract_string(&request.params, "reason"),
@@ -1267,6 +1274,9 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             (Err(err), _) | (_, Err(err)) => invalid_params(id, err),
         },
+        RpcMethod::ApprovalReject => {
+            handle_approval_reject(id, &request.params, state, &transport).await
+        }
         RpcMethod::GetDegradedReads => JsonRpcResponse::ok(
             id,
             json!({
@@ -1580,6 +1590,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "field_choices",
     "approve",
     "reject",
+    "approval_approve",
+    "approval_reject",
     "get_degraded_reads",
     "cache_info",
     "repair_vault",
@@ -1741,6 +1753,82 @@ fn count_cache_records(sqlite_path: &std::path::Path) -> Result<u64> {
     let conn = rusqlite::Connection::open(sqlite_path)?;
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
     Ok(count.max(0) as u64)
+}
+
+async fn handle_approval_approve(
+    id: Option<Value>,
+    params: &Value,
+    state: &DaemonState,
+    transport: &DaemonTransport<'_>,
+) -> JsonRpcResponse {
+    if !approval_tool_enabled(state, "approval_approve") {
+        return approval_policy_denied(id, "approval_approve");
+    }
+
+    let number = match extract_number(params) {
+        Ok(number) => number,
+        Err(err) => return invalid_params(id, err),
+    };
+    match state.core.approve(&number, None).await {
+        Ok(Some(record)) => daemon_record_response(id, transport, &record),
+        Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+        Err(err) => internal_error(id, err),
+    }
+}
+
+async fn handle_approval_reject(
+    id: Option<Value>,
+    params: &Value,
+    state: &DaemonState,
+    transport: &DaemonTransport<'_>,
+) -> JsonRpcResponse {
+    if !approval_tool_enabled(state, "approval_reject") {
+        return approval_policy_denied(id, "approval_reject");
+    }
+
+    let number = match extract_number(params) {
+        Ok(number) => number,
+        Err(err) => return invalid_params(id, err),
+    };
+    let reason = match extract_string(params, "reason") {
+        Ok(reason) => reason,
+        Err(err) => return invalid_params(id, err),
+    };
+    match state.core.reject(&number, &reason).await {
+        Ok(Some(record)) => daemon_record_response(id, transport, &record),
+        Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
+        Err(err) => internal_error(id, err),
+    }
+}
+
+fn approval_tool_enabled(state: &DaemonState, tool: &str) -> bool {
+    state
+        .mcp_config
+        .policy
+        .tool_enabled_in_environment(tool, &state.mcp_config.environment.label)
+}
+
+fn approval_policy_denied(id: Option<Value>, tool: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32040,
+        "policy denied",
+        Some(json!({
+            "details": "approval action tool is disabled by current MCP policy",
+            "tool": tool,
+        })),
+    )
+}
+
+fn daemon_record_response(
+    id: Option<Value>,
+    transport: &DaemonTransport<'_>,
+    record: &SnowRecord,
+) -> JsonRpcResponse {
+    match transport.record(record) {
+        Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
+        Err(err) => internal_error(id, err),
+    }
 }
 
 fn extract_number(params: &Value) -> Result<String> {
@@ -2861,6 +2949,14 @@ mod tests {
             RpcMethod::FieldChoices
         );
         assert_eq!(RpcMethod::from_method("approve"), RpcMethod::Approve);
+        assert_eq!(
+            RpcMethod::from_method("approval_approve"),
+            RpcMethod::ApprovalApprove
+        );
+        assert_eq!(
+            RpcMethod::from_method("approval_reject"),
+            RpcMethod::ApprovalReject
+        );
         assert_eq!(RpcMethod::from_method("my_projects"), RpcMethod::MyProjects);
         assert_eq!(
             RpcMethod::from_method("scheduler.status"),
@@ -2973,6 +3069,27 @@ mod tests {
                 "{method} should point to canonical method {replacement}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_action_dispatch_uses_mcp_policy_gate() {
+        let fixture = build_fixture_state().await.expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "approval_approve".to_string(),
+                params: json!({ "number": "RITM0010001" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let error = response.error.expect("approval action should be gated");
+        assert_eq!(error.code, -32040);
+        assert_eq!(error.message, "policy denied");
+        assert_eq!(error.data.unwrap()["tool"], json!("approval_approve"));
     }
 
     #[tokio::test(flavor = "current_thread")]

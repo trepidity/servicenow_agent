@@ -16,6 +16,8 @@ const EXPLICIT_WRITE_TOOLS: &[&str] = &[
     "catalog_submit_request",
     "catalog_cancel_request",
     "work_note_apply_add",
+    "approval_approve",
+    "approval_reject",
     "plan_cancel",
 ];
 

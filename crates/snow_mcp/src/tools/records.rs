@@ -119,6 +119,23 @@ pub fn register(registry: &mut ToolRegistry) {
             requires_confirmation: false,
         });
     }
+
+    registry.add(ToolMetadata {
+        name: "approval_approve".to_string(),
+        description: "Approve a ServiceNow approval target by record number through the current user's approval row".to_string(),
+        input_schema: number_arg_schema(),
+        output_schema: object_schema(),
+        default_enabled: false,
+        requires_confirmation: true,
+    });
+    registry.add(ToolMetadata {
+        name: "approval_reject".to_string(),
+        description: "Reject a ServiceNow approval target by record number through the current user's approval row".to_string(),
+        input_schema: approval_reject_arg_schema(),
+        output_schema: object_schema(),
+        default_enabled: false,
+        requires_confirmation: true,
+    });
 }
 
 pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {
@@ -165,6 +182,22 @@ pub fn search_records_arg_schema() -> Value {
         },
         "required": ["query"],
         "additionalProperties": false
+    })
+}
+
+fn approval_reject_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "number": {
+                "type": "string"
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1
+            }
+        },
+        "required": ["number", "reason"]
     })
 }
 

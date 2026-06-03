@@ -78,6 +78,8 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
     for expected in [
         "get_record",
         "get_approval",
+        "approval_approve",
+        "approval_reject",
         "search_records",
         "user_lookup",
         "user_search",
@@ -765,6 +767,22 @@ fn schemas_include_required_fields_for_create_update_apply() {
     assert_eq!(
         attachment_upload["properties"]["confirm_upload"]["const"],
         true
+    );
+
+    let approval_approve = &tool("approval_approve").input_schema;
+    assert_eq!(approval_approve["type"], "object");
+    assert_eq!(approval_approve["required"], json!(["number"]));
+    assert_eq!(
+        approval_approve["properties"]["number"]["type"],
+        json!("string")
+    );
+
+    let approval_reject = &tool("approval_reject").input_schema;
+    assert_eq!(approval_reject["type"], "object");
+    assert_eq!(approval_reject["required"], json!(["number", "reason"]));
+    assert_eq!(
+        approval_reject["properties"]["reason"]["minLength"],
+        json!(1)
     );
 
     for apply in [

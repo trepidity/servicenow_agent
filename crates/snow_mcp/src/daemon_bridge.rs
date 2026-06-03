@@ -33,6 +33,8 @@ const AUTOSPAWN_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("get_record", "get_record"),
     ("get_approval", "get_approval"),
+    ("approval_approve", "approval_approve"),
+    ("approval_reject", "approval_reject"),
     ("catalog_items_search", "catalog_items_search"),
     ("catalog_item_get", "catalog_item_get"),
     ("catalog_plan_request", "catalog_plan_request"),

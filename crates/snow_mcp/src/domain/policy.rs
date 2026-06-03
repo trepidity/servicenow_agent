@@ -566,6 +566,8 @@ pub fn is_write_tool(tool: &str) -> bool {
                 | "catalog_cancel_request"
                 | "work_note_apply_add"
                 | "attachment_upload"
+                | "approval_approve"
+                | "approval_reject"
                 | "plan_cancel"
         )
 }
@@ -863,6 +865,8 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
                 ..ToolPolicy::default()
             },
         ),
+        ("approval_approve".to_string(), approval_action_policy()),
+        ("approval_reject".to_string(), approval_action_policy()),
         (
             "change_request_plan_create".to_string(),
             change_plan_policy(),
@@ -1003,6 +1007,17 @@ fn story_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
 
 fn default_story_environments() -> Vec<String> {
     vec!["test".to_string(), "training".to_string()]
+}
+
+fn approval_action_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        environments: default_story_environments(),
+        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+        ..ToolPolicy::default()
+    }
 }
 
 fn change_plan_policy() -> ToolPolicy {
