@@ -168,6 +168,7 @@ fn change_request_properties(include_state: bool) -> Value {
         "impact": {"type": "string"},
         "justification": {"type": "string", "maxLength": 16000},
         "requested_by": {"type": "string"},
+        "requested_by_date": {"type": "string"},
         "u_subcategory": {"type": "string"},
         "u_division": {"type": "string"},
         "u_does_this_change_need_cmdb_update": {"type": "string"},

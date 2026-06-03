@@ -108,4 +108,15 @@ fn example_policy_parses() {
         cfg.tools.contains_key("story_apply_create"),
         "example policy should demonstrate enabling a write tool"
     );
+
+    for tool in ["change_request_apply_create", "change_request_apply_update"] {
+        let policy = cfg
+            .tools
+            .get(tool)
+            .unwrap_or_else(|| panic!("example policy missing {tool}"));
+        assert!(
+            policy.field_allowlist.contains("requested_by_date"),
+            "example policy {tool} allowlist missing requested_by_date"
+        );
+    }
 }

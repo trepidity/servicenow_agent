@@ -148,7 +148,7 @@ field_allowlist = [
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
     "implementation_plan", "change_plan", "backout_plan", "test_plan",
     "risk", "impact", "justification",
-    "requested_by", "u_subcategory", "u_division",
+    "requested_by", "requested_by_date", "u_subcategory", "u_division",
     "u_does_this_change_need_cmdb_update",
     "work_notes",
 ]
@@ -163,7 +163,7 @@ field_allowlist = [
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
     "implementation_plan", "change_plan", "backout_plan", "test_plan",
     "risk", "impact", "justification",
-    "requested_by", "u_subcategory", "u_division",
+    "requested_by", "requested_by_date", "u_subcategory", "u_division",
     "u_does_this_change_need_cmdb_update",
     "work_notes", "state",
 ]

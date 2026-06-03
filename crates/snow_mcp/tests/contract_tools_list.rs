@@ -702,6 +702,7 @@ fn schemas_include_required_fields_for_create_update_apply() {
     );
     for field in [
         "requested_by",
+        "requested_by_date",
         "u_subcategory",
         "u_division",
         "u_does_this_change_need_cmdb_update",
@@ -720,6 +721,10 @@ fn schemas_include_required_fields_for_create_update_apply() {
         "^CHG\\d+$"
     );
     assert_eq!(change_update["properties"]["state"]["type"], "string");
+    assert_eq!(
+        change_update["properties"]["requested_by_date"]["type"],
+        "string"
+    );
 
     let change_task_create = &tool("change_task_plan_create").input_schema;
     assert_eq!(change_task_create["type"], "object");
@@ -897,4 +902,54 @@ fn policy_defaults_allow_full_story_form_fields() {
         );
     }
     assert!(update.contains("percent_complete"));
+}
+
+#[test]
+fn policy_defaults_allow_full_change_request_form_fields() {
+    let cfg = PolicyConfig::default();
+    let create = &cfg
+        .tools
+        .get("change_request_apply_create")
+        .expect("change request create policy")
+        .field_allowlist;
+    let update = &cfg
+        .tools
+        .get("change_request_apply_update")
+        .expect("change request update policy")
+        .field_allowlist;
+
+    for field in [
+        "short_description",
+        "description",
+        "type",
+        "category",
+        "assignment_group",
+        "assigned_to",
+        "cmdb_ci",
+        "start_date",
+        "end_date",
+        "implementation_plan",
+        "change_plan",
+        "backout_plan",
+        "test_plan",
+        "risk",
+        "impact",
+        "justification",
+        "requested_by",
+        "requested_by_date",
+        "u_subcategory",
+        "u_division",
+        "u_does_this_change_need_cmdb_update",
+        "work_notes",
+    ] {
+        assert!(
+            create.contains(field),
+            "change_request_apply_create allowlist missing {field}"
+        );
+        assert!(
+            update.contains(field),
+            "change_request_apply_update allowlist missing {field}"
+        );
+    }
+    assert!(update.contains("state"));
 }
