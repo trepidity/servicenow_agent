@@ -11,9 +11,10 @@ use snow_mcp::domain::audit::{
 use snow_mcp::domain::primitives::{IdempotencyKey, IdempotencyKeySource, RecordRef};
 use snow_mcp::planner::{
     ConcurrencyToken, ConfirmationBinding, ConfirmationConsumeError, ConfirmationRecord,
-    ConfirmationStore, FieldChange, IdempotencyOutcome, IdempotencyStore, OperationPlan,
-    OperationPlanBuilder, OperationReceipt, PlanLifecycleState, PlanStore, PlanStoreRecord,
-    ReceiptStatus, SqliteConfirmationStore, SqliteIdempotencyStore, SqlitePlanStore,
+    ConfirmationStore, FieldChange, IdempotencyOutcome, IdempotencyRecord, IdempotencyStore,
+    OperationPlan, OperationPlanBuilder, OperationReceipt, PlanLifecycleState, PlanStore,
+    PlanStoreRecord, ReceiptStatus, SqliteConfirmationStore, SqliteIdempotencyStore,
+    SqlitePlanStore,
 };
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -376,7 +377,7 @@ pub async fn handle_change_apply(
             return JsonRpcResponse::ok(id, json!(receipt));
         }
         if record.apply_started_at.is_some() {
-            return pending_resolution_required(state, id, tool, &plan).await;
+            return pending_resolution_required(state, id, tool, &plan, &record).await;
         }
     }
 
@@ -527,11 +528,7 @@ pub async fn handle_change_apply(
                 tool,
                 -32059,
                 "UPSTREAM_ERROR",
-                json!({
-                    "code": "UPSTREAM_ERROR",
-                    "reason": err.to_string(),
-                    "retry_after_seconds": 2,
-                }),
+                upstream_error_data(tool, &plan, err.to_string()),
                 ResultStatus::Error,
             )
             .await;
@@ -1242,6 +1239,7 @@ async fn pending_resolution_required(
     id: Option<Value>,
     tool: &str,
     plan: &OperationPlan,
+    idempotency: &IdempotencyRecord,
 ) -> JsonRpcResponse {
     audited_change_error(
         state,
@@ -1249,11 +1247,7 @@ async fn pending_resolution_required(
         tool,
         -32060,
         "PENDING_RESOLUTION_REQUIRED",
-        json!({
-            "code": "PENDING_RESOLUTION_REQUIRED",
-            "plan_id": plan.plan_id,
-            "retry_after_seconds": 2,
-        }),
+        pending_resolution_data(plan, idempotency),
         ResultStatus::Error,
     )
     .await
@@ -1276,16 +1270,7 @@ async fn audited_change_error(
         status,
         None,
         None,
-        Some(ErrorRow {
-            code: message.to_string(),
-            reason: data
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or(message)
-                .to_string(),
-            retryable: false,
-            transient: false,
-        }),
+        Some(error_row_from_data(message, &data)),
         None,
         None,
     )
@@ -1293,6 +1278,115 @@ async fn audited_change_error(
     {
         Ok(_) => change_error(id, code, message, data),
         Err(err) => internal_error(id, err),
+    }
+}
+
+fn upstream_error_data(tool: &str, plan: &OperationPlan, reason: String) -> Value {
+    let mut data = json!({
+        "code": "UPSTREAM_ERROR",
+        "reason": reason,
+        "retryable": false,
+        "transient": false,
+        "plan_id": plan.plan_id,
+        "op_hash": plan.op_hash,
+        "plan_tool": plan.tool,
+        "apply_tool": tool,
+        "service_now_table": service_now_table_for_apply_tool(tool),
+        "service_now_operation": service_now_operation_for_apply_tool(tool),
+        "remediation": [
+            "Inspect the upstream reason returned by ServiceNow.",
+            "Correct the planned payload and create a fresh plan before retrying.",
+            "Use a new idempotency key after an apply attempt has started without a receipt."
+        ],
+    });
+
+    let hints = payload_hints(&plan.planned_changes);
+    if !hints.is_empty() {
+        data["payload_hints"] = Value::Array(hints);
+    }
+    data
+}
+
+fn pending_resolution_data(plan: &OperationPlan, idempotency: &IdempotencyRecord) -> Value {
+    json!({
+        "code": "PENDING_RESOLUTION_REQUIRED",
+        "reason": "an apply attempt for this idempotency key started but no receipt was recorded",
+        "retryable": false,
+        "transient": false,
+        "plan_id": plan.plan_id,
+        "op_hash": plan.op_hash,
+        "idempotency_key": idempotency.key,
+        "apply_started_at": idempotency.apply_started_at.map(|value| value.to_rfc3339()),
+        "idempotency_expires_at": idempotency.expires_at.to_rfc3339(),
+        "retry_after_seconds": 2,
+        "remediation": [
+            "Do not blindly retry the same idempotency key.",
+            "Check ServiceNow for a record created by the previous attempt.",
+            "If no record exists, correct the payload if needed and create a fresh plan or apply with a new idempotency key."
+        ],
+    })
+}
+
+fn error_row_from_data(message: &str, data: &Value) -> ErrorRow {
+    ErrorRow {
+        code: message.to_string(),
+        reason: data
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| data.get("details").and_then(Value::as_str))
+            .or_else(|| data.get("code").and_then(Value::as_str))
+            .unwrap_or(message)
+            .to_string(),
+        retryable: data
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        transient: data
+            .get("transient")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn payload_hints(planned_changes: &Value) -> Vec<Value> {
+    let mut hints = Vec::new();
+    let Some(payload) = planned_changes.as_object() else {
+        return hints;
+    };
+    for field in ["start_date", "end_date", "requested_by_date"] {
+        let Some(value) = payload.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if looks_like_iso_datetime(value) {
+            hints.push(json!({
+                "field": field,
+                "value": value,
+                "expected_format": "YYYY-MM-DD HH:mm:ss",
+                "reason": "ServiceNow change_request datetime fields expect internal datetime strings, not ISO-8601 T/Z values",
+            }));
+        }
+    }
+    hints
+}
+
+fn looks_like_iso_datetime(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains('T') && (trimmed.ends_with('Z') || trimmed.contains('+'))
+}
+
+fn service_now_table_for_apply_tool(tool: &str) -> &'static str {
+    match tool {
+        "change_request_apply_create" | "change_request_apply_update" => "change_request",
+        "change_task_apply_create" | "change_task_apply_update" => "change_task",
+        _ => "unknown",
+    }
+}
+
+fn service_now_operation_for_apply_tool(tool: &str) -> &'static str {
+    match tool {
+        "change_request_apply_create" | "change_task_apply_create" => "create",
+        "change_request_apply_update" | "change_task_apply_update" => "update",
+        _ => "unknown",
     }
 }
 
@@ -1500,5 +1594,78 @@ mod tests {
             reject_cancel_state(&payload),
             Err(PlanBuildError::FieldRejected(_))
         ));
+    }
+
+    #[test]
+    fn audit_error_row_preserves_human_reason() {
+        let row = error_row_from_data(
+            "UPSTREAM_ERROR",
+            &json!({
+                "code": "UPSTREAM_ERROR",
+                "reason": "ServiceNow rejected start_date",
+                "retryable": false,
+                "transient": false
+            }),
+        );
+
+        assert_eq!(row.code, "UPSTREAM_ERROR");
+        assert_eq!(row.reason, "ServiceNow rejected start_date");
+        assert!(!row.retryable);
+        assert!(!row.transient);
+    }
+
+    #[test]
+    fn upstream_error_data_includes_operation_context_and_date_hints() {
+        let plan = OperationPlanBuilder::new("change_request_plan_create")
+            .planned_changes(json!({
+                "start_date": "2026-06-10T01:00:00Z",
+                "end_date": "2026-06-10 02:00:00"
+            }))
+            .build();
+
+        let data = upstream_error_data(
+            "change_request_apply_create",
+            &plan,
+            "ServiceNow rejected payload".to_string(),
+        );
+
+        assert_eq!(data["code"], json!("UPSTREAM_ERROR"));
+        assert_eq!(data["reason"], json!("ServiceNow rejected payload"));
+        assert_eq!(data["plan_id"], json!(plan.plan_id));
+        assert_eq!(data["service_now_table"], json!("change_request"));
+        assert_eq!(data["service_now_operation"], json!("create"));
+        let hints = data["payload_hints"].as_array().expect("payload hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["field"], json!("start_date"));
+        assert_eq!(hints[0]["expected_format"], json!("YYYY-MM-DD HH:mm:ss"));
+    }
+
+    #[test]
+    fn pending_resolution_data_includes_idempotency_context() {
+        let plan = OperationPlanBuilder::new("change_request_plan_create")
+            .planned_changes(json!({"short_description": "Change"}))
+            .build();
+        let now = Utc::now();
+        let idempotency = IdempotencyRecord {
+            key: "idem-1".to_string(),
+            op_hash: plan.op_hash.clone(),
+            tool: "change_request_apply_create".to_string(),
+            receipt: None,
+            created_at: now,
+            expires_at: now + chrono::Duration::hours(24),
+            apply_started_at: Some(now),
+        };
+
+        let data = pending_resolution_data(&plan, &idempotency);
+
+        assert_eq!(data["code"], json!("PENDING_RESOLUTION_REQUIRED"));
+        assert_eq!(data["idempotency_key"], json!("idem-1"));
+        assert_eq!(data["plan_id"], json!(plan.plan_id));
+        assert_eq!(data["retryable"], json!(false));
+        assert!(
+            data["remediation"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
     }
 }
