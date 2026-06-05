@@ -448,6 +448,15 @@ pub fn business_application_query_arg_schema() -> Value {
 }
 
 pub fn business_application_servers_arg_schema() -> Value {
+    // Bound literals are derived from the canonical snow_core constants so the
+    // advertised JSON schema can never drift from the values that
+    // `snow_core::BusinessApplicationServersParams::validate` actually enforces.
+    let max_depth = snow_core::BUSINESS_APPLICATION_SERVERS_MAX_DEPTH;
+    let default_depth = snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH;
+    let max_cis = snow_core::BUSINESS_APPLICATION_SERVERS_MAX_CIS;
+    let default_cis = snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS;
+    let max_edges = snow_core::BUSINESS_APPLICATION_SERVERS_MAX_EDGES;
+    let default_edges = snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES;
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -465,23 +474,23 @@ pub fn business_application_servers_arg_schema() -> Value {
             "max_depth": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 4,
-                "default": 2,
-                "description": "Maximum relationship-traversal depth (BFS hops) from the root Business Application. Range 1-4, default 2."
+                "maximum": max_depth,
+                "default": default_depth,
+                "description": format!("Maximum relationship-traversal depth (BFS hops) from the root Business Application. Range 1-{max_depth}, default {default_depth}.")
             },
             "max_cis": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 5000,
-                "default": 500,
-                "description": "Maximum number of configuration items examined BEYOND the root Business Application. The root BA is excluded from this budget, so up to max_cis non-root CIs may be examined before traversal truncates. Range 1-5000, default 500."
+                "maximum": max_cis,
+                "default": default_cis,
+                "description": format!("Maximum number of configuration items examined BEYOND the root Business Application. The root BA is excluded from this budget, so up to max_cis non-root CIs may be examined before traversal truncates. Range 1-{max_cis}, default {default_cis}.")
             },
             "max_edges": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 20000,
-                "default": 2000,
-                "description": "Maximum number of cmdb_rel_ci relationship edges examined across the whole traversal. Edge reads are paginated and continue until this budget is consumed or the result set is exhausted, so large graphs are not silently undercounted. Range 1-20000, default 2000."
+                "maximum": max_edges,
+                "default": default_edges,
+                "description": format!("Maximum number of cmdb_rel_ci relationship edges examined across the whole traversal. Edge reads are paginated and continue until this budget is consumed or the result set is exhausted, so large graphs are not silently undercounted. Range 1-{max_edges}, default {default_edges}.")
             },
             "relationship_type": {
                 "type": "array",

@@ -849,7 +849,14 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             }
         }
         RpcMethod::BusinessApplicationServers => {
-            match extract_business_application_servers_params(&request.params) {
+            // Deserialize directly into the canonical snow_core request contract
+            // (which owns `deny_unknown_fields` and selector/bounds validation),
+            // then validate up-front so bad params surface as `invalid_params`.
+            // Validation is run here -- rather than relying on the inner
+            // re-validation inside `SnowCore::business_application_servers` -- so a
+            // validation failure maps to `-32602 invalid_params` instead of being
+            // misreported as an internal/service error.
+            match parse_business_application_servers_params(&request.params) {
                 Ok(params) => {
                     match business_application_servers(state.core.as_ref(), &transport, params)
                         .await
@@ -2082,25 +2089,6 @@ struct BusinessApplicationQueryParams {
     sort: Vec<BusinessApplicationSortField>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-struct BusinessApplicationServersParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    number: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sys_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_depth: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_cis: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_edges: Option<usize>,
-    #[serde(default)]
-    relationship_type: Vec<String>,
-    #[serde(default)]
-    include_paths: bool,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct BusinessApplicationFieldFilter {
     field: String,
@@ -2176,29 +2164,6 @@ fn default_true() -> bool {
 
 fn default_reference_depth() -> usize {
     1
-}
-
-fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn validate_optional_limit(
-    value: Option<usize>,
-    field: &str,
-    minimum: usize,
-    maximum: usize,
-) -> Result<()> {
-    if let Some(value) = value {
-        if value < minimum {
-            return Err(anyhow!("`{field}` must be at least {minimum}"));
-        }
-        if value > maximum {
-            return Err(anyhow!("`{field}` must be at most {maximum}"));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2376,51 +2341,26 @@ fn extract_business_application_query_params(
     Ok(query)
 }
 
-fn extract_business_application_servers_params(
+/// Deserialize an incoming `business_application_servers` request into the
+/// canonical [`snow_core::BusinessApplicationServersParams`] contract and run
+/// its validation up-front.
+///
+/// The core type owns `#[serde(deny_unknown_fields)]` and
+/// [`snow_core::BusinessApplicationServersParams::validate`], so unknown fields,
+/// the selector XOR (`number` vs `sys_id`), the `BA:<sys_id>` fallback guard,
+/// the traversal bounds (`max_depth`/`max_cis`/`max_edges`) and selector
+/// normalization are all enforced in one place. Validating here (instead of
+/// leaning on the re-validation inside `SnowCore::business_application_servers`)
+/// is what lets the dispatcher classify a validation failure as
+/// `invalid_params` rather than a service/internal error.
+fn parse_business_application_servers_params(
     params: &Value,
-) -> Result<BusinessApplicationServersParams> {
-    let mut params: BusinessApplicationServersParams = serde_json::from_value(params.clone())?;
-
-    params.number = normalize_optional_string(params.number);
-    params.sys_id = match normalize_optional_string(params.sys_id) {
-        Some(sys_id) => Some(snow_core::normalize_record_lookup_sys_id(&sys_id)?),
-        None => None,
-    };
-
-    match (params.number.as_deref(), params.sys_id.as_deref()) {
-        (Some(_), Some(_)) => {
-            return Err(anyhow!("provide exactly one of `number` or `sys_id`"));
-        }
-        (None, None) => {
-            return Err(anyhow!(
-                "missing required lookup: provide `number` or `sys_id`"
-            ));
-        }
-        _ => {}
-    }
-
-    if let Some(number) = params.number.as_deref()
-        && number.trim_start().starts_with("BA:")
-    {
-        return Err(anyhow!(
-            "`number` must be a real Business Application number, not a local BA:<sys_id> fallback"
-        ));
-    }
-
-    validate_optional_limit(params.max_depth, "max_depth", 1, 4)?;
-    validate_optional_limit(params.max_cis, "max_cis", 1, 5000)?;
-    validate_optional_limit(params.max_edges, "max_edges", 1, 20000)?;
-
-    let mut relationship_type = Vec::with_capacity(params.relationship_type.len());
-    for value in params.relationship_type {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(anyhow!("`relationship_type` values must not be empty"));
-        }
-        relationship_type.push(value.to_string());
-    }
-    params.relationship_type = relationship_type;
-
+) -> Result<snow_core::BusinessApplicationServersParams> {
+    let params: snow_core::BusinessApplicationServersParams =
+        serde_json::from_value(params.clone())?;
+    // Surface validation errors here so the caller maps them to invalid_params.
+    // The resulting options are discarded; core re-validates during traversal.
+    params.validate()?;
     Ok(params)
 }
 
@@ -2587,12 +2527,9 @@ fn core_field_operator(op: &str) -> Result<snow_core::query::filter::FieldOperat
 async fn business_application_servers(
     core: &SnowCore,
     transport: &DaemonTransport<'_>,
-    params: BusinessApplicationServersParams,
+    params: snow_core::BusinessApplicationServersParams,
 ) -> Result<Option<Value>> {
-    let Some(result) = core
-        .business_application_servers(core_business_application_servers_params(params))
-        .await?
-    else {
+    let Some(result) = core.business_application_servers(params).await? else {
         return Ok(None);
     };
 
@@ -2608,20 +2545,6 @@ async fn business_application_servers(
         "diagnostics": result.diagnostics,
         "server_paths": result.server_paths,
     })))
-}
-
-fn core_business_application_servers_params(
-    params: BusinessApplicationServersParams,
-) -> snow_core::BusinessApplicationServersParams {
-    snow_core::BusinessApplicationServersParams {
-        number: params.number,
-        sys_id: params.sys_id,
-        max_depth: params.max_depth,
-        max_cis: params.max_cis,
-        max_edges: params.max_edges,
-        relationship_type: params.relationship_type,
-        include_paths: params.include_paths,
-    }
 }
 
 async fn business_application_fields(
@@ -3953,8 +3876,11 @@ story_board_id = "board-sys"
 
     #[test]
     fn business_application_servers_params_validate_flat_selectors_and_limits() {
-        let params = extract_business_application_servers_params(&json!({
-            "number": " <APM_NUMBER> ",
+        // The daemon now delegates to the canonical snow_core contract, so the
+        // parsed value is the core params struct and selector/limit normalization
+        // is observed through the validated options it produces.
+        let params = parse_business_application_servers_params(&json!({
+            "number": " apm0000001 ",
             "max_depth": 2,
             "max_cis": 500,
             "max_edges": 2000,
@@ -3962,43 +3888,56 @@ story_board_id = "board-sys"
             "include_paths": true
         }))
         .expect("business application servers params");
+        let options = params.validate().expect("validated options");
 
-        assert_eq!(params.number.as_deref(), Some("<APM_NUMBER>"));
-        assert_eq!(params.sys_id, None);
-        assert_eq!(params.max_depth, Some(2));
-        assert_eq!(params.max_cis, Some(500));
-        assert_eq!(params.max_edges, Some(2000));
-        assert_eq!(params.relationship_type, vec!["Depends on::Used by"]);
-        assert!(params.include_paths);
+        // Core normalizes the number to uppercase and trims surrounding space.
+        assert_eq!(
+            options.selector,
+            snow_core::BusinessApplicationServersSelector::Number("APM0000001".to_string())
+        );
+        assert_eq!(options.max_depth, 2);
+        assert_eq!(options.max_cis, 500);
+        assert_eq!(options.max_edges, 2000);
+        assert_eq!(options.relationship_type, vec!["Depends on::Used by"]);
+        assert!(options.include_paths);
 
-        let params = extract_business_application_servers_params(&json!({
+        let params = parse_business_application_servers_params(&json!({
             "sys_id": "54A4B61B6FE845000ED852A03F3EE4D0"
         }))
         .expect("sys_id lookup");
+        let options = params.validate().expect("validated sys_id options");
         assert_eq!(
-            params.sys_id.as_deref(),
-            Some("54a4b61b6fe845000ed852a03f3ee4d0")
+            options.selector,
+            snow_core::BusinessApplicationServersSelector::SysId(
+                "54a4b61b6fe845000ed852a03f3ee4d0".to_string()
+            )
         );
     }
 
     #[test]
     fn business_application_servers_params_reject_invalid_shapes() {
+        // These mirror the canonical core contract: missing/double selector,
+        // BA:<sys_id> fallback, malformed sys_id, out-of-range bounds, and
+        // (via deny_unknown_fields) unknown fields must all be rejected. Note
+        // that an empty-string relationship_type entry is intentionally NOT
+        // listed: core silently drops empty entries rather than erroring, which
+        // is the canonical behavior the daemon now inherits.
         for params in [
             json!({}),
-            json!({ "number": "<APM_NUMBER>", "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0" }),
+            json!({ "number": "APM0000001", "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0" }),
             json!({ "number": "BA:54a4b61b6fe845000ed852a03f3ee4d0" }),
+            json!({ "number": "not-an-apm-number" }),
             json!({ "sys_id": "54a4b61b6fe845000ed852a03f3ee4d" }),
-            json!({ "number": "<APM_NUMBER>", "max_depth": 0 }),
-            json!({ "number": "<APM_NUMBER>", "max_depth": 5 }),
-            json!({ "number": "<APM_NUMBER>", "max_cis": 0 }),
-            json!({ "number": "<APM_NUMBER>", "max_cis": 5001 }),
-            json!({ "number": "<APM_NUMBER>", "max_edges": 0 }),
-            json!({ "number": "<APM_NUMBER>", "max_edges": 20001 }),
-            json!({ "number": "<APM_NUMBER>", "relationship_type": [""] }),
-            json!({ "number": "<APM_NUMBER>", "unexpected": true }),
+            json!({ "number": "APM0000001", "max_depth": 0 }),
+            json!({ "number": "APM0000001", "max_depth": 5 }),
+            json!({ "number": "APM0000001", "max_cis": 0 }),
+            json!({ "number": "APM0000001", "max_cis": 5001 }),
+            json!({ "number": "APM0000001", "max_edges": 0 }),
+            json!({ "number": "APM0000001", "max_edges": 20001 }),
+            json!({ "number": "APM0000001", "unexpected": true }),
         ] {
             assert!(
-                extract_business_application_servers_params(&params).is_err(),
+                parse_business_application_servers_params(&params).is_err(),
                 "accepted invalid params: {params}"
             );
         }

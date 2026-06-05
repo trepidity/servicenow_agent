@@ -4033,13 +4033,13 @@ fn business_application_projection_from_fields(
         .count();
     let name = field("name")
         .and_then(projected_field_display_or_value)
-        .or_else(|| non_empty_string(Some(&record.short_description)))
+        .or_else(|| crate::non_empty_owned(Some(&record.short_description)))
         .unwrap_or_else(|| record.sys_id.clone());
 
     BusinessApplicationProjectionRow {
         record_sys_id: record.sys_id.clone(),
         name,
-        number: non_empty_string(Some(&record.number)),
+        number: crate::non_empty_owned(Some(&record.number)),
         business_owner_sys_id,
         business_owner_name,
         is_owner_sys_id,
@@ -4121,8 +4121,8 @@ fn projected_fields_from_json(
             field_name: field_name.clone(),
             field_label: dictionary_row.and_then(|row| row.field_label.clone()),
             field_type,
-            value_text: non_empty_string(value_text.as_deref()),
-            display_value: non_empty_string(display_value.as_deref()),
+            value_text: crate::non_empty_owned(value_text.as_deref()),
+            display_value: crate::non_empty_owned(display_value.as_deref()),
             value_number,
             value_date,
             value_bool,
@@ -4177,7 +4177,7 @@ fn raw_display_value(value: &Value) -> Option<String> {
         Value::Object(map) => map
             .get("display_value")
             .map(json_value_to_projection_string)
-            .and_then(|value| non_empty_string(Some(&value))),
+            .and_then(|value| crate::non_empty_owned(Some(&value))),
         _ => None,
     }
 }
@@ -4232,13 +4232,6 @@ fn projected_field_display_or_value(field: &ProjectedFieldRow) -> Option<String>
         .filter(|value| !value.trim().is_empty())
 }
 
-fn non_empty_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 fn is_sys_id(value: &str) -> bool {
     value.len() == 32 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
@@ -4249,7 +4242,7 @@ fn business_application_matches_query(
     fields: &BTreeMap<String, ProjectedFieldRow>,
     query: &crate::query::filter::BusinessApplicationQuery,
 ) -> bool {
-    if let Some(text) = non_empty_string(query.text.as_deref()) {
+    if let Some(text) = crate::non_empty_owned(query.text.as_deref()) {
         let text = text.to_ascii_lowercase();
         let haystack = business_application_search_text(row, projection, fields);
         if !haystack.to_ascii_lowercase().contains(&text) {

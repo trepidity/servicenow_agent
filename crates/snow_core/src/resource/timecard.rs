@@ -6,6 +6,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
 
+use crate::helpers::non_empty_owned;
 use crate::{RecordRef, build_reference_json};
 
 const DAY_FIELDS: [&str; 7] = [
@@ -263,7 +264,7 @@ impl TimecardResource {
                 .or_else(|| record.get_str("category"))
                 .unwrap_or_default()
                 .to_string(),
-            project_time_category: non_empty_string(record.get_str("project_time_category")),
+            project_time_category: non_empty_owned(record.get_str("project_time_category")),
             hours: DAY_FIELDS.map(|field| raw_or_display(record, field).unwrap_or("0").to_string()),
             total: raw_or_display(record, "total")
                 .unwrap_or_default()
@@ -369,8 +370,8 @@ pub(crate) fn user_ref_from_record_field(record: &Record, field_name: &str) -> R
         })?;
     Ok(UserRef {
         sys_id: reference.sys_id.clone(),
-        user_name: non_empty_string(record.get_str(&format!("{field_name}.user_name"))),
-        email: non_empty_string(record.get_str(&format!("{field_name}.email"))),
+        user_name: non_empty_owned(record.get_str(&format!("{field_name}.user_name"))),
+        email: non_empty_owned(record.get_str(&format!("{field_name}.email"))),
         display: first_non_empty([
             Some(reference.display.as_str()),
             record.get_str(&format!("{field_name}.name")),
@@ -404,13 +405,6 @@ fn raw_or_display<'a>(record: &'a Record, field: &str) -> Option<&'a str> {
         .get_raw(field)
         .or_else(|| record.get_display(field))
         .or_else(|| record.get_str(field))
-}
-
-fn non_empty_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {

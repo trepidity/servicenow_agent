@@ -19,6 +19,20 @@ use crate::convert::{
 use crate::vault::VaultDocument;
 use crate::{JournalEntry, RecordRef, Reference, SnowRecord, normalize_knowledge_article};
 
+/// Trims a borrowed string and returns it as an owned `Option<String>`,
+/// dropping `None` and whitespace-only inputs.
+///
+/// This is the canonical crate-internal "trim to optional owned string" helper.
+/// It collapses several previously-duplicated copies (`non_empty_string`) that
+/// all shared identical semantics: map `Option<&str>` → trim → drop empty →
+/// own. Callers that hold an owned `String` can pass `Some(value.as_str())`.
+pub(crate) fn non_empty_owned(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 /// Checks if a state label represents a terminal (closed/completed) state.
 pub(crate) fn is_terminal_state(label: Option<&str>) -> bool {
     let Some(label) = label else {

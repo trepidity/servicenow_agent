@@ -1293,13 +1293,6 @@ fn parse_servicenow_date(value: Option<&str>) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }
 
-fn non_empty_owned(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 fn apply_reference_name_or_sys_id_filter(
     query: TableApi,
     field: &str,
@@ -1356,6 +1349,35 @@ fn roll_up_business_application_summary(
     }
 }
 
+/// Result of a single side-effect-free relationship-direction read.
+///
+/// Carries the collected `cmdb_rel_ci` rows plus the flags the merge step needs
+/// to update the shared traversal accounting. Keeping this separate from
+/// `summary`/`diagnostics` is what lets the two directions run concurrently:
+/// neither read touches shared state, and the merge applies side effects in a
+/// deterministic order.
+struct BusinessApplicationDirectionRead {
+    /// The `parent`/`child` field this read traversed (used for diagnostics).
+    field: &'static str,
+    /// Collected edge rows, already bounded to the per-read `remaining` budget.
+    records: Vec<Record>,
+    /// Set when the read consumed its budget while more pages remained.
+    edge_limit_reached: bool,
+    /// Set when a 401/403 ACL error stopped the read.
+    acl_restricted: bool,
+}
+
+impl BusinessApplicationDirectionRead {
+    fn new(field: &'static str) -> Self {
+        Self {
+            field,
+            records: Vec::new(),
+            edge_limit_reached: false,
+            acl_restricted: false,
+        }
+    }
+}
+
 impl BusinessApplicationRelationshipEdge {
     fn key(&self) -> (String, String, String, Option<String>) {
         (
@@ -1387,17 +1409,19 @@ impl BusinessApplicationRelationshipEdge {
         }
     }
 
+    /// Build a path edge for the route bookkeeping. The traversal endpoints
+    /// (`from`/`to`) are NOT stored: they are derived on demand from
+    /// `parent_sys_id`/`child_sys_id`/`direction` via
+    /// [`BusinessApplicationServerPathEdge::from_sys_id`] /
+    /// [`BusinessApplicationServerPathEdge::to_sys_id`], so the caller need only
+    /// supply the BFS `direction` it crossed the edge in.
     fn path_edge(
         &self,
         depth: usize,
-        from_sys_id: String,
-        to_sys_id: String,
         direction: BusinessApplicationRelationshipDirection,
     ) -> BusinessApplicationServerPathEdge {
         BusinessApplicationServerPathEdge {
             depth,
-            from_sys_id,
-            to_sys_id,
             parent_sys_id: self.parent_sys_id.clone(),
             child_sys_id: self.child_sys_id.clone(),
             direction,
@@ -1444,10 +1468,10 @@ fn business_application_relationship_edge_from_record(
 fn chain_node_sys_ids(chain: &[BusinessApplicationServerPathEdge]) -> HashSet<String> {
     let mut nodes = HashSet::new();
     if let Some(first) = chain.first() {
-        nodes.insert(first.from_sys_id.clone());
+        nodes.insert(first.from_sys_id().to_string());
     }
     for edge in chain {
-        nodes.insert(edge.to_sys_id.clone());
+        nodes.insert(edge.to_sys_id().to_string());
     }
     nodes
 }
@@ -1542,7 +1566,6 @@ fn emit_alternate_server_path(
     while entry.len() < chains.len() {
         let chain = &chains[entry.len()];
         entry.push(BusinessApplicationServerPath {
-            depth: chain.len(),
             edges: chain.clone(),
         });
     }
@@ -2459,6 +2482,11 @@ impl SnowCore {
         let mut servers_by_sys_id: BTreeMap<String, Server> = BTreeMap::new();
         let mut server_paths: BTreeMap<String, Vec<BusinessApplicationServerPath>> =
             BTreeMap::new();
+        // Per-traversal memo of the hierarchy-backed server-class decision, keyed
+        // by `sys_class_name`. The cheap sync checks never reach here; this only
+        // caches the result of the `sys_db_object` super_class descent so the same
+        // unrecognized class is not re-queried across BFS levels.
+        let mut server_class_cache: HashMap<String, bool> = HashMap::new();
 
         for depth in 1..=options.max_depth {
             if frontier.is_empty() || summary.edge_limit_reached || summary.ci_limit_reached {
@@ -2539,12 +2567,7 @@ impl SnowCore {
                     } else if options.include_paths {
                         // Record the alternate route(s) into the adjacent CI by
                         // extending each of the current CI's chains with this edge.
-                        let edge = relationship.path_edge(
-                            depth,
-                            current_sys_id.clone(),
-                            adjacent_sys_id.clone(),
-                            direction.clone(),
-                        );
+                        let edge = relationship.path_edge(depth, direction.clone());
                         extend_path_chains(
                             &mut paths_by_ci,
                             &current_sys_id,
@@ -2588,12 +2611,7 @@ impl SnowCore {
                 }
 
                 visited.insert(adjacent_sys_id.clone());
-                let edge = relationship.path_edge(
-                    depth,
-                    current_sys_id.clone(),
-                    adjacent_sys_id.clone(),
-                    direction,
-                );
+                let edge = relationship.path_edge(depth, direction);
                 // First discovery: seed the adjacent CI's routes from the current
                 // CI's routes extended by this edge.
                 extend_path_chains(&mut paths_by_ci, &current_sys_id, &adjacent_sys_id, edge);
@@ -2611,13 +2629,24 @@ impl SnowCore {
             let mut server_ids = Vec::new();
             let mut next_frontier = Vec::new();
             for sys_id in newly_seen {
-                let Some(class_name) = ci_classes.get(&sys_id) else {
+                let Some(class_name) = ci_classes.get(&sys_id).cloned() else {
                     continue;
                 };
                 // Hierarchy-aware classification: any descendant of
                 // `cmdb_ci_server` (not just the narrow alias list) is collected
-                // as a server. Non-server CIs continue into the next BFS frontier.
-                if is_server_class(class_name) {
+                // as a server. Cheap exact/alias/naming checks run first (no
+                // network); only genuinely unrecognized classes fall back to the
+                // metadata-backed super_class descent. Non-server CIs continue
+                // into the next BFS frontier.
+                let is_server = self
+                    .business_application_class_is_server(
+                        &class_name,
+                        &mut server_class_cache,
+                        &mut summary,
+                        &mut diagnostics,
+                    )
+                    .await?;
+                if is_server {
                     server_ids.push(sys_id);
                 } else {
                     next_frontier.push(sys_id);
@@ -2641,7 +2670,6 @@ impl SnowCore {
                     let entry = server_paths.entry(sys_id.clone()).or_default();
                     for chain in chains {
                         entry.push(BusinessApplicationServerPath {
-                            depth: chain.len(),
                             edges: chain.clone(),
                         });
                     }
@@ -2819,25 +2847,44 @@ impl SnowCore {
         summary: &mut BusinessApplicationServersSummary,
         diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
     ) -> Result<Vec<BusinessApplicationRelationshipEdge>> {
+        // The remaining `max_edges` budget for THIS level is fixed up front from
+        // the current running total. Both directions (parent + child) are
+        // independent remote reads, so we issue them concurrently. Each reader is
+        // bounded by the full `remaining` budget (so neither direction alone can
+        // exceed the level budget), then we MERGE deterministically below in a
+        // fixed parent-then-child order. The merge — not the concurrent reads —
+        // owns the shared `summary`/`max_edges` accounting, so the result is
+        // identical to the previous sequential version and reproducible.
+        if frontier.is_empty() || summary.edge_limit_reached {
+            return Ok(Vec::new());
+        }
+        let remaining = options
+            .max_edges
+            .saturating_sub(summary.relationships_examined);
+        if remaining == 0 {
+            mark_business_application_edge_limit(summary, diagnostics);
+            return Ok(Vec::new());
+        }
+
+        let (parent_read, child_read) = tokio::try_join!(
+            self.business_application_relationship_direction_read("parent", frontier, remaining),
+            self.business_application_relationship_direction_read("child", frontier, remaining),
+        )?;
+
+        // Merge in a stable order: parent first, then child. Parent consumes the
+        // shared budget first (exactly as the old sequential code did), and the
+        // child's contribution is then capped to whatever budget the parent left.
         let mut records = Vec::new();
-        self.business_application_relationship_direction(
-            "parent",
-            frontier,
-            options,
-            summary,
-            diagnostics,
-            &mut records,
-        )
-        .await?;
-        self.business_application_relationship_direction(
-            "child",
-            frontier,
-            options,
-            summary,
-            diagnostics,
-            &mut records,
-        )
-        .await?;
+        let mut budget = remaining;
+        for read in [parent_read, child_read] {
+            budget = self.merge_business_application_direction_read(
+                read,
+                budget,
+                summary,
+                diagnostics,
+                &mut records,
+            );
+        }
 
         let mut edges = Vec::new();
         let mut seen = HashSet::new();
@@ -2854,24 +2901,74 @@ impl SnowCore {
         Ok(edges)
     }
 
-    async fn business_application_relationship_direction(
+    /// Folds one direction's read result into the shared traversal accounting and
+    /// returns the budget remaining for the next direction.
+    ///
+    /// This is the single place that mutates `summary`/`diagnostics` for the edge
+    /// read, so the two concurrent direction reads stay side-effect-free and the
+    /// budget is consumed in a deterministic order. The direction's collected rows
+    /// are truncated to `budget`; if that truncation drops rows, or the read
+    /// itself was truncated by its own bound while pages remained, the shared
+    /// `edge_limit_reached` flag is set. ACL failures are surfaced exactly once
+    /// per direction.
+    fn merge_business_application_direction_read(
         &self,
-        field: &str,
-        frontier: &[String],
-        options: &BusinessApplicationServersOptions,
+        read: BusinessApplicationDirectionRead,
+        budget: usize,
         summary: &mut BusinessApplicationServersSummary,
         diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
         records: &mut Vec<Record>,
-    ) -> Result<()> {
-        if frontier.is_empty() || summary.edge_limit_reached {
-            return Ok(());
+    ) -> usize {
+        if read.acl_restricted {
+            summary.acl_restricted_count += 1;
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                read.field,
+                CMDB_REL_CI_TABLE,
+                "",
+                ReferenceResolutionReason::ReferenceAclRestricted,
+                "ACL restricted cmdb_rel_ci traversal",
+            );
         }
-        let remaining = options
-            .max_edges
-            .saturating_sub(summary.relationships_examined);
-        if remaining == 0 {
+
+        let mut rows = read.records;
+        // Cap this direction's rows at the budget left after the prior direction.
+        let over_budget = rows.len() > budget;
+        if over_budget {
+            rows.truncate(budget);
             mark_business_application_edge_limit(summary, diagnostics);
-            return Ok(());
+        } else if read.edge_limit_reached {
+            // The direction read consumed its own bound while pages remained; this
+            // is a genuine truncation that survives the merge.
+            mark_business_application_edge_limit(summary, diagnostics);
+        }
+
+        let consumed = rows.len();
+        summary.relationships_examined += consumed;
+        records.extend(rows);
+        budget.saturating_sub(consumed)
+    }
+
+    /// Reads one relationship direction (`parent` or `child`) of the `cmdb_rel_ci`
+    /// edges for the current frontier, bounded by `remaining` edges.
+    ///
+    /// This is a PURE read: it issues remote requests and returns the collected
+    /// rows plus truncation/ACL flags, but mutates no shared traversal state. That
+    /// lets the two directions run concurrently; all `summary`/`diagnostics`
+    /// accounting is applied afterwards by
+    /// [`Self::merge_business_application_direction_read`] in a deterministic
+    /// order. The read stops once `remaining` rows are collected (flagging
+    /// `edge_limit_reached` if pages still remain) or the result set is exhausted.
+    async fn business_application_relationship_direction_read(
+        &self,
+        field: &'static str,
+        frontier: &[String],
+        remaining: usize,
+    ) -> Result<BusinessApplicationDirectionRead> {
+        let mut read = BusinessApplicationDirectionRead::new(field);
+        if frontier.is_empty() || remaining == 0 {
+            return Ok(read);
         }
 
         let frontier_refs = frontier.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2881,7 +2978,7 @@ impl SnowCore {
         // `glide.rest.table.max_record_count`, returning FEWER rows than exist
         // with no signal — edges would then vanish and `edge_limit_reached` would
         // stay false. The paginator walks pages until the result set is exhausted
-        // or the `max_edges` budget (`remaining`) is consumed.
+        // or the `remaining` budget is consumed.
         let page_size = BUSINESS_APPLICATION_RELATIONSHIP_PAGE_SIZE.min(remaining.max(1));
         let mut paginator = self
             .client
@@ -2898,9 +2995,9 @@ impl SnowCore {
         loop {
             if collected >= remaining {
                 // Budget exhausted but the paginator may still have pages: this is
-                // a genuine truncation, surface it.
+                // a genuine truncation, surface it via the flag for the merge step.
                 if !paginator.is_done() {
-                    mark_business_application_edge_limit(summary, diagnostics);
+                    read.edge_limit_reached = true;
                 }
                 break;
             }
@@ -2908,17 +3005,8 @@ impl SnowCore {
                 Ok(Some(page)) => page,
                 Ok(None) => break,
                 Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
-                    summary.acl_restricted_count += 1;
-                    push_business_application_server_diagnostic(
-                        summary,
-                        diagnostics,
-                        field,
-                        CMDB_REL_CI_TABLE,
-                        "",
-                        ReferenceResolutionReason::ReferenceAclRestricted,
-                        "ACL restricted cmdb_rel_ci traversal",
-                    );
-                    return Ok(());
+                    read.acl_restricted = true;
+                    return Ok(read);
                 }
                 Err(err) => return Err(err.into()),
             };
@@ -2929,16 +3017,73 @@ impl SnowCore {
             let over_budget = rows.len() > room;
             if over_budget {
                 rows.truncate(room);
-                mark_business_application_edge_limit(summary, diagnostics);
+                read.edge_limit_reached = true;
             }
             collected += rows.len();
-            summary.relationships_examined += rows.len();
-            records.extend(rows);
+            read.records.extend(rows);
             if over_budget {
                 break;
             }
         }
-        Ok(())
+        Ok(read)
+    }
+
+    /// Decide whether a CMDB `sys_class_name` is a server, hierarchy-aware.
+    ///
+    /// Detection is layered cheapest-first:
+    /// 1. The sync [`is_server_class`] heuristic (base table, known OOTB
+    ///    subclasses, and the `cmdb_ci_*_server` naming convention) — no network.
+    /// 2. For classes that pass none of those (instance-custom server subclasses
+    ///    whose table name does NOT end in `_server`), a metadata-backed descent:
+    ///    walk the `sys_db_object` `super_class` chain via [`Self::table_ancestors`]
+    ///    and treat the class as a server iff `cmdb_ci_server` is an ancestor.
+    ///
+    /// The hierarchy result is memoized per `sys_class_name` in `server_class_cache`
+    /// so the same unrecognized class is queried at most once per traversal.
+    ///
+    /// Degradation: if the metadata walk fails (e.g. ACL/network), the failure is
+    /// surfaced as a `DictionaryUnavailable` diagnostic (never silent) and the
+    /// class is treated as a NON-server. That is the non-destructive choice — the
+    /// CI continues into the BFS frontier so its subtree is still explored, rather
+    /// than being pruned as a leaf server. A class only reaches this fallback after
+    /// failing every server-naming heuristic, so it is unlikely to be a server; and
+    /// the negative cache entry stops repeated failing queries within the traversal.
+    async fn business_application_class_is_server(
+        &self,
+        class_name: &str,
+        server_class_cache: &mut HashMap<String, bool>,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    ) -> Result<bool> {
+        // Cheap, network-free checks first.
+        if is_server_class(class_name) {
+            return Ok(true);
+        }
+
+        if let Some(cached) = server_class_cache.get(class_name) {
+            return Ok(*cached);
+        }
+
+        // Metadata-backed super_class descent for unrecognized classes.
+        let is_server = match self.table_ancestors(class_name).await {
+            Ok(ancestors) => ancestors.iter().any(|ancestor| ancestor == SERVER_TABLE),
+            Err(_) => {
+                // Degrade without failing the traversal: surface the metadata gap
+                // and fall back to NON-server (continue traversing through the CI).
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    "sys_class_name",
+                    "sys_db_object",
+                    "",
+                    ReferenceResolutionReason::DictionaryUnavailable,
+                    "sys_db_object super_class lookup failed; class not classified as server",
+                );
+                false
+            }
+        };
+        server_class_cache.insert(class_name.to_string(), is_server);
+        Ok(is_server)
     }
 
     async fn business_application_hydrate_ci_classes(
@@ -7695,10 +7840,49 @@ mod tests {
         // The two routes go through different branch CIs.
         let mut branches = paths
             .iter()
-            .map(|route| route.edges[0].to_sys_id.clone())
+            .map(|route| route.edges[0].to_sys_id().to_string())
             .collect::<Vec<_>>();
         branches.sort();
         assert_eq!(branches, vec![branch_a.to_string(), branch_b.to_string()]);
+    }
+
+    /// Task #10: the path-edge traversal endpoints are no longer stored — they are
+    /// derived from `parent_sys_id`/`child_sys_id`/`direction`. This pins that the
+    /// derivation matches the old stored semantics for BOTH crossing directions,
+    /// and that a path's depth equals its edge count.
+    #[test]
+    fn business_application_path_edge_derives_endpoints_from_direction() {
+        let parent = "pppppppppppppppppppppppppppppppp";
+        let child = "cccccccccccccccccccccccccccccccc";
+        let rel = BusinessApplicationRelationshipEdge {
+            parent_sys_id: parent.to_string(),
+            child_sys_id: child.to_string(),
+            parent_class: None,
+            child_class: None,
+            relationship_type: BusinessApplicationRelationshipType {
+                value: "dep".to_string(),
+                display_value: None,
+            },
+        };
+
+        // Parent→child crossing: traversal entered at the parent, exited at child.
+        let down = rel.path_edge(1, BusinessApplicationRelationshipDirection::ParentToChild);
+        assert_eq!(down.from_sys_id(), parent);
+        assert_eq!(down.to_sys_id(), child);
+
+        // Child→parent crossing: the endpoints flip.
+        let up = rel.path_edge(2, BusinessApplicationRelationshipDirection::ChildToParent);
+        assert_eq!(up.from_sys_id(), child);
+        assert_eq!(up.to_sys_id(), parent);
+
+        // A path's depth/len is exactly its edge count.
+        let path = BusinessApplicationServerPath {
+            edges: vec![down, up],
+        };
+        assert_eq!(path.depth(), 2);
+        assert_eq!(path.len(), 2);
+        assert!(!path.is_empty());
+        assert!(BusinessApplicationServerPath { edges: vec![] }.is_empty());
     }
 
     /// Fix #5: the paginated edge read must surface truncation when the
@@ -7767,6 +7951,90 @@ mod tests {
         );
         assert!(result.relationship_summary.truncated);
         assert_eq!(result.relationship_summary.relationships_examined, 2);
+    }
+
+    /// Task #8 regression: the parent and child directions are read CONCURRENTLY
+    /// but share a single `max_edges` budget that must be consumed in a stable
+    /// parent-then-child order. Here `max_edges = 2`, the parent direction returns
+    /// one edge and the child direction returns two. The merge must credit the
+    /// parent's single edge first, then cap the child's contribution to the one
+    /// remaining unit of budget — yielding exactly two examined edges (never three)
+    /// and flagging truncation. This proves concurrency does not double-count or
+    /// exceed the shared budget, and that the merge order is deterministic.
+    #[tokio::test]
+    async fn business_application_servers_shared_edge_budget_splits_across_directions() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let ci_one = "22222222222222222222222222222222";
+        let ci_two = "33333333333333333333333333333333";
+        let ci_three = "44444444444444444444444444444444";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Parent direction: a single edge. Merged first, it consumes one unit of
+        // the shared budget (max_edges = 2).
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row("99999999999999999999999999999991", app, ci_one, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl")
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Child direction: two edges, but only one unit of budget is left after the
+        // parent merge, so exactly one of these survives the merge truncation.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row("99999999999999999999999999999992", ci_two, app, rel_type, "cmdb_ci_appl", "cmdb_ci_business_app"),
+                    relationship_row("99999999999999999999999999999993", ci_three, app, rel_type, "cmdb_ci_appl", "cmdb_ci_business_app")
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                max_edges: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(
+            result.relationship_summary.relationships_examined, 2,
+            "shared budget must cap combined parent+child edges at max_edges"
+        );
+        assert!(
+            result.relationship_summary.edge_limit_reached,
+            "truncating the child direction at the shared budget sets edge_limit_reached"
+        );
+        assert!(result.relationship_summary.truncated);
     }
 
     /// Fix #4: `max_cis` bounds the CIs examined BEYOND the root BA. With
@@ -7974,6 +8242,128 @@ mod tests {
             result.servers[0].class_name.as_deref(),
             Some("cmdb_ci_esx_server")
         );
+        assert_eq!(result.relationship_summary.servers_found, 1);
+    }
+
+    /// Task #1-deeper: a server subclass whose table name does NOT end in
+    /// `_server` and is in no allowlist (here `cmdb_ci_acme_compute`) is invisible
+    /// to every cheap heuristic. It must still be recognized as a server via the
+    /// metadata-backed `sys_db_object` super_class descent — the class extends
+    /// `cmdb_ci_server`, so walking its ancestry reveals the server base table and
+    /// the CI is collected/hydrated rather than traversed through.
+    #[tokio::test]
+    async fn business_application_servers_detects_custom_subclass_via_hierarchy() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let compute = "77777777777777777777777777777777";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let rel_row = "99999999999999999999999999999991";
+        // sys_id of the cmdb_ci_server class row in sys_db_object.
+        let server_class = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The BA depends on a custom server subclass whose name does not end in
+        // `_server`, so no cheap heuristic classifies it.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row(
+                        rel_row,
+                        app,
+                        compute,
+                        rel_type,
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_acme_compute"
+                    )
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+
+        // super_class descent: cmdb_ci_acme_compute -> (super_class sys_id) ->
+        // cmdb_ci_server, which terminates the walk.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_db_object"))
+            .and(query_param("sysparm_query", "name=cmdb_ci_acme_compute"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "name": "cmdb_ci_acme_compute", "super_class": server_class }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_db_object"))
+            .and(query_param(
+                "sysparm_query",
+                format!("sys_id={server_class}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "name": "cmdb_ci_server" }]
+            })))
+            .mount(&server)
+            .await;
+        // Once cmdb_ci_server becomes the cursor, terminate the walk.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_db_object"))
+            .and(query_param("sysparm_query", "name=cmdb_ci_server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "name": "cmdb_ci_server", "super_class": "" }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Hydration of the recognized server by sys_id against the base table.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{compute}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(compute, "acme-compute-01.example.com", "cmdb_ci_acme_compute")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(
+            result.servers.len(),
+            1,
+            "custom subclass extending cmdb_ci_server must be detected via hierarchy"
+        );
+        assert_eq!(result.servers[0].record.sys_id, compute);
         assert_eq!(result.relationship_summary.servers_found, 1);
     }
 

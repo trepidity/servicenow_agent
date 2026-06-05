@@ -6,6 +6,7 @@ use serde_json::Value;
 use servicenow_rs::prelude::Record;
 
 use super::server::Server;
+use crate::helpers::non_empty_owned;
 use crate::{
     CacheSource, FieldValue, Reference, SnowRecord, normalize_record_lookup_sys_id,
     reference::choose_reference_display_name,
@@ -82,8 +83,8 @@ pub struct BusinessApplicationServersParams {
 
 impl BusinessApplicationServersParams {
     pub fn validate(&self) -> Result<BusinessApplicationServersOptions> {
-        let number = non_empty_string(self.number.as_deref());
-        let sys_id = non_empty_string(self.sys_id.as_deref());
+        let number = non_empty_owned(self.number.as_deref());
+        let sys_id = non_empty_owned(self.sys_id.as_deref());
         match (number, sys_id) {
             (Some(_), Some(_)) => {
                 anyhow::bail!("provide exactly one of `number` or `sys_id`")
@@ -210,7 +211,7 @@ impl From<&BusinessApplication> for BusinessApplicationServerApplication {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BusinessApplicationServersSummary {
     pub max_depth: usize,
     pub max_cis: usize,
@@ -242,23 +243,16 @@ pub struct BusinessApplicationServersSummary {
 }
 
 impl BusinessApplicationServersSummary {
+    /// Build a fresh summary seeded with the traversal bounds. Every count/flag
+    /// starts at its zero/false default; only the configured `max_*` limits carry
+    /// non-default values, so the rest is filled from `Default` to avoid spelling
+    /// out (and risking drift on) every counter by hand.
     pub fn new(options: &BusinessApplicationServersOptions) -> Self {
         Self {
             max_depth: options.max_depth,
             max_cis: options.max_cis,
             max_edges: options.max_edges,
-            servers_found: 0,
-            relationships_examined: 0,
-            cis_examined: 0,
-            depth_limit_reached: false,
-            ci_limit_reached: false,
-            edge_limit_reached: false,
-            truncated: false,
-            truncated_count: 0,
-            acl_restricted_count: 0,
-            missing_ci_count: 0,
-            cycle_count: 0,
-            degraded_reasons: BTreeMap::new(),
+            ..Default::default()
         }
     }
 
@@ -275,22 +269,74 @@ impl BusinessApplicationServersSummary {
     }
 }
 
+/// A single route from the root Business Application to a server, expressed as
+/// an ordered list of traversed edges.
+///
+/// The path length (`depth` in CLI/MCP terms) is always exactly `edges.len()`,
+/// so it is exposed as the [`Self::depth`] method rather than stored — a stored
+/// copy could only ever drift out of sync with the edges it describes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BusinessApplicationServerPath {
-    pub depth: usize,
     #[serde(default)]
     pub edges: Vec<BusinessApplicationServerPathEdge>,
 }
 
+impl BusinessApplicationServerPath {
+    /// Number of edges in this route (equivalently, the BFS depth of the
+    /// server relative to the root Business Application).
+    pub fn depth(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Alias for [`Self::depth`]; the route length is the edge count.
+    pub fn len(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Whether this route has no edges (only the root would have an empty route).
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+}
+
+/// One traversed `cmdb_rel_ci` edge along a [`BusinessApplicationServerPath`].
+///
+/// The edge stores the relationship as its raw CMDB orientation
+/// (`parent_sys_id`/`child_sys_id`) plus the `direction` in which the BFS
+/// crossed it. The traversal endpoints (`from`/`to`) are fully derivable from
+/// those three fields and are therefore exposed as the [`Self::from_sys_id`] /
+/// [`Self::to_sys_id`] accessors instead of being stored redundantly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BusinessApplicationServerPathEdge {
     pub depth: usize,
-    pub from_sys_id: String,
-    pub to_sys_id: String,
     pub parent_sys_id: String,
     pub child_sys_id: String,
     pub direction: BusinessApplicationRelationshipDirection,
     pub relationship_type: BusinessApplicationRelationshipType,
+}
+
+impl BusinessApplicationServerPathEdge {
+    /// The CI the BFS traversal entered this edge FROM.
+    ///
+    /// For a parent→child crossing this is the parent; for a child→parent
+    /// crossing it is the child. Derived from `direction` so it can never
+    /// disagree with the stored CMDB orientation.
+    pub fn from_sys_id(&self) -> &str {
+        match self.direction {
+            BusinessApplicationRelationshipDirection::ParentToChild => &self.parent_sys_id,
+            BusinessApplicationRelationshipDirection::ChildToParent => &self.child_sys_id,
+        }
+    }
+
+    /// The CI the BFS traversal exited this edge TO (the newly reached CI).
+    ///
+    /// The mirror of [`Self::from_sys_id`].
+    pub fn to_sys_id(&self) -> &str {
+        match self.direction {
+            BusinessApplicationRelationshipDirection::ParentToChild => &self.child_sys_id,
+            BusinessApplicationRelationshipDirection::ChildToParent => &self.parent_sys_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,7 +473,7 @@ fn normalize_business_application_number(number: &str) -> Result<String> {
 fn normalized_relationship_types(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
-        let Some(value) = non_empty_string(Some(value)) else {
+        let Some(value) = non_empty_owned(Some(value)) else {
             continue;
         };
         if !out.iter().any(|existing| existing == &value) {
@@ -439,13 +485,6 @@ fn normalized_relationship_types(values: &[String]) -> Vec<String> {
 
 fn normalize_relationship_type_match_value(value: &str) -> String {
     value.trim().to_ascii_lowercase()
-}
-
-fn non_empty_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
