@@ -199,6 +199,45 @@ async fn bridge_forwards_user_lookup() {
 }
 
 #[tokio::test]
+async fn bridge_forwards_business_application_servers_flat_params() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "business_application_servers"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "business_application_servers",
+                "arguments": {
+                    "number": "<APM_NUMBER>",
+                    "max_depth": 2,
+                    "max_cis": 500,
+                    "max_edges": 2000,
+                    "relationship_type": ["<RELATIONSHIP_TYPE>"],
+                    "include_paths": true
+                }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "business_application_servers");
+    assert_eq!(
+        calls[1].1,
+        json!({
+            "number": "<APM_NUMBER>",
+            "max_depth": 2,
+            "max_cis": 500,
+            "max_edges": 2000,
+            "relationship_type": ["<RELATIONSHIP_TYPE>"],
+            "include_paths": true
+        })
+    );
+}
+
+#[tokio::test]
 async fn bridge_forwards_get_work_notes_table_sys_id_lookup() {
     let daemon = MockDaemon::new(contract(&["contract_info", "get_work_notes"]));
     let server = bridge(daemon.clone());

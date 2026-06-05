@@ -42,6 +42,13 @@ async fn representative_read_tool_calls_round_trip() {
         let name = tool["name"].as_str().expect("tool name");
         assert_eq!(tool["read_only"], json!(!is_write_tool(name)));
     }
+    let ba_servers = tools
+        .iter()
+        .find(|tool| tool["name"] == "business_application_servers")
+        .expect("business_application_servers capability");
+    assert_eq!(ba_servers["mode"], json!("read"));
+    assert_eq!(ba_servers["read_only"], json!(true));
+    assert_eq!(ba_servers["requires_confirmation"], json!(false));
 }
 
 #[tokio::test]

@@ -43,13 +43,15 @@ use snow_core::{
 };
 
 use cli::{
-    AttachmentCommand, BusinessAppCommand, Cli, Command, KnowledgeCommand, KnowledgeSearchModeArg,
-    KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand, TimecardCommand,
+    AttachmentCommand, BusinessAppCommand, BusinessAppFilter, Cli, Command, KnowledgeCommand,
+    KnowledgeSearchModeArg, KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand,
+    TimecardCommand,
 };
 use error::SnowError;
 use tui_client::{
     BusinessApplicationQueryArgs, BusinessApplicationQueryFilter, BusinessApplicationQueryPageArgs,
-    BusinessApplicationSyncArgs, DaemonRpcClient, ServerQueryArgs, TuiClient,
+    BusinessApplicationServersArgs, BusinessApplicationSyncArgs, DaemonRpcClient, ServerQueryArgs,
+    TuiClient,
 };
 
 struct AuthContext {
@@ -1533,144 +1535,26 @@ async fn cmd_show_approval_runtime(core: &SnowCore, number: &str) -> Result<(), 
     Ok(())
 }
 
-/// Build daemon query filters by pairing each `--field` with operator values in
-/// command-line order. Clap stores `--contains` and `--eq` in separate vectors,
-/// so mixed operators need the original argv order to preserve the documented
-/// positional pairing contract.
-fn build_business_app_query_filters(
-    fields: Vec<String>,
-    contains: Vec<String>,
-    eq: Vec<String>,
-) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
-    build_business_app_filter_pairs("business-app query", "query", true, fields, contains, eq)
-}
-
-fn build_business_app_export_filters(
-    fields: Vec<String>,
-    contains: Vec<String>,
-    eq: Vec<String>,
-) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
-    build_business_app_filter_pairs("business-app export", "export", false, fields, contains, eq)
-}
-
-fn build_business_app_filter_pairs(
-    command: &str,
-    action: &str,
-    require_field: bool,
-    fields: Vec<String>,
-    contains: Vec<String>,
-    eq: Vec<String>,
-) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
-    let args = std::env::args_os()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    build_business_app_filter_pairs_with_args(
-        command,
-        action,
-        require_field,
-        fields,
-        contains,
-        eq,
-        Some(&args),
-    )
-}
-
-fn build_business_app_filter_pairs_with_args(
-    command: &str,
-    action: &str,
-    require_field: bool,
-    fields: Vec<String>,
-    contains: Vec<String>,
-    eq: Vec<String>,
-    args: Option<&[String]>,
-) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
-    if fields.is_empty() {
-        if require_field {
-            return Err(SnowError::Api(format!(
-                "{command} requires at least one --field"
-            )));
-        }
-        if contains.is_empty() && eq.is_empty() {
-            return Ok(Vec::new());
-        }
-    }
-    let contains_count = contains.len();
-    let eq_count = eq.len();
-
-    // Fallback preserves the historical homogeneous-filter behavior for tests
-    // and non-standard call paths where raw argv is unavailable.
-    let mut operands: Vec<(String, String)> = Vec::new();
-    operands.extend(contains.into_iter().map(|v| ("contains".to_string(), v)));
-    operands.extend(eq.into_iter().map(|v| ("eq".to_string(), v)));
-    if let Some(ordered) = args.and_then(|args| {
-        business_app_filter_operands_from_args(args, action, contains_count, eq_count)
-    }) {
-        operands = ordered;
-    }
-
-    if operands.len() != fields.len() {
-        return Err(SnowError::Api(format!(
-            "{command} needs one operator value per --field (got {} fields, {} operator values)",
-            fields.len(),
-            operands.len()
-        )));
-    }
-
-    Ok(fields
+/// Convert parsed `--filter <field>:<op>:<value>` tokens into the daemon wire
+/// shape, preserving their command-line order.
+///
+/// clap already validated each token (field/operator/value present, operator is
+/// a known token) and preserved the order of the repeated `--filter` argument,
+/// so this is a direct, total mapping with no re-parsing of the raw argv. The
+/// emitted `BusinessApplicationQueryFilter` shape (field + operator + value) is
+/// exactly what the daemon's `BusinessApplicationFieldFilter` expects on the
+/// wire, so this change is transparent to the daemon.
+fn business_app_filters_to_query(
+    filters: Vec<BusinessAppFilter>,
+) -> Vec<BusinessApplicationQueryFilter> {
+    filters
         .into_iter()
-        .zip(operands)
-        .map(
-            |(field, (operator, value))| BusinessApplicationQueryFilter {
-                field,
-                operator,
-                value,
-            },
-        )
-        .collect())
-}
-
-fn business_app_filter_operands_from_args(
-    args: &[String],
-    action: &str,
-    expected_contains: usize,
-    expected_eq: usize,
-) -> Option<Vec<(String, String)>> {
-    if expected_contains == 0 && expected_eq == 0 {
-        return Some(Vec::new());
-    }
-    let mut index = args
-        .windows(2)
-        .position(|window| window[0] == "business-app" && window[1] == action)?
-        + 2;
-    let mut operands = Vec::new();
-    while index < args.len() {
-        let arg = &args[index];
-        if let Some(value) = arg.strip_prefix("--contains=") {
-            operands.push(("contains".to_string(), value.to_string()));
-        } else if arg == "--contains" {
-            index += 1;
-            operands.push(("contains".to_string(), args.get(index)?.clone()));
-        } else if let Some(value) = arg.strip_prefix("--eq=") {
-            operands.push(("eq".to_string(), value.to_string()));
-        } else if arg == "--eq" {
-            index += 1;
-            operands.push(("eq".to_string(), args.get(index)?.clone()));
-        }
-        index += 1;
-    }
-    let contains = operands
-        .iter()
-        .filter(|(operator, _)| operator == "contains")
-        .count();
-    let eq = operands
-        .iter()
-        .filter(|(operator, _)| operator == "eq")
-        .count();
-    if contains == expected_contains && eq == expected_eq {
-        Some(operands)
-    } else {
-        None
-    }
+        .map(|filter| BusinessApplicationQueryFilter {
+            field: filter.field,
+            operator: filter.operator,
+            value: filter.value,
+        })
+        .collect()
 }
 
 async fn cmd_business_app_export_all(
@@ -1713,17 +1597,10 @@ async fn cmd_business_app_export_all(
 
 fn validate_business_app_export_all_options(
     text: Option<&str>,
-    field: &[String],
-    contains: &[String],
-    eq: &[String],
+    filter: &[BusinessAppFilter],
     limit: Option<usize>,
 ) -> Result<(), SnowError> {
-    if text.is_some()
-        || !field.is_empty()
-        || !contains.is_empty()
-        || !eq.is_empty()
-        || limit.is_some()
-    {
+    if text.is_some() || !filter.is_empty() || limit.is_some() {
         return Err(SnowError::Api(
             "business-app export --all accepts only --all, --format, and --output".to_string(),
         ));
@@ -1771,6 +1648,219 @@ async fn cmd_business_app_sync_all(
         );
     }
     Ok(())
+}
+
+fn format_business_application_servers_result(result: &serde_json::Value) -> String {
+    let payload = business_application_servers_payload(result);
+    let summary = payload.get("relationship_summary");
+    let servers = payload
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let server_count = summary
+        .and_then(|summary| json_usize_from_paths(summary, &[&["servers_found"]]))
+        .unwrap_or(servers.len());
+    let max_depth = summary.and_then(|summary| json_display_from_paths(summary, &[&["max_depth"]]));
+    let degraded_reasons = collect_business_application_servers_degraded_reasons(payload);
+
+    let mut out = String::new();
+    let app = payload
+        .get("business_application")
+        .map(format_business_application_servers_root)
+        .unwrap_or_else(|| "-".to_string());
+    let _ = writeln!(out, "Business Application: {app}");
+    let _ = writeln!(out, "Servers found: {server_count}");
+    if let Some(max_depth) = &max_depth {
+        let _ = writeln!(out, "Max depth: {max_depth}");
+    }
+    let _ = writeln!(
+        out,
+        "Completeness: {}",
+        if degraded_reasons.is_empty() {
+            "complete"
+        } else {
+            "partial"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "Degraded: {}",
+        if degraded_reasons.is_empty() {
+            "none".to_string()
+        } else {
+            degraded_reasons.join(", ")
+        }
+    );
+
+    if servers.is_empty() {
+        match max_depth {
+            Some(max_depth) => {
+                let _ = writeln!(
+                    out,
+                    "No associated server CIs found within max depth {max_depth}."
+                );
+            }
+            None => {
+                let _ = writeln!(out, "No associated server CIs found.");
+            }
+        }
+        return out;
+    }
+
+    for server in servers {
+        let name = json_display_from_paths(
+            server,
+            &[
+                &["name"],
+                &["record", "short_description"],
+                &["record", "number"],
+                &["record", "sys_id"],
+                &["sys_id"],
+            ],
+        )
+        .unwrap_or_else(|| "-".to_string());
+        let class_name = json_display_from_paths(server, &[&["class_name"], &["record", "table"]])
+            .unwrap_or_else(|| "-".to_string());
+        let ip_address =
+            json_display_from_paths(server, &[&["ip_address"], &["fields", "ip_address"]])
+                .unwrap_or_else(|| "-".to_string());
+        let status = json_display_from_paths(
+            server,
+            &[
+                &["operational_status"],
+                &["fields", "operational_status"],
+                &["fields", "install_status"],
+            ],
+        )
+        .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(out, "{name}  {class_name}  {ip_address}  {status}");
+    }
+
+    out
+}
+
+fn business_application_servers_payload(result: &serde_json::Value) -> &serde_json::Value {
+    result.get("business_application_servers").unwrap_or(result)
+}
+
+fn format_business_application_servers_root(app: &serde_json::Value) -> String {
+    let number = json_display_from_paths(app, &[&["number"], &["record", "number"]]);
+    let name = json_display_from_paths(app, &[&["name"], &["record", "short_description"]]);
+    match (number, name) {
+        (Some(number), Some(name)) if number != name => format!("{number} {name}"),
+        (Some(number), _) => number,
+        (_, Some(name)) => name,
+        _ => json_display_from_paths(app, &[&["sys_id"], &["record", "sys_id"]])
+            .unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn collect_business_application_servers_degraded_reasons(
+    payload: &serde_json::Value,
+) -> Vec<String> {
+    let mut reasons = BTreeSet::new();
+    if let Some(summary) = payload.get("relationship_summary") {
+        if json_bool(summary, "depth_limit_reached").unwrap_or(false) {
+            reasons.insert("depth_limit_reached".to_string());
+        }
+        if json_bool(summary, "truncated").unwrap_or(false) {
+            reasons.insert("truncated".to_string());
+        }
+        if json_usize(summary, "truncated_count").unwrap_or(0) > 0 {
+            reasons.insert("truncated_count".to_string());
+        }
+        if json_usize(summary, "acl_restricted_count").unwrap_or(0) > 0 {
+            reasons.insert("acl_restricted".to_string());
+        }
+        collect_degraded_reason_values(summary.get("degraded_reasons"), &mut reasons);
+    }
+    if payload
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|diagnostics| !diagnostics.is_empty())
+    {
+        reasons.insert("diagnostics".to_string());
+    }
+    reasons.into_iter().collect()
+}
+
+fn collect_degraded_reason_values(
+    value: Option<&serde_json::Value>,
+    reasons: &mut BTreeSet<String>,
+) {
+    match value {
+        Some(serde_json::Value::Array(values)) => {
+            for value in values {
+                if let Some(reason) = json_display_value(value) {
+                    reasons.insert(reason);
+                }
+            }
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for (key, value) in map {
+                let include = match value {
+                    serde_json::Value::Bool(flag) => *flag,
+                    serde_json::Value::Number(number) => number.as_u64().unwrap_or(0) > 0,
+                    serde_json::Value::String(text) => !text.trim().is_empty(),
+                    serde_json::Value::Array(values) => !values.is_empty(),
+                    serde_json::Value::Object(values) => !values.is_empty(),
+                    serde_json::Value::Null => false,
+                };
+                if include {
+                    reasons.insert(key.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_display_from_paths(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| json_path(value, path).and_then(json_display_value))
+}
+
+fn json_usize_from_paths(value: &serde_json::Value, paths: &[&[&str]]) -> Option<usize> {
+    paths.iter().find_map(|path| {
+        json_path(value, path).and_then(|value| match value {
+            serde_json::Value::Number(number) => number.as_u64().map(|value| value as usize),
+            serde_json::Value::String(text) => text.trim().parse::<usize>().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn json_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+}
+
+fn json_display_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        serde_json::Value::Object(_) => value
+            .get("display_value")
+            .and_then(json_display_value)
+            .or_else(|| value.get("value").and_then(json_display_value))
+            .or_else(|| value.get("display_name").and_then(json_display_value)),
+        _ => None,
+    }
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(serde_json::Value::as_bool)
+}
+
+fn json_usize(value: &serde_json::Value, key: &str) -> Option<usize> {
+    value.get(key).and_then(|value| match value {
+        serde_json::Value::Number(number) => number.as_u64().map(|value| value as usize),
+        serde_json::Value::String(text) => text.trim().parse::<usize>().ok(),
+        _ => None,
+    })
 }
 
 /// Dispatch the `snow business-app` subcommand family over the daemon client.
@@ -1838,13 +1928,16 @@ async fn cmd_business_app(
             Ok(())
         }
         BusinessAppCommand::Query {
-            field,
-            contains,
-            eq,
+            filter,
             limit,
             json,
         } => {
-            let filters = build_business_app_query_filters(field, contains, eq)?;
+            if filter.is_empty() {
+                return Err(SnowError::Api(
+                    "business-app query requires at least one --filter".to_string(),
+                ));
+            }
+            let filters = business_app_filters_to_query(filter);
             let result = client.business_application_query(&filters, limit).await?;
             if json {
                 print_full_dump_or_inline(&result);
@@ -1854,14 +1947,49 @@ async fn cmd_business_app(
             }
             Ok(())
         }
+        BusinessAppCommand::Servers {
+            number,
+            sys_id,
+            max_depth,
+            max_cis,
+            max_edges,
+            relationship_type,
+            include_paths,
+            json,
+        } => {
+            let selector_count = [number.is_some(), sys_id.is_some()]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count();
+            if selector_count != 1 {
+                return Err(SnowError::Api(
+                    "business-app servers requires exactly one of --number or --sys-id".to_string(),
+                ));
+            }
+            let result = client
+                .business_application_servers(BusinessApplicationServersArgs {
+                    number: number.as_deref(),
+                    sys_id: sys_id.as_deref(),
+                    max_depth,
+                    max_cis,
+                    max_edges,
+                    relationship_type: &relationship_type,
+                    include_paths,
+                })
+                .await?;
+            if json {
+                print_full_dump_or_inline(&result);
+            } else {
+                print!("{}", format_business_application_servers_result(&result));
+            }
+            Ok(())
+        }
         BusinessAppCommand::Export {
             all,
             format,
             output,
             text,
-            field,
-            contains,
-            eq,
+            filter,
             limit,
         } => {
             let export_format = match format {
@@ -1876,19 +2004,13 @@ async fn cmd_business_app(
                 }
             };
             if all {
-                validate_business_app_export_all_options(
-                    text.as_deref(),
-                    &field,
-                    &contains,
-                    &eq,
-                    limit,
-                )?;
+                validate_business_app_export_all_options(text.as_deref(), &filter, limit)?;
                 return cmd_business_app_export_all(client, export_format, output).await;
             }
             business_app_export::validate_limit(limit)?;
             business_app_export::validate_output_parent(&output)?;
             business_app_export::validate_text(text.as_deref())?;
-            let filters = build_business_app_export_filters(field, contains, eq)?;
+            let filters = business_app_filters_to_query(filter);
             let result = client
                 .business_application_query_with_args(BusinessApplicationQueryArgs {
                     text: text.as_deref(),
@@ -4209,8 +4331,9 @@ fn config_path(filename: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        KnowledgeStatusSnapshot, ShowTarget, TimecardSelectorShape, business_app_export,
-        classify_show_target, classify_timecard_selector, collect_timecard_updates,
+        BusinessAppFilter, KnowledgeStatusSnapshot, ShowTarget, TimecardSelectorShape,
+        business_app_export, classify_show_target, classify_timecard_selector,
+        collect_timecard_updates, format_business_application_servers_result,
         format_task_sla_status, is_show_sla_alias, load_knowledge_status, load_knowledge_tags,
         normalize_hours, weekday_index,
     };
@@ -4270,6 +4393,87 @@ mod tests {
     }
 
     #[test]
+    fn business_app_servers_human_output_summarizes_complete_result() {
+        let result = serde_json::json!({
+            "business_application": {
+                "sys_id": "<BUSINESS_APP_SYS_ID>",
+                "number": "<APM_NUMBER>",
+                "name": "<BUSINESS_APP_NAME>",
+                "table": "cmdb_ci_business_app"
+            },
+            "servers": [
+                {
+                    "record": {
+                        "sys_id": "<SERVER_SYS_ID>",
+                        "number": "<SERVER_NUMBER>",
+                        "table": "cmdb_ci_linux_server"
+                    },
+                    "name": "<SERVER_NAME>",
+                    "ip_address": "<SERVER_IP>",
+                    "class_name": "cmdb_ci_linux_server",
+                    "operational_status": {
+                        "value": "<STATUS_VALUE>",
+                        "display_value": "<STATUS_DISPLAY>"
+                    }
+                }
+            ],
+            "relationship_summary": {
+                "max_depth": 2,
+                "servers_found": 1,
+                "depth_limit_reached": false,
+                "truncated": false,
+                "truncated_count": 0,
+                "acl_restricted_count": 0,
+                "degraded_reasons": {}
+            }
+        });
+
+        let out = format_business_application_servers_result(&result);
+
+        assert!(out.contains("Business Application: <APM_NUMBER> <BUSINESS_APP_NAME>"));
+        assert!(out.contains("Servers found: 1"));
+        assert!(out.contains("Max depth: 2"));
+        assert!(out.contains("Completeness: complete"));
+        assert!(out.contains("Degraded: none"));
+        assert!(out.contains("<SERVER_NAME>"));
+        assert!(out.contains("cmdb_ci_linux_server"));
+        assert!(out.contains("<SERVER_IP>"));
+        assert!(out.contains("<STATUS_DISPLAY>"));
+    }
+
+    #[test]
+    fn business_app_servers_human_output_surfaces_partial_results() {
+        let result = serde_json::json!({
+            "business_application": {
+                "sys_id": "<BUSINESS_APP_SYS_ID>",
+                "number": "<APM_NUMBER>",
+                "name": "<BUSINESS_APP_NAME>"
+            },
+            "servers": [],
+            "relationship_summary": {
+                "max_depth": 2,
+                "servers_found": 0,
+                "depth_limit_reached": true,
+                "truncated": true,
+                "truncated_count": 1,
+                "acl_restricted_count": 1,
+                "degraded_reasons": {
+                    "reference_acl_restricted": 1
+                }
+            }
+        });
+
+        let out = format_business_application_servers_result(&result);
+
+        assert!(out.contains("Completeness: partial"));
+        assert!(out.contains("depth_limit_reached"));
+        assert!(out.contains("truncated"));
+        assert!(out.contains("acl_restricted"));
+        assert!(out.contains("reference_acl_restricted"));
+        assert!(out.contains("No associated server CIs found within max depth 2."));
+    }
+
+    #[test]
     fn business_app_export_validates_limit_before_query() {
         assert!(business_app_export::validate_limit(None).is_ok());
         assert!(business_app_export::validate_limit(Some(1)).is_ok());
@@ -4293,26 +4497,19 @@ mod tests {
 
     #[test]
     fn business_app_export_all_validation_rejects_bounded_options() {
-        assert!(super::validate_business_app_export_all_options(None, &[], &[], &[], None).is_ok());
+        assert!(super::validate_business_app_export_all_options(None, &[], None).is_ok());
 
-        let field = vec!["name".to_string()];
-        let err = super::validate_business_app_export_all_options(None, &field, &[], &[], None)
-            .expect_err("field should conflict with --all");
+        let filter = vec![BusinessAppFilter {
+            field: "name".to_string(),
+            operator: "contains".to_string(),
+            value: "Example".to_string(),
+        }];
+        let err = super::validate_business_app_export_all_options(None, &filter, None)
+            .expect_err("filter should conflict with --all");
         assert!(err.to_string().contains("accepts only --all"));
 
-        let contains = vec!["Example".to_string()];
-        let err = super::validate_business_app_export_all_options(None, &[], &contains, &[], None)
-            .expect_err("contains should conflict with --all");
-        assert!(err.to_string().contains("accepts only --all"));
-
-        let err = super::validate_business_app_export_all_options(
-            Some("Example"),
-            &[],
-            &[],
-            &[],
-            Some(50),
-        )
-        .expect_err("text/limit should conflict with --all");
+        let err = super::validate_business_app_export_all_options(Some("Example"), &[], Some(50))
+            .expect_err("text/limit should conflict with --all");
         assert!(err.to_string().contains("accepts only --all"));
     }
 
@@ -4414,62 +4611,28 @@ mod tests {
     }
 
     #[test]
-    fn business_app_export_allows_empty_filters_but_rejects_dangling_operands() {
-        let filters = super::build_business_app_export_filters(Vec::new(), Vec::new(), Vec::new())
-            .expect("unfiltered export");
+    fn business_app_filters_to_query_maps_empty_to_empty() {
+        let filters = super::business_app_filters_to_query(Vec::new());
         assert!(filters.is_empty());
-
-        let err = super::build_business_app_export_filters(
-            Vec::new(),
-            vec!["Example".to_string()],
-            Vec::new(),
-        )
-        .expect_err("dangling operator");
-        assert!(err.to_string().contains("one operator value per --field"));
-
-        let filters = super::build_business_app_export_filters(
-            vec!["name".to_string(), "number".to_string()],
-            vec!["Example".to_string()],
-            vec!["EXAMPLE-APP-001".to_string()],
-        )
-        .expect("paired filters");
-        assert_eq!(filters.len(), 2);
-        assert_eq!(filters[0].operator, "contains");
-        assert_eq!(filters[1].operator, "eq");
     }
 
     #[test]
-    fn business_app_filters_preserve_mixed_operator_order_from_args() {
-        let args = [
-            "snow",
-            "business-app",
-            "export",
-            "--format",
-            "json",
-            "--output",
-            "business-apps.json",
-            "--field",
-            "number",
-            "--eq",
-            "EXAMPLE-APP-001",
-            "--field",
-            "name",
-            "--contains",
-            "Example",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        let filters = super::build_business_app_filter_pairs_with_args(
-            "business-app export",
-            "export",
-            false,
-            vec!["number".to_string(), "name".to_string()],
-            vec!["Example".to_string()],
-            vec!["EXAMPLE-APP-001".to_string()],
-            Some(&args),
-        )
-        .expect("ordered filters");
+    fn business_app_filters_to_query_preserves_mixed_operator_order() {
+        // Mixed operators in eq-then-contains order. The conversion is a direct,
+        // order-preserving mapping: clap already fixed the order, so there is no
+        // argv re-read or homogeneous fallback that could mis-pair these.
+        let filters = super::business_app_filters_to_query(vec![
+            BusinessAppFilter {
+                field: "number".to_string(),
+                operator: "eq".to_string(),
+                value: "EXAMPLE-APP-001".to_string(),
+            },
+            BusinessAppFilter {
+                field: "name".to_string(),
+                operator: "contains".to_string(),
+                value: "Example".to_string(),
+            },
+        ]);
 
         assert_eq!(filters[0].field, "number");
         assert_eq!(filters[0].operator, "eq");

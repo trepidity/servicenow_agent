@@ -45,6 +45,10 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("business_application_get", "business_application_get"),
     ("business_application_search", "business_application_search"),
     ("business_application_query", "business_application_query"),
+    (
+        "business_application_servers",
+        "business_application_servers",
+    ),
     ("business_application_fields", "business_application_fields"),
     ("server_get", "server_get"),
     ("server_search", "server_search"),

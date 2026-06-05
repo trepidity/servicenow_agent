@@ -80,6 +80,7 @@ pub enum RpcMethod {
     BusinessApplicationGetFresh,
     BusinessApplicationSearch,
     BusinessApplicationQuery,
+    BusinessApplicationServers,
     BusinessApplicationSync,
     BusinessApplicationFields,
     ServerGet,
@@ -188,6 +189,7 @@ impl RpcMethod {
             "business_application_get_fresh" => Self::BusinessApplicationGetFresh,
             "business_application_search" => Self::BusinessApplicationSearch,
             "business_application_query" => Self::BusinessApplicationQuery,
+            "business_application_servers" => Self::BusinessApplicationServers,
             "business_application_sync" => Self::BusinessApplicationSync,
             "business_application_fields" => Self::BusinessApplicationFields,
             "server_get" => Self::ServerGet,
@@ -843,6 +845,25 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                     }
                     Err(err) => internal_error(id, err),
                 },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationServers => {
+            match extract_business_application_servers_params(&request.params) {
+                Ok(params) => {
+                    match business_application_servers(state.core.as_ref(), &transport, params)
+                        .await
+                    {
+                        Ok(Some(result)) => JsonRpcResponse::ok(id, result),
+                        Ok(None) => JsonRpcResponse::error(
+                            id,
+                            -32004,
+                            "business application not found",
+                            None,
+                        ),
+                        Err(err) => internal_error(id, err),
+                    }
+                }
                 Err(err) => invalid_params(id, err),
             }
         }
@@ -1567,6 +1588,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_get_fresh",
     "business_application_search",
     "business_application_query",
+    "business_application_servers",
     "business_application_sync",
     "business_application_fields",
     "server_get",
@@ -2060,6 +2082,25 @@ struct BusinessApplicationQueryParams {
     sort: Vec<BusinessApplicationSortField>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+struct BusinessApplicationServersParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sys_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_cis: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_edges: Option<usize>,
+    #[serde(default)]
+    relationship_type: Vec<String>,
+    #[serde(default)]
+    include_paths: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct BusinessApplicationFieldFilter {
     field: String,
@@ -2135,6 +2176,29 @@ fn default_true() -> bool {
 
 fn default_reference_depth() -> usize {
     1
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_optional_limit(
+    value: Option<usize>,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<()> {
+    if let Some(value) = value {
+        if value < minimum {
+            return Err(anyhow!("`{field}` must be at least {minimum}"));
+        }
+        if value > maximum {
+            return Err(anyhow!("`{field}` must be at most {maximum}"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2312,6 +2376,54 @@ fn extract_business_application_query_params(
     Ok(query)
 }
 
+fn extract_business_application_servers_params(
+    params: &Value,
+) -> Result<BusinessApplicationServersParams> {
+    let mut params: BusinessApplicationServersParams = serde_json::from_value(params.clone())?;
+
+    params.number = normalize_optional_string(params.number);
+    params.sys_id = match normalize_optional_string(params.sys_id) {
+        Some(sys_id) => Some(snow_core::normalize_record_lookup_sys_id(&sys_id)?),
+        None => None,
+    };
+
+    match (params.number.as_deref(), params.sys_id.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("provide exactly one of `number` or `sys_id`"));
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "missing required lookup: provide `number` or `sys_id`"
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(number) = params.number.as_deref()
+        && number.trim_start().starts_with("BA:")
+    {
+        return Err(anyhow!(
+            "`number` must be a real Business Application number, not a local BA:<sys_id> fallback"
+        ));
+    }
+
+    validate_optional_limit(params.max_depth, "max_depth", 1, 4)?;
+    validate_optional_limit(params.max_cis, "max_cis", 1, 5000)?;
+    validate_optional_limit(params.max_edges, "max_edges", 1, 20000)?;
+
+    let mut relationship_type = Vec::with_capacity(params.relationship_type.len());
+    for value in params.relationship_type {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow!("`relationship_type` values must not be empty"));
+        }
+        relationship_type.push(value.to_string());
+    }
+    params.relationship_type = relationship_type;
+
+    Ok(params)
+}
+
 fn extract_business_application_fields_params(
     params: &Value,
 ) -> Result<BusinessApplicationFieldsParams> {
@@ -2470,6 +2582,46 @@ fn core_field_operator(op: &str) -> Result<snow_core::query::filter::FieldOperat
             ));
         }
     })
+}
+
+async fn business_application_servers(
+    core: &SnowCore,
+    transport: &DaemonTransport<'_>,
+    params: BusinessApplicationServersParams,
+) -> Result<Option<Value>> {
+    let Some(result) = core
+        .business_application_servers(core_business_application_servers_params(params))
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let mut servers = Vec::with_capacity(result.servers.len());
+    for server in result.servers {
+        servers.push(transport.server(&server.record)?);
+    }
+
+    Ok(Some(json!({
+        "business_application": result.business_application,
+        "servers": servers,
+        "relationship_summary": result.relationship_summary,
+        "diagnostics": result.diagnostics,
+        "server_paths": result.server_paths,
+    })))
+}
+
+fn core_business_application_servers_params(
+    params: BusinessApplicationServersParams,
+) -> snow_core::BusinessApplicationServersParams {
+    snow_core::BusinessApplicationServersParams {
+        number: params.number,
+        sys_id: params.sys_id,
+        max_depth: params.max_depth,
+        max_cis: params.max_cis,
+        max_edges: params.max_edges,
+        relationship_type: params.relationship_type,
+        include_paths: params.include_paths,
+    }
 }
 
 async fn business_application_fields(
@@ -2921,6 +3073,10 @@ mod tests {
             RpcMethod::BusinessApplicationQuery
         );
         assert_eq!(
+            RpcMethod::from_method("business_application_servers"),
+            RpcMethod::BusinessApplicationServers
+        );
+        assert_eq!(
             RpcMethod::from_method("business_application_sync"),
             RpcMethod::BusinessApplicationSync
         );
@@ -3122,6 +3278,36 @@ mod tests {
         assert_eq!(error.code, -32040);
         assert_eq!(error.message, "policy denied");
         assert_eq!(error.data.unwrap()["tool"], json!("approval_approve"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn business_application_servers_dispatch_validates_selector_before_traversal() {
+        let fixture = build_fixture_state().await.expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "business_application_servers".to_string(),
+                params: json!({
+                    "number": "<APM_NUMBER>",
+                    "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0"
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let error = response.error.expect("mixed selector should be rejected");
+        assert_eq!(error.code, -32602);
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("details"))
+                .and_then(Value::as_str)
+                .is_some_and(|details| details.contains("exactly one"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3763,6 +3949,59 @@ story_board_id = "board-sys"
         assert_eq!(query.limit, Some(500));
         assert_eq!(query.offset, Some(1000));
         assert_eq!(query.filters.len(), 1);
+    }
+
+    #[test]
+    fn business_application_servers_params_validate_flat_selectors_and_limits() {
+        let params = extract_business_application_servers_params(&json!({
+            "number": " <APM_NUMBER> ",
+            "max_depth": 2,
+            "max_cis": 500,
+            "max_edges": 2000,
+            "relationship_type": [" Depends on::Used by "],
+            "include_paths": true
+        }))
+        .expect("business application servers params");
+
+        assert_eq!(params.number.as_deref(), Some("<APM_NUMBER>"));
+        assert_eq!(params.sys_id, None);
+        assert_eq!(params.max_depth, Some(2));
+        assert_eq!(params.max_cis, Some(500));
+        assert_eq!(params.max_edges, Some(2000));
+        assert_eq!(params.relationship_type, vec!["Depends on::Used by"]);
+        assert!(params.include_paths);
+
+        let params = extract_business_application_servers_params(&json!({
+            "sys_id": "54A4B61B6FE845000ED852A03F3EE4D0"
+        }))
+        .expect("sys_id lookup");
+        assert_eq!(
+            params.sys_id.as_deref(),
+            Some("54a4b61b6fe845000ed852a03f3ee4d0")
+        );
+    }
+
+    #[test]
+    fn business_application_servers_params_reject_invalid_shapes() {
+        for params in [
+            json!({}),
+            json!({ "number": "<APM_NUMBER>", "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0" }),
+            json!({ "number": "BA:54a4b61b6fe845000ed852a03f3ee4d0" }),
+            json!({ "sys_id": "54a4b61b6fe845000ed852a03f3ee4d" }),
+            json!({ "number": "<APM_NUMBER>", "max_depth": 0 }),
+            json!({ "number": "<APM_NUMBER>", "max_depth": 5 }),
+            json!({ "number": "<APM_NUMBER>", "max_cis": 0 }),
+            json!({ "number": "<APM_NUMBER>", "max_cis": 5001 }),
+            json!({ "number": "<APM_NUMBER>", "max_edges": 0 }),
+            json!({ "number": "<APM_NUMBER>", "max_edges": 20001 }),
+            json!({ "number": "<APM_NUMBER>", "relationship_type": [""] }),
+            json!({ "number": "<APM_NUMBER>", "unexpected": true }),
+        ] {
+            assert!(
+                extract_business_application_servers_params(&params).is_err(),
+                "accepted invalid params: {params}"
+            );
+        }
     }
 
     #[test]

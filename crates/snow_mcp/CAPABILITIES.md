@@ -80,7 +80,8 @@ work_record_ttl = "60m"
 ```
 
 - **Records:** `get_record`, `search_records`, `user_lookup`, `user_search`, `business_application_get`,
-  `business_application_search`, `business_application_query`, `business_application_fields`,
+  `business_application_search`, `business_application_query`, `business_application_servers`,
+  `business_application_fields`,
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`
@@ -126,8 +127,8 @@ They are **read-only** and enabled by default.
 ## Business Applications (read-only primitive)
 
 Business Applications (`cmdb_ci_business_app`) are a first-class local primitive
-with four **read-only** MCP tools. None mutate ServiceNow — there is **no
-create/update/delete/retire surface**. All four are **enabled by default** (they
+with five **read-only** MCP tools. None mutate ServiceNow — there is **no
+create/update/delete/retire surface**. All five are **enabled by default** (they
 are read tools) and are included in the `read_only_agent` role allow-list in
 [`policy.example.toml`](./policy.example.toml).
 
@@ -136,6 +137,7 @@ are read tools) and are included in the `read_only_agent` role allow-list in
 | `business_application_get` | Fetch one Business Application by `sys_id` or exact `name` | No (serves the local cache/vault) | n/a — reads local |
 | `business_application_search` | Live query `cmdb_ci_business_app` by name/owner/group/portfolio/state | Yes | Yes, by default |
 | `business_application_query` | Local SQLite query/filter/sort across **all** projected BA fields, including APM `number` values | No | n/a — reads local |
+| `business_application_servers` | Bounded, class-hierarchy-aware CMDB relationship traversal from one Business Application to associated Server CIs (any class extending `cmdb_ci_server`) | Yes | No required cache mutation |
 | `business_application_fields` | List dictionary-enriched BA field metadata merged with per-field observed counts (`refresh_dictionary` triggers a live `sys_dictionary` fetch) | Only when `refresh_dictionary=true` | n/a — reads local |
 
 Hydration behavior (search and the daemon `*_get_fresh` path): full-row fetch (no
@@ -203,6 +205,69 @@ custom fields are queryable.
   `ci_owner_group`, `primary_support_group`, `operational_state`,
   `primary_portfolio`).
 - **Returns:** `{ "business_applications": [<BA>...] }`.
+
+### `business_application_servers`
+
+Reads Server CIs associated with one Business Application through bounded CMDB
+relationship traversal. The MCP schema stays flat; runtime validation enforces
+the selector XOR because top-level schema composition is not allowed.
+
+**Server detection is class-hierarchy aware.** The traversal does not rely on a
+narrow three-table allowlist. Any CMDB class that extends the base `cmdb_ci_server`
+table is collected as a server — the canonical `cmdb_ci_server`,
+`cmdb_ci_linux_server`, and `cmdb_ci_win_server` tables, the known baseline
+subclasses (`cmdb_ci_esx_server`, `cmdb_ci_aix_server`, `cmdb_ci_solaris_server`,
+…), and the long tail of instance-specific subclasses recognized by the
+structural `cmdb_ci_*_server` naming convention. (See
+`snow_core::resource::server::is_server_class`.) Hydration then reads the matched
+CIs against the base `cmdb_ci_server` table by `sys_id`, so a non-server CI that
+slips through the name heuristic is simply not returned (recorded as a missing
+CI) rather than corrupting results.
+
+- **Params:** `number` (Business Application number such as `<APM_NUMBER>`) **xor**
+  `sys_id` (32-hex `cmdb_ci_business_app` sys_id); optional `max_depth`
+  (`1`-`4`, default `2`), `max_cis` (`1`-`5000`, default `500`), `max_edges`
+  (`1`-`20000`, default `2000`), `relationship_type[]`, and `include_paths`
+  (default `false`). `number` must be a real Business Application number, not a
+  local `BA:<sys_id>` fallback. The documented bounds and defaults match the
+  `snow_core` constants `BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_*` /
+  `BUSINESS_APPLICATION_SERVERS_MAX_*`.
+- **`max_cis` semantics:** bounds the number of CIs examined **beyond** the root
+  Business Application. The root BA is **excluded** from the budget, so a caller
+  passing `max_cis = N` may examine up to `N` non-root CIs before traversal
+  truncates (and sets `ci_limit_reached`).
+- **`max_edges` semantics:** bounds the total number of `cmdb_rel_ci` relationship
+  edges examined across the whole traversal. Edge reads are **paginated**
+  (page size 1000) and continue across pages until the `max_edges` budget is
+  consumed or the result set is exhausted, so large graphs are not silently
+  undercounted by a single server-capped request. Hitting the budget with pages
+  remaining sets `edge_limit_reached`.
+- **`relationship_type[]`:** allowlist of CMDB relationship types that gate which
+  edges are traversed. Each entry may be a `cmdb_rel_type` name or sys_id.
+  - **Omitted / empty list (the default through this tool):** the default set
+    (`Depends on::Used by`, `Runs on::Runs`, `Contains::Contained by`,
+    `Hosted on::Hosts`) is used and resolved once to **stable `cmdb_rel_type`
+    sys_id identities** before traversal, so edges are matched by identity rather
+    than by mutable/localizable display label. If `cmdb_rel_type` resolution
+    fails or is ACL-restricted, matching falls back to the default label strings
+    (no worse than prior label-only matching).
+  - **Explicit non-empty list:** used verbatim; each value is matched against both
+    the edge's raw relationship value and its display label.
+- **`include_paths`:** when `true`, the result adds `server_paths`, a map of
+  server `sys_id` → the edge chains (routes) from the root Business Application to
+  that server. A server reachable via different parents (diamond topology) reports
+  **multiple alternate paths**, while the `servers` array still returns **one
+  result per server** regardless of how many routes reach it.
+- **Returns:** `{ "business_application": <root>, "servers": [<Server>...],
+  "relationship_summary": <summary>, "diagnostics": [...] }`, plus
+  `server_paths` when `include_paths` is set. Server entries reuse the existing
+  Server transport shape. `relationship_summary` carries the traversal accounting
+  (`cis_examined`, `relationships_examined`, `servers_found`, and the
+  `depth_limit_reached` / `ci_limit_reached` / `edge_limit_reached` / `truncated`
+  flags).
+- **Daemon bridge:** MCP forwards this tool to daemon JSON-RPC method
+  `business_application_servers`; the bridge only advertises it when
+  `contract_info` reports that method as supported.
 
 ### Routing example
 
@@ -276,7 +341,7 @@ Each `business_application` object contains:
 - These are **read tools**: no confirmation token, no write-policy enablement,
   no `requires_kb_evidence`. They still respect normal MCP allow/deny filtering
   and per-role allow-lists.
-- The daemon bridge forwards all four to the matching daemon JSON-RPC methods and
+- The daemon bridge forwards all five to the matching daemon JSON-RPC methods and
   gates them on daemon `contract_info.supported_methods` — they are only
   advertised/callable when the attached daemon reports support. Search forwards
   the hydration options (`persist`, `resolve_references`, `reference_depth`,
@@ -289,8 +354,15 @@ Each `business_application` object contains:
 ## Servers (read-only primitive)
 
 Servers are first-class local CMDB primitives for Linux and Windows CIs. The
-canonical local resource type is `server`; supported ServiceNow classes are
+canonical local resource type is `server`; the dedicated server tools
+(`server_get` / `server_search`) restrict to the canonical ServiceNow classes
 `cmdb_ci_server`, `cmdb_ci_linux_server`, and `cmdb_ci_win_server`.
+
+> Note: the `business_application_servers` traversal is broader — it is
+> class-hierarchy aware and returns servers of **any** class extending
+> `cmdb_ci_server` (including subclasses such as `cmdb_ci_esx_server`,
+> `cmdb_ci_aix_server`, `cmdb_ci_solaris_server`). See
+> [`business_application_servers`](#business_application_servers).
 
 | Tool | What it does | Live API call? | Persists to vault? |
 |---|---|---|---|

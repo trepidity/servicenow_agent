@@ -161,6 +161,9 @@ impl McpServer {
                 self.call_business_application_search(id, params).await
             }
             "business_application_query" => self.call_business_application_query(id, params).await,
+            "business_application_servers" => {
+                self.call_business_application_servers(id, params).await
+            }
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
@@ -617,6 +620,52 @@ impl McpServer {
             }
         }
         JsonRpcResponse::ok(id, json!({ "business_applications": applications }))
+    }
+
+    async fn call_business_application_servers(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed = match parse_business_application_servers_arguments(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+
+        let result = match self
+            .core
+            .business_application_servers(core_business_application_servers_params(parsed))
+            .await
+        {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(id, -32004, "business application not found", None);
+            }
+            Err(err) => return service_failure(id, err),
+        };
+
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for server in result.servers {
+            match self.server_json(&server.record) {
+                Ok(server) => servers.push(server),
+                Err(err) => return service_failure(id, err),
+            }
+        }
+
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "business_application": result.business_application,
+                "servers": servers,
+                "relationship_summary": result.relationship_summary,
+                "diagnostics": result.diagnostics,
+                "server_paths": result.server_paths,
+            }),
+        )
     }
 
     async fn call_business_application_fields(
@@ -1545,6 +1594,25 @@ struct ListRecordsArguments {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BusinessApplicationServersArguments {
+    #[serde(default)]
+    number: Option<String>,
+    #[serde(default)]
+    sys_id: Option<String>,
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    max_cis: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+    #[serde(default)]
+    relationship_type: Vec<String>,
+    #[serde(default)]
+    include_paths: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct ListKnowledgeArticlesArguments {
     #[serde(default)]
     knowledge_base_sys_id: Option<String>,
@@ -1625,6 +1693,91 @@ fn strip_business_application_hydration(mut arguments: Value) -> Value {
         map.remove("refresh_dictionary");
     }
     arguments
+}
+
+fn parse_business_application_servers_arguments(
+    arguments: Value,
+) -> std::result::Result<BusinessApplicationServersArguments, String> {
+    let mut parsed: BusinessApplicationServersArguments =
+        serde_json::from_value(arguments).map_err(|err| err.to_string())?;
+    parsed.number = normalize_optional_string(parsed.number);
+    parsed.sys_id = match normalize_optional_string(parsed.sys_id) {
+        Some(sys_id) => Some(
+            snow_core::normalize_record_lookup_sys_id(&sys_id).map_err(|err| err.to_string())?,
+        ),
+        None => None,
+    };
+
+    match (parsed.number.as_deref(), parsed.sys_id.as_deref()) {
+        (Some(_), Some(_)) => return Err("provide exactly one of `number` or `sys_id`".to_string()),
+        (None, None) => {
+            return Err("missing required lookup: provide `number` or `sys_id`".to_string());
+        }
+        _ => {}
+    }
+
+    if let Some(number) = parsed.number.as_deref()
+        && number.trim_start().starts_with("BA:")
+    {
+        return Err(
+            "`number` must be a real Business Application number, not a local BA:<sys_id> fallback"
+                .to_string(),
+        );
+    }
+
+    validate_optional_limit(parsed.max_depth, "max_depth", 1, 4)?;
+    validate_optional_limit(parsed.max_cis, "max_cis", 1, 5000)?;
+    validate_optional_limit(parsed.max_edges, "max_edges", 1, 20000)?;
+
+    let mut relationship_type = Vec::with_capacity(parsed.relationship_type.len());
+    for value in parsed.relationship_type {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("`relationship_type` values must not be empty".to_string());
+        }
+        relationship_type.push(value.to_string());
+    }
+    parsed.relationship_type = relationship_type;
+
+    let _ = parsed.include_paths;
+    Ok(parsed)
+}
+
+fn core_business_application_servers_params(
+    args: BusinessApplicationServersArguments,
+) -> snow_core::BusinessApplicationServersParams {
+    snow_core::BusinessApplicationServersParams {
+        number: args.number,
+        sys_id: args.sys_id,
+        max_depth: args.max_depth,
+        max_cis: args.max_cis,
+        max_edges: args.max_edges,
+        relationship_type: args.relationship_type,
+        include_paths: args.include_paths,
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_optional_limit(
+    value: Option<usize>,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> std::result::Result<(), String> {
+    if let Some(value) = value {
+        if value < minimum {
+            return Err(format!("`{field}` must be at least {minimum}"));
+        }
+        if value > maximum {
+            return Err(format!("`{field}` must be at most {maximum}"));
+        }
+    }
+    Ok(())
 }
 
 fn business_application_name(record: &SnowRecord) -> String {

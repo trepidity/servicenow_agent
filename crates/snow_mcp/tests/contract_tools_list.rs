@@ -83,6 +83,15 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "search_records",
         "user_lookup",
         "user_search",
+        "business_application_get",
+        "business_application_search",
+        "business_application_query",
+        "business_application_servers",
+        "business_application_fields",
+        "server_get",
+        "server_search",
+        "server_query",
+        "server_fields",
         "search_knowledge",
         "get_article",
         "kb_semantic_search",
@@ -291,6 +300,45 @@ fn business_application_schemas_advertise_apm_number_routing() {
             .as_str()
             .expect("BA query filter value description")
             .contains("APM0002456")
+    );
+
+    let servers = tool("business_application_servers");
+    assert!(servers.description.contains("CMDB relationship traversal"));
+    assert_no_top_level_schema_composition(&servers.input_schema);
+    assert!(servers.input_schema.get("required").is_none());
+    assert_eq!(
+        servers.input_schema["properties"]["number"]["description"],
+        json!(
+            "Business Application number, for example <APM_NUMBER>. Not a local BA:<sys_id> fallback identifier."
+        )
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["max_depth"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["max_depth"]["maximum"],
+        json!(4)
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["max_cis"]["maximum"],
+        json!(5000)
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["max_edges"]["maximum"],
+        json!(20000)
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["relationship_type"]["items"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["include_paths"]["default"],
+        json!(false)
     );
 
     let fields = tool("business_application_fields");

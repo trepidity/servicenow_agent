@@ -34,10 +34,20 @@ pub use kb::{
 };
 pub(crate) use reference::*;
 pub use resource::business_application::{
+    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS, BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH,
+    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
+    BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES, BUSINESS_APPLICATION_SERVERS_MAX_CIS,
+    BUSINESS_APPLICATION_SERVERS_MAX_DEPTH, BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
     BusinessApplication, BusinessApplicationFieldAliases, BusinessApplicationFieldValue,
-    BusinessApplicationHydrationOptions, BusinessApplicationLookup, BusinessApplicationSyncSummary,
-    ChoiceValue, ReferencePrimitiveDescriptor, ReferencePrimitiveType,
-    ReferenceResolutionDiagnostic, ReferenceResolutionReason, ReferenceResolutionStatus,
+    BusinessApplicationHydrationOptions, BusinessApplicationLookup,
+    BusinessApplicationRelationshipDirection, BusinessApplicationRelationshipType,
+    BusinessApplicationServerApplication, BusinessApplicationServerPath,
+    BusinessApplicationServerPathEdge, BusinessApplicationServersOptions,
+    BusinessApplicationServersParams, BusinessApplicationServersResult,
+    BusinessApplicationServersSelector, BusinessApplicationServersSummary,
+    BusinessApplicationSyncSummary, ChoiceValue, ReferencePrimitiveDescriptor,
+    ReferencePrimitiveType, ReferenceResolutionDiagnostic, ReferenceResolutionReason,
+    ReferenceResolutionStatus,
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
@@ -78,7 +88,7 @@ use crate::cache::store::{
 use crate::enrich::derive_for_record;
 use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
 use crate::resource::approval::ApprovalResource;
-use crate::resource::server::{SERVER_LEAF_TABLES, canonical_server_class};
+use crate::resource::server::{SERVER_LEAF_TABLES, canonical_server_class, is_server_class};
 use crate::semantic::{
     EmbeddingProvider, OllamaEmbeddingProvider, content_hash, cosine_similarity,
     maybe_exact_kb_identifier, normalize_title_match, reciprocal_rank_fusion_score,
@@ -158,11 +168,38 @@ const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
 const BUSINESS_APPLICATION_DEFAULT_LIMIT: usize = 20;
 const BUSINESS_APPLICATION_MAX_LIMIT: usize = 100;
 const BUSINESS_APPLICATION_SYNC_ALL_PAGE_SIZE: usize = BUSINESS_APPLICATION_MAX_LIMIT;
+const CMDB_CI_TABLE: &str = "cmdb_ci";
+const CMDB_REL_CI_TABLE: &str = "cmdb_rel_ci";
+const CMDB_REL_TYPE_TABLE: &str = "cmdb_rel_type";
+const BUSINESS_APPLICATION_RELATIONSHIP_FIELDS: &[&str] = &[
+    "sys_id",
+    "parent",
+    "child",
+    "type",
+    "parent.sys_class_name",
+    "child.sys_class_name",
+];
+const BUSINESS_APPLICATION_CI_CLASS_FIELDS: &[&str] = &["sys_id", "name", "sys_class_name"];
+/// Page size for paginated `cmdb_rel_ci` edge reads. Kept well below the typical
+/// `glide.rest.table.max_record_count` server cap (default 10000) so the read
+/// never relies on a single oversized request that the instance could silently
+/// truncate. The paginator continues across pages until the `max_edges` budget
+/// is reached or the result set is exhausted.
+const BUSINESS_APPLICATION_RELATIONSHIP_PAGE_SIZE: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserLookupCandidate {
     field: &'static str,
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BusinessApplicationRelationshipEdge {
+    parent_sys_id: String,
+    child_sys_id: String,
+    parent_class: Option<String>,
+    child_class: Option<String>,
+    relationship_type: BusinessApplicationRelationshipType,
 }
 
 fn child_relation_for_parent_table(table_name: &str) -> Option<(&'static str, &'static str)> {
@@ -1319,6 +1356,275 @@ fn roll_up_business_application_summary(
     }
 }
 
+impl BusinessApplicationRelationshipEdge {
+    fn key(&self) -> (String, String, String, Option<String>) {
+        (
+            self.parent_sys_id.clone(),
+            self.child_sys_id.clone(),
+            self.relationship_type.value.clone(),
+            self.relationship_type.display_value.clone(),
+        )
+    }
+
+    fn traversal_endpoint(
+        &self,
+        frontier: &HashSet<String>,
+    ) -> Option<(String, String, BusinessApplicationRelationshipDirection)> {
+        if frontier.contains(&self.parent_sys_id) {
+            Some((
+                self.parent_sys_id.clone(),
+                self.child_sys_id.clone(),
+                BusinessApplicationRelationshipDirection::ParentToChild,
+            ))
+        } else if frontier.contains(&self.child_sys_id) {
+            Some((
+                self.child_sys_id.clone(),
+                self.parent_sys_id.clone(),
+                BusinessApplicationRelationshipDirection::ChildToParent,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn path_edge(
+        &self,
+        depth: usize,
+        from_sys_id: String,
+        to_sys_id: String,
+        direction: BusinessApplicationRelationshipDirection,
+    ) -> BusinessApplicationServerPathEdge {
+        BusinessApplicationServerPathEdge {
+            depth,
+            from_sys_id,
+            to_sys_id,
+            parent_sys_id: self.parent_sys_id.clone(),
+            child_sys_id: self.child_sys_id.clone(),
+            direction,
+            relationship_type: self.relationship_type.clone(),
+        }
+    }
+}
+
+fn business_application_relationship_edge_from_record(
+    record: &Record,
+    summary: &mut BusinessApplicationServersSummary,
+    diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+) -> Option<BusinessApplicationRelationshipEdge> {
+    let parent_sys_id = servicenow_reference_sys_id(record, "parent");
+    let child_sys_id = servicenow_reference_sys_id(record, "child");
+    let (Some(parent_sys_id), Some(child_sys_id)) = (parent_sys_id, child_sys_id) else {
+        push_business_application_server_diagnostic(
+            summary,
+            diagnostics,
+            "cmdb_rel_ci",
+            CMDB_REL_CI_TABLE,
+            "",
+            ReferenceResolutionReason::ReferenceResolutionFailed,
+            "relationship row was missing a readable parent or child reference",
+        );
+        return None;
+    };
+
+    Some(BusinessApplicationRelationshipEdge {
+        parent_sys_id,
+        child_sys_id,
+        parent_class: servicenow_record_text(record, "parent.sys_class_name"),
+        child_class: servicenow_record_text(record, "child.sys_class_name"),
+        relationship_type: BusinessApplicationRelationshipType {
+            value: servicenow_record_raw_text(record, "type").unwrap_or_default(),
+            display_value: servicenow_record_display_text(record, "type"),
+        },
+    })
+}
+
+/// All CI sys_ids that lie along a recorded route chain, i.e. every CI the
+/// route passes through. A chain is a list of edges; the CIs it touches are the
+/// `from_sys_id` of the first edge plus the `to_sys_id` of each edge.
+fn chain_node_sys_ids(chain: &[BusinessApplicationServerPathEdge]) -> HashSet<String> {
+    let mut nodes = HashSet::new();
+    if let Some(first) = chain.first() {
+        nodes.insert(first.from_sys_id.clone());
+    }
+    for edge in chain {
+        nodes.insert(edge.to_sys_id.clone());
+    }
+    nodes
+}
+
+/// Decide whether reaching `adjacent_sys_id` from `current_sys_id` is a true
+/// back-edge (cycle) rather than an alternate forward path.
+///
+/// It is a back-edge when `adjacent_sys_id` is an ancestor of
+/// `current_sys_id` — that is, the adjacent CI already lies on some route that
+/// leads to the current CI, so following this edge would loop back up the graph.
+/// If the adjacent CI does not appear on any of the current CI's chains, the
+/// edge is a genuine alternate route to an already-visited node (a diamond
+/// join), not a cycle.
+///
+/// When the current CI has no recorded chains (paths disabled or unknown), we
+/// conservatively treat the re-visit as a back-edge to preserve the prior
+/// cycle-counting behavior.
+fn path_chains_contain_ancestor(
+    current_chains: Option<&Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    adjacent_sys_id: &str,
+    current_sys_id: &str,
+) -> bool {
+    let Some(chains) = current_chains else {
+        return true;
+    };
+    if chains.is_empty() {
+        return true;
+    }
+    // The current CI itself is trivially "on" its own path; reaching it again is
+    // a self-loop / back-edge.
+    if adjacent_sys_id == current_sys_id {
+        return true;
+    }
+    chains
+        .iter()
+        .any(|chain| chain_node_sys_ids(chain).contains(adjacent_sys_id))
+}
+
+/// Extend every recorded route chain of `parent_sys_id` by `edge` and append the
+/// resulting chains to `child_sys_id`'s recorded routes.
+///
+/// On first discovery this seeds the child's routes; on a diamond join it adds
+/// the alternate route(s) without disturbing the existing ones. The child's
+/// existing chains are preserved (so multiple distinct parents accumulate).
+fn extend_path_chains(
+    paths_by_ci: &mut HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    parent_sys_id: &str,
+    child_sys_id: &str,
+    edge: BusinessApplicationServerPathEdge,
+) {
+    let parent_chains = paths_by_ci.get(parent_sys_id).cloned().unwrap_or_default();
+    let new_chains: Vec<Vec<BusinessApplicationServerPathEdge>> = if parent_chains.is_empty() {
+        // Parent has no recorded chain (e.g. paths disabled): record a
+        // single-edge chain so traversal bookkeeping still has one route.
+        vec![vec![edge]]
+    } else {
+        parent_chains
+            .into_iter()
+            .map(|mut chain| {
+                chain.push(edge.clone());
+                chain
+            })
+            .collect()
+    };
+    paths_by_ci
+        .entry(child_sys_id.to_string())
+        .or_default()
+        .extend(new_chains);
+}
+
+/// Emit any not-yet-recorded route chains for an already-collected server.
+///
+/// Used when a server is reached again via an alternate diamond route after it
+/// was first hydrated: its newly-added chains must be reflected in
+/// `server_paths`. Only chains beyond those already present are appended, so
+/// repeated edges in a single level do not double-count.
+fn emit_alternate_server_path(
+    servers_by_sys_id: &BTreeMap<String, Server>,
+    paths_by_ci: &HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    server_paths: &mut BTreeMap<String, Vec<BusinessApplicationServerPath>>,
+    sys_id: &str,
+) {
+    if !servers_by_sys_id.contains_key(sys_id) {
+        return;
+    }
+    let Some(chains) = paths_by_ci.get(sys_id) else {
+        return;
+    };
+    let entry = server_paths.entry(sys_id.to_string()).or_default();
+    // Re-sync the emitted routes with the recorded chains: append the chains
+    // that have not yet been emitted (the new alternate routes are at the tail).
+    while entry.len() < chains.len() {
+        let chain = &chains[entry.len()];
+        entry.push(BusinessApplicationServerPath {
+            depth: chain.len(),
+            edges: chain.clone(),
+        });
+    }
+}
+
+fn servicenow_reference_sys_id(record: &Record, field: &str) -> Option<String> {
+    let value = record
+        .get(field)
+        .and_then(|field_value| field_value.value.as_ref())
+        .and_then(Value::as_str)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))?;
+    normalize_record_lookup_sys_id(value).ok()
+}
+
+fn servicenow_record_text(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_display(field)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn servicenow_record_raw_text(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_raw(field)
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn servicenow_record_display_text(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_display(field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn mark_business_application_edge_limit(
+    summary: &mut BusinessApplicationServersSummary,
+    diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+) {
+    if summary.edge_limit_reached {
+        return;
+    }
+    summary.edge_limit_reached = true;
+    summary.mark_truncated(1);
+    push_business_application_server_diagnostic(
+        summary,
+        diagnostics,
+        "cmdb_rel_ci",
+        CMDB_REL_CI_TABLE,
+        "",
+        ReferenceResolutionReason::FanoutLimitExceeded,
+        "max_edges prevented reading more relationships",
+    );
+}
+
+fn push_business_application_server_diagnostic(
+    summary: &mut BusinessApplicationServersSummary,
+    diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    field: impl Into<String>,
+    reference_table: impl Into<String>,
+    reference_sys_id: impl Into<String>,
+    reason: ReferenceResolutionReason,
+    message: impl Into<String>,
+) {
+    summary.record_degraded_reason(&reason);
+    diagnostics.push(ReferenceResolutionDiagnostic {
+        field: field.into(),
+        reference_table: reference_table.into(),
+        reference_sys_id: reference_sys_id.into(),
+        display_value: None,
+        reason,
+        message: Some(message.into()),
+    });
+}
+
 fn is_business_application_reference_table_resolvable(table: &str) -> bool {
     matches!(table, "sys_user" | "sys_user_group" | "cmdb_ci")
         || table == BUSINESS_APPLICATION_TABLE
@@ -2088,6 +2394,710 @@ impl SnowCore {
         query: BusinessApplicationQuery,
     ) -> Result<Vec<SnowRecord>> {
         self.query.query_business_applications(query).await
+    }
+
+    pub async fn business_application_servers(
+        &self,
+        params: BusinessApplicationServersParams,
+    ) -> Result<Option<BusinessApplicationServersResult>> {
+        let options = params.validate()?;
+        // Public callers express "use the default relationship-type set" by
+        // leaving `relationship_type` empty; honor that by resolving the default
+        // labels to stable identities when empty.
+        self.business_application_servers_with_options(options, true)
+            .await
+    }
+
+    /// Core graph traversal for [`Self::business_application_servers`].
+    ///
+    /// `defaults_when_empty` controls how an empty `options.relationship_type`
+    /// is interpreted:
+    /// - `true` (the public path): an empty allowlist means "use the default
+    ///   relationship-type set", which is resolved to stable `cmdb_rel_type`
+    ///   sys_ids once at the start of the traversal (see
+    ///   [`Self::resolve_relationship_type_allowlist`]).
+    /// - `false`: an empty allowlist is taken literally as "match all
+    ///   relationship types" (no filtering, no resolution query).
+    ///
+    /// An explicitly-supplied non-empty allowlist is always used verbatim and is
+    /// matched by both raw value (sys_id) and display label, preserving the
+    /// ability for callers to pass either form.
+    async fn business_application_servers_with_options(
+        &self,
+        options: BusinessApplicationServersOptions,
+        defaults_when_empty: bool,
+    ) -> Result<Option<BusinessApplicationServersResult>> {
+        let Some(application) = self
+            .resolve_business_application_servers_selector(&options)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // Resolve the effective allowlist to stable relationship-type identities
+        // (sys_ids) before traversal. Matching on sys_ids instead of mutable
+        // display labels means a renamed/localized `cmdb_rel_type` label no
+        // longer silently drops every edge.
+        let allowed_relationship_types = self
+            .resolve_relationship_type_allowlist(&options, defaults_when_empty)
+            .await?;
+        let mut summary = BusinessApplicationServersSummary::new(&options);
+        let mut diagnostics = Vec::new();
+        let mut visited = HashSet::from([application.record.sys_id.clone()]);
+        let mut frontier = vec![application.record.sys_id.clone()];
+        let mut ci_classes = HashMap::from([(
+            application.record.sys_id.clone(),
+            BUSINESS_APPLICATION_TABLE.to_string(),
+        )]);
+        // Maps a CI sys_id to every recorded edge-chain (route) from the root BA
+        // to that CI. A simple tree gives each CI one chain; in a diamond a CI is
+        // reachable via multiple parents, so we keep a Vec of alternate chains
+        // (only grown beyond one when `include_paths` requests full route
+        // reporting). The root has a single empty chain.
+        let mut paths_by_ci: HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>> =
+            HashMap::from([(application.record.sys_id.clone(), vec![Vec::new()])]);
+        let mut servers_by_sys_id: BTreeMap<String, Server> = BTreeMap::new();
+        let mut server_paths: BTreeMap<String, Vec<BusinessApplicationServerPath>> =
+            BTreeMap::new();
+
+        for depth in 1..=options.max_depth {
+            if frontier.is_empty() || summary.edge_limit_reached || summary.ci_limit_reached {
+                break;
+            }
+
+            let relationships = self
+                .business_application_relationship_level(
+                    &frontier,
+                    &options,
+                    &mut summary,
+                    &mut diagnostics,
+                )
+                .await?;
+            let frontier_set = frontier.iter().cloned().collect::<HashSet<_>>();
+            let mut newly_seen = Vec::new();
+
+            for relationship in relationships {
+                if !relationship
+                    .relationship_type
+                    .matches_any(&allowed_relationship_types)
+                {
+                    continue;
+                }
+                if let Some(class_name) = relationship.parent_class.as_deref() {
+                    ci_classes
+                        .entry(relationship.parent_sys_id.clone())
+                        .or_insert_with(|| class_name.to_string());
+                }
+                if let Some(class_name) = relationship.child_class.as_deref() {
+                    ci_classes
+                        .entry(relationship.child_sys_id.clone())
+                        .or_insert_with(|| class_name.to_string());
+                }
+
+                let Some((current_sys_id, adjacent_sys_id, direction)) =
+                    relationship.traversal_endpoint(&frontier_set)
+                else {
+                    push_business_application_server_diagnostic(
+                        &mut summary,
+                        &mut diagnostics,
+                        "cmdb_rel_ci",
+                        CMDB_REL_CI_TABLE,
+                        "",
+                        ReferenceResolutionReason::ReferenceResolutionFailed,
+                        "relationship did not include a current frontier endpoint",
+                    );
+                    continue;
+                };
+
+                if visited.contains(&adjacent_sys_id) {
+                    // The adjacent CI was already discovered. Two cases:
+                    //  (a) true cycle/back-edge: the adjacent CI is an ancestor
+                    //      of the current CI along some recorded route, so this
+                    //      edge points back up the graph; or
+                    //  (b) alternate forward path (diamond): the adjacent CI is
+                    //      reachable via a different parent than before.
+                    // Case (b) is a genuine additional route to the same CI and,
+                    // when `include_paths` is set, must be recorded so the plural
+                    // `server_paths` reflects every route. Neither case re-enqueues
+                    // the CI for traversal (it is already visited).
+                    let is_back_edge = path_chains_contain_ancestor(
+                        paths_by_ci.get(&current_sys_id),
+                        &adjacent_sys_id,
+                        &current_sys_id,
+                    );
+                    if is_back_edge {
+                        summary.cycle_count += 1;
+                        push_business_application_server_diagnostic(
+                            &mut summary,
+                            &mut diagnostics,
+                            "cmdb_ci",
+                            CMDB_CI_TABLE,
+                            &adjacent_sys_id,
+                            ReferenceResolutionReason::CycleDetected,
+                            "relationship traversal skipped a CI that was already visited",
+                        );
+                    } else if options.include_paths {
+                        // Record the alternate route(s) into the adjacent CI by
+                        // extending each of the current CI's chains with this edge.
+                        let edge = relationship.path_edge(
+                            depth,
+                            current_sys_id.clone(),
+                            adjacent_sys_id.clone(),
+                            direction.clone(),
+                        );
+                        extend_path_chains(
+                            &mut paths_by_ci,
+                            &current_sys_id,
+                            &adjacent_sys_id,
+                            edge,
+                        );
+                        // A server reached again via an alternate route needs its
+                        // new route emitted now, since it will not pass through the
+                        // per-depth server-hydration loop again.
+                        emit_alternate_server_path(
+                            &servers_by_sys_id,
+                            &paths_by_ci,
+                            &mut server_paths,
+                            &adjacent_sys_id,
+                        );
+                    } else {
+                        // include_paths off: an alternate route adds no result, so
+                        // it is neither a traversal target nor recorded.
+                        summary.cycle_count += 1;
+                    }
+                    continue;
+                }
+                // `max_cis` bounds the CIs examined BEYOND the root BA. `visited`
+                // is seeded with the root, so the non-root examined count is
+                // `visited.len() - 1`. Truncate once that budget is exhausted, so
+                // a caller passing the exact expected non-root count is not
+                // silently short by one.
+                if visited.len().saturating_sub(1) >= options.max_cis {
+                    summary.ci_limit_reached = true;
+                    summary.mark_truncated(1);
+                    push_business_application_server_diagnostic(
+                        &mut summary,
+                        &mut diagnostics,
+                        "cmdb_ci",
+                        CMDB_CI_TABLE,
+                        &adjacent_sys_id,
+                        ReferenceResolutionReason::FanoutLimitExceeded,
+                        "max_cis prevented expanding another CI",
+                    );
+                    continue;
+                }
+
+                visited.insert(adjacent_sys_id.clone());
+                let edge = relationship.path_edge(
+                    depth,
+                    current_sys_id.clone(),
+                    adjacent_sys_id.clone(),
+                    direction,
+                );
+                // First discovery: seed the adjacent CI's routes from the current
+                // CI's routes extended by this edge.
+                extend_path_chains(&mut paths_by_ci, &current_sys_id, &adjacent_sys_id, edge);
+                newly_seen.push(adjacent_sys_id);
+            }
+
+            self.business_application_hydrate_ci_classes(
+                &newly_seen,
+                &mut ci_classes,
+                &mut summary,
+                &mut diagnostics,
+            )
+            .await?;
+
+            let mut server_ids = Vec::new();
+            let mut next_frontier = Vec::new();
+            for sys_id in newly_seen {
+                let Some(class_name) = ci_classes.get(&sys_id) else {
+                    continue;
+                };
+                // Hierarchy-aware classification: any descendant of
+                // `cmdb_ci_server` (not just the narrow alias list) is collected
+                // as a server. Non-server CIs continue into the next BFS frontier.
+                if is_server_class(class_name) {
+                    server_ids.push(sys_id);
+                } else {
+                    next_frontier.push(sys_id);
+                }
+            }
+
+            let servers = self
+                .business_application_hydrate_servers(&server_ids, &mut summary, &mut diagnostics)
+                .await?;
+            for server in servers {
+                let sys_id = server.record.sys_id.clone();
+                // Record this server first so later-depth alternate-route
+                // discoveries can emit additional paths for it.
+                servers_by_sys_id.entry(sys_id.clone()).or_insert(server);
+                if options.include_paths
+                    && let Some(chains) = paths_by_ci.get(&sys_id)
+                {
+                    // Emit every recorded route to this server. In a diamond the
+                    // server already carries multiple chains by the time it is
+                    // hydrated.
+                    let entry = server_paths.entry(sys_id.clone()).or_default();
+                    for chain in chains {
+                        entry.push(BusinessApplicationServerPath {
+                            depth: chain.len(),
+                            edges: chain.clone(),
+                        });
+                    }
+                }
+            }
+
+            if depth == options.max_depth && !next_frontier.is_empty() {
+                summary.depth_limit_reached = true;
+                summary.mark_truncated(next_frontier.len());
+                push_business_application_server_diagnostic(
+                    &mut summary,
+                    &mut diagnostics,
+                    "cmdb_rel_ci",
+                    CMDB_REL_CI_TABLE,
+                    "",
+                    ReferenceResolutionReason::FanoutLimitExceeded,
+                    "max_depth prevented expanding the next BFS frontier",
+                );
+                break;
+            }
+
+            frontier = next_frontier;
+        }
+
+        summary.cis_examined = visited.len();
+        summary.servers_found = servers_by_sys_id.len();
+
+        Ok(Some(BusinessApplicationServersResult {
+            business_application: BusinessApplicationServerApplication::from(&application),
+            servers: servers_by_sys_id.into_values().collect(),
+            relationship_summary: summary,
+            diagnostics,
+            server_paths,
+        }))
+    }
+
+    pub async fn get_business_application_servers(
+        &self,
+        params: BusinessApplicationServersParams,
+    ) -> Result<Option<BusinessApplicationServersResult>> {
+        self.business_application_servers(params).await
+    }
+
+    /// Resolve the relationship-type allowlist used to filter `cmdb_rel_ci`
+    /// edges during traversal.
+    ///
+    /// Relationship-type matching keys off the *stable* `cmdb_rel_type` identity
+    /// (sys_id), not the mutable/localizable display label. The behavior:
+    ///
+    /// - Explicit non-empty allowlist: returned verbatim. Callers may pass
+    ///   sys_ids or labels; [`BusinessApplicationRelationshipType::matches_any`]
+    ///   compares against both the edge raw value and display label.
+    /// - Empty allowlist with `defaults_when_empty == false`: returns empty,
+    ///   which `matches_any` treats as "match all".
+    /// - Empty allowlist with `defaults_when_empty == true`: resolves the default
+    ///   label set ([`BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES`])
+    ///   to `cmdb_rel_type` sys_ids via a single `name IN (...)` query, so each
+    ///   edge is matched by sys_id identity. If resolution fails or returns
+    ///   nothing (e.g. ACL-restricted `cmdb_rel_type`), it falls back to the
+    ///   default label strings so behavior is no worse than the prior label-only
+    ///   matching.
+    async fn resolve_relationship_type_allowlist(
+        &self,
+        options: &BusinessApplicationServersOptions,
+        defaults_when_empty: bool,
+    ) -> Result<Vec<String>> {
+        if !options.relationship_type.is_empty() {
+            // Explicit caller-supplied allowlist: use as-is.
+            return Ok(options.relationship_type.clone());
+        }
+        if !defaults_when_empty {
+            // Explicit empty allowlist => match all.
+            return Ok(Vec::new());
+        }
+
+        let default_labels = BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect::<Vec<_>>();
+        let label_refs = default_labels
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        // One lookup per traversal: resolve the stored `name` of each default
+        // relationship type to its sys_id. `cmdb_rel_type.name` is the configured
+        // stored name (stable), whereas the edge display value can be localized.
+        let response = self
+            .client
+            .table(CMDB_REL_TYPE_TABLE)
+            .in_list("name", &label_refs)
+            .fields(&["sys_id", "name"])
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(label_refs.len() as u32)
+            .execute()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let mut allowed = Vec::new();
+                for record in response.records {
+                    // `cmdb_rel_type.sys_id` is the stable relationship-type
+                    // identity. Read the canonical record sys_id directly.
+                    if let Ok(sys_id) = normalize_record_lookup_sys_id(&record.sys_id)
+                        && !allowed.contains(&sys_id)
+                    {
+                        allowed.push(sys_id);
+                    }
+                }
+                if allowed.is_empty() {
+                    // Resolution returned nothing useful; fall back to label
+                    // matching so the traversal is not silently emptied.
+                    Ok(default_labels)
+                } else {
+                    Ok(allowed)
+                }
+            }
+            // Degrade gracefully: if cmdb_rel_type cannot be read, fall back to
+            // matching by the default label strings (prior behavior).
+            Err(_) => Ok(default_labels),
+        }
+    }
+
+    async fn resolve_business_application_servers_selector(
+        &self,
+        options: &BusinessApplicationServersOptions,
+    ) -> Result<Option<BusinessApplication>> {
+        let aliases = self.resolve_business_application_aliases(false).await;
+        let record = match &options.selector {
+            BusinessApplicationServersSelector::SysId(sys_id) => match self
+                .client
+                .table(BUSINESS_APPLICATION_TABLE)
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(sys_id)
+                .await
+            {
+                Ok(record) => Some(record),
+                Err(SnowApiError::Api { status: 404, .. }) => None,
+                Err(err) => return Err(err.into()),
+            },
+            BusinessApplicationServersSelector::Number(number) => {
+                let records = self
+                    .client
+                    .table(BUSINESS_APPLICATION_TABLE)
+                    .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+                    .equals("number", number)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .limit(2)
+                    .execute()
+                    .await?
+                    .records;
+                if records.len() > 1 {
+                    anyhow::bail!("multiple Business Applications matched number={number}");
+                }
+                records.into_iter().next()
+            }
+        };
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        Ok(Some(BusinessApplication::from_servicenow(
+            &record, &aliases,
+        )?))
+    }
+
+    async fn business_application_relationship_level(
+        &self,
+        frontier: &[String],
+        options: &BusinessApplicationServersOptions,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    ) -> Result<Vec<BusinessApplicationRelationshipEdge>> {
+        let mut records = Vec::new();
+        self.business_application_relationship_direction(
+            "parent",
+            frontier,
+            options,
+            summary,
+            diagnostics,
+            &mut records,
+        )
+        .await?;
+        self.business_application_relationship_direction(
+            "child",
+            frontier,
+            options,
+            summary,
+            diagnostics,
+            &mut records,
+        )
+        .await?;
+
+        let mut edges = Vec::new();
+        let mut seen = HashSet::new();
+        for record in records {
+            let Some(edge) =
+                business_application_relationship_edge_from_record(&record, summary, diagnostics)
+            else {
+                continue;
+            };
+            if seen.insert(edge.key()) {
+                edges.push(edge);
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn business_application_relationship_direction(
+        &self,
+        field: &str,
+        frontier: &[String],
+        options: &BusinessApplicationServersOptions,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+        records: &mut Vec<Record>,
+    ) -> Result<()> {
+        if frontier.is_empty() || summary.edge_limit_reached {
+            return Ok(());
+        }
+        let remaining = options
+            .max_edges
+            .saturating_sub(summary.relationships_examined);
+        if remaining == 0 {
+            mark_business_application_edge_limit(summary, diagnostics);
+            return Ok(());
+        }
+
+        let frontier_refs = frontier.iter().map(String::as_str).collect::<Vec<_>>();
+        // Paginate the edge read instead of issuing one large `limit(remaining+1)`
+        // request. `servicenow_rs::execute()` does NOT auto-paginate, so a single
+        // request can be silently capped server-side by
+        // `glide.rest.table.max_record_count`, returning FEWER rows than exist
+        // with no signal — edges would then vanish and `edge_limit_reached` would
+        // stay false. The paginator walks pages until the result set is exhausted
+        // or the `max_edges` budget (`remaining`) is consumed.
+        let page_size = BUSINESS_APPLICATION_RELATIONSHIP_PAGE_SIZE.min(remaining.max(1));
+        let mut paginator = self
+            .client
+            .table(CMDB_REL_CI_TABLE)
+            .in_list(field, &frontier_refs)
+            .fields(BUSINESS_APPLICATION_RELATIONSHIP_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(page_size as u32)
+            .paginate()?;
+
+        let mut collected = 0usize;
+        loop {
+            if collected >= remaining {
+                // Budget exhausted but the paginator may still have pages: this is
+                // a genuine truncation, surface it.
+                if !paginator.is_done() {
+                    mark_business_application_edge_limit(summary, diagnostics);
+                }
+                break;
+            }
+            let page = match paginator.next_page().await {
+                Ok(Some(page)) => page,
+                Ok(None) => break,
+                Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
+                    summary.acl_restricted_count += 1;
+                    push_business_application_server_diagnostic(
+                        summary,
+                        diagnostics,
+                        field,
+                        CMDB_REL_CI_TABLE,
+                        "",
+                        ReferenceResolutionReason::ReferenceAclRestricted,
+                        "ACL restricted cmdb_rel_ci traversal",
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            let mut rows = page.records;
+            // Cap the running total at the remaining edge budget.
+            let room = remaining - collected;
+            let over_budget = rows.len() > room;
+            if over_budget {
+                rows.truncate(room);
+                mark_business_application_edge_limit(summary, diagnostics);
+            }
+            collected += rows.len();
+            summary.relationships_examined += rows.len();
+            records.extend(rows);
+            if over_budget {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn business_application_hydrate_ci_classes(
+        &self,
+        sys_ids: &[String],
+        ci_classes: &mut HashMap<String, String>,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    ) -> Result<()> {
+        let pending = sys_ids
+            .iter()
+            .filter(|sys_id| !ci_classes.contains_key(sys_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let pending_refs = pending.iter().map(String::as_str).collect::<Vec<_>>();
+        let response = self
+            .client
+            .table(CMDB_CI_TABLE)
+            .in_list("sys_id", &pending_refs)
+            .fields(BUSINESS_APPLICATION_CI_CLASS_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(pending.len() as u32)
+            .execute()
+            .await;
+
+        let records = match response {
+            Ok(response) => response.records,
+            Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
+                summary.acl_restricted_count += pending.len();
+                for sys_id in pending {
+                    push_business_application_server_diagnostic(
+                        summary,
+                        diagnostics,
+                        "sys_class_name",
+                        CMDB_CI_TABLE,
+                        &sys_id,
+                        ReferenceResolutionReason::ReferenceAclRestricted,
+                        "ACL restricted cmdb_ci class read",
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let mut found = HashSet::new();
+        for record in records {
+            let Some(sys_id) = servicenow_reference_sys_id(&record, "sys_id") else {
+                continue;
+            };
+            if let Some(class_name) = servicenow_record_text(&record, "sys_class_name") {
+                ci_classes.insert(sys_id.clone(), class_name);
+                found.insert(sys_id);
+            }
+        }
+        for sys_id in pending {
+            if found.contains(&sys_id) {
+                continue;
+            }
+            summary.missing_ci_count += 1;
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                "sys_class_name",
+                CMDB_CI_TABLE,
+                &sys_id,
+                ReferenceResolutionReason::ReferenceNotFound,
+                "CI class could not be read",
+            );
+        }
+        Ok(())
+    }
+
+    async fn business_application_hydrate_servers(
+        &self,
+        sys_ids: &[String],
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+    ) -> Result<Vec<Server>> {
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for sys_id in sys_ids {
+            if seen.insert(sys_id) {
+                unique.push(sys_id.clone());
+            }
+        }
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sys_id_refs = unique.iter().map(String::as_str).collect::<Vec<_>>();
+        // Query the BASE `cmdb_ci_server` table by `sys_id` only. In
+        // ServiceNow's table-per-hierarchy model the base table transparently
+        // returns rows of every subclass (linux, win, esx, aix, ...), so a
+        // record exists here iff the CI is a true server. The previous
+        // `sys_class_name IN SERVER_TABLES` filter was over-restrictive: it
+        // excluded legitimate subclass servers whose class is not in the narrow
+        // alias list, silently dropping them. Relying on the base-table query is
+        // both correct (non-servers simply do not exist in `cmdb_ci_server`) and
+        // hierarchy-complete.
+        let response = self
+            .client
+            .table(SERVER_TABLE)
+            .in_list("sys_id", &sys_id_refs)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(unique.len() as u32)
+            .execute()
+            .await;
+
+        let records = match response {
+            Ok(response) => response.records,
+            Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
+                summary.acl_restricted_count += unique.len();
+                for sys_id in unique {
+                    push_business_application_server_diagnostic(
+                        summary,
+                        diagnostics,
+                        "sys_id",
+                        SERVER_TABLE,
+                        &sys_id,
+                        ReferenceResolutionReason::ReferenceAclRestricted,
+                        "ACL restricted server CI read",
+                    );
+                }
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let mut found = HashSet::new();
+        let mut servers = Vec::new();
+        for record in records {
+            found.insert(record.sys_id.clone());
+            servers.push(Server::from_servicenow(&record)?);
+        }
+        for sys_id in unique {
+            if found.contains(&sys_id) {
+                continue;
+            }
+            summary.missing_ci_count += 1;
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                "sys_id",
+                SERVER_TABLE,
+                &sys_id,
+                ReferenceResolutionReason::ReferenceNotFound,
+                "server CI could not be read",
+            );
+        }
+        Ok(servers)
     }
 
     pub async fn get_server_fresh(&self, lookup: ServerLookup) -> Result<Option<Server>> {
@@ -6349,6 +7359,873 @@ mod tests {
                 .map(|value| value.as_ref()),
             Some("true")
         );
+    }
+
+    #[test]
+    fn business_application_servers_params_validate_selector_and_bounds() {
+        let options = BusinessApplicationServersParams {
+            number: Some("apm0000001".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid number selector");
+        assert_eq!(
+            options.selector,
+            BusinessApplicationServersSelector::Number("APM0000001".to_string())
+        );
+        assert_eq!(options.max_depth, 2);
+        assert_eq!(options.max_cis, 500);
+        assert_eq!(options.max_edges, 2000);
+
+        let err = BusinessApplicationServersParams::default()
+            .validate()
+            .expect_err("missing selector should fail")
+            .to_string();
+        assert!(err.contains("exactly one"));
+
+        let err = BusinessApplicationServersParams {
+            number: Some("APM0000001".to_string()),
+            sys_id: Some("11111111111111111111111111111111".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("dual selector should fail")
+        .to_string();
+        assert!(err.contains("exactly one"));
+
+        let err = BusinessApplicationServersParams {
+            number: Some("BA:11111111111111111111111111111111".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("synthetic BA number should fail")
+        .to_string();
+        assert!(err.contains("BA:<sys_id>"));
+
+        let err = BusinessApplicationServersParams {
+            number: Some("APP0000001".to_string()),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("non-APM number should fail")
+        .to_string();
+        assert!(err.contains("<APM_NUMBER>"));
+
+        let err = BusinessApplicationServersParams {
+            sys_id: Some("11111111111111111111111111111111".to_string()),
+            max_depth: Some(5),
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("max depth should be bounded")
+        .to_string();
+        assert!(err.contains("at most 4"));
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_batches_bfs_levels_and_hydrates_servers() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let linux = "33333333333333333333333333333333";
+        let windows = "44444444444444444444444444444444";
+        let component = "55555555555555555555555555555555";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let rel_row_1 = "99999999999999999999999999999991";
+        let rel_row_2 = "99999999999999999999999999999992";
+        let rel_row_3 = "99999999999999999999999999999993";
+        let rel_row_4 = "99999999999999999999999999999994";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app",
+                    "operational_status": { "value": "1", "display_value": "Operational" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row(rel_row_1, app, service, rel_type, "cmdb_ci_business_app", "cmdb_ci_service"),
+                    relationship_row(rel_row_2, app, component, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl"),
+                    relationship_row(rel_row_3, app, linux, rel_type, "cmdb_ci_business_app", "cmdb_ci_linux_server")
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-alpha.example.com", "cmdb_ci_linux_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("parentIN{service},{component}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row(rel_row_4, component, windows, rel_type, "cmdb_ci_appl", "cmdb_ci_win_server")
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("childIN{service},{component}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{windows}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(windows, "windows-alpha.example.com", "cmdb_ci_win_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                include_paths: true,
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.business_application.sys_id, app);
+        assert_eq!(result.servers.len(), 2);
+        assert_eq!(result.relationship_summary.relationships_examined, 4);
+        assert_eq!(result.relationship_summary.cis_examined, 5);
+        assert_eq!(result.relationship_summary.servers_found, 2);
+        assert!(!result.relationship_summary.truncated);
+        assert_eq!(result.server_paths[linux][0].edges.len(), 1);
+        assert_eq!(result.server_paths[windows][0].edges.len(), 2);
+        assert_eq!(
+            result.server_paths[linux][0].edges[0].direction,
+            BusinessApplicationRelationshipDirection::ParentToChild
+        );
+
+        let serialized = serde_json::to_string(&result).expect("serialize result");
+        assert!(!serialized.contains(rel_row_1));
+        assert!(!serialized.contains(rel_row_2));
+        assert!(!serialized.contains(rel_row_3));
+        assert!(!serialized.contains(rel_row_4));
+
+        let requests = server.received_requests().await.expect("requests");
+        let relationship_queries = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/now/table/cmdb_rel_ci")
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "sysparm_query")
+                    .map(|(_, value)| value.to_string())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relationship_queries,
+            vec![
+                format!("parentIN{app}"),
+                format!("childIN{app}"),
+                format!("parentIN{service},{component}"),
+                format!("childIN{service},{component}"),
+            ]
+        );
+    }
+
+    /// Fix #3 regression guard: in a diamond topology (`app -> A -> S` and
+    /// `app -> B -> S`) the server `S` is reachable via two distinct parents.
+    /// With `include_paths`, BOTH routes must be recorded (the plural
+    /// `server_paths` Vec holds two entries), while `S` remains a single server
+    /// result. The second discovery is an alternate forward path, not a cycle.
+    #[tokio::test]
+    async fn business_application_servers_records_diamond_alternate_paths() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let branch_a = "22222222222222222222222222222222";
+        let branch_b = "33333333333333333333333333333333";
+        let leaf = "44444444444444444444444444444444";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Depth 1: app -> A and app -> B (two intermediate application CIs).
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row("99999999999999999999999999999991", app, branch_a, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl"),
+                    relationship_row("99999999999999999999999999999992", app, branch_b, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl")
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Depth 2: both A and B point at the SAME leaf server S.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("parentIN{branch_a},{branch_b}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row("99999999999999999999999999999993", branch_a, leaf, rel_type, "cmdb_ci_appl", "cmdb_ci_linux_server"),
+                    relationship_row("99999999999999999999999999999994", branch_b, leaf, rel_type, "cmdb_ci_appl", "cmdb_ci_linux_server")
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("childIN{branch_a},{branch_b}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{leaf}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(leaf, "linux-leaf.example.com", "cmdb_ci_linux_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                include_paths: true,
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        // One server, two distinct routes to it.
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(result.servers[0].record.sys_id, leaf);
+        let paths = result
+            .server_paths
+            .get(leaf)
+            .expect("leaf should have recorded paths");
+        assert_eq!(paths.len(), 2, "both diamond routes must be recorded");
+        // Each route is two edges long: app->branch then branch->leaf.
+        assert!(paths.iter().all(|route| route.edges.len() == 2));
+        // The two routes go through different branch CIs.
+        let mut branches = paths
+            .iter()
+            .map(|route| route.edges[0].to_sys_id.clone())
+            .collect::<Vec<_>>();
+        branches.sort();
+        assert_eq!(branches, vec![branch_a.to_string(), branch_b.to_string()]);
+    }
+
+    /// Fix #5: the paginated edge read must surface truncation when the
+    /// `max_edges` budget is consumed while more edge pages remain. Here
+    /// `max_edges = 2` and the first (and only fetched) page returns exactly two
+    /// edges, filling the page; with `no_count()` the paginator cannot prove it
+    /// is done, so reaching the budget with the paginator not exhausted sets
+    /// `edge_limit_reached`. This is the boundary the old single-request guard
+    /// (`rows.len() > remaining`) could never detect when a server-side cap
+    /// returned fewer rows than requested.
+    #[tokio::test]
+    async fn business_application_servers_edge_budget_paginates_and_truncates() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let ci_one = "22222222222222222222222222222222";
+        let ci_two = "33333333333333333333333333333333";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // First parent page is full (2 == page size derived from max_edges=2),
+        // so the paginator believes more pages may exist. The budget caps here.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .and(query_param("sysparm_offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row("99999999999999999999999999999991", app, ci_one, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl"),
+                    relationship_row("99999999999999999999999999999992", app, ci_two, rel_type, "cmdb_ci_business_app", "cmdb_ci_appl")
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                max_edges: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert!(
+            result.relationship_summary.edge_limit_reached,
+            "consuming max_edges with pages remaining must set edge_limit_reached"
+        );
+        assert!(result.relationship_summary.truncated);
+        assert_eq!(result.relationship_summary.relationships_examined, 2);
+    }
+
+    /// Fix #4: `max_cis` bounds the CIs examined BEYOND the root BA. With
+    /// `max_cis = 1` and two adjacent CIs, exactly one non-root CI is examined
+    /// and the second is truncated. The root BA does not consume the budget, so a
+    /// caller asking for one CI is not silently short-changed to zero.
+    #[tokio::test]
+    async fn business_application_servers_reports_ci_limit_truncation() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let service_two = "55555555555555555555555555555555";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Two adjacent non-root CIs; with max_cis=1 only the first is examined.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row(
+                        "99999999999999999999999999999991",
+                        app,
+                        service,
+                        rel_type,
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    ),
+                    relationship_row(
+                        "99999999999999999999999999999992",
+                        app,
+                        service_two,
+                        rel_type,
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    )
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The first examined CI (service) is hydrated as a non-server class and
+        // expanded into the next depth; it has no further relationships.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{service}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{service}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                max_cis: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert!(result.servers.is_empty());
+        assert!(result.relationship_summary.ci_limit_reached);
+        assert!(result.relationship_summary.truncated);
+        assert_eq!(result.relationship_summary.truncated_count, 1);
+        // One non-root CI examined plus the root => 2 in cis_examined.
+        assert_eq!(result.relationship_summary.cis_examined, 2);
+        assert_eq!(
+            result
+                .relationship_summary
+                .degraded_reasons
+                .get("fanout_limit_exceeded")
+                .copied(),
+            Some(1)
+        );
+        // The SECOND CI (service_two) is the one truncated by the budget.
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason == ReferenceResolutionReason::FanoutLimitExceeded
+                && diagnostic.reference_sys_id == service_two
+        }));
+    }
+
+    /// Fix #1 regression guard: a `cmdb_ci_server` subclass that is NOT in the
+    /// legacy `SERVER_TABLES` allowlist (here `cmdb_ci_esx_server`) must still be
+    /// classified as a server and hydrated, not traversed through as an
+    /// intermediate CI. The hydration query targets the base `cmdb_ci_server`
+    /// table and must NOT pin `sys_class_name` to the allowlist, otherwise the
+    /// subclass record would be filtered out server-side.
+    #[tokio::test]
+    async fn business_application_servers_collects_server_subclasses() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let esx = "66666666666666666666666666666666";
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let rel_row = "99999999999999999999999999999991";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The BA depends on an ESX server subclass directly.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row(
+                        rel_row,
+                        app,
+                        esx,
+                        rel_type,
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_esx_server"
+                    )
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Hydration must query the base server table by sys_id only (no
+        // sys_class_name allowlist filter) so the ESX subclass row is returned.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{esx}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(esx, "esx-alpha.example.com", "cmdb_ci_esx_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.servers.len(), 1, "ESX subclass should be a server");
+        assert_eq!(result.servers[0].record.sys_id, esx);
+        assert_eq!(
+            result.servers[0].class_name.as_deref(),
+            Some("cmdb_ci_esx_server")
+        );
+        assert_eq!(result.relationship_summary.servers_found, 1);
+    }
+
+    /// Fix #2 regression guard: with the default (unspecified) relationship-type
+    /// filter, an edge must match by the stable `cmdb_rel_type` identity (sys_id)
+    /// even when the instance's display label has been renamed/localized so it no
+    /// longer equals any default label string. The traversal resolves the default
+    /// label set to sys_ids once via a `cmdb_rel_type` lookup and matches on those.
+    #[tokio::test]
+    async fn business_application_servers_default_types_match_by_resolved_identity() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let linux = "33333333333333333333333333333333";
+        // sys_id of the "Depends on::Used by" cmdb_rel_type on this instance.
+        let depends_on = "dededededededededededededededede";
+        let rel_row = "99999999999999999999999999999991";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The default-label resolution query against cmdb_rel_type returns the
+        // sys_id of the "Depends on::Used by" type (by its stored name).
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_type"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "sys_id": depends_on, "name": "Depends on::Used by" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // The edge carries the resolved sys_id but a RENAMED display label that
+        // does not equal any default label string.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        rel_row,
+                        app,
+                        linux,
+                        depends_on,
+                        "Depende de::Usado por",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_linux_server"
+                    )
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-alpha.example.com", "cmdb_ci_linux_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(
+            result.servers.len(),
+            1,
+            "default filter must match renamed-label edge by resolved sys_id"
+        );
+        assert_eq!(result.servers[0].record.sys_id, linux);
+    }
+
+    /// Fix #2: an explicitly-supplied EMPTY relationship-type allowlist means
+    /// "match all", so an edge with an arbitrary type is still traversed and its
+    /// server collected, and no cmdb_rel_type resolution query is required.
+    #[tokio::test]
+    async fn business_application_servers_explicit_empty_types_match_all() {
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let linux = "33333333333333333333333333333333";
+        let weird_type = "cccccccccccccccccccccccccccccccc";
+        let rel_row = "99999999999999999999999999999991";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // An arbitrary, non-default relationship type with an unfamiliar label.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        rel_row,
+                        app,
+                        linux,
+                        weird_type,
+                        "Some Custom Relationship",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_linux_server"
+                    )
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-alpha.example.com", "cmdb_ci_linux_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        // An explicit empty allowlist (caller passed `relationship_type: []`
+        // explicitly via the options) means "match all".
+        let options = BusinessApplicationServersOptions {
+            selector: BusinessApplicationServersSelector::Number("APM0000001".to_string()),
+            max_depth: 2,
+            max_cis: 500,
+            max_edges: 2000,
+            relationship_type: Vec::new(),
+            include_paths: false,
+        };
+        // defaults_when_empty = false => empty allowlist means "match all".
+        let result = core
+            .business_application_servers_with_options(options, false)
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(
+            result.servers.len(),
+            1,
+            "explicit empty allowlist must match all relationship types"
+        );
+    }
+
+    fn relationship_row(
+        sys_id: &str,
+        parent: &str,
+        child: &str,
+        relationship_type: &str,
+        parent_class: &str,
+        child_class: &str,
+    ) -> serde_json::Value {
+        relationship_row_typed(
+            sys_id,
+            parent,
+            child,
+            relationship_type,
+            "Depends on::Used by",
+            parent_class,
+            child_class,
+        )
+    }
+
+    /// Like [`relationship_row`] but lets a test set the relationship type's
+    /// display label independently of its sys_id, so Fix #2 can simulate a
+    /// renamed/localized `cmdb_rel_type` label.
+    fn relationship_row_typed(
+        sys_id: &str,
+        parent: &str,
+        child: &str,
+        relationship_type: &str,
+        relationship_type_label: &str,
+        parent_class: &str,
+        child_class: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": sys_id,
+            "parent": { "value": parent, "display_value": "Parent CI" },
+            "child": { "value": child, "display_value": "Child CI" },
+            "type": {
+                "value": relationship_type,
+                "display_value": relationship_type_label
+            },
+            "parent.sys_class_name": parent_class,
+            "child.sys_class_name": child_class
+        })
+    }
+
+    fn server_row(sys_id: &str, name: &str, class_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": sys_id,
+            "name": name,
+            "sys_class_name": class_name,
+            "ip_address": "192.0.2.10",
+            "operational_status": { "value": "1", "display_value": "Operational" }
+        })
     }
 
     /// Mount a `sys_db_object` response so `table_ancestors` terminates with no

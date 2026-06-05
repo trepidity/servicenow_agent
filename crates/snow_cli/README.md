@@ -130,23 +130,73 @@ Notes:
 
 ### Business Applications
 
-Business Applications (`cmdb_ci_business_app`) are a first-class local primitive; the canonical local resource type is `business_application` (`cmdb_ci_business_app` is an accepted filter alias). The read-only surface is the daemon JSON-RPC methods (`business_application_search`, `business_application_get`, `business_application_query`, `business_application_fields`, `business_application_sync`) and the matching MCP tools, driven through a running daemon (`snow daemon start`). There is no write/create/update surface.
+Business Applications (`cmdb_ci_business_app`) are a first-class local primitive; the canonical local resource type is `business_application` (`cmdb_ci_business_app` is an accepted filter alias). The read-only surface is the daemon JSON-RPC methods (`business_application_search`, `business_application_get`, `business_application_query`, `business_application_fields`, `business_application_sync`, `business_application_servers`) and the matching MCP tools, driven through a running daemon (`snow daemon start`). There is no write/create/update surface.
 
 The `snow business-app` subcommand family is a thin CLI over those daemon methods (it auto-spawns the daemon as needed):
 
 ```bash
 snow business-app get --sys-id <sys_id> | --name "Epic" [--fresh] [--json] [--full]
 snow business-app search --name Epic --operational-state-not 2 [--limit N] [--json] [--full]
-snow business-app query --field business_owner --contains "Jane" [--limit N] [--json]
-snow business-app query --field u_custom_field --eq "value"
-snow business-app export --format <json|jsonl|csv> --output ./output/business-apps.csv [--text "Example Application"] [--field name --contains "Example"] [--limit N]
+snow business-app query --filter business_owner:contains:Jane [--limit N] [--json]
+snow business-app query --filter u_custom_field:eq:value
+snow business-app query --filter number:eq:EXAMPLE-APP-001 --filter name:contains:Example
+snow business-app servers --number <APM_NUMBER> [--max-depth N] [--max-cis N] [--max-edges N] [--relationship-type <type>] [--include-paths] [--json]
+snow business-app servers --sys-id <BUSINESS_APP_SYS_ID> [--max-depth N] [--max-cis N] [--max-edges N] [--relationship-type <type>] [--include-paths] [--json]
+snow business-app export --format <json|jsonl|csv> --output ./output/business-apps.csv [--text "Example Application"] [--filter name:contains:Example] [--limit N]
 snow business-app export --all --format <json|jsonl|csv> --output ./output/business-apps.csv
 snow business-app fields [--refresh] [--json]
 snow business-app sync --name Epic [--persist] [--resolve-references] [--reference-depth N] [--refresh-dictionary] [--json]
 snow business-app sync --all --persist [--resolve-references] [--reference-depth N] [--refresh-dictionary] [--json]
 ```
 
-Default human output shows name, sys_id, owners, groups, portfolio, operational status, attested date, vault path, and unresolved-reference count; `--json` emits the raw daemon payload and `--full` adds the all-fields table. `query`'s `--field` is repeatable and pairs by position with `--contains`/`--eq` (one operator value per field). `export` writes local `business_application_query` results to JSON, JSONL, or CSV after validating `--limit` and the output parent locally; `export --all` drains the cached local Business Application projection page-by-page and rejects search/filter/limit options. `sync` runs a live search+persist and prints a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`); `sync --all --persist` pages the live Business Application table before local export, and rejects bounded sync filters. `--persist` defaults on. The TUI routes `cmdb_ci_business_app` records to a first-class Business Application detail view (typed ownership/operational sections, then the all-fields table).
+Default human output shows name, sys_id, owners, groups, portfolio, operational status, attested date, vault path, and unresolved-reference count; `--json` emits the raw daemon payload and `--full` adds the all-fields table.
+
+#### Filters (`query` and `export`)
+
+`query` and `export` take repeatable `--filter <field>:<op>:<value>` arguments, where `<op>` is `contains` or `eq`. This is a single coupled argument (it replaced the earlier separate `--field` / `--contains` / `--eq` flags), so:
+
+- **Ordering is exact.** clap preserves the order in which each `--filter` is supplied, so the field/operator/value pairing is intact end to end (including interleaved operators) regardless of how the binary is invoked — there is no reliance on re-reading the process argv.
+- **Values may contain colons.** Only the first two colons delimit the token, so a value can itself contain colons (e.g. a URL or timestamp): `--filter browser_url:eq:https://example.com:8443/app`.
+- **Unknown operators are rejected at parse time.** A typo such as `name:equals:Example` fails immediately rather than being forwarded to the daemon.
+- `query` **requires at least one** `--filter`.
+
+```bash
+# A single contains filter
+snow business-app query --filter business_owner:contains:Jane
+
+# An exact-match filter on a custom field
+snow business-app query --filter u_custom_field:eq:value
+
+# Multiple filters, order preserved
+snow business-app query --filter number:eq:EXAMPLE-APP-001 --filter name:contains:Example
+```
+
+#### `servers` — walk CMDB relationships to enumerate a Business Application's servers
+
+`servers` calls `business_application_servers`, which performs a breadth-first traversal of CMDB relationships starting from a Business Application and collects the server CIs reachable from it. Provide exactly one selector:
+
+- `--number <APM_NUMBER>` — the real APM number field. It does **not** accept synthetic `BA:<sys_id>` values.
+- `--sys-id <BUSINESS_APP_SYS_ID>` — the Business Application sys_id.
+
+Traversal bounds (each is validated against an upper limit and falls back to a default when omitted):
+
+- `--max-depth N` — maximum relationship hops from the root Business Application. Default `2`, maximum `4`.
+- `--max-cis N` — maximum number of CIs **examined beyond the root** Business Application. The root BA is never counted against this budget, so `--max-cis N` allows up to `N` non-root CIs to be examined before traversal truncates. Default `500`, maximum `5000`.
+- `--max-edges N` — maximum number of relationship edges examined during traversal. Default `2000`, maximum `20000`.
+- `--relationship-type TYPE` — restrict traversal to one relationship type. Repeat the flag to include several types.
+- `--include-paths` — also report the relationship path(s) that lead to each server. In diamond topologies (where a server is reachable by more than one route) this reports **all** distinct alternate routes to that server, not just the first one found.
+
+Human `servers` output summarizes the Business Application, server count, the effective traversal bounds, completeness/degraded flags (`depth_limit_reached`, `ci_limit_reached`, `edge_limit_reached`, `truncated`), and compact server rows; `--json` prints the raw daemon result (including the per-server `server_paths` map when `--include-paths` is set).
+
+```bash
+snow business-app servers --number <APM_NUMBER>
+snow business-app servers --number <APM_NUMBER> --max-depth 3 --max-cis 1000 --include-paths
+snow business-app servers --sys-id <BUSINESS_APP_SYS_ID> --relationship-type "Depends on::Used by" --json
+```
+
+#### `export` and `sync`
+
+`export` writes local `business_application_query` results to JSON, JSONL, or CSV after validating `--limit` and the output parent locally; `export --all` drains the cached local Business Application projection page-by-page and conflicts with `--text`, `--filter`, and `--limit` (the bounded-query options). `sync` runs a live search+persist and prints a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`); `sync --all --persist` pages the live Business Application table before local export, and rejects bounded sync filters. `--persist` defaults on. The TUI routes `cmdb_ci_business_app` records to a first-class Business Application detail view (typed ownership/operational sections, then the all-fields table).
 
 Search/sync/fresh-fetch persists by default: each Business Application is fetched as a full row (no `sysparm_fields`, `display_value=all`), written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md`, and projected into local SQLite (schema v8) so `business_application_query` filters/sorts on any field locally. Reference sys_ids (owners, groups, portfolio) hydrate into local primitive objects when supported, or persist as unresolved stubs otherwise; reference failures degrade rather than fail the read. The daemon DTO returns `browser_url` and `vault_relative_path` when available.
 

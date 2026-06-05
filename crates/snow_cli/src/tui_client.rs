@@ -727,6 +727,21 @@ impl DaemonRpcClient {
             .await
     }
 
+    /// Return server CIs associated with a Business Application. The backend
+    /// owns the evolving result shape, so callers receive the raw daemon result.
+    pub async fn business_application_servers(
+        &self,
+        args: BusinessApplicationServersArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_application_servers_params(args);
+        let response = self
+            .send_request("business_application_servers", Some(Value::Object(params)))
+            .await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
     pub async fn server_get(
         &self,
         sys_id: Option<&str>,
@@ -1336,6 +1351,45 @@ pub(crate) fn business_application_query_page_params(
     if let Some(offset) = args.offset {
         params.insert("offset".to_string(), json!(offset));
     }
+    params
+}
+
+/// Request arguments passed to `business_application_servers`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationServersArgs<'a> {
+    pub number: Option<&'a str>,
+    pub sys_id: Option<&'a str>,
+    pub max_depth: Option<usize>,
+    pub max_cis: Option<usize>,
+    pub max_edges: Option<usize>,
+    pub relationship_type: &'a [String],
+    pub include_paths: bool,
+}
+
+pub(crate) fn business_application_servers_params(
+    args: BusinessApplicationServersArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(number) = args.number {
+        params.insert("number".to_string(), json!(number));
+    }
+    if let Some(sys_id) = args.sys_id {
+        params.insert("sys_id".to_string(), json!(sys_id));
+    }
+    if let Some(max_depth) = args.max_depth {
+        params.insert("max_depth".to_string(), json!(max_depth));
+    }
+    if let Some(max_cis) = args.max_cis {
+        params.insert("max_cis".to_string(), json!(max_cis));
+    }
+    if let Some(max_edges) = args.max_edges {
+        params.insert("max_edges".to_string(), json!(max_edges));
+    }
+    params.insert(
+        "relationship_type".to_string(),
+        json!(args.relationship_type),
+    );
+    params.insert("include_paths".to_string(), json!(args.include_paths));
     params
 }
 
@@ -2083,6 +2137,61 @@ mod tests {
                 ],
                 "limit": 500,
                 "offset": 1000
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_servers_params_use_daemon_contract_keys() {
+        let relationship_type = vec![
+            "<RELATIONSHIP_TYPE>".to_string(),
+            "<SECOND_RELATIONSHIP_TYPE>".to_string(),
+        ];
+
+        let params = business_application_servers_params(BusinessApplicationServersArgs {
+            number: Some("<APM_NUMBER>"),
+            sys_id: None,
+            max_depth: Some(2),
+            max_cis: Some(500),
+            max_edges: Some(2_000),
+            relationship_type: &relationship_type,
+            include_paths: true,
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "number": "<APM_NUMBER>",
+                "max_depth": 2,
+                "max_cis": 500,
+                "max_edges": 2000,
+                "relationship_type": [
+                    "<RELATIONSHIP_TYPE>",
+                    "<SECOND_RELATIONSHIP_TYPE>"
+                ],
+                "include_paths": true
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_servers_params_support_sys_id_selector() {
+        let params = business_application_servers_params(BusinessApplicationServersArgs {
+            number: None,
+            sys_id: Some("<BUSINESS_APP_SYS_ID>"),
+            max_depth: None,
+            max_cis: None,
+            max_edges: None,
+            relationship_type: &[],
+            include_paths: false,
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "sys_id": "<BUSINESS_APP_SYS_ID>",
+                "relationship_type": [],
+                "include_paths": false
             })
         );
     }

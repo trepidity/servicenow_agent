@@ -374,6 +374,72 @@ pub enum BusinessAppExportFormat {
     Csv,
 }
 
+/// One Business Application query filter parsed from a single `--filter` token.
+///
+/// The CLI surface intentionally couples the field, operator, and value into a
+/// single repeatable argument (`--filter <field>:<op>:<value>`). Because clap
+/// preserves the order of repeated occurrences of one argument, this keeps the
+/// field/operator/value pairing intact end to end without re-reading the raw
+/// process argv after clap has already parsed it. The wire shape sent to the
+/// daemon (`field` + `operator` + `value`) is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessAppFilter {
+    /// Field name to filter on.
+    pub field: String,
+    /// Operator token understood by the daemon query layer (`contains` or `eq`).
+    pub operator: String,
+    /// Value compared against the field using the operator.
+    pub value: String,
+}
+
+/// Operator tokens accepted in the `--filter <field>:<op>:<value>` form.
+///
+/// Kept deliberately small and explicit so a typo (e.g. `:equals:`) is rejected
+/// at parse time rather than silently forwarded to the daemon as an unknown
+/// operator.
+const BUSINESS_APP_FILTER_OPERATORS: [&str; 2] = ["contains", "eq"];
+
+/// Parse a single `--filter` token of the form `field:op:value`.
+///
+/// Splitting is done on the first two colons only, so the value may itself
+/// contain colons (e.g. a URL or timestamp). The field and operator must not be
+/// empty and the operator must be one of [`BUSINESS_APP_FILTER_OPERATORS`].
+fn parse_business_app_filter(value: &str) -> Result<BusinessAppFilter, String> {
+    // Split into at most three parts so the value keeps any embedded colons.
+    let mut parts = value.splitn(3, ':');
+    let field = parts.next().unwrap_or("").trim();
+    let operator = parts.next().map(str::trim);
+    let raw_value = parts.next();
+
+    let (operator, raw_value) = match (operator, raw_value) {
+        (Some(operator), Some(raw_value)) => (operator, raw_value),
+        _ => {
+            return Err(format!(
+                "--filter expects <field>:<op>:<value>, got '{value}'"
+            ));
+        }
+    };
+
+    if field.is_empty() {
+        return Err(format!("--filter field must not be empty in '{value}'"));
+    }
+    if !BUSINESS_APP_FILTER_OPERATORS.contains(&operator) {
+        return Err(format!(
+            "--filter operator must be one of {}, got '{operator}' in '{value}'",
+            BUSINESS_APP_FILTER_OPERATORS.join(", ")
+        ));
+    }
+    if raw_value.is_empty() {
+        return Err(format!("--filter value must not be empty in '{value}'"));
+    }
+
+    Ok(BusinessAppFilter {
+        field: field.to_string(),
+        operator: operator.to_string(),
+        value: raw_value.to_string(),
+    })
+}
+
 #[derive(Debug, Subcommand)]
 pub enum BusinessAppCommand {
     /// Get a single Business Application by sys_id or exact name
@@ -414,15 +480,10 @@ pub enum BusinessAppCommand {
     },
     /// Run a local all-field query using repeatable field/operator/value filters
     Query {
-        /// Field name to filter on. Repeatable; paired by position with operator values.
-        #[arg(long = "field")]
-        field: Vec<String>,
-        /// "contains" operator value. Repeatable.
-        #[arg(long = "contains")]
-        contains: Vec<String>,
-        /// "equals" operator value. Repeatable.
-        #[arg(long = "eq")]
-        eq: Vec<String>,
+        /// Filter as `<field>:<op>:<value>` where op is `contains` or `eq`.
+        /// Repeatable; clap preserves the order in which filters are supplied.
+        #[arg(long = "filter", value_name = "FIELD:OP:VALUE", value_parser = parse_business_app_filter)]
+        filter: Vec<BusinessAppFilter>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<usize>,
@@ -430,10 +491,48 @@ pub enum BusinessAppCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List server CIs associated with a Business Application
+    Servers {
+        /// Business Application number. This is the real APM number field, not a synthetic BA:<sys_id> value.
+        #[arg(
+            long,
+            value_name = "APM_NUMBER",
+            value_parser = parse_business_app_number,
+            required_unless_present = "sys_id",
+            conflicts_with = "sys_id"
+        )]
+        number: Option<String>,
+        /// Business Application sys_id.
+        #[arg(
+            long = "sys-id",
+            value_name = "BUSINESS_APP_SYS_ID",
+            required_unless_present = "number",
+            conflicts_with = "number"
+        )]
+        sys_id: Option<String>,
+        /// Maximum relationship traversal depth.
+        #[arg(long = "max-depth", value_name = "N")]
+        max_depth: Option<usize>,
+        /// Maximum CIs to examine beyond the root Business Application (the root is not counted against this budget).
+        #[arg(long = "max-cis", value_name = "N")]
+        max_cis: Option<usize>,
+        /// Maximum relationship edges to examine during traversal.
+        #[arg(long = "max-edges", value_name = "N")]
+        max_edges: Option<usize>,
+        /// Relationship type to include during traversal. Repeat to include multiple types.
+        #[arg(long = "relationship-type", value_name = "TYPE")]
+        relationship_type: Vec<String>,
+        /// Include relationship path metadata for each server when supported by the daemon.
+        #[arg(long)]
+        include_paths: bool,
+        /// Emit the raw daemon JSON payload.
+        #[arg(long)]
+        json: bool,
+    },
     /// Export Business Applications from the daemon query surface
     Export {
         /// Export the complete local Business Application projection
-        #[arg(long, conflicts_with_all = ["text", "field", "contains", "eq", "limit"])]
+        #[arg(long, conflicts_with_all = ["text", "filter", "limit"])]
         all: bool,
         /// Export file format
         #[arg(long, value_enum)]
@@ -444,15 +543,10 @@ pub enum BusinessAppCommand {
         /// Free-text query passed to the daemon query surface
         #[arg(long)]
         text: Option<String>,
-        /// Field name to filter on. Repeatable; paired by position with operator values.
-        #[arg(long = "field")]
-        field: Vec<String>,
-        /// "contains" operator value. Repeatable.
-        #[arg(long = "contains")]
-        contains: Vec<String>,
-        /// "equals" operator value. Repeatable.
-        #[arg(long = "eq")]
-        eq: Vec<String>,
+        /// Filter as `<field>:<op>:<value>` where op is `contains` or `eq`.
+        /// Repeatable; clap preserves the order in which filters are supplied.
+        #[arg(long = "filter", value_name = "FIELD:OP:VALUE", value_parser = parse_business_app_filter)]
+        filter: Vec<BusinessAppFilter>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<usize>,
@@ -493,6 +587,22 @@ pub enum BusinessAppCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+fn parse_business_app_number(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Business Application number must not be empty".to_string());
+    }
+    if value
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BA:"))
+    {
+        return Err(
+            "--number accepts a real Business Application number, not BA:<sys_id>".to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -819,40 +929,95 @@ mod tests {
             "snow",
             "business-app",
             "query",
-            "--field",
-            "business_owner",
-            "--contains",
-            "Jane",
+            "--filter",
+            "business_owner:contains:Jane",
         ]);
         assert!(matches!(
             cli.command,
             Command::BusinessApp {
-                action: BusinessAppCommand::Query {
-                    field,
-                    contains,
-                    eq,
-                    ..
-                },
-            } if field == vec!["business_owner".to_string()]
-                && contains == vec!["Jane".to_string()]
-                && eq.is_empty()
+                action: BusinessAppCommand::Query { filter, .. },
+            } if filter == vec![BusinessAppFilter {
+                field: "business_owner".to_string(),
+                operator: "contains".to_string(),
+                value: "Jane".to_string(),
+            }]
         ));
 
         let cli = Cli::parse_from([
             "snow",
             "business-app",
             "query",
-            "--field",
-            "u_custom_field",
-            "--eq",
-            "value",
+            "--filter",
+            "u_custom_field:eq:value",
         ]);
         assert!(matches!(
             cli.command,
             Command::BusinessApp {
-                action: BusinessAppCommand::Query { field, eq, .. },
-            } if field == vec!["u_custom_field".to_string()]
-                && eq == vec!["value".to_string()]
+                action: BusinessAppCommand::Query { filter, .. },
+            } if filter == vec![BusinessAppFilter {
+                field: "u_custom_field".to_string(),
+                operator: "eq".to_string(),
+                value: "value".to_string(),
+            }]
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--max-depth",
+            "2",
+            "--max-cis",
+            "500",
+            "--max-edges",
+            "2000",
+            "--relationship-type",
+            "<RELATIONSHIP_TYPE>",
+            "--relationship-type",
+            "<SECOND_RELATIONSHIP_TYPE>",
+            "--include-paths",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    number: Some(number),
+                    sys_id: None,
+                    max_depth: Some(2),
+                    max_cis: Some(500),
+                    max_edges: Some(2000),
+                    relationship_type,
+                    include_paths: true,
+                    json: true,
+                },
+            } if number == "<APM_NUMBER>"
+                && relationship_type == vec![
+                    "<RELATIONSHIP_TYPE>".to_string(),
+                    "<SECOND_RELATIONSHIP_TYPE>".to_string()
+                ]
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--sys-id",
+            "<BUSINESS_APP_SYS_ID>",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    number: None,
+                    sys_id: Some(sys_id),
+                    include_paths: false,
+                    json: false,
+                    ..
+                },
+            } if sys_id == "<BUSINESS_APP_SYS_ID>"
         ));
 
         let cli = Cli::parse_from([
@@ -865,14 +1030,10 @@ mod tests {
             "business-apps.jsonl",
             "--text",
             "portfolio",
-            "--field",
-            "business_owner",
-            "--contains",
-            "User",
-            "--field",
-            "operational_state",
-            "--eq",
-            "1",
+            "--filter",
+            "business_owner:contains:User",
+            "--filter",
+            "operational_state:eq:1",
             "--limit",
             "50",
         ]);
@@ -884,16 +1045,23 @@ mod tests {
                     format: BusinessAppExportFormat::Jsonl,
                     output,
                     text: Some(text),
-                    field,
-                    contains,
-                    eq,
+                    filter,
                     limit: Some(50),
                 },
             } if output.as_path() == std::path::Path::new("business-apps.jsonl")
                 && text == "portfolio"
-                && field == vec!["business_owner".to_string(), "operational_state".to_string()]
-                && contains == vec!["User".to_string()]
-                && eq == vec!["1".to_string()]
+                && filter == vec![
+                    BusinessAppFilter {
+                        field: "business_owner".to_string(),
+                        operator: "contains".to_string(),
+                        value: "User".to_string(),
+                    },
+                    BusinessAppFilter {
+                        field: "operational_state".to_string(),
+                        operator: "eq".to_string(),
+                        value: "1".to_string(),
+                    },
+                ]
         ));
 
         let cli = Cli::parse_from(["snow", "business-app", "fields", "--refresh"]);
@@ -976,16 +1144,128 @@ mod tests {
                     format: BusinessAppExportFormat::Csv,
                     output,
                     text: None,
-                    field,
-                    contains,
-                    eq,
+                    filter,
                     limit: None,
                 },
             } if output.as_path() == std::path::Path::new("business-apps.csv")
-                && field.is_empty()
-                && contains.is_empty()
-                && eq.is_empty()
+                && filter.is_empty()
         ));
+    }
+
+    #[test]
+    fn business_app_query_filter_preserves_interleaved_operator_order() {
+        // Headline regression: interleave eq before contains. The previous
+        // implementation re-read raw argv and, when that scan failed, fell back
+        // to a homogeneous ordering (all --contains first, then all --eq) which
+        // would have mis-paired these two filters. With a single repeatable
+        // --filter argument, clap itself preserves CLI order, so the pairing is
+        // exact regardless of how the binary was invoked.
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "query",
+            "--filter",
+            "number:eq:EXAMPLE-APP-001",
+            "--filter",
+            "name:contains:Example",
+        ]);
+        let filter = match cli.command {
+            Command::BusinessApp {
+                action: BusinessAppCommand::Query { filter, .. },
+            } => filter,
+            other => panic!("expected business-app query, got {other:?}"),
+        };
+        assert_eq!(
+            filter,
+            vec![
+                BusinessAppFilter {
+                    field: "number".to_string(),
+                    operator: "eq".to_string(),
+                    value: "EXAMPLE-APP-001".to_string(),
+                },
+                BusinessAppFilter {
+                    field: "name".to_string(),
+                    operator: "contains".to_string(),
+                    value: "Example".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn business_app_filter_value_may_contain_colons() {
+        // Only the first two colons delimit field/op/value, so values such as
+        // URLs or timestamps survive intact.
+        let parsed = parse_business_app_filter("browser_url:eq:https://example.com:8443/app")
+            .expect("parse");
+        assert_eq!(parsed.field, "browser_url");
+        assert_eq!(parsed.operator, "eq");
+        assert_eq!(parsed.value, "https://example.com:8443/app");
+    }
+
+    #[test]
+    fn business_app_filter_rejects_malformed_tokens() {
+        // Missing the value segment entirely.
+        assert!(parse_business_app_filter("name:contains").is_err());
+        // Empty field.
+        assert!(parse_business_app_filter(":contains:Example").is_err());
+        // Empty value.
+        assert!(parse_business_app_filter("name:contains:").is_err());
+        // Unknown operator is rejected at parse time, not forwarded to the daemon.
+        assert!(parse_business_app_filter("name:equals:Example").is_err());
+    }
+
+    #[test]
+    fn business_app_query_surfaces_filter_parse_errors() {
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "query",
+            "--filter",
+            "name:equals:Example",
+        ]) {
+            Ok(_) => panic!("invalid operator should fail to parse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn business_app_servers_requires_exactly_one_selector() {
+        let err = match Cli::try_parse_from(["snow", "business-app", "servers"]) {
+            Ok(_) => panic!("servers without selector should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--sys-id",
+            "<BUSINESS_APP_SYS_ID>",
+        ]) {
+            Ok(_) => panic!("servers with both selectors should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn business_app_servers_rejects_synthetic_ba_number() {
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "BA:<BUSINESS_APP_SYS_ID>",
+        ]) {
+            Ok(_) => panic!("synthetic BA number should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
@@ -1040,8 +1320,8 @@ mod tests {
                 "json",
                 "--output",
                 "business-apps.json",
-                "--field",
-                "name",
+                "--filter",
+                "name:contains:Example",
             ],
             [
                 "snow",

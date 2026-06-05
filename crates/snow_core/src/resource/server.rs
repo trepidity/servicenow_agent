@@ -19,6 +19,25 @@ pub const SERVER_MAX_LIMIT: usize = 100;
 pub const SERVER_TABLES: &[&str] = &[SERVER_TABLE, LINUX_SERVER_TABLE, WINDOWS_SERVER_TABLE];
 pub const SERVER_LEAF_TABLES: &[&str] = &[LINUX_SERVER_TABLE, WINDOWS_SERVER_TABLE];
 
+/// Common `cmdb_ci_server` subclasses shipped in baseline CMDB plus widely-used
+/// OOTB extensions. These are the descendants of `cmdb_ci_server` that the
+/// graph traversal must recognize as servers even though they are not in the
+/// narrow [`SERVER_TABLES`] hydration alias list. The list is not meant to be
+/// exhaustive of every custom subclass an instance may define; see
+/// [`is_server_class`] for how the structural naming convention covers the long
+/// tail without a per-class CMDB hierarchy lookup.
+pub const SERVER_SUBCLASS_TABLES: &[&str] = &[
+    "cmdb_ci_unix_server",
+    "cmdb_ci_aix_server",
+    "cmdb_ci_solaris_server",
+    "cmdb_ci_hpux_server",
+    "cmdb_ci_osx_server",
+    "cmdb_ci_esx_server",
+    "cmdb_ci_ucs_blade",
+    "cmdb_ci_mainframe_hardware",
+    "cmdb_ci_mainframe_lpar",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Server {
     pub record: SnowRecord,
@@ -154,8 +173,53 @@ impl ServerQuery {
     }
 }
 
+/// True when `value` names one of the canonical server hydration aliases
+/// (`cmdb_ci_server`, `cmdb_ci_linux_server`, `cmdb_ci_win_server`).
+///
+/// This is the narrow exact-name check used where the canonical alias matters
+/// (e.g. building hydration field projections). For deciding whether an
+/// arbitrary CMDB class encountered during graph traversal is a server, use
+/// [`is_server_class`], which is hierarchy-aware.
 pub fn is_server_table(value: &str) -> bool {
     SERVER_TABLES.contains(&canonical_server_table_alias(value).as_str())
+}
+
+/// Hierarchy-aware server-class detection for CMDB graph traversal.
+///
+/// ServiceNow models CIs as a table-per-hierarchy rooted at `cmdb_ci`. Every
+/// physical/virtual server class extends `cmdb_ci_server`, but the concrete
+/// `sys_class_name` is the *leaf* subclass (`cmdb_ci_linux_server`,
+/// `cmdb_ci_esx_server`, `cmdb_ci_aix_server`, ...). An exact-name allowlist
+/// therefore silently drops real servers and traverses *through* them.
+///
+/// The fully general solution is to walk the `sys_db_object` super_class chain
+/// for the encountered class and test descent from `cmdb_ci_server`. That costs
+/// an extra CMDB metadata query per distinct class. To stay hierarchy-aware
+/// without that per-class lookup, this function recognizes a server class when
+/// any of the following hold:
+///
+/// 1. it is the base server table or a canonical alias ([`is_server_table`]);
+/// 2. it is a known baseline/OOTB subclass ([`SERVER_SUBCLASS_TABLES`]); or
+/// 3. it matches the structural naming convention used by server subclasses —
+///    a `cmdb_ci_*` class whose name ends in `_server` (e.g. a custom
+///    `cmdb_ci_acme_server`).
+///
+/// Rule (3) is the hierarchy-shaped backstop that covers the long tail of
+/// instance-specific subclasses. The downstream hydration query targets the
+/// base `cmdb_ci_server` table by `sys_id`, so a false positive here is
+/// self-correcting: a non-server CI that slips through is simply not returned by
+/// the base-table read (recorded as a missing CI) rather than corrupting results.
+pub fn is_server_class(value: &str) -> bool {
+    let normalized = canonical_server_table_alias(value);
+    if SERVER_TABLES.contains(&normalized.as_str())
+        || SERVER_SUBCLASS_TABLES.contains(&normalized.as_str())
+    {
+        return true;
+    }
+    // Structural convention: server subclasses are cmdb_ci_* tables whose name
+    // ends in `_server`. Guard against the bare `cmdb_ci_server` having already
+    // been handled above and against unrelated `cmdb_ci` tables.
+    normalized.starts_with("cmdb_ci_") && normalized.ends_with("_server")
 }
 
 pub fn is_server_alias(value: &str) -> bool {

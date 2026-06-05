@@ -55,6 +55,11 @@ pub fn register(registry: &mut ToolRegistry) {
             business_application_query_arg_schema(),
         ),
         (
+            "business_application_servers",
+            "Read servers associated with a Business Application by Business Application number or cmdb_ci_business_app sys_id using bounded CMDB relationship traversal.",
+            business_application_servers_arg_schema(),
+        ),
+        (
             "business_application_fields",
             "List observed Business Application fields from the local projection, including owner-related fields when field mapping for an APM lookup is unclear.",
             business_application_fields_arg_schema(),
@@ -437,6 +442,59 @@ pub fn business_application_query_arg_schema() -> Value {
                         "direction": { "type": "string", "enum": ["asc", "desc"], "default": "asc" }
                     }
                 }
+            }
+        }
+    })
+}
+
+pub fn business_application_servers_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Reads Server CIs associated with one Business Application via bounded CMDB relationship traversal. Provide exactly one of number or sys_id. Runtime validation enforces the selector XOR and traversal bounds. Server detection is class-hierarchy aware: any CMDB class extending cmdb_ci_server (the canonical cmdb_ci_server/cmdb_ci_linux_server/cmdb_ci_win_server tables plus subclasses such as cmdb_ci_esx_server, cmdb_ci_aix_server, cmdb_ci_solaris_server, and instance-specific cmdb_ci_*_server classes) is returned as a server.",
+        "properties": {
+            "number": {
+                "type": "string",
+                "description": "Business Application number, for example <APM_NUMBER>. Not a local BA:<sys_id> fallback identifier."
+            },
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "32-character cmdb_ci_business_app sys_id."
+            },
+            "max_depth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4,
+                "default": 2,
+                "description": "Maximum relationship-traversal depth (BFS hops) from the root Business Application. Range 1-4, default 2."
+            },
+            "max_cis": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5000,
+                "default": 500,
+                "description": "Maximum number of configuration items examined BEYOND the root Business Application. The root BA is excluded from this budget, so up to max_cis non-root CIs may be examined before traversal truncates. Range 1-5000, default 500."
+            },
+            "max_edges": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20000,
+                "default": 2000,
+                "description": "Maximum number of cmdb_rel_ci relationship edges examined across the whole traversal. Edge reads are paginated and continue until this budget is consumed or the result set is exhausted, so large graphs are not silently undercounted. Range 1-20000, default 2000."
+            },
+            "relationship_type": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "default": [],
+                "description": "Optional allowlist of CMDB relationship types (cmdb_rel_type names or sys_ids) that gate which edges are traversed. When omitted/empty, the default set (Depends on::Used by, Runs on::Runs, Contains::Contained by, Hosted on::Hosts) is used, resolved to stable cmdb_rel_type sys_id identities so a renamed or localized display label still matches. An explicit non-empty list is matched against both each edge's raw value and its display label."
+            },
+            "include_paths": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, the result includes server_paths: every route (chain of relationship edges) from the root Business Application to each server, reporting multiple alternate paths when a server is reachable via different parents (diamond topology). One server result is still returned per server regardless of path count. Default false."
             }
         }
     })

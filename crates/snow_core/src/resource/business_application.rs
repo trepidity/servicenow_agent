@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use servicenow_rs::prelude::Record;
 
+use super::server::Server;
 use crate::{
     CacheSource, FieldValue, Reference, SnowRecord, normalize_record_lookup_sys_id,
     reference::choose_reference_display_name,
@@ -12,6 +13,18 @@ use crate::{
 
 pub const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
 pub const BUSINESS_APPLICATION_RESOURCE_TYPE: &str = "business_application";
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH: usize = 2;
+pub const BUSINESS_APPLICATION_SERVERS_MAX_DEPTH: usize = 4;
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS: usize = 500;
+pub const BUSINESS_APPLICATION_SERVERS_MAX_CIS: usize = 5000;
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES: usize = 2000;
+pub const BUSINESS_APPLICATION_SERVERS_MAX_EDGES: usize = 20000;
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES: &[&str] = &[
+    "Depends on::Used by",
+    "Runs on::Runs",
+    "Contains::Contained by",
+    "Hosted on::Hosts",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BusinessApplication {
@@ -39,6 +52,276 @@ pub struct BusinessApplication {
     pub references: Vec<ReferencePrimitiveDescriptor>,
     #[serde(default)]
     pub unresolved_references: Vec<ReferenceResolutionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessApplicationServersParams {
+    /// Real Business Application number, for example <APM_NUMBER>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    /// Business Application sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sys_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<usize>,
+    /// Maximum number of configuration items EXAMINED BEYOND the root Business
+    /// Application during traversal. The root BA itself is never counted against
+    /// this budget, so a caller passing `max_cis = N` may examine up to `N`
+    /// non-root CIs. Defaults to
+    /// [`BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cis: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_edges: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationship_type: Vec<String>,
+    #[serde(default)]
+    pub include_paths: bool,
+}
+
+impl BusinessApplicationServersParams {
+    pub fn validate(&self) -> Result<BusinessApplicationServersOptions> {
+        let number = non_empty_string(self.number.as_deref());
+        let sys_id = non_empty_string(self.sys_id.as_deref());
+        match (number, sys_id) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("provide exactly one of `number` or `sys_id`")
+            }
+            (None, None) => anyhow::bail!("provide exactly one of `number` or `sys_id`"),
+            (Some(number), None) => {
+                let number = normalize_business_application_number(&number)?;
+                Ok(BusinessApplicationServersOptions {
+                    selector: BusinessApplicationServersSelector::Number(number),
+                    max_depth: validate_bound(
+                        "max_depth",
+                        self.max_depth,
+                        BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH,
+                        BUSINESS_APPLICATION_SERVERS_MAX_DEPTH,
+                    )?,
+                    max_cis: validate_bound(
+                        "max_cis",
+                        self.max_cis,
+                        BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS,
+                        BUSINESS_APPLICATION_SERVERS_MAX_CIS,
+                    )?,
+                    max_edges: validate_bound(
+                        "max_edges",
+                        self.max_edges,
+                        BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
+                        BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
+                    )?,
+                    relationship_type: normalized_relationship_types(&self.relationship_type),
+                    include_paths: self.include_paths,
+                })
+            }
+            (None, Some(sys_id)) => Ok(BusinessApplicationServersOptions {
+                selector: BusinessApplicationServersSelector::SysId(
+                    normalize_record_lookup_sys_id(&sys_id)?,
+                ),
+                max_depth: validate_bound(
+                    "max_depth",
+                    self.max_depth,
+                    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH,
+                    BUSINESS_APPLICATION_SERVERS_MAX_DEPTH,
+                )?,
+                max_cis: validate_bound(
+                    "max_cis",
+                    self.max_cis,
+                    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS,
+                    BUSINESS_APPLICATION_SERVERS_MAX_CIS,
+                )?,
+                max_edges: validate_bound(
+                    "max_edges",
+                    self.max_edges,
+                    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
+                    BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
+                )?,
+                relationship_type: normalized_relationship_types(&self.relationship_type),
+                include_paths: self.include_paths,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationServersSelector {
+    Number(String),
+    SysId(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServersOptions {
+    pub selector: BusinessApplicationServersSelector,
+    pub max_depth: usize,
+    /// Maximum number of configuration items examined BEYOND the root Business
+    /// Application. The root BA is excluded from this budget; up to `max_cis`
+    /// non-root CIs may be examined before traversal truncates.
+    pub max_cis: usize,
+    pub max_edges: usize,
+    #[serde(default)]
+    pub relationship_type: Vec<String>,
+    #[serde(default)]
+    pub include_paths: bool,
+}
+
+impl BusinessApplicationServersOptions {
+    pub fn effective_relationship_types(&self) -> Vec<String> {
+        if self.relationship_type.is_empty() {
+            BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect()
+        } else {
+            self.relationship_type.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServersResult {
+    pub business_application: BusinessApplicationServerApplication,
+    #[serde(default)]
+    pub servers: Vec<Server>,
+    pub relationship_summary: BusinessApplicationServersSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ReferenceResolutionDiagnostic>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_paths: BTreeMap<String, Vec<BusinessApplicationServerPath>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServerApplication {
+    pub sys_id: String,
+    pub number: String,
+    pub name: String,
+    pub table: String,
+}
+
+impl From<&BusinessApplication> for BusinessApplicationServerApplication {
+    fn from(application: &BusinessApplication) -> Self {
+        Self {
+            sys_id: application.record.sys_id.clone(),
+            number: application.record.number.clone(),
+            name: application.name.clone(),
+            table: application.record.table.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServersSummary {
+    pub max_depth: usize,
+    pub max_cis: usize,
+    pub max_edges: usize,
+    #[serde(default)]
+    pub servers_found: usize,
+    #[serde(default)]
+    pub relationships_examined: usize,
+    #[serde(default)]
+    pub cis_examined: usize,
+    #[serde(default)]
+    pub depth_limit_reached: bool,
+    #[serde(default)]
+    pub ci_limit_reached: bool,
+    #[serde(default)]
+    pub edge_limit_reached: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub truncated_count: usize,
+    #[serde(default)]
+    pub acl_restricted_count: usize,
+    #[serde(default)]
+    pub missing_ci_count: usize,
+    #[serde(default)]
+    pub cycle_count: usize,
+    #[serde(default)]
+    pub degraded_reasons: BTreeMap<String, usize>,
+}
+
+impl BusinessApplicationServersSummary {
+    pub fn new(options: &BusinessApplicationServersOptions) -> Self {
+        Self {
+            max_depth: options.max_depth,
+            max_cis: options.max_cis,
+            max_edges: options.max_edges,
+            servers_found: 0,
+            relationships_examined: 0,
+            cis_examined: 0,
+            depth_limit_reached: false,
+            ci_limit_reached: false,
+            edge_limit_reached: false,
+            truncated: false,
+            truncated_count: 0,
+            acl_restricted_count: 0,
+            missing_ci_count: 0,
+            cycle_count: 0,
+            degraded_reasons: BTreeMap::new(),
+        }
+    }
+
+    pub fn record_degraded_reason(&mut self, reason: &ReferenceResolutionReason) {
+        *self
+            .degraded_reasons
+            .entry(reason.as_key().to_string())
+            .or_insert(0) += 1;
+    }
+
+    pub fn mark_truncated(&mut self, skipped: usize) {
+        self.truncated = true;
+        self.truncated_count += skipped;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServerPath {
+    pub depth: usize,
+    #[serde(default)]
+    pub edges: Vec<BusinessApplicationServerPathEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServerPathEdge {
+    pub depth: usize,
+    pub from_sys_id: String,
+    pub to_sys_id: String,
+    pub parent_sys_id: String,
+    pub child_sys_id: String,
+    pub direction: BusinessApplicationRelationshipDirection,
+    pub relationship_type: BusinessApplicationRelationshipType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationRelationshipDirection {
+    ParentToChild,
+    ChildToParent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationRelationshipType {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
+}
+
+impl BusinessApplicationRelationshipType {
+    pub fn matches_any(&self, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        let raw = normalize_relationship_type_match_value(&self.value);
+        let display = self
+            .display_value
+            .as_deref()
+            .map(normalize_relationship_type_match_value);
+        allowed.iter().any(|allowed| {
+            let allowed = normalize_relationship_type_match_value(allowed);
+            raw == allowed || display.as_deref() == Some(allowed.as_str())
+        })
+    }
 }
 
 impl BusinessApplication {
@@ -115,6 +398,54 @@ impl BusinessApplication {
             record: snow_record,
         })
     }
+}
+
+fn validate_bound(name: &str, value: Option<usize>, default: usize, max: usize) -> Result<usize> {
+    let value = value.unwrap_or(default);
+    if value == 0 {
+        anyhow::bail!("`{name}` must be at least 1");
+    }
+    if value > max {
+        anyhow::bail!("`{name}` must be at most {max}");
+    }
+    Ok(value)
+}
+
+fn normalize_business_application_number(number: &str) -> Result<String> {
+    let number = number.trim();
+    if number.to_ascii_uppercase().starts_with("BA:") {
+        anyhow::bail!("`number` must be a real Business Application number, not BA:<sys_id>");
+    }
+    let normalized = number.to_ascii_uppercase();
+    let suffix = normalized.strip_prefix("APM").unwrap_or_default();
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("`number` must be a real Business Application number such as <APM_NUMBER>");
+    }
+    Ok(normalized)
+}
+
+fn normalized_relationship_types(values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        let Some(value) = non_empty_string(Some(value)) else {
+            continue;
+        };
+        if !out.iter().any(|existing| existing == &value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn normalize_relationship_type_match_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
