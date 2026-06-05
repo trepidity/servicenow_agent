@@ -672,23 +672,36 @@ impl DaemonRpcClient {
         filters: &[BusinessApplicationQueryFilter],
         limit: Option<usize>,
     ) -> Result<Value, SnowError> {
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "filters".to_string(),
-            json!(
-                filters
-                    .iter()
-                    .map(|f| json!({
-                        "field": f.field,
-                        "operator": f.operator,
-                        "value": f.value,
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        if let Some(limit) = limit {
-            params.insert("limit".to_string(), json!(limit));
-        }
+        self.business_application_query_with_args(BusinessApplicationQueryArgs {
+            text: None,
+            filters,
+            limit,
+        })
+        .await
+    }
+
+    /// Run a Business Application query with optional text, filters, and limit.
+    pub async fn business_application_query_with_args(
+        &self,
+        args: BusinessApplicationQueryArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_application_query_params(args);
+        self.business_application_query_with_params(params).await
+    }
+
+    /// Run a paged Business Application query against the local daemon cache.
+    pub async fn business_application_query_page_with_args(
+        &self,
+        args: BusinessApplicationQueryPageArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_application_query_page_params(args);
+        self.business_application_query_with_params(params).await
+    }
+
+    async fn business_application_query_with_params(
+        &self,
+        params: serde_json::Map<String, Value>,
+    ) -> Result<Value, SnowError> {
         // The daemon may key results under "business_applications" or "records";
         // unwrap either, falling back to the whole payload.
         let raw: Value = self
@@ -779,19 +792,24 @@ impl DaemonRpcClient {
         reference_depth: Option<u32>,
         refresh_dictionary: bool,
     ) -> Result<Value, SnowError> {
-        let mut params = serde_json::Map::new();
-        if let Some(name) = name {
-            params.insert("name".to_string(), json!(name));
-        }
-        if let Some(state) = operational_state_not {
-            params.insert("operational_state_not".to_string(), json!(state));
-        }
-        params.insert("persist".to_string(), json!(persist));
-        params.insert("resolve_references".to_string(), json!(resolve_references));
-        if let Some(depth) = reference_depth {
-            params.insert("reference_depth".to_string(), json!(depth));
-        }
-        params.insert("refresh_dictionary".to_string(), json!(refresh_dictionary));
+        self.business_application_sync_with_args(BusinessApplicationSyncArgs {
+            all: false,
+            name,
+            operational_state_not,
+            persist,
+            resolve_references,
+            reference_depth,
+            refresh_dictionary,
+        })
+        .await
+    }
+
+    /// Sync Business Applications with the full request shape understood by RPC.
+    pub async fn business_application_sync_with_args(
+        &self,
+        args: BusinessApplicationSyncArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_application_sync_params(args);
         self.call_wrapped(
             "business_application_sync",
             Some(Value::Object(params)),
@@ -1268,6 +1286,97 @@ pub struct BusinessApplicationQueryFilter {
     /// Operator token understood by the daemon query layer (e.g. "contains", "eq").
     pub operator: String,
     pub value: String,
+}
+
+/// Request arguments passed to `business_application_query`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationQueryArgs<'a> {
+    pub text: Option<&'a str>,
+    pub filters: &'a [BusinessApplicationQueryFilter],
+    pub limit: Option<usize>,
+}
+
+/// Paged request arguments passed to `business_application_query`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationQueryPageArgs<'a> {
+    pub query: BusinessApplicationQueryArgs<'a>,
+    pub offset: Option<usize>,
+}
+
+pub(crate) fn business_application_query_params(
+    args: BusinessApplicationQueryArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(text) = args.text {
+        params.insert("text".to_string(), json!(text));
+    }
+    params.insert(
+        "filters".to_string(),
+        json!(
+            args.filters
+                .iter()
+                .map(|f| json!({
+                    "field": f.field,
+                    "op": f.operator,
+                    "value": f.value,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    if let Some(limit) = args.limit {
+        params.insert("limit".to_string(), json!(limit));
+    }
+    params
+}
+
+pub(crate) fn business_application_query_page_params(
+    args: BusinessApplicationQueryPageArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = business_application_query_params(args.query);
+    if let Some(offset) = args.offset {
+        params.insert("offset".to_string(), json!(offset));
+    }
+    params
+}
+
+/// Request arguments passed to `business_application_sync`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationSyncArgs<'a> {
+    pub all: bool,
+    pub name: Option<&'a str>,
+    pub operational_state_not: Option<&'a str>,
+    pub persist: bool,
+    pub resolve_references: bool,
+    pub reference_depth: Option<u32>,
+    pub refresh_dictionary: bool,
+}
+
+pub(crate) fn business_application_sync_params(
+    args: BusinessApplicationSyncArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if args.all {
+        params.insert("all".to_string(), json!(true));
+    }
+    if let Some(name) = args.name {
+        params.insert("name".to_string(), json!(name));
+    }
+    if let Some(state) = args.operational_state_not {
+        params.insert("operational_state_not".to_string(), json!(state));
+    }
+    params.insert("persist".to_string(), json!(args.persist));
+    params.insert(
+        "resolve_references".to_string(),
+        json!(args.resolve_references),
+    );
+    if let Some(depth) = args.reference_depth {
+        params.insert("reference_depth".to_string(), json!(depth));
+    }
+    params.insert(
+        "refresh_dictionary".to_string(),
+        json!(args.refresh_dictionary),
+    );
+    params
 }
 
 /// Filter bag passed to `server_search` and `server_query`.
@@ -1900,6 +2009,105 @@ mod tests {
         assert_eq!(
             unwrap_field_or_self(json!({ "number": "CHG001" }), "record"),
             json!({ "number": "CHG001" })
+        );
+    }
+
+    #[test]
+    fn business_application_query_params_use_daemon_filter_op_key() {
+        let filters = vec![
+            BusinessApplicationQueryFilter {
+                field: "business_owner".to_string(),
+                operator: "contains".to_string(),
+                value: "User".to_string(),
+            },
+            BusinessApplicationQueryFilter {
+                field: "operational_state".to_string(),
+                operator: "eq".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+
+        let params = business_application_query_params(BusinessApplicationQueryArgs {
+            text: Some("portfolio"),
+            filters: &filters,
+            limit: Some(50),
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "text": "portfolio",
+                "filters": [
+                    {
+                        "field": "business_owner",
+                        "op": "contains",
+                        "value": "User"
+                    },
+                    {
+                        "field": "operational_state",
+                        "op": "eq",
+                        "value": "1"
+                    }
+                ],
+                "limit": 50
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_query_page_params_include_offset() {
+        let filters = vec![BusinessApplicationQueryFilter {
+            field: "name".to_string(),
+            operator: "contains".to_string(),
+            value: "Example".to_string(),
+        }];
+
+        let params = business_application_query_page_params(BusinessApplicationQueryPageArgs {
+            query: BusinessApplicationQueryArgs {
+                text: None,
+                filters: &filters,
+                limit: Some(500),
+            },
+            offset: Some(1_000),
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "filters": [
+                    {
+                        "field": "name",
+                        "op": "contains",
+                        "value": "Example"
+                    }
+                ],
+                "limit": 500,
+                "offset": 1000
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_sync_params_include_all_contract_flag() {
+        let params = business_application_sync_params(BusinessApplicationSyncArgs {
+            all: true,
+            name: None,
+            operational_state_not: None,
+            persist: true,
+            resolve_references: true,
+            reference_depth: Some(1),
+            refresh_dictionary: true,
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "all": true,
+                "persist": true,
+                "resolve_references": true,
+                "reference_depth": 1,
+                "refresh_dictionary": true
+            })
         );
     }
 

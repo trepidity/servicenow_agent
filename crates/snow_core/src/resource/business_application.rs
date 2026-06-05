@@ -162,28 +162,50 @@ impl Default for BusinessApplicationHydrationOptions {
 /// this serialized as the `summary` object of `business_application_sync`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BusinessApplicationSyncSummary {
+    /// True when the sync used the explicit all-record live drain path.
+    #[serde(default)]
+    pub all: bool,
+    /// ServiceNow table synced by this run.
+    #[serde(default)]
+    pub table: String,
+    /// Effective live page size for the run.
+    #[serde(default)]
+    pub page_size: usize,
+    /// Count of live pages that returned records.
+    #[serde(default)]
+    pub pages: usize,
+    /// Total Business Applications returned by the live API.
+    #[serde(default)]
+    pub total_returned: usize,
     /// Total Business Applications returned by the live search.
+    #[serde(default)]
     pub total_applications: usize,
     /// Number of applications persisted to vault/cache during the run.
     ///
     /// Equals `total_applications` when `persist` is enabled; `0` for a
     /// non-persistent preview run.
+    #[serde(default)]
     pub persisted: usize,
     /// Total reference fields across all synced applications that resolved to a
     /// local primitive object.
+    #[serde(default)]
     pub references_resolved: usize,
     /// Total reference fields that could not be resolved (unknown table, ACL
     /// restriction, not found, dictionary-degraded inference, etc.). These are
     /// degraded reads, not failures.
+    #[serde(default)]
     pub references_unresolved: usize,
     /// Whether the sync ran in dictionary-degraded mode (baseline aliases used
     /// because verified `sys_dictionary` metadata was unavailable).
+    #[serde(default)]
     pub dictionary_degraded: bool,
     /// Per-reason counts of unresolved references, keyed by the snake_case
     /// `ReferenceResolutionReason` (e.g. `dictionary_unavailable`,
     /// `unknown_reference_table`). Useful for surfacing why a sync degraded.
+    #[serde(default)]
     pub degraded_reasons: BTreeMap<String, usize>,
     /// Whether the run requested (and attempted) a live dictionary refresh.
+    #[serde(default)]
     pub dictionary_refreshed: bool,
 }
 

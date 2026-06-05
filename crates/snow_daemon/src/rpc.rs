@@ -848,10 +848,20 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         }
         RpcMethod::BusinessApplicationSync => {
             match extract_business_application_sync_params(&request.params) {
-                Ok((params, options)) => {
+                Ok(params) => {
+                    if params.all {
+                        return match state
+                            .core
+                            .sync_all_business_applications(params.options.into())
+                            .await
+                        {
+                            Ok(summary) => JsonRpcResponse::ok(id, json!({ "summary": summary })),
+                            Err(err) => internal_error(id, err),
+                        };
+                    }
                     match state
                         .core
-                        .sync_business_applications(params, options.into())
+                        .sync_business_applications(params.search_params, params.options.into())
                         .await
                     {
                         Ok(summary) => JsonRpcResponse::ok(id, json!({ "summary": summary })),
@@ -2027,6 +2037,13 @@ impl From<BusinessApplicationHydrationOptions> for snow_core::BusinessApplicatio
     }
 }
 
+#[derive(Debug, Clone)]
+struct BusinessApplicationSyncRequest {
+    all: bool,
+    search_params: Option<snow_core::BusinessApplicationSearchParams>,
+    options: BusinessApplicationHydrationOptions,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct BusinessApplicationQueryParams {
     #[serde(default)]
@@ -2211,14 +2228,29 @@ fn extract_business_application_search_params(
 /// Business Application search.
 fn extract_business_application_sync_params(
     params: &Value,
-) -> Result<(
-    Option<snow_core::BusinessApplicationSearchParams>,
-    BusinessApplicationHydrationOptions,
-)> {
-    let (search_params, options) = extract_business_application_search_params(params)?;
+) -> Result<BusinessApplicationSyncRequest> {
+    let mut sync_params = params.clone();
+    let mut all = false;
+    if let Value::Object(map) = &mut sync_params {
+        match map.remove("all") {
+            Some(Value::Bool(value)) => all = value,
+            Some(_) => return Err(anyhow!("`all` must be a boolean")),
+            None => {}
+        }
+    }
+    let (search_params, options) = extract_business_application_search_params(&sync_params)?;
     // Treat an all-default params object (no filters set) as "no search params".
     let has_filter = search_params != snow_core::BusinessApplicationSearchParams::default();
-    Ok((has_filter.then_some(search_params), options))
+    if all && has_filter {
+        return Err(anyhow!(
+            "`all` cannot be combined with Business Application search filters"
+        ));
+    }
+    Ok(BusinessApplicationSyncRequest {
+        all,
+        search_params: (!all && has_filter).then_some(search_params),
+        options,
+    })
 }
 
 fn extract_business_application_hydration_options(
@@ -3644,26 +3676,93 @@ story_board_id = "board-sys"
     fn business_application_sync_params_are_optional() {
         // Only hydration options, no search filters => params should be None so
         // core runs the default bounded search.
-        let (params, options) = extract_business_application_sync_params(&json!({
+        let params = extract_business_application_sync_params(&json!({
             "refresh_dictionary": true
         }))
         .expect("sync params");
-        assert!(params.is_none());
-        assert!(options.refresh_dictionary);
+        assert!(!params.all);
+        assert!(params.search_params.is_none());
+        assert!(params.options.refresh_dictionary);
 
         // A search filter is present => params should be Some.
-        let (params, _options) =
-            extract_business_application_sync_params(&json!({ "name": "Epic" }))
-                .expect("sync params");
+        let params = extract_business_application_sync_params(&json!({
+            "name": "Example Application"
+        }))
+        .expect("sync params");
         assert_eq!(
-            params.and_then(|params| params.name),
-            Some("Epic".to_string())
+            params.search_params.and_then(|params| params.name),
+            Some("Example Application".to_string())
         );
 
         // Empty object => params None.
-        let (params, _options) =
-            extract_business_application_sync_params(&json!({})).expect("sync params");
-        assert!(params.is_none());
+        let params = extract_business_application_sync_params(&json!({})).expect("sync params");
+        assert!(!params.all);
+        assert!(params.search_params.is_none());
+    }
+
+    #[test]
+    fn business_application_sync_params_accept_all_without_filters() {
+        let params = extract_business_application_sync_params(&json!({
+            "all": true,
+            "persist": true,
+            "resolve_references": true,
+            "reference_depth": 1,
+            "refresh_dictionary": true
+        }))
+        .expect("sync-all params");
+
+        assert!(params.all);
+        assert!(params.search_params.is_none());
+        assert!(params.options.persist);
+        assert!(params.options.resolve_references);
+        assert_eq!(params.options.reference_depth, 1);
+        assert!(params.options.refresh_dictionary);
+    }
+
+    #[test]
+    fn business_application_sync_all_rejects_filters_and_non_boolean_all() {
+        let err = extract_business_application_sync_params(&json!({
+            "all": true,
+            "name": "Example Application"
+        }))
+        .expect_err("all with name should fail");
+        assert!(err.to_string().contains("cannot be combined"));
+
+        let err = extract_business_application_sync_params(&json!({
+            "all": true,
+            "operational_state_not": "retired"
+        }))
+        .expect_err("all with operational_state_not should fail");
+        assert!(err.to_string().contains("cannot be combined"));
+
+        let err = extract_business_application_sync_params(&json!({
+            "all": "true"
+        }))
+        .expect_err("string all should fail");
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    #[test]
+    fn business_application_query_params_accept_offset_for_paged_local_queries() {
+        let params = extract_business_application_query_params(&json!({
+            "text": "portfolio",
+            "filters": [
+                {
+                    "field": "name",
+                    "op": "contains",
+                    "value": "Example"
+                }
+            ],
+            "limit": 500,
+            "offset": 1000
+        }))
+        .expect("query params");
+        let query = core_business_application_query(&params).expect("core query");
+
+        assert_eq!(query.text.as_deref(), Some("portfolio"));
+        assert_eq!(query.limit, Some(500));
+        assert_eq!(query.offset, Some(1000));
+        assert_eq!(query.filters.len(), 1);
     }
 
     #[test]

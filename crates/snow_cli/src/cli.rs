@@ -367,6 +367,13 @@ pub enum KnowledgeSemanticCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum BusinessAppExportFormat {
+    Json,
+    Jsonl,
+    Csv,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum BusinessAppCommand {
     /// Get a single Business Application by sys_id or exact name
@@ -423,6 +430,33 @@ pub enum BusinessAppCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Export Business Applications from the daemon query surface
+    Export {
+        /// Export the complete local Business Application projection
+        #[arg(long, conflicts_with_all = ["text", "field", "contains", "eq", "limit"])]
+        all: bool,
+        /// Export file format
+        #[arg(long, value_enum)]
+        format: BusinessAppExportFormat,
+        /// Output file path
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// Free-text query passed to the daemon query surface
+        #[arg(long)]
+        text: Option<String>,
+        /// Field name to filter on. Repeatable; paired by position with operator values.
+        #[arg(long = "field")]
+        field: Vec<String>,
+        /// "contains" operator value. Repeatable.
+        #[arg(long = "contains")]
+        contains: Vec<String>,
+        /// "equals" operator value. Repeatable.
+        #[arg(long = "eq")]
+        eq: Vec<String>,
+        /// Maximum number of results to return
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// List the dictionary-backed Business Application fields
     Fields {
         /// Refresh the dictionary from ServiceNow before listing
@@ -434,6 +468,9 @@ pub enum BusinessAppCommand {
     },
     /// Sync Business Applications into the local vault/cache with optional hydration
     Sync {
+        /// Sync all active Business Applications from ServiceNow
+        #[arg(long, conflicts_with_all = ["name", "operational_state_not"])]
+        all: bool,
         /// Filter by name (contains match)
         #[arg(long)]
         name: Option<String>,
@@ -818,6 +855,47 @@ mod tests {
                 && eq == vec!["value".to_string()]
         ));
 
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "export",
+            "--format",
+            "jsonl",
+            "--output",
+            "business-apps.jsonl",
+            "--text",
+            "portfolio",
+            "--field",
+            "business_owner",
+            "--contains",
+            "User",
+            "--field",
+            "operational_state",
+            "--eq",
+            "1",
+            "--limit",
+            "50",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Export {
+                    all: false,
+                    format: BusinessAppExportFormat::Jsonl,
+                    output,
+                    text: Some(text),
+                    field,
+                    contains,
+                    eq,
+                    limit: Some(50),
+                },
+            } if output.as_path() == std::path::Path::new("business-apps.jsonl")
+                && text == "portfolio"
+                && field == vec!["business_owner".to_string(), "operational_state".to_string()]
+                && contains == vec!["User".to_string()]
+                && eq == vec!["1".to_string()]
+        ));
+
         let cli = Cli::parse_from(["snow", "business-app", "fields", "--refresh"]);
         assert!(matches!(
             cli.command,
@@ -843,6 +921,7 @@ mod tests {
             cli.command,
             Command::BusinessApp {
                 action: BusinessAppCommand::Sync {
+                    all: false,
                     name: Some(name),
                     resolve_references: true,
                     reference_depth: Some(1),
@@ -850,6 +929,178 @@ mod tests {
                 },
             } if name == "Epic"
         ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "sync",
+            "--all",
+            "--persist",
+            "--resolve-references",
+            "--reference-depth",
+            "1",
+            "--refresh-dictionary",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Sync {
+                    all: true,
+                    name: None,
+                    operational_state_not: None,
+                    persist: true,
+                    resolve_references: true,
+                    reference_depth: Some(1),
+                    refresh_dictionary: true,
+                    json: true,
+                },
+            }
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "export",
+            "--all",
+            "--format",
+            "csv",
+            "--output",
+            "business-apps.csv",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Export {
+                    all: true,
+                    format: BusinessAppExportFormat::Csv,
+                    output,
+                    text: None,
+                    field,
+                    contains,
+                    eq,
+                    limit: None,
+                },
+            } if output.as_path() == std::path::Path::new("business-apps.csv")
+                && field.is_empty()
+                && contains.is_empty()
+                && eq.is_empty()
+        ));
+    }
+
+    #[test]
+    fn business_app_sync_all_rejects_bounded_filters() {
+        for args in [
+            [
+                "snow",
+                "business-app",
+                "sync",
+                "--all",
+                "--name",
+                "Example Application",
+            ],
+            [
+                "snow",
+                "business-app",
+                "sync",
+                "--all",
+                "--operational-state-not",
+                "retired",
+            ],
+        ] {
+            let err = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("sync --all conflict should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn business_app_export_all_rejects_search_filter_and_limit_options() {
+        for args in [
+            [
+                "snow",
+                "business-app",
+                "export",
+                "--all",
+                "--format",
+                "json",
+                "--output",
+                "business-apps.json",
+                "--text",
+                "portfolio",
+            ],
+            [
+                "snow",
+                "business-app",
+                "export",
+                "--all",
+                "--format",
+                "json",
+                "--output",
+                "business-apps.json",
+                "--field",
+                "name",
+            ],
+            [
+                "snow",
+                "business-app",
+                "export",
+                "--all",
+                "--format",
+                "json",
+                "--output",
+                "business-apps.json",
+                "--limit",
+                "50",
+            ],
+        ] {
+            let err = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("export --all conflict should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn business_app_export_requires_format_and_output() {
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "export",
+            "--output",
+            "business-apps.json",
+        ]) {
+            Ok(_) => panic!("missing format should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let missing_output_args = ["snow", "business-app", "export", "--format", "json"];
+        let err = match Cli::try_parse_from(missing_output_args) {
+            Ok(_) => panic!("missing output should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn business_app_export_rejects_invalid_format() {
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "export",
+            "--format",
+            "xml",
+            "--output",
+            "business-apps.xml",
+        ]) {
+            Ok(_) => panic!("invalid format should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

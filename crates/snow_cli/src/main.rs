@@ -47,7 +47,10 @@ use cli::{
     KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand, TimecardCommand,
 };
 use error::SnowError;
-use tui_client::{BusinessApplicationQueryFilter, DaemonRpcClient, ServerQueryArgs, TuiClient};
+use tui_client::{
+    BusinessApplicationQueryArgs, BusinessApplicationQueryFilter, BusinessApplicationQueryPageArgs,
+    BusinessApplicationSyncArgs, DaemonRpcClient, ServerQueryArgs, TuiClient,
+};
 
 struct AuthContext {
     env_name: String,
@@ -1531,29 +1534,83 @@ async fn cmd_show_approval_runtime(core: &SnowCore, number: &str) -> Result<(), 
 }
 
 /// Build daemon query filters by pairing each `--field` with operator values in
-/// declaration order (contains first, then eq). This honors the documented
-/// single-filter forms and homogeneous repeated filters; a mismatch between the
-/// number of fields and operator values is rejected so the user gets a clear
-/// error instead of a silently dropped predicate.
+/// command-line order. Clap stores `--contains` and `--eq` in separate vectors,
+/// so mixed operators need the original argv order to preserve the documented
+/// positional pairing contract.
 fn build_business_app_query_filters(
     fields: Vec<String>,
     contains: Vec<String>,
     eq: Vec<String>,
 ) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
+    build_business_app_filter_pairs("business-app query", "query", true, fields, contains, eq)
+}
+
+fn build_business_app_export_filters(
+    fields: Vec<String>,
+    contains: Vec<String>,
+    eq: Vec<String>,
+) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
+    build_business_app_filter_pairs("business-app export", "export", false, fields, contains, eq)
+}
+
+fn build_business_app_filter_pairs(
+    command: &str,
+    action: &str,
+    require_field: bool,
+    fields: Vec<String>,
+    contains: Vec<String>,
+    eq: Vec<String>,
+) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
+    let args = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    build_business_app_filter_pairs_with_args(
+        command,
+        action,
+        require_field,
+        fields,
+        contains,
+        eq,
+        Some(&args),
+    )
+}
+
+fn build_business_app_filter_pairs_with_args(
+    command: &str,
+    action: &str,
+    require_field: bool,
+    fields: Vec<String>,
+    contains: Vec<String>,
+    eq: Vec<String>,
+    args: Option<&[String]>,
+) -> Result<Vec<BusinessApplicationQueryFilter>, SnowError> {
     if fields.is_empty() {
-        return Err(SnowError::Api(
-            "business-app query requires at least one --field".to_string(),
-        ));
+        if require_field {
+            return Err(SnowError::Api(format!(
+                "{command} requires at least one --field"
+            )));
+        }
+        if contains.is_empty() && eq.is_empty() {
+            return Ok(Vec::new());
+        }
     }
-    // Flatten operator values, tagging each with its operator token in the same
-    // order clap collected them.
+    let contains_count = contains.len();
+    let eq_count = eq.len();
+
+    // Fallback preserves the historical homogeneous-filter behavior for tests
+    // and non-standard call paths where raw argv is unavailable.
     let mut operands: Vec<(String, String)> = Vec::new();
     operands.extend(contains.into_iter().map(|v| ("contains".to_string(), v)));
     operands.extend(eq.into_iter().map(|v| ("eq".to_string(), v)));
+    if let Some(ordered) = args.and_then(|args| {
+        business_app_filter_operands_from_args(args, action, contains_count, eq_count)
+    }) {
+        operands = ordered;
+    }
 
     if operands.len() != fields.len() {
         return Err(SnowError::Api(format!(
-            "business-app query needs one operator value per --field (got {} fields, {} operator values)",
+            "{command} needs one operator value per --field (got {} fields, {} operator values)",
             fields.len(),
             operands.len()
         )));
@@ -1570,6 +1627,150 @@ fn build_business_app_query_filters(
             },
         )
         .collect())
+}
+
+fn business_app_filter_operands_from_args(
+    args: &[String],
+    action: &str,
+    expected_contains: usize,
+    expected_eq: usize,
+) -> Option<Vec<(String, String)>> {
+    if expected_contains == 0 && expected_eq == 0 {
+        return Some(Vec::new());
+    }
+    let mut index = args
+        .windows(2)
+        .position(|window| window[0] == "business-app" && window[1] == action)?
+        + 2;
+    let mut operands = Vec::new();
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--contains=") {
+            operands.push(("contains".to_string(), value.to_string()));
+        } else if arg == "--contains" {
+            index += 1;
+            operands.push(("contains".to_string(), args.get(index)?.clone()));
+        } else if let Some(value) = arg.strip_prefix("--eq=") {
+            operands.push(("eq".to_string(), value.to_string()));
+        } else if arg == "--eq" {
+            index += 1;
+            operands.push(("eq".to_string(), args.get(index)?.clone()));
+        }
+        index += 1;
+    }
+    let contains = operands
+        .iter()
+        .filter(|(operator, _)| operator == "contains")
+        .count();
+    let eq = operands
+        .iter()
+        .filter(|(operator, _)| operator == "eq")
+        .count();
+    if contains == expected_contains && eq == expected_eq {
+        Some(operands)
+    } else {
+        None
+    }
+}
+
+async fn cmd_business_app_export_all(
+    client: &DaemonRpcClient,
+    format: business_app_export::BusinessAppExportFormat,
+    output: PathBuf,
+) -> Result<(), SnowError> {
+    business_app_export::validate_output_parent(&output)?;
+    let mut offset = 0;
+    let mut records = Vec::new();
+    let filters: &[BusinessApplicationQueryFilter] = &[];
+    loop {
+        let result = client
+            .business_application_query_page_with_args(BusinessApplicationQueryPageArgs {
+                query: BusinessApplicationQueryArgs {
+                    text: None,
+                    filters,
+                    limit: Some(business_app_export::EXPORT_ALL_PAGE_SIZE),
+                },
+                offset: Some(offset),
+            })
+            .await?;
+        let page_len =
+            business_app_export::append_records_from_query_result(&mut records, &result)?;
+        if page_len < business_app_export::EXPORT_ALL_PAGE_SIZE {
+            break;
+        }
+        offset += page_len;
+    }
+    let result = serde_json::Value::Array(records);
+    let bytes = business_app_export::serialize(&result, format)?;
+    let exported_count = business_app_export::record_count(&result)?;
+    business_app_export::write_file(&output, &bytes)?;
+    println!(
+        "Exported {exported_count} cached Business Applications to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn validate_business_app_export_all_options(
+    text: Option<&str>,
+    field: &[String],
+    contains: &[String],
+    eq: &[String],
+    limit: Option<usize>,
+) -> Result<(), SnowError> {
+    if text.is_some()
+        || !field.is_empty()
+        || !contains.is_empty()
+        || !eq.is_empty()
+        || limit.is_some()
+    {
+        return Err(SnowError::Api(
+            "business-app export --all accepts only --all, --format, and --output".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_business_app_sync_all_options(
+    name: Option<&str>,
+    operational_state_not: Option<&str>,
+) -> Result<(), SnowError> {
+    if name.is_some() || operational_state_not.is_some() {
+        return Err(SnowError::Api(
+            "business-app sync --all does not accept bounded sync filters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn cmd_business_app_sync_all(
+    client: &DaemonRpcClient,
+    persist: bool,
+    resolve_references: bool,
+    reference_depth: Option<u32>,
+    refresh_dictionary: bool,
+    json: bool,
+) -> Result<(), SnowError> {
+    let summary = client
+        .business_application_sync_with_args(BusinessApplicationSyncArgs {
+            all: true,
+            name: None,
+            operational_state_not: None,
+            persist,
+            resolve_references,
+            reference_depth,
+            refresh_dictionary,
+        })
+        .await?;
+    if json {
+        print_full_dump_or_inline(&summary);
+    } else {
+        print!(
+            "{}",
+            display::format_business_application_summary_object(&summary)
+        );
+    }
+    Ok(())
 }
 
 /// Dispatch the `snow business-app` subcommand family over the daemon client.
@@ -1653,6 +1854,57 @@ async fn cmd_business_app(
             }
             Ok(())
         }
+        BusinessAppCommand::Export {
+            all,
+            format,
+            output,
+            text,
+            field,
+            contains,
+            eq,
+            limit,
+        } => {
+            let export_format = match format {
+                cli::BusinessAppExportFormat::Json => {
+                    business_app_export::BusinessAppExportFormat::Json
+                }
+                cli::BusinessAppExportFormat::Jsonl => {
+                    business_app_export::BusinessAppExportFormat::Jsonl
+                }
+                cli::BusinessAppExportFormat::Csv => {
+                    business_app_export::BusinessAppExportFormat::Csv
+                }
+            };
+            if all {
+                validate_business_app_export_all_options(
+                    text.as_deref(),
+                    &field,
+                    &contains,
+                    &eq,
+                    limit,
+                )?;
+                return cmd_business_app_export_all(client, export_format, output).await;
+            }
+            business_app_export::validate_limit(limit)?;
+            business_app_export::validate_output_parent(&output)?;
+            business_app_export::validate_text(text.as_deref())?;
+            let filters = build_business_app_export_filters(field, contains, eq)?;
+            let result = client
+                .business_application_query_with_args(BusinessApplicationQueryArgs {
+                    text: text.as_deref(),
+                    filters: &filters,
+                    limit,
+                })
+                .await?;
+            let bytes = business_app_export::serialize(&result, export_format)?;
+            let exported_count = business_app_export::record_count(&result)?;
+            business_app_export::write_file(&output, &bytes)?;
+            println!(
+                "Exported {exported_count} Business Applications to {}",
+                output.display()
+            );
+            Ok(())
+        }
         BusinessAppCommand::Fields { refresh, json } => {
             let fields = client.business_application_fields(refresh).await?;
             if json {
@@ -1663,6 +1915,7 @@ async fn cmd_business_app(
             Ok(())
         }
         BusinessAppCommand::Sync {
+            all,
             name,
             operational_state_not,
             persist,
@@ -1671,6 +1924,21 @@ async fn cmd_business_app(
             refresh_dictionary,
             json,
         } => {
+            if all {
+                validate_business_app_sync_all_options(
+                    name.as_deref(),
+                    operational_state_not.as_deref(),
+                )?;
+                return cmd_business_app_sync_all(
+                    client,
+                    persist,
+                    resolve_references,
+                    reference_depth,
+                    refresh_dictionary,
+                    json,
+                )
+                .await;
+            }
             let summary = client
                 .business_application_sync(
                     name.as_deref(),
@@ -1816,6 +2084,345 @@ async fn cmd_server(client: &DaemonRpcClient, action: ServerCommand) -> Result<(
                 print!("{}", display::format_server_fields(&fields));
             }
             Ok(())
+        }
+    }
+}
+
+mod business_app_export {
+    use super::SnowError;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::io::Write;
+    use std::path::Path;
+
+    const MAX_EXPORT_LIMIT: usize = 500;
+    pub(super) const EXPORT_ALL_PAGE_SIZE: usize = 500;
+    const CSV_BASE_HEADERS: &[&str] = &[
+        "record.sys_id",
+        "record.number",
+        "name",
+        "record.short_description",
+        "operational_state",
+        "business_owner",
+        "is_owner",
+        "ci_owner_group",
+        "primary_support_group",
+        "primary_portfolio",
+        "attested_date",
+        "vault_relative_path",
+        "browser_url",
+    ];
+    const CSV_BASE_SOURCE_FIELDS: &[&str] = &[
+        "sys_id",
+        "number",
+        "name",
+        "short_description",
+        "operational_status",
+        "business_owner",
+        "it_application_owner",
+        "managed_by_group",
+        "support_group",
+        "portfolio",
+        "attested_date",
+        "vault_relative_path",
+        "browser_url",
+    ];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BusinessAppExportFormat {
+        Json,
+        Jsonl,
+        Csv,
+    }
+
+    pub(super) fn validate_limit(limit: Option<usize>) -> Result<(), SnowError> {
+        match limit {
+            Some(0) => Err(SnowError::Api("`limit` must be at least 1".to_string())),
+            Some(value) if value > MAX_EXPORT_LIMIT => Err(SnowError::Api(format!(
+                "`limit` must be at most {MAX_EXPORT_LIMIT}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) fn validate_output_parent(output: &Path) -> Result<(), SnowError> {
+        if output.file_name().is_none() {
+            return Err(SnowError::Api(
+                "business-app export --output must name a file".to_string(),
+            ));
+        }
+        if output.is_dir() {
+            return Err(SnowError::Api(format!(
+                "business-app export --output must name a file, got directory: {}",
+                output.display()
+            )));
+        }
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.exists() {
+            return Err(SnowError::Api(format!(
+                "business-app export output parent does not exist: {}",
+                parent.display()
+            )));
+        }
+        if !parent.is_dir() {
+            return Err(SnowError::Api(format!(
+                "business-app export output parent is not a directory: {}",
+                parent.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_text(text: Option<&str>) -> Result<(), SnowError> {
+        if let Some(text) = text
+            && text.trim().is_empty()
+        {
+            return Err(SnowError::Api(
+                "business-app export --text must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn serialize(
+        result: &Value,
+        format: BusinessAppExportFormat,
+    ) -> Result<Vec<u8>, SnowError> {
+        let records = records_from_query_result(result)?;
+        validate_record_objects(records)?;
+        match format {
+            BusinessAppExportFormat::Json => {
+                serde_json::to_vec_pretty(&Value::Array(records.to_vec()))
+                    .map_err(|err| SnowError::Api(err.to_string()))
+            }
+            BusinessAppExportFormat::Jsonl => serialize_jsonl(records),
+            BusinessAppExportFormat::Csv => serialize_csv(records),
+        }
+    }
+
+    pub(super) fn record_count(result: &Value) -> Result<usize, SnowError> {
+        Ok(records_from_query_result(result)?.len())
+    }
+
+    pub(super) fn append_records_from_query_result(
+        target: &mut Vec<Value>,
+        result: &Value,
+    ) -> Result<usize, SnowError> {
+        let records = records_from_query_result(result)?;
+        validate_record_objects(records)?;
+        let count = records.len();
+        target.extend(records.iter().cloned());
+        Ok(count)
+    }
+
+    pub(super) fn write_file(output: &Path, bytes: &[u8]) -> Result<(), SnowError> {
+        validate_output_parent(output)?;
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = output.file_name().ok_or_else(|| {
+            SnowError::Api("business-app export --output must name a file".to_string())
+        })?;
+        let temp_name = format!(
+            ".{}.{}.tmp",
+            file_name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        );
+        let temp_path = parent.join(temp_name);
+        let write_result = (|| -> Result<(), SnowError> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
+
+        if let Err(err) = std::fs::rename(&temp_path, output) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(SnowError::from(err));
+        }
+        Ok(())
+    }
+
+    fn records_from_query_result(result: &Value) -> Result<&[Value], SnowError> {
+        match result {
+            Value::Array(records) => Ok(records.as_slice()),
+            Value::Object(map) => {
+                for key in ["business_applications", "records", "results"] {
+                    if let Some(value) = map.get(key) {
+                        return value.as_array().map(Vec::as_slice).ok_or_else(|| {
+                            SnowError::Api(format!(
+                                "business_application_query field `{key}` was not an array"
+                            ))
+                        });
+                    }
+                }
+                Err(SnowError::Api(
+                    "business_application_query result did not contain an exportable array"
+                        .to_string(),
+                ))
+            }
+            _ => Err(SnowError::Api(
+                "business_application_query result was not an exportable array".to_string(),
+            )),
+        }
+    }
+
+    fn validate_record_objects(records: &[Value]) -> Result<(), SnowError> {
+        if let Some((index, _)) = records
+            .iter()
+            .enumerate()
+            .find(|(_, record)| !record.is_object())
+        {
+            return Err(SnowError::Api(format!(
+                "business_application_query record at index {index} was not an object"
+            )));
+        }
+        Ok(())
+    }
+
+    fn serialize_jsonl(records: &[Value]) -> Result<Vec<u8>, SnowError> {
+        let mut output = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut output, record)
+                .map_err(|err| SnowError::Api(err.to_string()))?;
+            output.push(b'\n');
+        }
+        Ok(output)
+    }
+
+    fn serialize_csv(records: &[Value]) -> Result<Vec<u8>, SnowError> {
+        let headers = csv_headers(records);
+        let mut output = String::new();
+        write_csv_row(&mut output, &headers);
+        for record in records {
+            let row = headers
+                .iter()
+                .map(|header| csv_cell_for_header(record, header))
+                .collect::<Vec<_>>();
+            write_csv_row(&mut output, &row);
+        }
+        Ok(output.into_bytes())
+    }
+
+    fn csv_headers(records: &[Value]) -> Vec<String> {
+        let mut headers = CSV_BASE_HEADERS
+            .iter()
+            .map(|header| (*header).to_string())
+            .collect::<Vec<_>>();
+        let mut projected_fields = BTreeSet::new();
+        for record in records {
+            if let Some(fields) = record.get("fields").and_then(Value::as_object) {
+                for field in fields.keys() {
+                    if !CSV_BASE_HEADERS.contains(&field.as_str())
+                        && !CSV_BASE_SOURCE_FIELDS.contains(&field.as_str())
+                    {
+                        projected_fields.insert(field.clone());
+                    }
+                }
+            }
+        }
+        headers.extend(projected_fields);
+        headers
+    }
+
+    fn csv_cell_for_header(record: &Value, header: &str) -> String {
+        match header {
+            "record.sys_id" => value_text(record.get("record").and_then(|v| v.get("sys_id"))),
+            "record.number" => value_text(record.get("record").and_then(|v| v.get("number"))),
+            "name" => value_text(record.get("name")),
+            "record.short_description" => value_text(
+                record
+                    .get("record")
+                    .and_then(|v| v.get("short_description")),
+            ),
+            "operational_state" => value_text(record.get("operational_state")),
+            "business_owner" => value_text(record.get("business_owner")),
+            "is_owner" => value_text(record.get("is_owner")),
+            "ci_owner_group" => value_text(record.get("ci_owner_group")),
+            "primary_support_group" => value_text(record.get("primary_support_group")),
+            "primary_portfolio" => value_text(record.get("primary_portfolio")),
+            "attested_date" => value_text(record.get("attested_date")),
+            "vault_relative_path" => value_text(record.get("vault_relative_path")),
+            "browser_url" => value_text(record.get("browser_url")),
+            field => value_text(
+                record
+                    .get("fields")
+                    .and_then(Value::as_object)
+                    .and_then(|fields| fields.get(field)),
+            ),
+        }
+    }
+
+    fn value_text(value: Option<&Value>) -> String {
+        let Some(value) = value else {
+            return String::new();
+        };
+        match value {
+            Value::Null => String::new(),
+            Value::String(text) => text.clone(),
+            Value::Bool(value) => value.to_string(),
+            Value::Number(value) => value.to_string(),
+            Value::Array(_) => compact_json(value),
+            Value::Object(map) => {
+                for key in ["display_name", "display_value", "value"] {
+                    if let Some(text) = map
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        return text.to_string();
+                    }
+                    if key == "value"
+                        && let Some(raw_value) = map.get(key)
+                        && !raw_value.is_null()
+                    {
+                        return value_text(Some(raw_value));
+                    }
+                }
+                compact_json(value)
+            }
+        }
+    }
+
+    fn compact_json(value: &Value) -> String {
+        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+    }
+
+    fn write_csv_row(output: &mut String, cells: &[String]) {
+        for (index, cell) in cells.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            write_csv_cell(output, cell);
+        }
+        output.push('\n');
+    }
+
+    fn write_csv_cell(output: &mut String, cell: &str) {
+        if cell.chars().any(|ch| matches!(ch, ',' | '"' | '\n' | '\r')) {
+            output.push('"');
+            for ch in cell.chars() {
+                if ch == '"' {
+                    output.push_str("\"\"");
+                } else {
+                    output.push(ch);
+                }
+            }
+            output.push('"');
+        } else {
+            output.push_str(cell);
         }
     }
 }
@@ -3602,12 +4209,13 @@ fn config_path(filename: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        KnowledgeStatusSnapshot, ShowTarget, TimecardSelectorShape, classify_show_target,
-        classify_timecard_selector, collect_timecard_updates, format_task_sla_status,
-        is_show_sla_alias, load_knowledge_status, load_knowledge_tags, normalize_hours,
-        weekday_index,
+        KnowledgeStatusSnapshot, ShowTarget, TimecardSelectorShape, business_app_export,
+        classify_show_target, classify_timecard_selector, collect_timecard_updates,
+        format_task_sla_status, is_show_sla_alias, load_knowledge_status, load_knowledge_tags,
+        normalize_hours, weekday_index,
     };
     use crate::cli::KnowledgeTagLayer;
+    use business_app_export::BusinessAppExportFormat;
     use chrono::TimeZone;
     use rusqlite::Connection;
     use snow_core::cache::store::{KnowledgeArticleRow, RecordRow, Store};
@@ -3618,6 +4226,369 @@ mod tests {
     };
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    fn sample_business_app_query_result() -> serde_json::Value {
+        serde_json::json!({
+            "business_applications": [
+                {
+                    "browser_url": "https://example.service-now.com/nav_to.do?uri=cmdb_ci_business_app.do?sys_id=example-sys-id",
+                    "vault_relative_path": "business_applications/example-application.md",
+                    "record": {
+                        "sys_id": "example-sys-id",
+                        "number": "EXAMPLE-APP-001",
+                        "short_description": "Description \"quoted\"\nsecond line"
+                    },
+                    "name": "Example Application, Core",
+                    "business_owner": {
+                        "sys_id": "example-owner-sys-id",
+                        "table": "sys_user",
+                        "display_name": "Example Owner",
+                        "extra": {}
+                    },
+                    "operational_state": {
+                        "value": "1",
+                        "display_value": "In Use"
+                    },
+                    "attested_date": "2026-01-31",
+                    "fields": {
+                        "custom_beta": {
+                            "value": "raw \"quote\"",
+                            "display_value": null
+                        },
+                        "custom_alpha": {
+                            "value": "raw",
+                            "display_value": "Display, Value"
+                        },
+                        "managed_by_group": {
+                            "value": "covered-by-base-source",
+                            "display_value": "Covered By Base Source"
+                        }
+                    }
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn business_app_export_validates_limit_before_query() {
+        assert!(business_app_export::validate_limit(None).is_ok());
+        assert!(business_app_export::validate_limit(Some(1)).is_ok());
+        assert!(business_app_export::validate_limit(Some(500)).is_ok());
+
+        let zero = business_app_export::validate_limit(Some(0)).expect_err("zero limit");
+        assert!(zero.to_string().contains("at least 1"));
+
+        let too_high = business_app_export::validate_limit(Some(501)).expect_err("high limit");
+        assert!(too_high.to_string().contains("at most 500"));
+    }
+
+    #[test]
+    fn business_app_export_validates_text_before_query() {
+        assert!(business_app_export::validate_text(None).is_ok());
+        assert!(business_app_export::validate_text(Some("Example Application")).is_ok());
+
+        let err = business_app_export::validate_text(Some("   ")).expect_err("blank text");
+        assert!(err.to_string().contains("--text must not be empty"));
+    }
+
+    #[test]
+    fn business_app_export_all_validation_rejects_bounded_options() {
+        assert!(super::validate_business_app_export_all_options(None, &[], &[], &[], None).is_ok());
+
+        let field = vec!["name".to_string()];
+        let err = super::validate_business_app_export_all_options(None, &field, &[], &[], None)
+            .expect_err("field should conflict with --all");
+        assert!(err.to_string().contains("accepts only --all"));
+
+        let contains = vec!["Example".to_string()];
+        let err = super::validate_business_app_export_all_options(None, &[], &contains, &[], None)
+            .expect_err("contains should conflict with --all");
+        assert!(err.to_string().contains("accepts only --all"));
+
+        let err = super::validate_business_app_export_all_options(
+            Some("Example"),
+            &[],
+            &[],
+            &[],
+            Some(50),
+        )
+        .expect_err("text/limit should conflict with --all");
+        assert!(err.to_string().contains("accepts only --all"));
+    }
+
+    #[test]
+    fn business_app_sync_all_validation_rejects_bounded_filters() {
+        assert!(super::validate_business_app_sync_all_options(None, None).is_ok());
+
+        let err = super::validate_business_app_sync_all_options(Some("Example"), None)
+            .expect_err("name should conflict with --all");
+        assert!(
+            err.to_string()
+                .contains("does not accept bounded sync filters")
+        );
+
+        let err = super::validate_business_app_sync_all_options(None, Some("2"))
+            .expect_err("operational-state-not should conflict with --all");
+        assert!(
+            err.to_string()
+                .contains("does not accept bounded sync filters")
+        );
+    }
+
+    #[test]
+    fn business_app_export_appends_query_pages_in_order() {
+        let mut records = Vec::new();
+        let first = serde_json::json!({
+            "business_applications": [
+                { "name": "First", "record": { "sys_id": "1" } },
+                { "name": "Second", "record": { "sys_id": "2" } }
+            ]
+        });
+        let second = serde_json::json!([{ "name": "Third", "record": { "sys_id": "3" } }]);
+
+        let first_count =
+            business_app_export::append_records_from_query_result(&mut records, &first)
+                .expect("first page");
+        let second_count =
+            business_app_export::append_records_from_query_result(&mut records, &second)
+                .expect("second page");
+
+        assert_eq!(first_count, 2);
+        assert_eq!(second_count, 1);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["name"], "First");
+        assert_eq!(records[2]["record"]["sys_id"], "3");
+    }
+
+    #[test]
+    fn business_app_export_appends_beyond_single_query_cap() {
+        let mut records = Vec::new();
+        let first = serde_json::json!({
+            "business_applications": (0..business_app_export::EXPORT_ALL_PAGE_SIZE)
+                .map(|index| serde_json::json!({
+                    "name": format!("Application {index:03}"),
+                    "record": { "sys_id": format!("first-{index:03}") }
+                }))
+                .collect::<Vec<_>>()
+        });
+        let second = serde_json::json!({
+            "business_applications": [
+                { "name": "Application 500", "record": { "sys_id": "second-000" } }
+            ]
+        });
+
+        let first_count =
+            business_app_export::append_records_from_query_result(&mut records, &first)
+                .expect("first page");
+        let second_count =
+            business_app_export::append_records_from_query_result(&mut records, &second)
+                .expect("second page");
+        let result = serde_json::Value::Array(records);
+
+        assert_eq!(first_count, business_app_export::EXPORT_ALL_PAGE_SIZE);
+        assert_eq!(second_count, 1);
+        assert_eq!(
+            business_app_export::record_count(&result).expect("record count"),
+            business_app_export::EXPORT_ALL_PAGE_SIZE + 1
+        );
+        assert_eq!(
+            result[business_app_export::EXPORT_ALL_PAGE_SIZE]["record"]["sys_id"],
+            "second-000"
+        );
+    }
+
+    #[test]
+    fn business_app_export_page_append_rejects_non_object_records() {
+        let mut records = Vec::new();
+        let err = business_app_export::append_records_from_query_result(
+            &mut records,
+            &serde_json::json!({ "business_applications": ["not an object"] }),
+        )
+        .expect_err("non-object record should fail");
+
+        assert!(
+            err.to_string()
+                .contains("record at index 0 was not an object")
+        );
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn business_app_export_allows_empty_filters_but_rejects_dangling_operands() {
+        let filters = super::build_business_app_export_filters(Vec::new(), Vec::new(), Vec::new())
+            .expect("unfiltered export");
+        assert!(filters.is_empty());
+
+        let err = super::build_business_app_export_filters(
+            Vec::new(),
+            vec!["Example".to_string()],
+            Vec::new(),
+        )
+        .expect_err("dangling operator");
+        assert!(err.to_string().contains("one operator value per --field"));
+
+        let filters = super::build_business_app_export_filters(
+            vec!["name".to_string(), "number".to_string()],
+            vec!["Example".to_string()],
+            vec!["EXAMPLE-APP-001".to_string()],
+        )
+        .expect("paired filters");
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].operator, "contains");
+        assert_eq!(filters[1].operator, "eq");
+    }
+
+    #[test]
+    fn business_app_filters_preserve_mixed_operator_order_from_args() {
+        let args = [
+            "snow",
+            "business-app",
+            "export",
+            "--format",
+            "json",
+            "--output",
+            "business-apps.json",
+            "--field",
+            "number",
+            "--eq",
+            "EXAMPLE-APP-001",
+            "--field",
+            "name",
+            "--contains",
+            "Example",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let filters = super::build_business_app_filter_pairs_with_args(
+            "business-app export",
+            "export",
+            false,
+            vec!["number".to_string(), "name".to_string()],
+            vec!["Example".to_string()],
+            vec!["EXAMPLE-APP-001".to_string()],
+            Some(&args),
+        )
+        .expect("ordered filters");
+
+        assert_eq!(filters[0].field, "number");
+        assert_eq!(filters[0].operator, "eq");
+        assert_eq!(filters[0].value, "EXAMPLE-APP-001");
+        assert_eq!(filters[1].field, "name");
+        assert_eq!(filters[1].operator, "contains");
+        assert_eq!(filters[1].value, "Example");
+    }
+
+    #[test]
+    fn business_app_export_validates_output_parent_before_query() {
+        let tempdir = tempdir().expect("tempdir");
+        let output = tempdir.path().join("business-apps.csv");
+        business_app_export::validate_output_parent(&output).expect("existing parent");
+
+        let err =
+            business_app_export::validate_output_parent(tempdir.path()).expect_err("directory");
+        assert!(err.to_string().contains("must name a file"));
+
+        let missing_parent = tempdir.path().join("missing").join("business-apps.csv");
+        let err = business_app_export::validate_output_parent(&missing_parent)
+            .expect_err("missing parent");
+        assert!(err.to_string().contains("parent does not exist"));
+
+        let parent_file = tempdir.path().join("parent-file");
+        std::fs::write(&parent_file, "not a directory").expect("parent file");
+        let child_output = parent_file.join("business-apps.csv");
+        let err =
+            business_app_export::validate_output_parent(&child_output).expect_err("parent file");
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn business_app_export_serializes_json_array() {
+        let bytes = business_app_export::serialize(
+            &sample_business_app_query_result(),
+            BusinessAppExportFormat::Json,
+        )
+        .expect("json export");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+
+        let records = parsed.as_array().expect("json array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["name"], "Example Application, Core");
+    }
+
+    #[test]
+    fn business_app_export_serializes_jsonl_compact_objects() {
+        let bytes = business_app_export::serialize(
+            &sample_business_app_query_result(),
+            BusinessAppExportFormat::Jsonl,
+        )
+        .expect("jsonl export");
+        let text = String::from_utf8(bytes).expect("utf8 jsonl");
+
+        assert!(text.ends_with('\n'));
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("jsonl row");
+        assert_eq!(parsed["record"]["number"], "EXAMPLE-APP-001");
+    }
+
+    #[test]
+    fn business_app_export_serializes_csv_with_deterministic_headers_and_escaping() {
+        let bytes = business_app_export::serialize(
+            &sample_business_app_query_result(),
+            BusinessAppExportFormat::Csv,
+        )
+        .expect("csv export");
+        let csv = String::from_utf8(bytes).expect("utf8 csv");
+        let header = csv.lines().next().expect("header");
+
+        assert_eq!(
+            header,
+            "record.sys_id,record.number,name,record.short_description,operational_state,business_owner,is_owner,ci_owner_group,primary_support_group,primary_portfolio,attested_date,vault_relative_path,browser_url,custom_alpha,custom_beta"
+        );
+        assert!(!header.contains("managed_by_group"));
+        assert!(csv.contains("\"Example Application, Core\""));
+        assert!(csv.contains("\"Description \"\"quoted\"\"\nsecond line\""));
+        assert!(csv.contains("In Use"));
+        assert!(csv.contains("Example Owner"));
+        assert!(csv.contains("\"Display, Value\""));
+        assert!(csv.contains("\"raw \"\"quote\"\"\""));
+    }
+
+    #[test]
+    fn business_app_export_serializes_empty_formats() {
+        let empty = serde_json::json!({ "business_applications": [] });
+
+        let json = business_app_export::serialize(&empty, BusinessAppExportFormat::Json)
+            .expect("empty json");
+        assert_eq!(String::from_utf8(json).expect("utf8"), "[]");
+
+        let jsonl = business_app_export::serialize(&empty, BusinessAppExportFormat::Jsonl)
+            .expect("empty jsonl");
+        assert!(jsonl.is_empty());
+
+        let csv = business_app_export::serialize(&empty, BusinessAppExportFormat::Csv)
+            .expect("empty csv");
+        assert_eq!(
+            String::from_utf8(csv).expect("utf8"),
+            "record.sys_id,record.number,name,record.short_description,operational_state,business_owner,is_owner,ci_owner_group,primary_support_group,primary_portfolio,attested_date,vault_relative_path,browser_url\n"
+        );
+    }
+
+    #[test]
+    fn business_app_export_write_file_replaces_target_after_temp_write() {
+        let tempdir = tempdir().expect("tempdir");
+        let output = tempdir.path().join("business-apps.json");
+        std::fs::write(&output, "old content").expect("old file");
+
+        business_app_export::write_file(&output, b"new content").expect("write export");
+
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("read output"),
+            "new content"
+        );
+    }
 
     #[test]
     fn classify_show_target_routes_inc_and_chg_correctly() {

@@ -157,6 +157,7 @@ const USER_SEARCH_MAX_LIMIT: usize = 100;
 const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
 const BUSINESS_APPLICATION_DEFAULT_LIMIT: usize = 20;
 const BUSINESS_APPLICATION_MAX_LIMIT: usize = 100;
+const BUSINESS_APPLICATION_SYNC_ALL_PAGE_SIZE: usize = BUSINESS_APPLICATION_MAX_LIMIT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserLookupCandidate {
@@ -1290,6 +1291,34 @@ fn normalize_operational_state(value: &str) -> String {
     }
 }
 
+fn roll_up_business_application_summary(
+    summary: &mut BusinessApplicationSyncSummary,
+    applications: &[BusinessApplication],
+) {
+    for application in applications {
+        // Resolved references are tracked on descriptors; unresolved references
+        // surface as diagnostics. Count each independently so totals stay
+        // meaningful even when a reference appears in both lists.
+        summary.references_resolved += application
+            .references
+            .iter()
+            .filter(|descriptor| {
+                descriptor.resolution_status == ReferenceResolutionStatus::Resolved
+            })
+            .count();
+        for diagnostic in &application.unresolved_references {
+            summary.references_unresolved += 1;
+            *summary
+                .degraded_reasons
+                .entry(diagnostic.reason.as_key().to_string())
+                .or_insert(0) += 1;
+            if diagnostic.reason.is_dictionary_unavailable() {
+                summary.dictionary_degraded = true;
+            }
+        }
+    }
+}
+
 fn is_business_application_reference_table_resolvable(table: &str) -> bool {
     matches!(table, "sys_user" | "sys_user_group" | "cmdb_ci")
         || table == BUSINESS_APPLICATION_TABLE
@@ -2050,20 +2079,8 @@ impl SnowCore {
         }
 
         let records = query.execute().await?.records;
-        let mut business_applications = Vec::with_capacity(records.len());
-        for record in records {
-            let mut business_application = BusinessApplication::from_servicenow(&record, &aliases)?;
-            if options.persist {
-                self.persist_record(&record)?;
-                self.persist_business_application_reference_primitives(
-                    &mut business_application,
-                    &options,
-                )
-                .await?;
-            }
-            business_applications.push(business_application);
-        }
-        Ok(business_applications)
+        self.hydrate_business_application_page(records, &aliases, &options)
+            .await
     }
 
     pub async fn query_business_applications(
@@ -2205,6 +2222,7 @@ impl SnowCore {
         options: BusinessApplicationHydrationOptions,
     ) -> Result<BusinessApplicationSyncSummary> {
         let params = params.unwrap_or_default();
+        let page_size = params.validated_limit()?;
         // When the caller explicitly asks for a dictionary refresh, attempt it
         // up front so degraded status reflects the freshest metadata. The fetch
         // is best-effort: a failure leaves us in baseline/degraded mode. We do
@@ -2222,6 +2240,11 @@ impl SnowCore {
             .await?;
 
         let mut summary = BusinessApplicationSyncSummary {
+            all: false,
+            table: BUSINESS_APPLICATION_TABLE.to_string(),
+            page_size,
+            pages: usize::from(!applications.is_empty()),
+            total_returned: applications.len(),
             total_applications: applications.len(),
             persisted: if options.persist {
                 applications.len()
@@ -2232,30 +2255,91 @@ impl SnowCore {
             ..Default::default()
         };
 
-        for application in &applications {
-            // Resolved references are tracked on the descriptors; unresolved ones
-            // surface as diagnostics. Count each independently so the totals stay
-            // meaningful even when a reference appears in both lists.
-            summary.references_resolved += application
-                .references
-                .iter()
-                .filter(|descriptor| {
-                    descriptor.resolution_status == ReferenceResolutionStatus::Resolved
-                })
-                .count();
-            for diagnostic in &application.unresolved_references {
-                summary.references_unresolved += 1;
-                *summary
-                    .degraded_reasons
-                    .entry(diagnostic.reason.as_key().to_string())
-                    .or_insert(0) += 1;
-                if diagnostic.reason.is_dictionary_unavailable() {
-                    summary.dictionary_degraded = true;
-                }
+        roll_up_business_application_summary(&mut summary, &applications);
+
+        Ok(summary)
+    }
+
+    /// Drain every live Business Application page and persist each page before
+    /// requesting the next one.
+    ///
+    /// This explicit full-inventory path uses the `servicenow_rs` paginator
+    /// directly. It deliberately avoids `execute_all()` so persistence remains
+    /// durable page by page and the whole live result set is never required in
+    /// memory.
+    pub async fn sync_all_business_applications(
+        &self,
+        options: BusinessApplicationHydrationOptions,
+    ) -> Result<BusinessApplicationSyncSummary> {
+        let mut dictionary_refreshed = false;
+        let mut live_options = options.clone();
+        if options.refresh_dictionary {
+            dictionary_refreshed = self.refresh_business_application_dictionary().await.is_ok();
+            live_options.refresh_dictionary = false;
+        }
+
+        let aliases = self
+            .resolve_business_application_aliases(live_options.refresh_dictionary)
+            .await;
+        let mut paginator = self
+            .client
+            .table(BUSINESS_APPLICATION_TABLE)
+            .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(BUSINESS_APPLICATION_SYNC_ALL_PAGE_SIZE as u32)
+            .order_by("name", Order::Asc)
+            .order_by("sys_id", Order::Asc)
+            .paginate()?;
+
+        let mut summary = BusinessApplicationSyncSummary {
+            all: true,
+            table: BUSINESS_APPLICATION_TABLE.to_string(),
+            page_size: BUSINESS_APPLICATION_SYNC_ALL_PAGE_SIZE,
+            dictionary_refreshed,
+            ..Default::default()
+        };
+
+        while let Some(page) = paginator.next_page().await? {
+            if page.records.is_empty() {
+                continue;
             }
+            let applications = self
+                .hydrate_business_application_page(page.records, &aliases, &live_options)
+                .await?;
+
+            summary.pages += 1;
+            summary.total_returned += applications.len();
+            summary.total_applications += applications.len();
+            if options.persist {
+                summary.persisted += applications.len();
+            }
+            roll_up_business_application_summary(&mut summary, &applications);
         }
 
         Ok(summary)
+    }
+
+    async fn hydrate_business_application_page(
+        &self,
+        records: Vec<Record>,
+        aliases: &BusinessApplicationFieldAliases,
+        options: &BusinessApplicationHydrationOptions,
+    ) -> Result<Vec<BusinessApplication>> {
+        let mut business_applications = Vec::with_capacity(records.len());
+        for record in records {
+            let mut business_application = BusinessApplication::from_servicenow(&record, aliases)?;
+            if options.persist {
+                self.persist_record(&record)?;
+                self.persist_business_application_reference_primitives(
+                    &mut business_application,
+                    options,
+                )
+                .await?;
+            }
+            business_applications.push(business_application);
+        }
+        Ok(business_applications)
     }
 
     async fn persist_business_application_reference_primitives(
@@ -6414,6 +6498,11 @@ mod tests {
             .await
             .expect("sync summary");
 
+        assert!(!summary.all);
+        assert_eq!(summary.table, BUSINESS_APPLICATION_TABLE);
+        assert_eq!(summary.page_size, 5);
+        assert_eq!(summary.pages, 1);
+        assert_eq!(summary.total_returned, 1);
         assert_eq!(summary.total_applications, 1);
         assert_eq!(summary.persisted, 1);
         // Owner reference resolves; the portfolio reference is degraded because
@@ -6458,7 +6547,109 @@ mod tests {
             .expect("sync summary");
 
         assert_eq!(summary.total_applications, 1);
+        assert_eq!(summary.total_returned, 1);
         assert_eq!(summary.persisted, 0);
+    }
+
+    fn business_application_page_record(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": format!("{:032x}", index + 1),
+            "name": format!("Application {:03}", index + 1),
+            "number": format!("APP{:07}", index + 1),
+            "sys_class_name": BUSINESS_APPLICATION_TABLE,
+            "operational_status": { "value": "1", "display_value": "Operational" }
+        })
+    }
+
+    #[tokio::test]
+    async fn business_application_sync_all_drains_live_pages_and_persists_each_page() {
+        let server = MockServer::start().await;
+        mount_no_table_ancestors(&server).await;
+        let first_page = (0..100)
+            .map(business_application_page_record)
+            .collect::<Vec<_>>();
+        let second_page = vec![business_application_page_record(100)];
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param("sysparm_limit", "100"))
+            .and(query_param("sysparm_offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": first_page
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param("sysparm_limit", "100"))
+            .and(query_param("sysparm_offset", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": second_page
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let summary = core
+            .sync_all_business_applications(BusinessApplicationHydrationOptions::default())
+            .await
+            .expect("sync all summary");
+
+        assert!(summary.all);
+        assert_eq!(summary.table, BUSINESS_APPLICATION_TABLE);
+        assert_eq!(summary.page_size, 100);
+        assert_eq!(summary.pages, 2);
+        assert_eq!(summary.total_returned, 101);
+        assert_eq!(summary.total_applications, 101);
+        assert_eq!(summary.persisted, 101);
+        assert!(summary.dictionary_degraded);
+        assert_eq!(
+            summary
+                .degraded_reasons
+                .get("dictionary_unavailable")
+                .copied(),
+            Some(101)
+        );
+
+        let cached = core
+            .query_business_applications(BusinessApplicationQuery {
+                limit: Some(200),
+                ..Default::default()
+            })
+            .await
+            .expect("cached business applications");
+        assert_eq!(cached.len(), 101);
+
+        let requests = server.received_requests().await.expect("requests");
+        let business_app_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/now/table/cmdb_ci_business_app")
+            .collect::<Vec<_>>();
+        assert_eq!(business_app_requests.len(), 2);
+        for request in business_app_requests {
+            let query = request
+                .url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                query.get("sysparm_query").map(|value| value.as_ref()),
+                Some("sys_class_name=cmdb_ci_business_app^ORDERBYname^ORDERBYsys_id")
+            );
+            assert_eq!(
+                query
+                    .get("sysparm_display_value")
+                    .map(|value| value.as_ref()),
+                Some("all")
+            );
+            assert_eq!(
+                query
+                    .get("sysparm_exclude_reference_link")
+                    .map(|value| value.as_ref()),
+                Some("true")
+            );
+        }
     }
 
     #[test]
