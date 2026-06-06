@@ -81,6 +81,7 @@ work_record_ttl = "60m"
 
 - **Records:** `get_record`, `search_records`, `user_lookup`, `user_search`, `business_application_get`,
   `business_application_search`, `business_application_query`, `business_application_servers`,
+  `business_application_servers_cached`, `business_applications_for_server`,
   `business_application_fields`,
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
@@ -127,8 +128,8 @@ They are **read-only** and enabled by default.
 ## Business Applications (read-only primitive)
 
 Business Applications (`cmdb_ci_business_app`) are a first-class local primitive
-with five **read-only** MCP tools. None mutate ServiceNow — there is **no
-create/update/delete/retire surface**. All five are **enabled by default** (they
+with seven **read-only** MCP tools. None mutate ServiceNow — there is **no
+create/update/delete/retire surface**. All seven are **enabled by default** (they
 are read tools) and are included in the `read_only_agent` role allow-list in
 [`policy.example.toml`](./policy.example.toml).
 
@@ -137,13 +138,15 @@ are read tools) and are included in the `read_only_agent` role allow-list in
 | `business_application_get` | Fetch one Business Application by `sys_id` or exact `name` | No (serves the local cache/vault) | n/a — reads local |
 | `business_application_search` | Live query `cmdb_ci_business_app` by name/owner/group/portfolio/state | Yes | Yes, by default |
 | `business_application_query` | Local SQLite query/filter/sort across **all** projected BA fields, including APM `number` values | No | n/a — reads local |
-| `business_application_servers` | Bounded, class-hierarchy-aware CMDB relationship traversal from one Business Application to associated Server CIs (any class extending `cmdb_ci_server`) | Yes | No required cache mutation |
+| `business_application_servers` | Bounded, class-hierarchy-aware CMDB relationship traversal from one Business Application to associated Server CIs (any class extending `cmdb_ci_server`) | Yes | No — traversal-only; no persist/prune args |
+| `business_application_servers_cached` | Read locally cached Server relationships for one Business Application | No | n/a — reads local |
+| `business_applications_for_server` | Read locally cached Business Application relationships for one Server | No | n/a — reads local |
 | `business_application_fields` | List dictionary-enriched BA field metadata merged with per-field observed counts (`refresh_dictionary` triggers a live `sys_dictionary` fetch) | Only when `refresh_dictionary=true` | n/a — reads local |
 
 Hydration behavior (search and the daemon `*_get_fresh` path): full-row fetch (no
 `sysparm_fields`, `sysparm_display_value=all`), persist to
 `business_applications/business_application_<sys_id>_<slug>.md`, project all
-fields into SQLite (schema v8), and hydrate referenced sys_ids — owners, groups,
+fields into SQLite (current cache schema v11), and hydrate referenced sys_ids — owners, groups,
 portfolio — into local primitive objects (or unresolved/blocked/unknown stubs).
 Reference-resolution failures are **degraded reads**: the BA read still succeeds
 and surfaces diagnostics rather than failing.
@@ -209,8 +212,11 @@ custom fields are queryable.
 ### `business_application_servers`
 
 Reads Server CIs associated with one Business Application through bounded CMDB
-relationship traversal. The MCP schema stays flat; runtime validation enforces
-the selector XOR because top-level schema composition is not allowed.
+relationship traversal. This is a live traversal read, not an inventory
+persistence operation: its MCP schema intentionally exposes no `persist`,
+`prune_stale`, or vault-write arguments. The MCP schema stays flat; runtime
+validation enforces the selector XOR because top-level schema composition is not
+allowed.
 
 **Server detection is class-hierarchy aware.** The traversal does not rely on a
 narrow three-table allowlist. Any CMDB class that extends the base `cmdb_ci_server`
@@ -227,11 +233,28 @@ CI) rather than corrupting results.
 - **Params:** `number` (Business Application number such as `<APM_NUMBER>`) **xor**
   `sys_id` (32-hex `cmdb_ci_business_app` sys_id); optional `max_depth`
   (`1`-`4`, default `2`), `max_cis` (`1`-`5000`, default `500`), `max_edges`
-  (`1`-`20000`, default `2000`), `relationship_type[]`, and `include_paths`
-  (default `false`). `number` must be a real Business Application number, not a
-  local `BA:<sys_id>` fallback. The documented bounds and defaults match the
-  `snow_core` constants `BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_*` /
+  (`1`-`20000`, default `2000`),
+  `max_service_membership_associations` (`1`-`20000`, default `2000`),
+  `max_service_membership_pages` (`1`-`200`, default `20`),
+  `relationship_type[]`, `include_paths` (default `false`), and
+  `fallback_strategy` (`none` | `ci_owner_group`, default `none`). `number` must
+  be a real Business Application number, not a local `BA:<sys_id>` fallback. The
+  documented bounds and defaults match the `snow_core` constants
+  `BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_*` /
   `BUSINESS_APPLICATION_SERVERS_MAX_*`.
+- **`fallback_strategy` (CMDB-gap fallback):** opt-in, only-on-empty heuristic
+  used **only** when the `cmdb_rel_ci` traversal finds **0** servers. `none`
+  (default) preserves current behavior exactly — no fallback, no new response
+  fields. `ci_owner_group` queries `cmdb_ci_server` by the BA's **raw
+  `u_ci_owner_group`** field (NOT the empty `managed_by_group` alias) with an
+  exact group-sys_id filter, bounded by the same `max_cis` budget, and returns
+  the matches tagged `source: "ci_owner_group_fallback"`. The fallback never
+  fires when the traversal finds one or more servers. Fallback results are
+  **live-only**: they are never persisted to the durable BA↔server membership or
+  inventory-health tables. The fallback surfaces the underlying CMDB
+  data-quality gap via
+  `relationship_summary.degraded_reasons.cmdb_relationships_unmapped` and the
+  `fallback_used` / `cmdb_servers_found` / `fallback_group_*` summary fields.
 - **`max_cis` semantics:** bounds the number of CIs examined **beyond** the root
   Business Application. The root BA is **excluded** from the budget, so a caller
   passing `max_cis = N` may examine up to `N` non-root CIs before traversal
@@ -242,11 +265,18 @@ CI) rather than corrupting results.
   consumed or the result set is exhausted, so large graphs are not silently
   undercounted by a single server-capped request. Hitting the budget with pages
   remaining sets `edge_limit_reached`.
+- **Service-membership budget semantics:** `max_service_membership_associations`
+  and `max_service_membership_pages` bound the `svc_ci_assoc` reader separately
+  from `cmdb_rel_ci` relationship traversal. Hitting either budget is reported in
+  `relationship_summary` as `service_membership_association_limit_reached` or
+  `service_membership_page_limit_reached`, and does not set `edge_limit_reached`
+  unless the `cmdb_rel_ci` edge budget was also exhausted.
 - **`relationship_type[]`:** allowlist of CMDB relationship types that gate which
   edges are traversed. Each entry may be a `cmdb_rel_type` name or sys_id.
   - **Omitted / empty list (the default through this tool):** the default set
     (`Depends on::Used by`, `Runs on::Runs`, `Contains::Contained by`,
-    `Hosted on::Hosts`) is used and resolved once to **stable `cmdb_rel_type`
+    `Hosted on::Hosts`, `Instantiates::Instantiated by`, and
+    `Members::Member of`) is used and resolved once to **stable `cmdb_rel_type`
     sys_id identities** before traversal, so edges are matched by identity rather
     than by mutable/localizable display label. If `cmdb_rel_type` resolution
     fails or is ACL-restricted, matching falls back to the default label strings
@@ -262,11 +292,66 @@ CI) rather than corrupting results.
   "relationship_summary": <summary>, "diagnostics": [...] }`, plus
   `server_paths` when `include_paths` is set. Server entries reuse the existing
   Server transport shape. `relationship_summary` carries the traversal accounting
-  (`cis_examined`, `relationships_examined`, `servers_found`, and the
-  `depth_limit_reached` / `ci_limit_reached` / `edge_limit_reached` / `truncated`
-  flags).
+  (`cis_examined`, `relationships_examined`,
+  `service_membership_associations_examined`,
+  `service_membership_pages_examined`, `servers_found`, and the
+  `depth_limit_reached` / `ci_limit_reached` / `edge_limit_reached` /
+  `service_membership_association_limit_reached` /
+  `service_membership_page_limit_reached` / `truncated` flags). When
+  `fallback_strategy != none`, each fallback server additionally carries a
+  `source: "ci_owner_group_fallback"` field, and `relationship_summary` adds
+  `cmdb_servers_found` (pre-fallback traversal count), `fallback_used`,
+  `fallback_strategy`, `fallback_group_sys_id`, `fallback_group_display_name`,
+  and `degraded_reasons.cmdb_relationships_unmapped`.
 - **Daemon bridge:** MCP forwards this tool to daemon JSON-RPC method
   `business_application_servers`; the bridge only advertises it when
+  `contract_info` reports that method as supported. Because the daemon JSON-RPC
+  method defaults local persistence on for CLI workflows, the MCP bridge always
+  injects `persist=false` and strips `prune_stale` for this tool.
+
+### `business_application_servers_cached`
+
+Reads locally cached Server relationships for one Business Application. This is
+a cache-only local read: no ServiceNow API call, no live relationship traversal,
+no persistence, no prune, and no vault writes.
+
+- **Params:** exactly one of `number` (Business Application number such as
+  `<APM_NUMBER>`), `sys_id` (32-hex `cmdb_ci_business_app` sys_id), or `name`
+  (exact Business Application name); optional `include_tombstoned` (default
+  `false`).
+- **Returns:** `{ "business_application": <BA>, "servers": [...] }`, where each
+  server relationship includes the cached Server, source table, `provenance`
+  (`relationship` | `service_membership` | `both`), `min_depth`, path evidence,
+  and optional `tombstoned_at`. The response includes `endpoint_status`
+  (`cache_hit`) and `relationship_status` (`known_relationships`,
+  `no_cached_relationships`, `unknown_not_synced`, or `degraded`), plus
+  `inventory_health` when a persisted inventory-health marker exists. A local
+  miss returns not-found with
+  `endpoint_status=live_confirmation_not_attempted`.
+- **Daemon bridge:** MCP forwards this tool to daemon JSON-RPC method
+  `business_application_servers_cached`; the bridge only advertises it when
+  `contract_info` reports that method as supported.
+
+### `business_applications_for_server`
+
+Reads locally cached Business Application relationships for one Server. This is
+a cache-only local read: no ServiceNow API call, no live relationship traversal,
+no persistence, no prune, and no vault writes.
+
+- **Params:** exactly one of `sys_id` (32-hex Server sys_id), `name` (exact
+  Server name), or `ip_address` (exact Server IP address); optional
+  `include_tombstoned` (default `false`). Exact duplicate cached server names
+  may return multiple matched servers.
+- **Returns:** `{ "servers": [{ "server": <Server>, "business_applications": [...] }] }`.
+  Each cached relationship includes the Business Application, `provenance`
+  (`relationship` | `service_membership` | `both`), `min_depth`, path evidence,
+  per-BA `inventory_health` when available, and optional `tombstoned_at`. The
+  top-level response and each matched server include `endpoint_status` and
+  `relationship_status`; a cached Server with no BA membership rows is returned
+  with `relationship_status=no_cached_relationships`. A local miss returns
+  not-found with `endpoint_status=live_confirmation_not_attempted`.
+- **Daemon bridge:** MCP forwards this tool to daemon JSON-RPC method
+  `business_applications_for_server`; the bridge only advertises it when
   `contract_info` reports that method as supported.
 
 ### Routing example
@@ -341,13 +426,15 @@ Each `business_application` object contains:
 - These are **read tools**: no confirmation token, no write-policy enablement,
   no `requires_kb_evidence`. They still respect normal MCP allow/deny filtering
   and per-role allow-lists.
-- The daemon bridge forwards all five to the matching daemon JSON-RPC methods and
+- The daemon bridge forwards all seven to the matching daemon JSON-RPC methods and
   gates them on daemon `contract_info.supported_methods` — they are only
   advertised/callable when the attached daemon reports support. Search forwards
   the hydration options (`persist`, `resolve_references`, `reference_depth`,
-  `refresh_dictionary`) to the daemon. The daemon-only
-  `business_application_get_fresh` and `business_application_sync` methods are
-  **not** exposed as foreground MCP tools.
+  `refresh_dictionary`) to the daemon. The cached relationship tools are
+  cache-only reads and do not forward persistence, prune, or vault-write
+  controls. The daemon-only `business_application_get_fresh` and
+  `business_application_sync` methods are **not** exposed as foreground MCP
+  tools.
 
 ---
 
@@ -366,7 +453,7 @@ canonical local resource type is `server`; the dedicated server tools
 
 | Tool | What it does | Live API call? | Persists to vault? |
 |---|---|---|---|
-| `server_get` | Fetch one Server by `sys_id`, exact `name`, or exact `ip_address` | No (serves the local cache/vault) | n/a — reads local |
+| `server_get` | Fetch one Server by `sys_id`, exact `name`, or exact `ip_address` (read-through cache: cache hit → cached; cache miss → live exact fetch) | On cache miss | No on MCP (forces `persist=false`); the CLI/daemon path persists |
 | `server_search` | Live query Linux/Windows servers by name, IP, CI owner group, and class | Yes | Yes |
 | `server_query` | Local SQLite query across projected Server records | No | n/a — reads local |
 | `server_fields` | List observed Server field metadata from the local projection | No | n/a — reads local |
@@ -379,13 +466,35 @@ into SQLite.
 
 ### `server_get`
 
-Reads a single Server from the local cache/vault. Schema is a strict union:
-supply **exactly one** of `sys_id`, `name`, or `ip_address`.
+Reads a single Server as a **read-through cache**: a cache hit returns the
+cached record without any live call; a cache miss triggers a **live exact
+fetch** against ServiceNow. Schema is a strict union: supply **exactly one** of
+`sys_id`, `name`, or `ip_address`.
+
+**MCP boundary — mutation-free.** On the MCP surface, `server_get` **forces
+`persist = false`**: a cache-miss live fetch returns the live record but
+**never** writes it to the local cache/vault (the daemon bridge injects
+`persist=false`; see `daemon_bridge.rs`). The CLI/daemon `server_get` path is
+different — it **does** persist the live record into the local cache. This
+distinction is intentional: the MCP boundary is read/cache-write free, while the
+CLI/daemon path is allowed to hydrate the cache.
 
 - **Params:** `sys_id` (32-hex) **xor** `name` (exact match) **xor**
   `ip_address` (exact match).
-- **Returns:** `{ "server": <Server>, "record": <record>, "markdown":
-  "<rendered markdown>" }`. Not found → JSON-RPC error `-32004`.
+- **Returns:** `{ "server": <Server>, "markdown": "<rendered markdown>" }` on a
+  cache hit, and the same shape from the live record on a cache miss.
+- **Error codes (consumers must treat ONLY `-32004` as not-found):**
+  - `-32004` — ServiceNow-confirmed 404 (the record does not exist). This is the
+    **only** not-found signal.
+  - `-32003` — the record exists but is ACL-restricted to the caller.
+  - `-32001` — network / timeout error reaching ServiceNow (record state
+    unknown; retryable).
+  - `-32005` — multiple servers matched the selector; the error payload carries
+    `selector` and `matched` for disambiguation.
+- **`server_get_fresh` is NOT an MCP tool.** The forced-live re-fetch path is
+  reachable only via the daemon JSON-RPC method `server_get_fresh` and the CLI
+  `--fresh` flag; it is never advertised or callable on the foreground MCP
+  surface.
 
 ### `server_search`
 

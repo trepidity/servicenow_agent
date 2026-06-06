@@ -140,8 +140,10 @@ snow business-app search --name Epic --operational-state-not 2 [--limit N] [--js
 snow business-app query --filter business_owner:contains:Jane [--limit N] [--json]
 snow business-app query --filter u_custom_field:eq:value
 snow business-app query --filter number:eq:EXAMPLE-APP-001 --filter name:contains:Example
-snow business-app servers --number <APM_NUMBER> [--max-depth N] [--max-cis N] [--max-edges N] [--relationship-type <type>] [--include-paths] [--json]
-snow business-app servers --sys-id <BUSINESS_APP_SYS_ID> [--max-depth N] [--max-cis N] [--max-edges N] [--relationship-type <type>] [--include-paths] [--json]
+snow business-app servers --number <APM_NUMBER> [--max-depth N] [--max-cis N] [--max-edges N] [--max-service-membership-associations N] [--max-service-membership-pages N] [--relationship-type <type>] [--include-paths] [--fallback-strategy none|ci-owner-group] [--no-persist] [--prune-stale] [--include-tombstoned] [--json]
+snow business-app servers --sys-id <BUSINESS_APP_SYS_ID> [--max-depth N] [--max-cis N] [--max-edges N] [--max-service-membership-associations N] [--max-service-membership-pages N] [--relationship-type <type>] [--include-paths] [--fallback-strategy none|ci-owner-group] [--no-persist] [--prune-stale] [--include-tombstoned] [--json]
+snow business-app servers --cached --number <APM_NUMBER> [--include-tombstoned] [--json]
+snow business-app servers --for-server <SERVER_SYS_ID> [--include-tombstoned] [--json]
 snow business-app export --format <json|jsonl|csv> --output ./output/business-apps.csv [--text "Example Application"] [--filter name:contains:Example] [--limit N]
 snow business-app export --all --format <json|jsonl|csv> --output ./output/business-apps.csv
 snow business-app fields [--refresh] [--json]
@@ -153,7 +155,14 @@ Default human output shows name, sys_id, owners, groups, portfolio, operational 
 
 #### Filters (`query` and `export`)
 
-`query` and `export` take repeatable `--filter <field>:<op>:<value>` arguments, where `<op>` is `contains` or `eq`. This is a single coupled argument (it replaced the earlier separate `--field` / `--contains` / `--eq` flags), so:
+> **Breaking change / migration.** The single coupled `--filter <field>:<op>:<value>` argument **replaced** the earlier separate `--field` / `--contains` / `--eq` flags, which have been removed. Migrate existing invocations:
+>
+> - `--field X --contains Y` → `--filter X:contains:Y`
+> - `--field X --eq Y` → `--filter X:eq:Y`
+>
+> See `CHANGELOG.md` for the full migration note.
+
+`query` and `export` take repeatable `--filter <field>:<op>:<value>` arguments, where `<op>` is `contains` or `eq`. Because it is a single coupled argument:
 
 - **Ordering is exact.** clap preserves the order in which each `--filter` is supplied, so the field/operator/value pairing is intact end to end (including interleaved operators) regardless of how the binary is invoked — there is no reliance on re-reading the process argv.
 - **Values may contain colons.** Only the first two colons delimit the token, so a value can itself contain colons (e.g. a URL or timestamp): `--filter browser_url:eq:https://example.com:8443/app`.
@@ -183,10 +192,23 @@ Traversal bounds (each is validated against an upper limit and falls back to a d
 - `--max-depth N` — maximum relationship hops from the root Business Application. Default `2`, maximum `4`.
 - `--max-cis N` — maximum number of CIs **examined beyond the root** Business Application. The root BA is never counted against this budget, so `--max-cis N` allows up to `N` non-root CIs to be examined before traversal truncates. Default `500`, maximum `5000`.
 - `--max-edges N` — maximum number of relationship edges examined during traversal. Default `2000`, maximum `20000`.
+- `--max-service-membership-associations N` — maximum `svc_ci_assoc` service-membership associations examined during traversal. Default `3000`.
+- `--max-service-membership-pages N` — maximum `svc_ci_assoc` service-membership pages examined during traversal. Default `30`.
 - `--relationship-type TYPE` — restrict traversal to one relationship type. Repeat the flag to include several types.
 - `--include-paths` — also report the relationship path(s) that lead to each server. In diamond topologies (where a server is reachable by more than one route) this reports **all** distinct alternate routes to that server, not just the first one found.
+- `--fallback-strategy none|ci-owner-group` — opt-in fallback used **only** when the CMDB traversal finds **0** servers. Default `none` preserves current behavior exactly. `ci-owner-group` queries `cmdb_ci_server` by the BA's raw `u_ci_owner_group` field (the populated CI-owner-group column, not the empty `managed_by_group` alias) and returns the matched servers tagged `source: ci_owner_group_fallback`. These results are **live-only** — never written to the local cache or the BA↔server inventory — and surface the CMDB data-quality gap (servers exist by owner group but are not linked to the BA via `cmdb_rel_ci`). The fallback never fires when the traversal finds one or more servers.
 
-Human `servers` output summarizes the Business Application, server count, the effective traversal bounds, completeness/degraded flags (`depth_limit_reached`, `ci_limit_reached`, `edge_limit_reached`, `truncated`), and compact server rows; `--json` prints the raw daemon result (including the per-server `server_paths` map when `--include-paths` is set).
+Cached reads and persistence control:
+
+- `--cached` — read the cached forward Business Application→Server relationships instead of running a live traversal. Pair with `--number` or `--sys-id` to select the Business Application. Cached rows carry a `provenance` value of `relationship`, `service_membership`, or `both`.
+- `--for-server <SERVER_SYS_ID>` — cached reverse lookup: read the cached Business Applications associated with this Server sys_id. This is its own selector (do not combine with `--number`/`--sys-id`).
+- `--no-persist` — run the live traversal but do not write results into the local cache.
+- `--prune-stale` — after a persisting live traversal, prune cached relationship rows that the traversal no longer observed.
+- `--include-tombstoned` — include tombstoned cached relationship rows and endpoint records (applies to cached reads, including `--for-server`).
+
+Mutual exclusions: `--cached` and `--for-server` conflict with each other and with all live-traversal/persistence flags (`--max-depth`, `--max-cis`, `--max-edges`, `--max-service-membership-associations`, `--max-service-membership-pages`, `--relationship-type`, `--include-paths`, `--fallback-strategy`, `--no-persist`, `--prune-stale`). `--prune-stale` also conflicts with `--no-persist`. The relationship cache is SQLite schema v11.
+
+Human `servers` output summarizes the Business Application, server count, the effective traversal bounds, completeness/degraded flags (`depth_limit_reached`, `ci_limit_reached`, `edge_limit_reached`, `truncated`), and compact server rows; `--json` prints the raw daemon result (including the per-server `server_paths` map when `--include-paths` is set). When the `ci-owner-group` fallback fires, the human output flags the fallback source and group, lists the fallback servers, and prints a warning that CMDB relationships should be reviewed; the JSON adds the per-server `source` tag and the `fallback_used` / `cmdb_servers_found` / `fallback_group_*` / `degraded_reasons.cmdb_relationships_unmapped` fields to `relationship_summary`.
 
 ```bash
 snow business-app servers --number <APM_NUMBER>
@@ -198,7 +220,7 @@ snow business-app servers --sys-id <BUSINESS_APP_SYS_ID> --relationship-type "De
 
 `export` writes local `business_application_query` results to JSON, JSONL, or CSV after validating `--limit` and the output parent locally; `export --all` drains the cached local Business Application projection page-by-page and conflicts with `--text`, `--filter`, and `--limit` (the bounded-query options). `sync` runs a live search+persist and prints a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`); `sync --all --persist` pages the live Business Application table before local export, and rejects bounded sync filters. `--persist` defaults on. The TUI routes `cmdb_ci_business_app` records to a first-class Business Application detail view (typed ownership/operational sections, then the all-fields table).
 
-Search/sync/fresh-fetch persists by default: each Business Application is fetched as a full row (no `sysparm_fields`, `display_value=all`), written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md`, and projected into local SQLite (schema v8) so `business_application_query` filters/sorts on any field locally. Reference sys_ids (owners, groups, portfolio) hydrate into local primitive objects when supported, or persist as unresolved stubs otherwise; reference failures degrade rather than fail the read. The daemon DTO returns `browser_url` and `vault_relative_path` when available.
+Search/sync/fresh-fetch persists by default: each Business Application is fetched as a full row (no `sysparm_fields`, `display_value=all`), written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md`, and projected into local SQLite (current cache schema v11) so `business_application_query` filters/sorts on any field locally. Reference sys_ids (owners, groups, portfolio) hydrate into local primitive objects when supported, or persist as unresolved stubs otherwise; reference failures degrade rather than fail the read. The daemon DTO returns `browser_url` and `vault_relative_path` when available.
 
 `snow business-app fields` returns dictionary-enriched metadata. `--refresh` triggers a live `sys_dictionary` fetch for `cmdb_ci_business_app` and its inherited tables (cached in `business_application_field_dictionary`); each entry then merges label, field type, reference table, mandatory/read-only/choice flags, max length, and `dictionary_verified=true` with observed per-field counts. When the dictionary is unreachable, entries fall back to observed-only plus a degraded diagnostic. See `crates/snow_mcp/CAPABILITIES.md` for the MCP tools — `sync` is JSON-RPC + CLI only and is deliberately not an MCP tool.
 
@@ -215,7 +237,16 @@ snow server query --ci-owner-group "Platform Operations" [--text app] [--class w
 snow server fields [--json]
 ```
 
-`get` accepts exactly one selector (`--sys-id`, `--name`, or `--ip-address`). `search` is live, bounded, Linux/Windows-only, and persists returned rows to `servers/server_<sys_id>_<slug>.md`; `query` reads the local SQLite projection and supports the same name/IP/class/CI-owner-group filters. Human output shows name, sys_id, class, IP address, CI owner group, support group, operational status, vault path, and URL when available; `--full` adds the all-fields table.
+`get` accepts exactly one selector (`--sys-id`, `--name`, or `--ip-address`) and is **read-through with live fallback**: on a cache hit it returns the cached server; on a cache miss it performs a live exact fetch and (on the CLI/daemon path) persists the hit before returning it. `server get --fresh` forces a live refresh regardless of cache state. Error contract:
+
+- `-32004` (not found) is returned **only** on a ServiceNow-confirmed 404. A cache miss alone is never a 404 — it triggers the live fallback.
+- `-32003` — the record exists but is ACL-restricted (read not permitted).
+- `-32001` — a network or timeout failure reaching ServiceNow.
+- `-32005` — the selector matched more than one server (disambiguation required).
+
+Transient (`-32001`) and ACL (`-32003`) failures are deliberately distinct from the 404 (`-32004`) so callers do not treat an unreadable or unreachable record as nonexistent.
+
+`search` is live, bounded, Linux/Windows-only, and persists returned rows to `servers/server_<sys_id>_<slug>.md`; `query` reads the local SQLite projection and supports the same name/IP/class/CI-owner-group filters. Human output shows name, sys_id, class, IP address, CI owner group, support group, operational status, vault path, and URL when available; `--full` adds the all-fields table.
 
 ## Daemon and TUI
 

@@ -86,30 +86,39 @@ The record detail pane includes a collapsed `Task SLA` heading by default. Press
 
 Business Applications (`cmdb_ci_business_app`) are a first-class local primitive. The canonical local resource type is `business_application`; `cmdb_ci_business_app` is accepted as an input alias for list/query filters.
 
-The `snow business-app` subcommand family is a thin CLI over the daemon JSON-RPC methods (`business_application_get`, `business_application_search`, `business_application_query`, `business_application_fields`, `business_application_sync`); it drives a running daemon and auto-spawns it as needed. There is no Business Application write/create/update surface — every subcommand is a read (`sync`/`search` perform a live ServiceNow read plus a local vault/SQLite write).
+The `snow business-app` subcommand family is a thin CLI over the daemon JSON-RPC methods (`business_application_get`, `business_application_search`, `business_application_query`, `business_application_fields`, `business_application_sync`); it drives a running daemon and auto-spawns it as needed. There is no Business Application write/create/update surface — every subcommand is a read (`sync`/`search`/`servers` perform a live ServiceNow read plus a local vault/SQLite write).
+
+> **Breaking changes:** the `query`/`export` filter grammar changed (the old `--field`/`--contains`/`--eq` flags are gone — use `--filter <field>:<op>:<value>` instead), and `server get` is now a read-through cache rather than cache-only. See [CHANGELOG.md](CHANGELOG.md) for migration detail.
 
 ```bash
-snow business-app get --sys-id <sys_id> | --name "Epic" [--fresh] [--json] [--full]
+snow business-app get --sys-id <BUSINESS_APP_SYS_ID> | --name "Epic" [--fresh] [--json] [--full]
 snow business-app search --name Epic --operational-state-not 2 [--limit N] [--json] [--full]
-snow business-app query --field business_owner --contains "Jane" [--limit N] [--json]
-snow business-app query --field u_custom_field --eq "value"
+snow business-app query --filter business_owner:contains:"Jane" [--limit N] [--json]
+snow business-app query --filter u_custom_field:eq:"value"
+snow business-app servers --number <APM_NUMBER> | --sys-id <BUSINESS_APP_SYS_ID> [--cached] [--json]
+snow business-app servers --for-server <SERVER_SYS_ID> [--cached] [--json]
+snow business-app export --all [--format json|jsonl|csv] [--output <PATH>]
+snow business-app export --text Epic --filter business_owner:contains:"Jane" [--limit N] [--format csv] [--output <PATH>]
 snow business-app fields [--refresh] [--json]
 snow business-app sync --name Epic [--persist] [--resolve-references] [--reference-depth N] [--refresh-dictionary] [--json]
+snow business-app sync --all [--json]
 ```
 
 - `get` reads from the local cache/vault (after hydration); `--fresh` re-fetches the live row and updates the projection. Supply exactly one of `--sys-id` or `--name`.
 - `search` runs a live `cmdb_ci_business_app` query and persists by default.
-- `query` filters/sorts entirely against the local SQLite projection — no API call. `--field` is repeatable and pairs by position with `--contains`/`--eq` (one operator value per field).
+- `query` filters/sorts entirely against the local SQLite projection — no API call. Use the repeatable `--filter <field>:<op>:<value>` flag, where `op` is `contains` or `eq`. (The old `--field` + `--contains`/`--eq` flags were removed.)
+- `servers` traverses the BA→server CMDB relationship graph. Select the BA with `--number <APM_NUMBER>` or `--sys-id <BUSINESS_APP_SYS_ID>`, or reverse the lookup with `--for-server <SERVER_SYS_ID>`. `--cached` reads the persisted BA↔server projection without a live fetch. Traversal bounds are tunable via `--max-depth`, `--max-cis`, `--max-edges`, `--max-service-membership-associations`, and `--max-service-membership-pages`; constrain edges with the repeatable `--relationship-type`. Other flags: `--include-paths`, `--fallback-strategy none|ci-owner-group`, `--no-persist`, `--prune-stale`, `--include-tombstoned`, and `--json`.
+- `export` dumps Business Applications from the local projection. Pass `--all` for everything, or filter with `--text`/`--filter`/`--limit` (same `--filter` grammar as `query`). `--format` is `json` (default), `jsonl`, or `csv`; `--output <PATH>` writes to a file instead of stdout.
 - `fields` lists dictionary-backed field metadata; `--refresh` triggers a live `sys_dictionary` fetch first (see below).
-- `sync` runs a live search+persist and returns a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`). `--persist` defaults on; `--refresh-dictionary` refreshes the dictionary once before syncing.
+- `sync` runs a live search+persist and returns a roll-up summary (`total_applications`, `persisted`, `references_resolved`, `references_unresolved`, `dictionary_degraded`, `dictionary_refreshed`, `degraded_reasons`). `--persist` defaults on; `--refresh-dictionary` refreshes the dictionary once before syncing. `sync --all` drains the full live inventory and conflicts with `--name`/`--operational-state-not`.
 
 Default human output shows name, sys_id, owners, groups, portfolio, operational status, attested date, vault path, and unresolved-reference count. `--json` emits the daemon view DTO; `--full` appends the all-fields table.
 
 What a search, sync, or fresh fetch does:
 
 - Fetches the complete readable ServiceNow row — no hand-picked `sysparm_fields`, with `display_value=all` — and maps it to a typed `BusinessApplication`.
-- Persists by default. Each returned Business Application is written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md` (for example `business_applications/business_application_54a4b61b6fe845000ed852a03f3ee4d0_epic.md`). `persist=false` exists only for explicit debug/preview paths.
-- Projects every returned field into local SQLite (schema v8) so `business_application_query` filters and sorts on any observed field locally, without another API call.
+- Persists by default. Each returned Business Application is written to the vault as canonical markdown at the stable path `business_applications/business_application_<sys_id>_<slug>.md` (for example `business_applications/business_application_<sys_id>_<slug>.md`). `persist=false` exists only for explicit debug/preview paths.
+- Projects every returned field into local SQLite (schema v11, auto-migrated forward-only on open) so `business_application_query` filters and sorts on any observed field locally, without another API call. Schema v11 adds the `business_application_servers` (BA↔server membership and path projection, provenance `relationship`/`service_membership`/`both`) and `business_application_server_inventory_health` tables backing the cached BA↔server reads (`business-app servers --cached` and `--for-server`).
 - Resolves reference-valued sys_ids (owners, groups, portfolio) into local primitive objects when the target table is supported, or stores them as unresolved/blocked/unknown reference stubs otherwise. Reference-resolution failures are degraded reads — they do not fail the Business Application read.
 - Returns `browser_url` and `vault_relative_path` in the daemon DTO when the instance URL and file path are available.
 
@@ -126,13 +135,13 @@ Servers are a first-class read-only CMDB primitive for Windows and Linux CIs. Th
 The `snow server` subcommand family is a thin CLI over daemon JSON-RPC methods (`server_get`, `server_get_fresh`, `server_search`, `server_query`, `server_fields`) and auto-spawns the daemon as needed. There is no Server write/create/update surface.
 
 ```bash
-snow server get --sys-id <sys_id> | --name "app01.example.internal" | --ip-address 192.0.2.10 [--fresh] [--json] [--full]
+snow server get --sys-id <SERVER_SYS_ID> | --name "app01.example.internal" | --ip-address 192.0.2.10 [--fresh] [--json] [--full]
 snow server search --name app01 --ip-address 192.0.2.10 --ci-owner-group "Platform Operations" --class linux [--limit N] [--json] [--full]
 snow server query --ci-owner-group "Platform Operations" [--text app] [--class windows] [--limit N] [--json] [--full]
 snow server fields [--json]
 ```
 
-- `get` reads from the local cache/vault by `sys_id`, exact `name`, or exact `ip_address`; `--fresh` re-fetches the live row and updates the projection.
+- `get` is a read-through cache keyed by `sys_id`, exact `name`, or exact `ip_address`: a cache hit returns the cached row; a cache miss triggers a live exact fetch, and on the CLI/daemon path that hit is persisted into the projection. Only a ServiceNow-confirmed 404 returns not-found (`-32004`); other failure modes return distinct structured errors — `-32003` (ACL-restricted), `-32001` (network/timeout), and `-32005` (multiple-match disambiguation). `--fresh` still forces a live refresh regardless of cache state.
 - `search` runs a live bounded `cmdb_ci_server` query restricted to Linux/Windows subclasses, supports `name` contains, exact `ip_address`, `ci_owner_group` display-name/sys_id, and class filters, then persists returned rows.
 - `query` filters entirely against the local SQLite projection with the same primitive filters, so CI owner group inventory queries do not need another API call after hydration.
 - `fields` lists observed local Server fields.
