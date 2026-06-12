@@ -124,7 +124,7 @@ What a search, sync, or fresh fetch does:
 
 `business_application_fields` returns dictionary-enriched metadata. With `--refresh` (or `refresh_dictionary=true`), the daemon fetches live `sys_dictionary` rows for `cmdb_ci_business_app` and its inherited tables, caches them in `business_application_field_dictionary`, and merges label, field type, reference table, mandatory/read-only/choice flags, max length, and `dictionary_verified=true` with the observed per-field counts. When the dictionary is unreachable it falls back to observed-only entries plus a degraded diagnostic. Field aliases (`ci_owner_group`, `primary_portfolio` and its reference target table, `attested_date`) are dictionary-verified when metadata is available and use the hardcoded baseline otherwise.
 
-Business Applications are also exposed as four read-only MCP tools (`get`/`search`/`query`/`fields`) — see `crates/snow_mcp/CAPABILITIES.md`. `business_application_sync` and `business_application_get_fresh` are JSON-RPC + CLI only; they are deliberately not MCP tools.
+Business Applications are also exposed through read-only MCP tools documented in `crates/snow_mcp/CAPABILITIES.md`. `business_application_sync` and `business_application_get_fresh` are JSON-RPC + CLI only; they are deliberately not MCP tools.
 
 In the record browser TUI, `cmdb_ci_business_app` records route to a first-class Business Application detail view with typed ownership/operational sections (operational status, business owner, information owner, CI owner group, support group, portfolio, attested date) plus the all-fields table.
 

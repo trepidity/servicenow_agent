@@ -303,6 +303,56 @@ pub async fn spawn_json_http_server(
     Ok((format!("http://{}", addr), request_rx))
 }
 
+pub async fn spawn_json_http_sequence_server(
+    response_bodies: Vec<Value>,
+) -> Result<(String, oneshot::Receiver<Vec<String>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (request_tx, request_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut request_lines = Vec::new();
+        for response_body in response_bodies {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let read = match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => return,
+                };
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            if let Some(first_line) = request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .and_then(|line| std::str::from_utf8(line).ok())
+            {
+                request_lines.push(first_line.trim().to_string());
+            }
+
+            let body = response_body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+        let _ = request_tx.send(request_lines);
+    });
+
+    Ok((format!("http://{}", addr), request_rx))
+}
+
 pub fn socket_path(tempdir: &TempDir) -> PathBuf {
     tempdir.path().join("snow.sock")
 }

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use servicenow_rs::prelude::Record;
@@ -14,18 +15,43 @@ use crate::{
 
 pub const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
 pub const BUSINESS_APPLICATION_RESOURCE_TYPE: &str = "business_application";
+/// Raw CMDB column holding the CI owner group on both `cmdb_ci_business_app`
+/// records and `cmdb_ci_server` records on this instance.
+///
+/// IMPORTANT: this is intentionally NOT the `ci_owner_group` typed alias. The
+/// typed alias resolves to `managed_by_group` (see
+/// [`BusinessApplicationFieldAliases::baseline`] and the server reference map in
+/// `resource/server.rs`), which is present-but-empty on live data. The
+/// `ci_owner_group` CMDB-gap fallback must source and filter on this raw column
+/// directly so it does not silently never fire. The same field name is used on
+/// both the BA and the server side and targets `sys_user_group`, so the group
+/// sys_id matches across the two reads without any translation.
+pub const BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD: &str = "u_ci_owner_group";
+/// `relationship_summary.degraded_reasons` key set when the `ci_owner_group`
+/// fallback fires, surfacing the CMDB data-quality gap (servers exist by owner
+/// group but are not linked to the BA via `cmdb_rel_ci`).
+pub const BUSINESS_APPLICATION_DEGRADED_REASON_CMDB_RELATIONSHIPS_UNMAPPED: &str =
+    "cmdb_relationships_unmapped";
 pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH: usize = 2;
 pub const BUSINESS_APPLICATION_SERVERS_MAX_DEPTH: usize = 4;
 pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS: usize = 500;
 pub const BUSINESS_APPLICATION_SERVERS_MAX_CIS: usize = 5000;
 pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES: usize = 2000;
 pub const BUSINESS_APPLICATION_SERVERS_MAX_EDGES: usize = 20000;
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS: usize = 2000;
+pub const BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS: usize = 20000;
+pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES: usize = 20;
+pub const BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_PAGES: usize = 200;
 pub const BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES: &[&str] = &[
     "Depends on::Used by",
     "Runs on::Runs",
     "Contains::Contained by",
     "Hosted on::Hosts",
+    "Instantiates::Instantiated by",
+    "Members::Member of",
 ];
+pub const BUSINESS_APPLICATION_SERVICE_DISCOVERY_RELATIONSHIP_TYPES: &[&str] =
+    &["Consumes::Consumed by", "Uses::Used by"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BusinessApplication {
@@ -55,6 +81,62 @@ pub struct BusinessApplication {
     pub unresolved_references: Vec<ReferenceResolutionDiagnostic>,
 }
 
+/// Strategy applied when the `cmdb_rel_ci` traversal returns zero servers.
+///
+/// The fallback is opt-in and only-on-empty: it never fires when the traversal
+/// finds one or more servers, regardless of this value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackStrategy {
+    /// No fallback. Exact current behavior; a 0-server traversal returns
+    /// `servers: []` with no new response fields.
+    #[default]
+    None,
+    /// When the traversal finds 0 servers, query `cmdb_ci_server` by the BA's
+    /// raw `u_ci_owner_group` field (NOT the empty `managed_by_group` alias) and
+    /// return the matched servers tagged `ci_owner_group_fallback`, live-only.
+    CiOwnerGroup,
+}
+
+impl FallbackStrategy {
+    /// True when this strategy requests a fallback (anything but `None`).
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Stable wire/string identity used in the `relationship_summary`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CiOwnerGroup => "ci_owner_group",
+        }
+    }
+}
+
+/// Per-server provenance tag distinguishing CMDB traversal results from
+/// `ci_owner_group` fallback results in the response.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerResultSource {
+    /// Server discovered via the authoritative `cmdb_rel_ci` graph (or service
+    /// membership). This is the default; surfaces omit the `source` field for it.
+    #[default]
+    CmdbRelCi,
+    /// Server discovered via the read-time `u_ci_owner_group` fallback. Live-only;
+    /// never persisted to the durable BA↔server inventory.
+    CiOwnerGroupFallback,
+}
+
+impl ServerResultSource {
+    /// Stable wire/string identity used in the per-server `source` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CmdbRelCi => "cmdb_rel_ci",
+            Self::CiOwnerGroupFallback => "ci_owner_group_fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessApplicationServersParams {
@@ -75,16 +157,44 @@ pub struct BusinessApplicationServersParams {
     pub max_cis: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_edges: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_service_membership_associations: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_service_membership_pages: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relationship_type: Vec<String>,
     #[serde(default)]
     pub include_paths: bool,
+    /// Opt-in fallback used ONLY when the `cmdb_rel_ci` traversal returns zero
+    /// servers. Defaults to [`FallbackStrategy::None`], which preserves the exact
+    /// current behavior (no fallback, no new response fields). See
+    /// [`FallbackStrategy`] for the CMDB data-quality fallback.
+    #[serde(default)]
+    pub fallback_strategy: FallbackStrategy,
+    /// Persist traversal results to the local cache/vault and BA/server
+    /// membership table. Core defaults this to false so read-only callers must
+    /// opt in explicitly; CLI/daemon surfaces can choose their own default.
+    ///
+    /// NOTE: persistence covers ONLY `cmdb_rel_ci`/service-membership traversal
+    /// results. `ci_owner_group` fallback servers are live-only and are never
+    /// written to the durable BA↔server membership or inventory-health tables
+    /// regardless of this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<bool>,
+    /// Tombstone this BA's previously persisted membership rows that were not
+    /// re-seen by this persisting traversal.
+    #[serde(default)]
+    pub prune_stale: bool,
 }
 
 impl BusinessApplicationServersParams {
     pub fn validate(&self) -> Result<BusinessApplicationServersOptions> {
         let number = non_empty_owned(self.number.as_deref());
         let sys_id = non_empty_owned(self.sys_id.as_deref());
+        let persist = self.persist.unwrap_or(false);
+        if self.prune_stale && !persist {
+            anyhow::bail!("`prune_stale` requires `persist=true`");
+        }
         match (number, sys_id) {
             (Some(_), Some(_)) => {
                 anyhow::bail!("provide exactly one of `number` or `sys_id`")
@@ -112,8 +222,23 @@ impl BusinessApplicationServersParams {
                         BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
                         BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
                     )?,
+                    max_service_membership_associations: validate_bound(
+                        "max_service_membership_associations",
+                        self.max_service_membership_associations,
+                        BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+                        BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+                    )?,
+                    max_service_membership_pages: validate_bound(
+                        "max_service_membership_pages",
+                        self.max_service_membership_pages,
+                        BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES,
+                        BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_PAGES,
+                    )?,
                     relationship_type: normalized_relationship_types(&self.relationship_type),
                     include_paths: self.include_paths,
+                    fallback_strategy: self.fallback_strategy,
+                    persist,
+                    prune_stale: self.prune_stale,
                 })
             }
             (None, Some(sys_id)) => Ok(BusinessApplicationServersOptions {
@@ -138,8 +263,23 @@ impl BusinessApplicationServersParams {
                     BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
                     BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
                 )?,
+                max_service_membership_associations: validate_bound(
+                    "max_service_membership_associations",
+                    self.max_service_membership_associations,
+                    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+                    BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+                )?,
+                max_service_membership_pages: validate_bound(
+                    "max_service_membership_pages",
+                    self.max_service_membership_pages,
+                    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES,
+                    BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_PAGES,
+                )?,
                 relationship_type: normalized_relationship_types(&self.relationship_type),
                 include_paths: self.include_paths,
+                fallback_strategy: self.fallback_strategy,
+                persist,
+                prune_stale: self.prune_stale,
             }),
         }
     }
@@ -161,10 +301,18 @@ pub struct BusinessApplicationServersOptions {
     /// non-root CIs may be examined before traversal truncates.
     pub max_cis: usize,
     pub max_edges: usize,
+    pub max_service_membership_associations: usize,
+    pub max_service_membership_pages: usize,
     #[serde(default)]
     pub relationship_type: Vec<String>,
     #[serde(default)]
     pub include_paths: bool,
+    #[serde(default)]
+    pub fallback_strategy: FallbackStrategy,
+    #[serde(default)]
+    pub persist: bool,
+    #[serde(default)]
+    pub prune_stale: bool,
 }
 
 impl BusinessApplicationServersOptions {
@@ -185,11 +333,276 @@ pub struct BusinessApplicationServersResult {
     pub business_application: BusinessApplicationServerApplication,
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// Per-server provenance tag, keyed by server `sys_id`. Only populated for
+    /// `ci_owner_group` fallback servers (tagged
+    /// [`ServerResultSource::CiOwnerGroupFallback`]); traversal servers are the
+    /// default [`ServerResultSource::CmdbRelCi`] and are omitted here so the
+    /// default (no-fallback) response shape is unchanged. Surfaces use this map
+    /// to attach the per-server `source` field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_sources: BTreeMap<String, ServerResultSource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_provenance: BTreeMap<String, BusinessApplicationServerProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_health: Option<BusinessApplicationServerInventoryHealth>,
     pub relationship_summary: BusinessApplicationServersSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<ReferenceResolutionDiagnostic>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub server_paths: BTreeMap<String, Vec<BusinessApplicationServerPath>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessApplicationServersCachedParams {
+    /// Business Application number, for example <APM_NUMBER>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    /// Business Application sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sys_id: Option<String>,
+    /// Exact Business Application name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub include_tombstoned: bool,
+}
+
+impl BusinessApplicationServersCachedParams {
+    pub fn validate(&self) -> Result<BusinessApplicationServersCachedOptions> {
+        let number = non_empty_owned(self.number.as_deref());
+        let sys_id = non_empty_owned(self.sys_id.as_deref());
+        let name = non_empty_owned(self.name.as_deref());
+        let selectors = [number.is_some(), sys_id.is_some(), name.is_some()]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count();
+        if selectors != 1 {
+            anyhow::bail!("provide exactly one of `number`, `sys_id`, or `name`");
+        }
+        let selector = if let Some(number) = number {
+            BusinessApplicationServersCachedSelector::Number(normalize_business_application_number(
+                &number,
+            )?)
+        } else if let Some(sys_id) = sys_id {
+            BusinessApplicationServersCachedSelector::SysId(normalize_record_lookup_sys_id(
+                &sys_id,
+            )?)
+        } else {
+            BusinessApplicationServersCachedSelector::ExactName(
+                name.expect("selector count already checked"),
+            )
+        };
+        Ok(BusinessApplicationServersCachedOptions {
+            selector,
+            include_tombstoned: self.include_tombstoned,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationServersCachedSelector {
+    Number(String),
+    SysId(String),
+    ExactName(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServersCachedOptions {
+    pub selector: BusinessApplicationServersCachedSelector,
+    #[serde(default)]
+    pub include_tombstoned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessApplicationsForServerParams {
+    /// Server sys_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sys_id: Option<String>,
+    /// Exact Server name. This may match more than one cached server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Exact Server IP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    #[serde(default)]
+    pub include_tombstoned: bool,
+}
+
+impl BusinessApplicationsForServerParams {
+    pub fn validate(&self) -> Result<BusinessApplicationsForServerOptions> {
+        let sys_id = non_empty_owned(self.sys_id.as_deref());
+        let name = non_empty_owned(self.name.as_deref());
+        let ip_address = non_empty_owned(self.ip_address.as_deref());
+        let selectors = [sys_id.is_some(), name.is_some(), ip_address.is_some()]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count();
+        if selectors != 1 {
+            anyhow::bail!("provide exactly one of `sys_id`, `name`, or `ip_address`");
+        }
+        let selector = if let Some(sys_id) = sys_id {
+            BusinessApplicationsForServerSelector::SysId(normalize_record_lookup_sys_id(&sys_id)?)
+        } else if let Some(name) = name {
+            BusinessApplicationsForServerSelector::ExactName(name)
+        } else {
+            BusinessApplicationsForServerSelector::IpAddress(
+                ip_address.expect("selector count already checked"),
+            )
+        };
+        Ok(BusinessApplicationsForServerOptions {
+            selector,
+            include_tombstoned: self.include_tombstoned,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationsForServerSelector {
+    SysId(String),
+    ExactName(String),
+    IpAddress(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationsForServerOptions {
+    pub selector: BusinessApplicationsForServerSelector,
+    #[serde(default)]
+    pub include_tombstoned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServersCachedResult {
+    pub business_application: SnowRecord,
+    #[serde(default)]
+    pub servers: Vec<CachedBusinessApplicationServer>,
+    #[serde(default)]
+    pub endpoint_status: EndpointResolutionStatus,
+    #[serde(default)]
+    pub relationship_status: RelationshipKnowledgeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_health: Option<BusinessApplicationServerInventoryHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedBusinessApplicationServer {
+    pub server: SnowRecord,
+    pub server_table: String,
+    pub provenance: String,
+    pub min_depth: usize,
+    #[serde(default)]
+    pub paths: Vec<BusinessApplicationServerPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstoned_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationsForServerResult {
+    #[serde(default)]
+    pub servers: Vec<CachedServerBusinessApplications>,
+    #[serde(default)]
+    pub endpoint_status: EndpointResolutionStatus,
+    #[serde(default)]
+    pub relationship_status: RelationshipKnowledgeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedServerBusinessApplications {
+    pub server: SnowRecord,
+    #[serde(default)]
+    pub business_applications: Vec<CachedBusinessApplicationForServer>,
+    #[serde(default)]
+    pub endpoint_status: EndpointResolutionStatus,
+    #[serde(default)]
+    pub relationship_status: RelationshipKnowledgeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedBusinessApplicationForServer {
+    pub business_application: SnowRecord,
+    pub provenance: String,
+    pub min_depth: usize,
+    #[serde(default)]
+    pub paths: Vec<BusinessApplicationServerPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_health: Option<BusinessApplicationServerInventoryHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstoned_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointResolutionStatus {
+    CacheHit,
+    LiveConfirmed,
+    NotFoundLiveConfirmed,
+    LiveLookupFailed,
+    LiveConfirmationNotAttempted,
+}
+
+impl Default for EndpointResolutionStatus {
+    fn default() -> Self {
+        Self::CacheHit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipKnowledgeStatus {
+    KnownRelationships,
+    NoCachedRelationships,
+    UnknownNotSynced,
+    Degraded,
+}
+
+impl Default for RelationshipKnowledgeStatus {
+    fn default() -> Self {
+        Self::KnownRelationships
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BusinessApplicationServerInventoryHealth {
+    pub ba_sys_id: String,
+    pub run_started_at: DateTime<Utc>,
+    pub run_completed_at: DateTime<Utc>,
+    pub service_membership_status: String,
+    pub relationship_status: String,
+    pub inventory_status: String,
+    #[serde(default)]
+    pub summary: Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationServerProvenance {
+    Relationship,
+    ServiceMembership,
+    Both,
+}
+
+impl BusinessApplicationServerProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relationship => "relationship",
+            Self::ServiceMembership => "service_membership",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Relationship, Self::ServiceMembership)
+            | (Self::ServiceMembership, Self::Relationship)
+            | (Self::Both, _)
+            | (_, Self::Both) => Self::Both,
+            (Self::Relationship, Self::Relationship) => Self::Relationship,
+            (Self::ServiceMembership, Self::ServiceMembership) => Self::ServiceMembership,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,10 +629,16 @@ pub struct BusinessApplicationServersSummary {
     pub max_depth: usize,
     pub max_cis: usize,
     pub max_edges: usize,
+    pub max_service_membership_associations: usize,
+    pub max_service_membership_pages: usize,
     #[serde(default)]
     pub servers_found: usize,
     #[serde(default)]
     pub relationships_examined: usize,
+    #[serde(default)]
+    pub service_membership_associations_examined: usize,
+    #[serde(default)]
+    pub service_membership_pages_examined: usize,
     #[serde(default)]
     pub cis_examined: usize,
     #[serde(default)]
@@ -229,17 +648,63 @@ pub struct BusinessApplicationServersSummary {
     #[serde(default)]
     pub edge_limit_reached: bool,
     #[serde(default)]
+    pub service_membership_association_limit_reached: bool,
+    #[serde(default)]
+    pub service_membership_page_limit_reached: bool,
+    #[serde(default)]
     pub truncated: bool,
     #[serde(default)]
     pub truncated_count: usize,
     #[serde(default)]
     pub acl_restricted_count: usize,
     #[serde(default)]
+    pub relationship_acl_restricted_count: usize,
+    #[serde(default)]
     pub missing_ci_count: usize,
     #[serde(default)]
     pub cycle_count: usize,
     #[serde(default)]
     pub degraded_reasons: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub persisted_servers: usize,
+    #[serde(default)]
+    pub membership_upserts: usize,
+    #[serde(default)]
+    pub membership_pruned: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_membership_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_status: Option<String>,
+    /// Pre-fallback `cmdb_rel_ci`/service-membership traversal server count.
+    /// Present (and equal to `servers_found` minus any fallback servers) ONLY
+    /// when a fallback strategy was requested; `None` (omitted) for the default
+    /// `fallback_strategy = none` path so the default response shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdb_servers_found: Option<usize>,
+    /// Whether the `ci_owner_group` fallback actually fired. Only meaningful when
+    /// a fallback strategy was requested. False/omitted on the default path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fallback_used: bool,
+    /// Requested fallback strategy as a stable string. Present only when a
+    /// fallback strategy other than `none` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_strategy: Option<String>,
+    /// The BA's raw `u_ci_owner_group` sys_id used to drive the fallback query.
+    /// Present only when the fallback fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_group_sys_id: Option<String>,
+    /// Display name of the fallback CI owner group, when known. Present only when
+    /// the fallback fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_group_display_name: Option<String>,
+}
+
+/// serde `skip_serializing_if` predicate for `bool` fields that should be omitted
+/// when false, keeping the default (no-fallback) response shape unchanged.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BusinessApplicationServersSummary {
@@ -252,6 +717,8 @@ impl BusinessApplicationServersSummary {
             max_depth: options.max_depth,
             max_cis: options.max_cis,
             max_edges: options.max_edges,
+            max_service_membership_associations: options.max_service_membership_associations,
+            max_service_membership_pages: options.max_service_membership_pages,
             ..Default::default()
         }
     }
@@ -266,6 +733,21 @@ impl BusinessApplicationServersSummary {
     pub fn mark_truncated(&mut self, skipped: usize) {
         self.truncated = true;
         self.truncated_count += skipped;
+    }
+
+    /// Surface the CMDB data-quality gap raised by the `ci_owner_group` fallback.
+    ///
+    /// Sets the `cmdb_relationships_unmapped` entry in `degraded_reasons` to a
+    /// truthy value. The map is typed `BTreeMap<String, usize>` (it counts
+    /// reference-resolution reasons), so this records `1` rather than a JSON
+    /// boolean; consumers treat a `> 0` value under this key as the flag being
+    /// set. This is a live-summary-only signal and is never written into the
+    /// durable inventory-health marker.
+    pub fn record_cmdb_relationships_unmapped(&mut self) {
+        self.degraded_reasons.insert(
+            BUSINESS_APPLICATION_DEGRADED_REASON_CMDB_RELATIONSHIPS_UNMAPPED.to_string(),
+            1,
+        );
     }
 }
 
@@ -313,6 +795,11 @@ pub struct BusinessApplicationServerPathEdge {
     pub child_sys_id: String,
     pub direction: BusinessApplicationRelationshipDirection,
     pub relationship_type: BusinessApplicationRelationshipType,
+    #[serde(
+        default,
+        skip_serializing_if = "BusinessApplicationServerPathEdgeSource::is_relationship"
+    )]
+    pub edge_source: BusinessApplicationServerPathEdgeSource,
 }
 
 impl BusinessApplicationServerPathEdge {
@@ -336,6 +823,25 @@ impl BusinessApplicationServerPathEdge {
             BusinessApplicationRelationshipDirection::ParentToChild => &self.child_sys_id,
             BusinessApplicationRelationshipDirection::ChildToParent => &self.parent_sys_id,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessApplicationServerPathEdgeSource {
+    Relationship,
+    ServiceMembership,
+}
+
+impl Default for BusinessApplicationServerPathEdgeSource {
+    fn default() -> Self {
+        Self::Relationship
+    }
+}
+
+impl BusinessApplicationServerPathEdgeSource {
+    pub fn is_relationship(&self) -> bool {
+        matches!(self, Self::Relationship)
     }
 }
 
@@ -444,6 +950,46 @@ impl BusinessApplication {
             record: snow_record,
         })
     }
+
+    /// Resolve the raw `u_ci_owner_group` reference (sys_id + display name) that
+    /// drives the `ci_owner_group` CMDB-gap fallback.
+    ///
+    /// This deliberately reads the raw [`BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD`]
+    /// column captured in `self.fields`, NOT the [`Self::ci_owner_group`] typed
+    /// alias. The typed alias maps to `managed_by_group`, which is
+    /// present-but-empty on live BA records; sourcing the fallback from it would
+    /// make the fallback silently never fire. Returns `None` when the BA has no
+    /// owner-group value set (the field is absent or empty), which the caller
+    /// surfaces as a clean diagnostic rather than an error.
+    pub fn ci_owner_group_raw(&self) -> Option<CiOwnerGroupRef> {
+        let field = self
+            .fields
+            .get(BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD)?;
+        let sys_id = field
+            .value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)?;
+        let display_name = field
+            .display_value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        Some(CiOwnerGroupRef {
+            sys_id,
+            display_name,
+        })
+    }
+}
+
+/// Minimal owner-group reference extracted from the BA's raw `u_ci_owner_group`
+/// column for the `ci_owner_group` fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiOwnerGroupRef {
+    pub sys_id: String,
+    pub display_name: Option<String>,
 }
 
 fn validate_bound(name: &str, value: Option<usize>, default: usize, max: usize) -> Result<usize> {

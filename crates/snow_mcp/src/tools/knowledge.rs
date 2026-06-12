@@ -6,7 +6,7 @@ pub fn register(registry: &mut ToolRegistry) {
     let tools = vec![
         ToolMetadata {
             name: "search_knowledge".to_string(),
-            description: "Search knowledge articles".to_string(),
+            description: "Compatibility alias for knowledge_search; prefer knowledge_search for product-facing MCP calls".to_string(),
             input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"knowledge_base":{"type":"string"},"category":{"type":"string"},"limit":{"type":"integer","minimum":1}},"required":["query"]}),
             output_schema: object_schema(),
             default_enabled: true,
@@ -14,7 +14,7 @@ pub fn register(registry: &mut ToolRegistry) {
         },
         ToolMetadata {
             name: "knowledge_search".to_string(),
-            description: "Search knowledge articles with the product MCP nomenclature".to_string(),
+            description: "Search knowledge articles with the canonical product MCP nomenclature".to_string(),
             input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"knowledge_base":{"type":"string"},"category":{"type":"string"},"limit":{"type":"integer","minimum":1},"mode":{"type":"string","enum":["lexical","semantic","hybrid"]}},"required":["query"]}),
             output_schema: object_schema(),
             default_enabled: true,
@@ -22,7 +22,7 @@ pub fn register(registry: &mut ToolRegistry) {
         },
         ToolMetadata {
             name: "get_article".to_string(),
-            description: "Get a knowledge article".to_string(),
+            description: "Compatibility alias for knowledge_fetch; prefer knowledge_fetch for product-facing MCP calls".to_string(),
             input_schema: json!({"type":"object","properties":{"number":{"type":"string"},"fresh":{"type":"boolean"}},"required":["number"]}),
             output_schema: object_schema(),
             default_enabled: true,
@@ -30,7 +30,7 @@ pub fn register(registry: &mut ToolRegistry) {
         },
         ToolMetadata {
             name: "knowledge_fetch".to_string(),
-            description: "Fetch a full KB article by number".to_string(),
+            description: "Fetch a full KB article by number with the canonical product MCP nomenclature".to_string(),
             input_schema: number_arg_schema(),
             output_schema: object_schema(),
             default_enabled: true,

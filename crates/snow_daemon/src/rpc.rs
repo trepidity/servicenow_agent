@@ -81,6 +81,8 @@ pub enum RpcMethod {
     BusinessApplicationSearch,
     BusinessApplicationQuery,
     BusinessApplicationServers,
+    BusinessApplicationServersCached,
+    BusinessApplicationsForServer,
     BusinessApplicationSync,
     BusinessApplicationFields,
     ServerGet,
@@ -190,6 +192,8 @@ impl RpcMethod {
             "business_application_search" => Self::BusinessApplicationSearch,
             "business_application_query" => Self::BusinessApplicationQuery,
             "business_application_servers" => Self::BusinessApplicationServers,
+            "business_application_servers_cached" => Self::BusinessApplicationServersCached,
+            "business_applications_for_server" => Self::BusinessApplicationsForServer,
             "business_application_sync" => Self::BusinessApplicationSync,
             "business_application_fields" => Self::BusinessApplicationFields,
             "server_get" => Self::ServerGet,
@@ -858,8 +862,41 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             // misreported as an internal/service error.
             match parse_business_application_servers_params(&request.params) {
                 Ok(params) => {
-                    match business_application_servers(state.core.as_ref(), &transport, params)
-                        .await
+                    let mut traversal_params = params.traversal;
+                    traversal_params.persist = Some(params.persist);
+                    traversal_params.prune_stale = params.prune_stale;
+                    match business_application_servers(
+                        state.core.as_ref(),
+                        &transport,
+                        traversal_params,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => JsonRpcResponse::ok(id, result),
+                        Ok(None) => JsonRpcResponse::error(
+                            id,
+                            -32004,
+                            "business application not found",
+                            Some(json!({
+                                "endpoint_status": "live_confirmation_not_attempted",
+                                "relationship_status": "unknown_not_synced"
+                            })),
+                        ),
+                        Err(err) => internal_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationServersCached => {
+            match parse_business_application_servers_cached_params(&request.params) {
+                Ok(params) => {
+                    match business_application_servers_cached(
+                        state.core.as_ref(),
+                        &transport,
+                        params,
+                    )
+                    .await
                     {
                         Ok(Some(result)) => JsonRpcResponse::ok(id, result),
                         Ok(None) => JsonRpcResponse::error(
@@ -867,6 +904,28 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                             -32004,
                             "business application not found",
                             None,
+                        ),
+                        Err(err) => internal_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::BusinessApplicationsForServer => {
+            match parse_business_applications_for_server_params(&request.params) {
+                Ok(params) => {
+                    match business_applications_for_server(state.core.as_ref(), &transport, params)
+                        .await
+                    {
+                        Ok(Some(result)) => JsonRpcResponse::ok(id, result),
+                        Ok(None) => JsonRpcResponse::error(
+                            id,
+                            -32004,
+                            "server not found",
+                            Some(json!({
+                                "endpoint_status": "live_confirmation_not_attempted",
+                                "relationship_status": "unknown_not_synced"
+                            })),
                         ),
                         Err(err) => internal_error(id, err),
                     }
@@ -910,8 +969,9 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 Err(err) => invalid_params(id, err),
             }
         }
-        RpcMethod::ServerGet => match extract_server_lookup_params(&request.params) {
-            Ok(lookup) => match get_server_cached(state.core.as_ref(), &lookup).await {
+        RpcMethod::ServerGet => match extract_server_get_params(&request.params) {
+            Ok(params) => match get_server_cached(state.core.as_ref(), &params.lookup).await {
+                // Cache hit: return the cached record without a live query.
                 Ok(Some(record)) => match transport.server(&record) {
                     Ok(server) => {
                         let record_dto = server.record.clone();
@@ -926,7 +986,41 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                     }
                     Err(err) => internal_error(id, err),
                 },
-                Ok(None) => JsonRpcResponse::error(id, -32004, "server not found", None),
+                // Cache miss: fall through to the live exact fetch. On the
+                // CLI/daemon path we persist the hit (read primitive contract);
+                // a confirmed 404 is the only -32004, transient/ACL failures map
+                // to distinct codes.
+                Ok(None) => match core_server_lookup(params.lookup) {
+                    Ok(core_lookup) => {
+                        match state
+                            .core
+                            .get_server_live(core_lookup, params.persist)
+                            .await
+                        {
+                            Ok(Some(server)) => match transport.server(&server.record) {
+                                Ok(server_dto) => {
+                                    let record_dto = server_dto.record.clone();
+                                    JsonRpcResponse::ok(
+                                        id,
+                                        json!({
+                                            "server": server_dto,
+                                            "record": record_dto,
+                                            "markdown": render_snow_record(&server.record),
+                                        }),
+                                    )
+                                }
+                                Err(err) => internal_error(id, err),
+                            },
+                            // get_server_live never returns Ok(None); NotFound is
+                            // an Err variant. Treat the impossible case as 404.
+                            Ok(None) => {
+                                JsonRpcResponse::error(id, -32004, "server not found", None)
+                            }
+                            Err(err) => server_get_error_response(id, err),
+                        }
+                    }
+                    Err(err) => invalid_params(id, err),
+                },
                 Err(err) => internal_error(id, err),
             },
             Err(err) => invalid_params(id, err),
@@ -1175,20 +1269,17 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 Err(err) => internal_error(id, err),
             },
         },
-        RpcMethod::MyApprovals => match state.core.my_approvals().await {
-            Ok(records) => wrap_approvals_response(id, &transport, records),
+        RpcMethod::MyApprovals => match state.core.my_approvals_with_routing_fresh().await {
+            Ok(response) => wrap_list_my_approvals_response(id, &transport, response),
             Err(err) => internal_error(id, err),
         },
-        RpcMethod::MyApprovalsFresh => match state.core.my_approvals_fresh().await {
-            Ok(records) => wrap_approvals_response(id, &transport, records),
+        RpcMethod::MyApprovalsFresh => match state.core.my_approvals_with_routing_fresh().await {
+            Ok(response) => wrap_list_my_approvals_response(id, &transport, response),
             Err(err) => internal_error(id, err),
         },
-        RpcMethod::ListMyApprovals => match state.core.my_approvals().await {
-            Ok(records) if !records.is_empty() => wrap_approvals_response(id, &transport, records),
-            Ok(_) | Err(_) => match state.core.my_approvals_fresh().await {
-                Ok(records) => wrap_approvals_response(id, &transport, records),
-                Err(err) => internal_error(id, err),
-            },
+        RpcMethod::ListMyApprovals => match state.core.my_approvals_with_routing_fresh().await {
+            Ok(response) => wrap_list_my_approvals_response(id, &transport, response),
+            Err(err) => internal_error(id, err),
         },
         RpcMethod::MyProjects => match state.core.my_projects().await {
             Ok(records) => wrap_records_response(id, &transport, records),
@@ -1284,34 +1375,11 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 Err(err) => invalid_params(id, err),
             }
         }
-        RpcMethod::Approve => match extract_number(&request.params) {
-            Ok(number) => match state.core.approve(&number, None).await {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                    Err(err) => internal_error(id, err),
-                },
-                Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
-            },
-            Err(err) => invalid_params(id, err),
-        },
+        RpcMethod::Approve => handle_approval_approve(id, &request.params, state, &transport).await,
         RpcMethod::ApprovalApprove => {
             handle_approval_approve(id, &request.params, state, &transport).await
         }
-        RpcMethod::Reject => match (
-            extract_number(&request.params),
-            extract_string(&request.params, "reason"),
-        ) {
-            (Ok(number), Ok(reason)) => match state.core.reject(&number, &reason).await {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                    Err(err) => internal_error(id, err),
-                },
-                Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
-            },
-            (Err(err), _) | (_, Err(err)) => invalid_params(id, err),
-        },
+        RpcMethod::Reject => handle_approval_reject(id, &request.params, state, &transport).await,
         RpcMethod::ApprovalReject => {
             handle_approval_reject(id, &request.params, state, &transport).await
         }
@@ -1596,6 +1664,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_search",
     "business_application_query",
     "business_application_servers",
+    "business_application_servers_cached",
+    "business_applications_for_server",
     "business_application_sync",
     "business_application_fields",
     "server_get",
@@ -1627,8 +1697,6 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "attachment_upload",
     "set_state",
     "field_choices",
-    "approve",
-    "reject",
     "approval_approve",
     "approval_reject",
     "get_degraded_reads",
@@ -1686,6 +1754,8 @@ const DEPRECATED_RPC_ALIASES: &[(&str, &str)] = &[
     ("my_projects_fresh", "list_my_projects"),
     ("my_stories_fresh", "list_my_stories"),
     ("my_incidents_fresh", "list_my_incidents"),
+    ("approve", "approval_approve"),
+    ("reject", "approval_reject"),
 ];
 
 fn contract_info(state: &DaemonState) -> Value {
@@ -1804,11 +1874,17 @@ async fn handle_approval_approve(
         return approval_policy_denied(id, "approval_approve");
     }
 
-    let number = match extract_number(params) {
-        Ok(number) => number,
+    let target = match extract_approval_action_target(params) {
+        Ok(target) => target,
         Err(err) => return invalid_params(id, err),
     };
-    match state.core.approve(&number, None).await {
+    let result = match target {
+        ApprovalActionTarget::Number(number) => state.core.approve(&number, None).await,
+        ApprovalActionTarget::ApprovalSysId(approval_sys_id) => {
+            state.core.approve_approval(&approval_sys_id, None).await
+        }
+    };
+    match result {
         Ok(Some(record)) => daemon_record_response(id, transport, &record),
         Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
         Err(err) => internal_error(id, err),
@@ -1825,15 +1901,21 @@ async fn handle_approval_reject(
         return approval_policy_denied(id, "approval_reject");
     }
 
-    let number = match extract_number(params) {
-        Ok(number) => number,
+    let target = match extract_approval_action_target(params) {
+        Ok(target) => target,
         Err(err) => return invalid_params(id, err),
     };
     let reason = match extract_string(params, "reason") {
         Ok(reason) => reason,
         Err(err) => return invalid_params(id, err),
     };
-    match state.core.reject(&number, &reason).await {
+    let result = match target {
+        ApprovalActionTarget::Number(number) => state.core.reject(&number, &reason).await,
+        ApprovalActionTarget::ApprovalSysId(approval_sys_id) => {
+            state.core.reject_approval(&approval_sys_id, &reason).await
+        }
+    };
+    match result {
         Ok(Some(record)) => daemon_record_response(id, transport, &record),
         Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
         Err(err) => internal_error(id, err),
@@ -1878,6 +1960,33 @@ fn extract_number(params: &Value) -> Result<String> {
             .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow!("missing required field `number`")),
         _ => Err(anyhow!("expected object params")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalActionTarget {
+    Number(String),
+    ApprovalSysId(String),
+}
+
+fn extract_approval_action_target(params: &Value) -> Result<ApprovalActionTarget> {
+    let Value::Object(map) = params else {
+        return Err(anyhow!("expected object params"));
+    };
+    let number = map.get("number").and_then(Value::as_str);
+    let approval_sys_id = map.get("approval_sys_id").and_then(Value::as_str);
+
+    match (number, approval_sys_id) {
+        (Some(number), None) => Ok(ApprovalActionTarget::Number(number.to_owned())),
+        (None, Some(approval_sys_id)) => Ok(ApprovalActionTarget::ApprovalSysId(
+            snow_core::normalize_record_lookup_sys_id(approval_sys_id)?,
+        )),
+        (Some(_), Some(_)) => Err(anyhow!(
+            "provide either `number` or `approval_sys_id`, not both"
+        )),
+        (None, None) => Err(anyhow!(
+            "missing required lookup: provide either `number` or `approval_sys_id`"
+        )),
     }
 }
 
@@ -2030,6 +2139,12 @@ enum ServerLookup {
     SysId(String),
     Name(String),
     IpAddress(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerGetRpcParams {
+    lookup: ServerLookup,
+    persist: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2341,9 +2456,16 @@ fn extract_business_application_query_params(
     Ok(query)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BusinessApplicationServersRpcParams {
+    traversal: snow_core::BusinessApplicationServersParams,
+    persist: bool,
+    prune_stale: bool,
+}
+
 /// Deserialize an incoming `business_application_servers` request into the
-/// canonical [`snow_core::BusinessApplicationServersParams`] contract and run
-/// its validation up-front.
+/// canonical [`snow_core::BusinessApplicationServersParams`] traversal contract
+/// plus daemon-level persistence controls, then run validation up-front.
 ///
 /// The core type owns `#[serde(deny_unknown_fields)]` and
 /// [`snow_core::BusinessApplicationServersParams::validate`], so unknown fields,
@@ -2355,11 +2477,51 @@ fn extract_business_application_query_params(
 /// `invalid_params` rather than a service/internal error.
 fn parse_business_application_servers_params(
     params: &Value,
-) -> Result<snow_core::BusinessApplicationServersParams> {
+) -> Result<BusinessApplicationServersRpcParams> {
+    let mut traversal_params = params.clone();
+    let mut persist = true;
+    let mut prune_stale = false;
+    if let Value::Object(map) = &mut traversal_params {
+        match map.remove("persist") {
+            Some(Value::Bool(value)) => persist = value,
+            Some(_) => return Err(anyhow!("`persist` must be a boolean")),
+            None => {}
+        }
+        match map.remove("prune_stale") {
+            Some(Value::Bool(value)) => prune_stale = value,
+            Some(_) => return Err(anyhow!("`prune_stale` must be a boolean")),
+            None => {}
+        }
+    }
+    if prune_stale && !persist {
+        return Err(anyhow!("`prune_stale` requires `persist=true`"));
+    }
     let params: snow_core::BusinessApplicationServersParams =
-        serde_json::from_value(params.clone())?;
+        serde_json::from_value(traversal_params)?;
     // Surface validation errors here so the caller maps them to invalid_params.
     // The resulting options are discarded; core re-validates during traversal.
+    params.validate()?;
+    Ok(BusinessApplicationServersRpcParams {
+        traversal: params,
+        persist,
+        prune_stale,
+    })
+}
+
+fn parse_business_application_servers_cached_params(
+    params: &Value,
+) -> Result<snow_core::BusinessApplicationServersCachedParams> {
+    let params: snow_core::BusinessApplicationServersCachedParams =
+        serde_json::from_value(params.clone())?;
+    params.validate()?;
+    Ok(params)
+}
+
+fn parse_business_applications_for_server_params(
+    params: &Value,
+) -> Result<snow_core::BusinessApplicationsForServerParams> {
+    let params: snow_core::BusinessApplicationsForServerParams =
+        serde_json::from_value(params.clone())?;
     params.validate()?;
     Ok(params)
 }
@@ -2394,6 +2556,21 @@ fn extract_server_lookup_params(params: &Value) -> Result<ServerLookup> {
             "provide exactly one of `sys_id`, `name`, or `ip_address`"
         )),
     }
+}
+
+fn extract_server_get_params(params: &Value) -> Result<ServerGetRpcParams> {
+    let Value::Object(map) = params else {
+        return Err(anyhow!("expected object params"));
+    };
+    let persist = match map.get("persist") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(anyhow!("`persist` must be a boolean")),
+        None => true,
+    };
+    Ok(ServerGetRpcParams {
+        lookup: extract_server_lookup_params(params)?,
+        persist,
+    })
 }
 
 fn core_server_lookup(lookup: ServerLookup) -> Result<snow_core::ServerLookup> {
@@ -2533,17 +2710,110 @@ async fn business_application_servers(
         return Ok(None);
     };
 
+    let result_value = serde_json::to_value(&result)?;
     let mut servers = Vec::with_capacity(result.servers.len());
     for server in result.servers {
-        servers.push(transport.server(&server.record)?);
+        // Per-server `source` tag. Traversal servers are the default
+        // (`cmdb_rel_ci`) and are omitted from `server_sources`, so only
+        // `ci_owner_group` fallback servers carry an explicit source here.
+        let source = result.server_sources.get(&server.record.sys_id).copied();
+        let mut server_value = serde_json::to_value(transport.server(&server.record)?)?;
+        if let (Some(source), Some(object)) = (source, server_value.as_object_mut()) {
+            object.insert("source".to_string(), json!(source.as_str()));
+        }
+        servers.push(server_value);
     }
 
-    Ok(Some(json!({
+    let mut response = json!({
         "business_application": result.business_application,
         "servers": servers,
         "relationship_summary": result.relationship_summary,
         "diagnostics": result.diagnostics,
         "server_paths": result.server_paths,
+    });
+    if let (Some(response), Some(result_value)) =
+        (response.as_object_mut(), result_value.as_object())
+    {
+        for (key, value) in result_value {
+            // The per-server `source` tag is already attached to each server
+            // above; the top-level `server_sources` map is an internal merge
+            // helper, not part of the response contract, so it is not surfaced.
+            if key == "server_sources" {
+                continue;
+            }
+            response.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    Ok(Some(response))
+}
+
+async fn business_application_servers_cached(
+    core: &SnowCore,
+    transport: &DaemonTransport<'_>,
+    params: snow_core::BusinessApplicationServersCachedParams,
+) -> Result<Option<Value>> {
+    let Some(result) = core.business_application_servers_cached(params).await? else {
+        return Ok(None);
+    };
+
+    let business_application = transport.business_application(&result.business_application)?;
+    let mut servers = Vec::with_capacity(result.servers.len());
+    for relationship in result.servers {
+        servers.push(json!({
+            "server": transport.server(&relationship.server)?,
+            "server_table": relationship.server_table,
+            "provenance": relationship.provenance,
+            "min_depth": relationship.min_depth,
+            "paths": relationship.paths,
+            "tombstoned_at": relationship.tombstoned_at,
+        }));
+    }
+
+    Ok(Some(json!({
+        "business_application": business_application,
+        "servers": servers,
+        "endpoint_status": result.endpoint_status,
+        "relationship_status": result.relationship_status,
+        "inventory_health": result.inventory_health,
+    })))
+}
+
+async fn business_applications_for_server(
+    core: &SnowCore,
+    transport: &DaemonTransport<'_>,
+    params: snow_core::BusinessApplicationsForServerParams,
+) -> Result<Option<Value>> {
+    let Some(result) = core.business_applications_for_server(params).await? else {
+        return Ok(None);
+    };
+
+    let mut servers = Vec::with_capacity(result.servers.len());
+    for server_relationships in result.servers {
+        let mut business_applications =
+            Vec::with_capacity(server_relationships.business_applications.len());
+        for relationship in server_relationships.business_applications {
+            business_applications.push(json!({
+                "business_application": transport.business_application(&relationship.business_application)?,
+                "provenance": relationship.provenance,
+                "min_depth": relationship.min_depth,
+                "paths": relationship.paths,
+                "inventory_health": relationship.inventory_health,
+                "tombstoned_at": relationship.tombstoned_at,
+            }));
+        }
+        servers.push(json!({
+            "server": transport.server(&server_relationships.server)?,
+            "business_applications": business_applications,
+            "endpoint_status": server_relationships.endpoint_status,
+            "relationship_status": server_relationships.relationship_status,
+        }));
+    }
+
+    Ok(Some(json!({
+        "servers": servers,
+        "endpoint_status": result.endpoint_status,
+        "relationship_status": result.relationship_status,
     })))
 }
 
@@ -2847,19 +3117,25 @@ fn wrap_records_response(
     JsonRpcResponse::ok(id, json!({ "records": record_dtos }))
 }
 
-fn wrap_approvals_response(
+fn wrap_list_my_approvals_response(
     id: Option<Value>,
     transport: &DaemonTransport<'_>,
-    approvals: Vec<snow_core::ApprovalRecord>,
+    response: snow_core::ListMyApprovalsResponse,
 ) -> JsonRpcResponse {
-    let mut approval_dtos = Vec::with_capacity(approvals.len());
-    for approval in approvals {
+    let mut approval_dtos = Vec::with_capacity(response.records.len());
+    for approval in response.records {
         match transport.approval(&approval) {
             Ok(approval) => approval_dtos.push(approval),
             Err(err) => return internal_error(id, err),
         }
     }
-    JsonRpcResponse::ok(id, json!({ "records": approval_dtos }))
+    JsonRpcResponse::ok(
+        id,
+        json!({
+            "records": approval_dtos,
+            "query_summary": response.query_summary,
+        }),
+    )
 }
 
 fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
@@ -2869,6 +3145,38 @@ fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "internal error",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+/// Map a structured [`snow_core::ServerGetError`] from the live `server_get`
+/// fallback onto a distinct JSON-RPC error. A confirmed not-found is the only
+/// `-32004`; ACL, network/timeout, and duplicate-CI disambiguation each get
+/// their own code so callers never mistake a transient failure for a genuine
+/// not-found.
+fn server_get_error_response(id: Option<Value>, err: snow_core::ServerGetError) -> JsonRpcResponse {
+    use snow_core::ServerGetError;
+    match err {
+        ServerGetError::NotFound => JsonRpcResponse::error(id, -32004, "server not found", None),
+        ServerGetError::AclRestricted(detail) => JsonRpcResponse::error(
+            id,
+            -32003,
+            "server is ACL-restricted",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Network(detail) => JsonRpcResponse::error(
+            id,
+            -32001,
+            "network error reaching ServiceNow",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Disambiguation { selector, matched } => JsonRpcResponse::error(
+            id,
+            -32005,
+            "multiple servers matched selector",
+            Some(json!({ "selector": selector, "matched": matched })),
+        ),
+        ServerGetError::Hydration(detail) => internal_error(id, detail),
+        ServerGetError::Other(detail) => internal_error(id, detail),
+    }
 }
 
 fn invalid_params(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
@@ -2909,7 +3217,8 @@ mod tests {
     use super::*;
     use crate::test_support::{
         build_fixture_state, build_fixture_state_at_instance,
-        build_fixture_state_without_instance_config, socket_path, spawn_json_http_server,
+        build_fixture_state_without_instance_config, socket_path, spawn_json_http_sequence_server,
+        spawn_json_http_server,
     };
     use interprocess::local_socket::tokio::Stream as LocalSocketStream;
     use rusqlite::Connection;
@@ -2998,6 +3307,14 @@ mod tests {
         assert_eq!(
             RpcMethod::from_method("business_application_servers"),
             RpcMethod::BusinessApplicationServers
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_application_servers_cached"),
+            RpcMethod::BusinessApplicationServersCached
+        );
+        assert_eq!(
+            RpcMethod::from_method("business_applications_for_server"),
+            RpcMethod::BusinessApplicationsForServer
         );
         assert_eq!(
             RpcMethod::from_method("business_application_sync"),
@@ -3190,7 +3507,7 @@ mod tests {
             JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
                 method: "approval_approve".to_string(),
-                params: json!({ "number": "RITM0010001" }),
+                params: json!({ "number": "TARGET_RECORD_NUMBER" }),
                 id: Some(json!(1)),
             },
             &fixture.state,
@@ -3201,6 +3518,42 @@ mod tests {
         assert_eq!(error.code, -32040);
         assert_eq!(error.message, "policy denied");
         assert_eq!(error.data.unwrap()["tool"], json!("approval_approve"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_approval_aliases_use_mcp_policy_gate() {
+        let fixture = build_fixture_state().await.expect("fixture");
+
+        for (method, params, replacement) in [
+            (
+                "approve",
+                json!({ "number": "TARGET_RECORD_NUMBER" }),
+                "approval_approve",
+            ),
+            (
+                "reject",
+                json!({ "number": "TARGET_RECORD_NUMBER", "reason": "Missing evidence." }),
+                "approval_reject",
+            ),
+        ] {
+            let response = dispatch(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params,
+                    id: Some(json!(1)),
+                },
+                &fixture.state,
+            )
+            .await;
+
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method} should be gated"));
+            assert_eq!(error.code, -32040, "{method}");
+            assert_eq!(error.message, "policy denied", "{method}");
+            assert_eq!(error.data.unwrap()["tool"], json!(replacement), "{method}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3651,6 +4004,17 @@ story_board_id = "board-sys"
                 .iter()
                 .any(|method| method.as_str() == Some("list_my_tasks"))
         );
+        for legacy_method in ["approve", "reject"] {
+            assert!(
+                !result
+                    .get("supported_methods")
+                    .and_then(Value::as_array)
+                    .expect("supported methods")
+                    .iter()
+                    .any(|method| method.as_str() == Some(legacy_method)),
+                "{legacy_method} should not be advertised as a supported method"
+            );
+        }
         assert!(
             result
                 .get("deprecated_aliases")
@@ -3663,6 +4027,22 @@ story_board_id = "board-sys"
                             == Some("list_my_tasks")
                 )
         );
+        for (legacy_method, replacement) in [
+            ("approve", "approval_approve"),
+            ("reject", "approval_reject"),
+        ] {
+            assert!(
+                result
+                    .get("deprecated_aliases")
+                    .and_then(Value::as_array)
+                    .expect("deprecated aliases")
+                    .iter()
+                    .any(|alias| alias.get("method").and_then(Value::as_str)
+                        == Some(legacy_method)
+                        && alias.get("replacement").and_then(Value::as_str) == Some(replacement)),
+                "{legacy_method} should be reported as deprecated alias"
+            );
+        }
 
         let payload = serde_json::to_string(&result).expect("contract info json");
         assert!(!payload.contains("secret"), "{payload}");
@@ -3676,6 +4056,37 @@ story_board_id = "board-sys"
     fn extract_number_reads_param() {
         let params = json!({ "number": "INC0012345" });
         assert_eq!(extract_number(&params).unwrap(), "INC0012345");
+    }
+
+    #[test]
+    fn extract_approval_action_target_accepts_number_or_approval_sys_id() {
+        assert_eq!(
+            extract_approval_action_target(&json!({ "number": "CHANGE0010001" })).unwrap(),
+            ApprovalActionTarget::Number("CHANGE0010001".to_string())
+        );
+        assert_eq!(
+            extract_approval_action_target(
+                &json!({ "approval_sys_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" })
+            )
+            .unwrap(),
+            ApprovalActionTarget::ApprovalSysId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_approval_action_target_rejects_missing_or_mixed_selector() {
+        assert!(
+            extract_approval_action_target(&json!({})).is_err(),
+            "missing selector must fail"
+        );
+        assert!(
+            extract_approval_action_target(&json!({
+                "number": "CHANGE0010001",
+                "approval_sys_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }))
+            .is_err(),
+            "mixed selector must fail"
+        );
     }
 
     #[test]
@@ -3695,6 +4106,22 @@ story_board_id = "board-sys"
             lookup,
             RecordLookup::TableSysId {
                 table: "dmn_demand".to_string(),
+                sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn extract_record_lookup_accepts_change_request_table_sys_id() {
+        let lookup = extract_record_lookup(&json!({
+            "table": "change_request",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }))
+        .expect("lookup");
+        assert_eq!(
+            lookup,
+            RecordLookup::TableSysId {
+                table: "change_request".to_string(),
                 sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string()
             }
         );
@@ -3888,7 +4315,7 @@ story_board_id = "board-sys"
             "include_paths": true
         }))
         .expect("business application servers params");
-        let options = params.validate().expect("validated options");
+        let options = params.traversal.validate().expect("validated options");
 
         // Core normalizes the number to uppercase and trims surrounding space.
         assert_eq!(
@@ -3905,13 +4332,124 @@ story_board_id = "board-sys"
             "sys_id": "54A4B61B6FE845000ED852A03F3EE4D0"
         }))
         .expect("sys_id lookup");
-        let options = params.validate().expect("validated sys_id options");
+        let options = params
+            .traversal
+            .validate()
+            .expect("validated sys_id options");
         assert_eq!(
             options.selector,
             snow_core::BusinessApplicationServersSelector::SysId(
                 "54a4b61b6fe845000ed852a03f3ee4d0".to_string()
             )
         );
+    }
+
+    #[test]
+    fn business_application_servers_params_accept_persistence_controls() {
+        let defaults = parse_business_application_servers_params(&json!({
+            "number": "APM0000001"
+        }))
+        .expect("default persistence controls");
+        assert!(defaults.persist);
+        assert!(!defaults.prune_stale);
+
+        let params = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "persist": true,
+            "prune_stale": true,
+            "max_service_membership_associations": 3000,
+            "max_service_membership_pages": 30
+        }))
+        .expect("explicit persistence controls");
+        assert!(params.persist);
+        assert!(params.prune_stale);
+        assert_eq!(params.traversal.number.as_deref(), Some("APM0000001"));
+        let options = params
+            .traversal
+            .validate()
+            .expect("validated budget options");
+        assert_eq!(options.max_service_membership_associations, 3000);
+        assert_eq!(options.max_service_membership_pages, 30);
+
+        let err = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "persist": false,
+            "prune_stale": true
+        }))
+        .expect_err("prune stale without persistence should fail");
+        assert!(
+            err.to_string()
+                .contains("`prune_stale` requires `persist=true`")
+        );
+
+        let err = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "persist": "false"
+        }))
+        .expect_err("string persist should fail");
+        assert!(err.to_string().contains("`persist` must be a boolean"));
+
+        let err = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "prune_stale": "true"
+        }))
+        .expect_err("string prune_stale should fail");
+        assert!(err.to_string().contains("`prune_stale` must be a boolean"));
+
+        let err = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "max_service_membership_associations": 0
+        }))
+        .expect_err("zero service-membership association budget should fail");
+        assert!(
+            err.to_string()
+                .contains("max_service_membership_associations")
+        );
+
+        let err = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "max_service_membership_pages": 201
+        }))
+        .expect_err("above max service-membership page budget should fail");
+        assert!(err.to_string().contains("max_service_membership_pages"));
+    }
+
+    #[test]
+    fn business_application_servers_params_parse_fallback_strategy() {
+        use snow_core::FallbackStrategy;
+
+        // Default: fallback_strategy omitted => None.
+        let defaults = parse_business_application_servers_params(&json!({
+            "number": "APM0000001"
+        }))
+        .expect("default fallback strategy");
+        assert_eq!(defaults.traversal.fallback_strategy, FallbackStrategy::None);
+
+        // Explicit ci_owner_group parses through to the typed enum.
+        let params = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "fallback_strategy": "ci_owner_group"
+        }))
+        .expect("ci_owner_group fallback strategy");
+        assert_eq!(
+            params.traversal.fallback_strategy,
+            FallbackStrategy::CiOwnerGroup
+        );
+
+        // Explicit none parses to None.
+        let params = parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "fallback_strategy": "none"
+        }))
+        .expect("none fallback strategy");
+        assert_eq!(params.traversal.fallback_strategy, FallbackStrategy::None);
+
+        // Unknown value is rejected.
+        parse_business_application_servers_params(&json!({
+            "number": "APM0000001",
+            "fallback_strategy": "bogus"
+        }))
+        .expect_err("unknown fallback strategy should fail");
     }
 
     #[test]
@@ -3939,6 +4477,67 @@ story_board_id = "board-sys"
             assert!(
                 parse_business_application_servers_params(&params).is_err(),
                 "accepted invalid params: {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn business_application_cached_params_accept_include_tombstoned_only() {
+        let params = parse_business_application_servers_cached_params(&json!({
+            "number": "APM0000001",
+            "include_tombstoned": true
+        }))
+        .expect("cached business application servers params");
+        let options = params.validate().expect("cached options");
+        assert_eq!(
+            options.selector,
+            snow_core::BusinessApplicationServersCachedSelector::Number("APM0000001".to_string())
+        );
+        assert!(options.include_tombstoned);
+
+        let params = parse_business_applications_for_server_params(&json!({
+            "name": "example-server",
+            "include_tombstoned": true
+        }))
+        .expect("cached business applications for server params");
+        let options = params.validate().expect("server cached options");
+        assert_eq!(
+            options.selector,
+            snow_core::BusinessApplicationsForServerSelector::ExactName(
+                "example-server".to_string()
+            )
+        );
+        assert!(options.include_tombstoned);
+
+        for params in [
+            json!({
+                "number": "APM0000001",
+                "persist": true
+            }),
+            json!({
+                "number": "APM0000001",
+                "prune_stale": true
+            }),
+        ] {
+            assert!(
+                parse_business_application_servers_cached_params(&params).is_err(),
+                "cached BA servers accepted write controls: {params}"
+            );
+        }
+
+        for params in [
+            json!({
+                "name": "example-server",
+                "persist": true
+            }),
+            json!({
+                "name": "example-server",
+                "prune_stale": true
+            }),
+        ] {
+            assert!(
+                parse_business_applications_for_server_params(&params).is_err(),
+                "server reverse lookup accepted write controls: {params}"
             );
         }
     }
@@ -4002,7 +4601,38 @@ story_board_id = "board-sys"
 
     #[tokio::test(flavor = "current_thread")]
     async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
-        let fixture = build_fixture_state().await.expect("fixture");
+        let (instance_url, _approval_requests) = spawn_json_http_sequence_server(vec![
+            json!({
+                "result": [{
+                    "sys_id": "user-1",
+                    "user_name": "tester",
+                    "email": "tester@example.com",
+                    "name": "Example User"
+                }]
+            }),
+            json!({
+                "result": [{
+                    "sys_id": "apr-sys",
+                    "number": "APR001",
+                    "state": "requested",
+                    "short_description": "Approval for CHG001",
+                    "approver": { "value": "user-1", "display_value": "Example User" },
+                    "source_table": { "value": "change_request", "display_value": "Change Request" },
+                    "sysapproval": { "value": "chg-sys", "display_value": "CHG001" },
+                    "sysapproval.number": "CHG001",
+                    "sysapproval.short_description": "Example change",
+                    "sysapproval.state": "assess",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-04-09 10:11:12"
+                }]
+            }),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("approval http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
         seed_kb_runtime_state(&fixture).expect("seed kb runtime state");
 
         let get_record = dispatch(
@@ -4746,16 +5376,69 @@ story_board_id = "board-sys"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_get_record_fetches_change_request_by_table_sys_id() {
+        let sys_id = "0123456789abcdef0123456789abcdef";
+        let response = json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "<CHG_NUMBER>",
+                "short_description": "<SHORT_DESC>",
+                "description": "<CHANGE_DESCRIPTION>",
+                "state": "scheduled"
+            }
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "get_record".to_string(),
+                params: json!({
+                    "table": "change_request",
+                    "sys_id": "0123456789ABCDEF0123456789ABCDEF"
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let record = response
+            .result
+            .expect("record result")
+            .get("record")
+            .cloned()
+            .expect("wrapped record");
+        assert_eq!(record.get("sys_id").and_then(Value::as_str), Some(sys_id));
+        assert_eq!(
+            record.get("number").and_then(Value::as_str),
+            Some("<CHG_NUMBER>")
+        );
+        assert_eq!(
+            record.get("resource_type").and_then(Value::as_str),
+            Some("change")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/change_request/"));
+        assert!(request_line.contains(sys_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn direct_rpc_user_lookup_fetches_active_user_by_user_name() {
         let sys_id = "0123456789abcdef0123456789abcdef";
         let response = json!({
             "result": [
                 {
                     "sys_id": sys_id,
-                    "user_name": "JOW2145",
-                    "name": "Jordan Worker",
-                    "email": "jordan.worker@example.com",
-                    "employee_number": "2145",
+                    "user_name": "USER1234",
+                    "name": "Casey User",
+                    "email": "user@example.com",
+                    "employee_number": "1234",
                     "active": "true",
                     "department": "IAM",
                     "location": "Main Street",
@@ -4773,7 +5456,7 @@ story_board_id = "board-sys"
             JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
                 method: "user_lookup".to_string(),
-                params: json!({ "user_name": "JOW2145" }),
+                params: json!({ "user_name": "USER1234" }),
                 id: Some(json!(1)),
             },
             &fixture.state,
@@ -4790,13 +5473,13 @@ story_board_id = "board-sys"
         assert_eq!(user.get("sys_id").and_then(Value::as_str), Some(sys_id));
         assert_eq!(
             user.get("user_name").and_then(Value::as_str),
-            Some("JOW2145")
+            Some("USER1234")
         );
         assert_eq!(user.get("active").and_then(Value::as_bool), Some(true));
 
         let request_line = request_rx.await.expect("request line");
         assert!(request_line.contains("/api/now/table/sys_user"));
-        assert!(request_line.contains("user_name%3DJOW2145"));
+        assert!(request_line.contains("user_name%3DUSER1234"));
         assert!(request_line.contains("active%3Dtrue"));
     }
 
@@ -4807,11 +5490,11 @@ story_board_id = "board-sys"
             "result": [
                 {
                     "sys_id": sys_id,
-                    "user_name": "JXJ1234",
-                    "name": "Jared Jennings",
-                    "first_name": "Jared",
-                    "last_name": "Jennings",
-                    "email": "jared.jennings@example.com",
+                    "user_name": "USER1234",
+                    "name": "Casey User",
+                    "first_name": "Casey",
+                    "last_name": "User",
+                    "email": "user@example.com",
                     "employee_number": "1234",
                     "active": "true",
                     "department": "IAM",
@@ -4830,7 +5513,7 @@ story_board_id = "board-sys"
             JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
                 method: "user_search".to_string(),
-                params: json!({ "first_name": "Jared", "last_name": "Jennings", "limit": 10 }),
+                params: json!({ "first_name": "Casey", "last_name": "User", "limit": 10 }),
                 id: Some(json!(1)),
             },
             &fixture.state,
@@ -4847,17 +5530,17 @@ story_board_id = "board-sys"
         assert_eq!(users[0].get("sys_id").and_then(Value::as_str), Some(sys_id));
         assert_eq!(
             users[0].get("first_name").and_then(Value::as_str),
-            Some("Jared")
+            Some("Casey")
         );
         assert_eq!(
             users[0].get("last_name").and_then(Value::as_str),
-            Some("Jennings")
+            Some("User")
         );
 
         let request_line = request_rx.await.expect("request line");
         assert!(request_line.contains("/api/now/table/sys_user"));
-        assert!(request_line.contains("first_name%3DJared"));
-        assert!(request_line.contains("last_name%3DJennings"));
+        assert!(request_line.contains("first_name%3DCasey"));
+        assert!(request_line.contains("last_name%3DUser"));
         assert!(request_line.contains("active%3Dtrue"));
     }
 
@@ -5451,7 +6134,7 @@ story_board_id = "board-sys"
                 "state": "2",
                 "assigned_to": {
                     "value": "user-sys",
-                    "display_value": "Jared Jennings"
+                    "display_value": "Casey User"
                 }
             }]
         });
@@ -5783,5 +6466,196 @@ story_board_id = "board-sys"
                 "display_value": "2 Hours"
             }
         })
+    }
+
+    // ----- server_get read-through (live fallback) RPC tests -----
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
+        let sys_id = "abababababababababababababababab";
+        let response = json!({
+            "result": [{
+                "sys_id": sys_id,
+                "name": "host10.example.internal",
+                "ip_address": "192.0.2.40",
+                "sys_class_name": "cmdb_ci_linux_server",
+                "operational_status": { "value": "1", "display_value": "Operational" }
+            }]
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "server_get".to_string(),
+                params: json!({ "name": "host10.example.internal" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let server = response
+            .result
+            .expect("server result")
+            .get("server")
+            .cloned()
+            .expect("wrapped server");
+        assert_eq!(
+            server
+                .get("record")
+                .and_then(|r| r.get("sys_id"))
+                .and_then(Value::as_str),
+            Some(sys_id)
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/cmdb_ci_server"));
+
+        let cached = fixture
+            .state
+            .core
+            .query_servers(snow_core::ServerQuery {
+                name: Some("host10".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached server query");
+        assert_eq!(cached.len(), 1, "default server_get must cache live hit");
+        assert_eq!(cached[0].sys_id, sys_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_server_get_persist_false_does_not_write_cache() {
+        let sys_id = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        let response = json!({
+            "result": [{
+                "sys_id": sys_id,
+                "name": "host11.example.internal",
+                "ip_address": "192.0.2.41",
+                "sys_class_name": "cmdb_ci_linux_server",
+                "operational_status": { "value": "1", "display_value": "Operational" }
+            }]
+        });
+        let (instance_url, _request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "server_get".to_string(),
+                params: json!({
+                    "name": "host11.example.internal",
+                    "persist": false
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let server = response
+            .result
+            .expect("server result")
+            .get("server")
+            .cloned()
+            .expect("wrapped server");
+        assert_eq!(
+            server
+                .get("record")
+                .and_then(|record| record.get("sys_id"))
+                .and_then(Value::as_str),
+            Some(sys_id)
+        );
+
+        let cached = fixture
+            .state
+            .core
+            .query_servers(snow_core::ServerQuery {
+                name: Some("host11".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached server query");
+        assert!(
+            cached.is_empty(),
+            "persist=false must not cache server_get hit"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_server_get_cache_miss_live_miss_is_not_found() {
+        let response = json!({ "result": [] });
+        let (instance_url, _request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "server_get".to_string(),
+                params: json!({ "name": "ghost.example.internal" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let error = response.error.expect("not found error");
+        assert_eq!(error.code, -32004);
+    }
+
+    #[test]
+    fn server_get_error_response_maps_each_variant_to_distinct_code() {
+        use snow_core::ServerGetError;
+        assert_eq!(
+            server_get_error_response(Some(json!(1)), ServerGetError::NotFound)
+                .error
+                .expect("err")
+                .code,
+            -32004
+        );
+        assert_eq!(
+            server_get_error_response(
+                Some(json!(1)),
+                ServerGetError::AclRestricted("denied".to_string())
+            )
+            .error
+            .expect("err")
+            .code,
+            -32003
+        );
+        assert_eq!(
+            server_get_error_response(
+                Some(json!(1)),
+                ServerGetError::Network("timeout".to_string())
+            )
+            .error
+            .expect("err")
+            .code,
+            -32001
+        );
+        assert_eq!(
+            server_get_error_response(
+                Some(json!(1)),
+                ServerGetError::Disambiguation {
+                    selector: "name=dup".to_string(),
+                    matched: 2
+                }
+            )
+            .error
+            .expect("err")
+            .code,
+            -32005
+        );
     }
 }

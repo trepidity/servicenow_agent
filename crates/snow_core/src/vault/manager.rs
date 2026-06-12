@@ -307,6 +307,8 @@ mod tests {
             },
             requested_at: Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
             due_date: Some(Utc.timestamp_opt(1_712_736_000, 0).unwrap()),
+            routed_via: crate::ApprovalRoutedVia::Direct,
+            approver_group: None,
         }
     }
 

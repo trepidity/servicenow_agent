@@ -6,8 +6,9 @@ use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalRecord, CacheSource, FieldValue, JournalEntry, KnowledgeArticle, RecordRef, Reference,
-    ResourceType, SnowRecord, choose_reference_display_name, normalize_knowledge_article,
+    ApprovalRecord, ApprovalRoutedVia, CacheSource, FieldValue, JournalEntry, KnowledgeArticle,
+    RecordRef, Reference, ResourceType, SnowRecord, choose_reference_display_name,
+    normalize_knowledge_article,
 };
 
 pub trait MarkdownRenderable {
@@ -106,6 +107,10 @@ struct ApprovalRecordFrontmatter {
     requested_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     due_date: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    routed_via: ApprovalRoutedVia,
+    #[serde(default)]
+    approver_group: Option<Reference>,
     synced_at: chrono::DateTime<chrono::Utc>,
     source: String,
 }
@@ -328,6 +333,17 @@ pub fn render_approval_record(approval: &ApprovalRecord) -> String {
     push_record_ref(&mut out, "target", &approval.target);
     push_scalar(
         &mut out,
+        "routed_via",
+        match approval.routed_via {
+            ApprovalRoutedVia::Direct => "direct",
+            ApprovalRoutedVia::Group => "group",
+        },
+    );
+    if let Some(approver_group) = &approval.approver_group {
+        push_reference(&mut out, "approver_group", approver_group);
+    }
+    push_scalar(
+        &mut out,
         "requested_at",
         &approval
             .requested_at
@@ -505,6 +521,8 @@ pub fn parse_approval_record(markdown: &str) -> Result<ApprovalRecord> {
         target: frontmatter.target,
         requested_at: frontmatter.requested_at,
         due_date: frontmatter.due_date,
+        routed_via: frontmatter.routed_via,
+        approver_group: frontmatter.approver_group,
     })
 }
 
@@ -1136,6 +1154,8 @@ mod tests {
             },
             requested_at: Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
             due_date: Some(Utc.timestamp_opt(1_712_736_000, 0).unwrap()),
+            routed_via: ApprovalRoutedVia::Direct,
+            approver_group: None,
         }
     }
 

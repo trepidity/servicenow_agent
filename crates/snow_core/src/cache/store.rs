@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -289,6 +289,30 @@ pub struct BusinessApplicationProjectionRow {
     pub unresolved_reference_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessApplicationServerMembershipRow {
+    pub ba_sys_id: String,
+    pub server_sys_id: String,
+    pub server_table: String,
+    pub provenance: String,
+    pub min_depth: usize,
+    pub paths_json: String,
+    pub discovered_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub tombstoned_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessApplicationServerInventoryHealthRow {
+    pub ba_sys_id: String,
+    pub run_started_at: DateTime<Utc>,
+    pub run_completed_at: DateTime<Utc>,
+    pub service_membership_status: String,
+    pub relationship_status: String,
+    pub inventory_status: String,
+    pub summary_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedFieldRow {
     pub owner_sys_id: String,
@@ -440,6 +464,12 @@ impl Store {
         }
         if self.needs_v9_migration(schema_version)? {
             self.migrate_to_v9()?;
+        }
+        if self.needs_v10_migration(schema_version)? {
+            self.migrate_to_v10()?;
+        }
+        if self.needs_v11_migration(schema_version)? {
+            self.migrate_to_v11()?;
         }
         self.create_post_migration_indexes()?;
         self.set_schema_version(SCHEMA_VERSION)?;
@@ -656,6 +686,57 @@ impl Store {
                 PRIMARY KEY(table_name, field_name)
             );
 
+            CREATE TABLE IF NOT EXISTS business_application_servers (
+                ba_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                server_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                server_table TEXT NOT NULL,
+                provenance TEXT NOT NULL,
+                min_depth INTEGER NOT NULL CHECK (min_depth >= 0),
+                paths_json TEXT NOT NULL DEFAULT '[]',
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                tombstoned_at INTEGER,
+                PRIMARY KEY(ba_sys_id, server_sys_id, provenance)
+            );
+
+            CREATE TABLE IF NOT EXISTS business_application_server_inventory_health (
+                ba_sys_id TEXT PRIMARY KEY
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                run_started_at INTEGER NOT NULL,
+                run_completed_at INTEGER NOT NULL,
+                service_membership_status TEXT NOT NULL
+                    CHECK (service_membership_status IN (
+                        'ok',
+                        'not_attempted',
+                        'acl_restricted',
+                        'association_budget_exhausted',
+                        'page_budget_exhausted'
+                    )),
+                relationship_status TEXT NOT NULL
+                    CHECK (relationship_status IN (
+                        'ok',
+                        'depth_limited',
+                        'edge_budget_exhausted',
+                        'ci_budget_exhausted',
+                        'acl_restricted',
+                        'truncated'
+                    )),
+                inventory_status TEXT NOT NULL
+                    CHECK (inventory_status IN (
+                        'complete',
+                        'service_membership_degraded',
+                        'relationship_degraded',
+                        'truncated',
+                        'failed'
+                    )),
+                summary_json TEXT NOT NULL DEFAULT '{}'
+            );
+
             CREATE TABLE IF NOT EXISTS primitive_objects (
                 sys_id TEXT PRIMARY KEY,
                 table_name TEXT NOT NULL,
@@ -759,6 +840,10 @@ impl Store {
                 ON business_application_fields(field_name, value_number);
             CREATE INDEX IF NOT EXISTS idx_ba_fields_ref
                 ON business_application_fields(field_name, reference_table, reference_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_ba_servers_ba
+                ON business_application_servers(ba_sys_id, tombstoned_at, min_depth, server_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_ba_servers_server
+                ON business_application_servers(server_sys_id, tombstoned_at, min_depth, ba_sys_id);
             CREATE INDEX IF NOT EXISTS idx_primitive_objects_table
                 ON primitive_objects(table_name, display_name);
             CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_text
@@ -805,6 +890,8 @@ impl Store {
     fn migrate_to_v3(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
+            PRAGMA foreign_keys=OFF;
+            PRAGMA legacy_alter_table=ON;
             BEGIN IMMEDIATE;
 
             ALTER TABLE records RENAME TO records_v2;
@@ -844,6 +931,8 @@ impl Store {
             DROP TABLE records_v2;
 
             COMMIT;
+            PRAGMA legacy_alter_table=OFF;
+            PRAGMA foreign_keys=ON;
             "#,
         )?;
         Ok(())
@@ -1106,6 +1195,58 @@ impl Store {
             || !self.index_exists("idx_cached_user_queries_expires")?)
     }
 
+    fn migrate_to_v10(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.create_v10_schema_objects();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn needs_v10_migration(&self, schema_version: i64) -> Result<bool> {
+        if schema_version > 0 && schema_version < 10 {
+            return Ok(true);
+        }
+        Ok(!self.table_exists("business_application_servers")?
+            || !self.index_exists("idx_ba_servers_ba")?
+            || !self.index_exists("idx_ba_servers_server")?)
+    }
+
+    fn migrate_to_v11(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.create_v11_schema_objects()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn needs_v11_migration(&self, schema_version: i64) -> Result<bool> {
+        if schema_version > 0 && schema_version < 11 {
+            return Ok(true);
+        }
+        Ok(
+            !self.table_exists("business_application_server_inventory_health")?
+                || !self.index_exists("idx_ba_servers_one_live_pair")?,
+        )
+    }
+
     fn create_v8_schema_objects(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -1284,6 +1425,187 @@ impl Store {
                 ON cached_users(first_name, last_name);
             CREATE INDEX IF NOT EXISTS idx_cached_user_queries_expires
                 ON cached_user_queries(expires_at);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn create_v10_schema_objects(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS business_application_servers (
+                ba_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                server_sys_id TEXT NOT NULL
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                server_table TEXT NOT NULL,
+                provenance TEXT NOT NULL,
+                min_depth INTEGER NOT NULL CHECK (min_depth >= 0),
+                paths_json TEXT NOT NULL DEFAULT '[]',
+                discovered_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                tombstoned_at INTEGER,
+                PRIMARY KEY(ba_sys_id, server_sys_id, provenance)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ba_servers_ba
+                ON business_application_servers(ba_sys_id, tombstoned_at, min_depth, server_sys_id);
+            CREATE INDEX IF NOT EXISTS idx_ba_servers_server
+                ON business_application_servers(server_sys_id, tombstoned_at, min_depth, ba_sys_id);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn create_v11_schema_objects(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS business_application_server_inventory_health (
+                ba_sys_id TEXT PRIMARY KEY
+                    REFERENCES records(sys_id)
+                    ON DELETE CASCADE,
+                run_started_at INTEGER NOT NULL,
+                run_completed_at INTEGER NOT NULL,
+                service_membership_status TEXT NOT NULL
+                    CHECK (service_membership_status IN (
+                        'ok',
+                        'not_attempted',
+                        'acl_restricted',
+                        'association_budget_exhausted',
+                        'page_budget_exhausted'
+                    )),
+                relationship_status TEXT NOT NULL
+                    CHECK (relationship_status IN (
+                        'ok',
+                        'depth_limited',
+                        'edge_budget_exhausted',
+                        'ci_budget_exhausted',
+                        'acl_restricted',
+                        'truncated'
+                    )),
+                inventory_status TEXT NOT NULL
+                    CHECK (inventory_status IN (
+                        'complete',
+                        'service_membership_degraded',
+                        'relationship_degraded',
+                        'truncated',
+                        'failed'
+                    )),
+                summary_json TEXT NOT NULL DEFAULT '{}'
+            );
+            "#,
+        )?;
+        self.collapse_duplicate_live_business_application_server_memberships()?;
+        self.conn.execute(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ba_servers_one_live_pair
+                ON business_application_servers(ba_sys_id, server_sys_id)
+                WHERE tombstoned_at IS NULL
+            "#,
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn collapse_duplicate_live_business_application_server_memberships(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS temp.ba_server_live_pair_cleanup;
+            CREATE TEMP TABLE ba_server_live_pair_cleanup AS
+            SELECT
+                ba_sys_id,
+                server_sys_id,
+                MIN(discovered_at) AS earliest_discovered_at,
+                MAX(last_seen_at) AS latest_last_seen_at,
+                MIN(min_depth) AS min_depth,
+                COALESCE(
+                    MAX(CASE WHEN provenance = 'both' THEN server_table END),
+                    MAX(CASE WHEN provenance = 'relationship' THEN server_table END),
+                    MAX(CASE WHEN provenance = 'service_membership' THEN server_table END),
+                    MAX(server_table)
+                ) AS server_table,
+                COALESCE(
+                    MAX(CASE WHEN provenance = 'both' THEN paths_json END),
+                    MAX(CASE WHEN provenance = 'relationship' THEN paths_json END),
+                    MAX(paths_json),
+                    '[]'
+                ) AS paths_json,
+                CASE
+                    WHEN SUM(CASE WHEN provenance = 'both' THEN 1 ELSE 0 END) > 0 THEN 'both'
+                    WHEN SUM(CASE WHEN provenance = 'relationship' THEN 1 ELSE 0 END) > 0
+                     AND SUM(CASE WHEN provenance = 'service_membership' THEN 1 ELSE 0 END) > 0 THEN 'both'
+                    WHEN SUM(CASE WHEN provenance = 'relationship' THEN 1 ELSE 0 END) > 0 THEN 'relationship'
+                    WHEN SUM(CASE WHEN provenance = 'service_membership' THEN 1 ELSE 0 END) > 0 THEN 'service_membership'
+                    ELSE MIN(provenance)
+                END AS desired_provenance
+            FROM business_application_servers
+            WHERE tombstoned_at IS NULL
+            GROUP BY ba_sys_id, server_sys_id
+            HAVING COUNT(*) > 1;
+
+            INSERT INTO business_application_servers (
+                ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                paths_json, discovered_at, last_seen_at, tombstoned_at
+            )
+            SELECT
+                ba_sys_id, server_sys_id, server_table, desired_provenance, min_depth,
+                paths_json, earliest_discovered_at, latest_last_seen_at, NULL
+            FROM ba_server_live_pair_cleanup
+            WHERE desired_provenance = 'both'
+            ON CONFLICT(ba_sys_id, server_sys_id, provenance) DO UPDATE SET
+                server_table = excluded.server_table,
+                min_depth = excluded.min_depth,
+                paths_json = excluded.paths_json,
+                discovered_at = MIN(business_application_servers.discovered_at, excluded.discovered_at),
+                last_seen_at = MAX(business_application_servers.last_seen_at, excluded.last_seen_at),
+                tombstoned_at = NULL;
+
+            UPDATE business_application_servers
+            SET
+                discovered_at = (
+                    SELECT earliest_discovered_at
+                    FROM ba_server_live_pair_cleanup cleanup
+                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
+                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
+                ),
+                last_seen_at = MAX(
+                    last_seen_at,
+                    (
+                        SELECT latest_last_seen_at
+                        FROM ba_server_live_pair_cleanup cleanup
+                        WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
+                          AND cleanup.server_sys_id = business_application_servers.server_sys_id
+                    )
+                ),
+                tombstoned_at = NULL
+            WHERE tombstoned_at IS NULL
+              AND EXISTS (
+                    SELECT 1
+                    FROM ba_server_live_pair_cleanup cleanup
+                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
+                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
+                      AND cleanup.desired_provenance = business_application_servers.provenance
+              );
+
+            UPDATE business_application_servers
+            SET tombstoned_at = (
+                SELECT latest_last_seen_at
+                FROM ba_server_live_pair_cleanup cleanup
+                WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
+                  AND cleanup.server_sys_id = business_application_servers.server_sys_id
+            )
+            WHERE tombstoned_at IS NULL
+              AND EXISTS (
+                    SELECT 1
+                    FROM ba_server_live_pair_cleanup cleanup
+                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
+                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
+                      AND cleanup.desired_provenance <> business_application_servers.provenance
+              );
+
+            DROP TABLE IF EXISTS temp.ba_server_live_pair_cleanup;
             "#,
         )?;
         Ok(())
@@ -1764,6 +2086,225 @@ impl Store {
                 field_name: row.get(3)?,
             })
         })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_business_application_server_membership(
+        &self,
+        membership: &BusinessApplicationServerMembershipRow,
+    ) -> Result<()> {
+        self.conn
+            .execute_batch("SAVEPOINT ba_server_membership_upsert")?;
+        let result = (|| -> Result<()> {
+            if membership.tombstoned_at.is_none() {
+                self.conn.execute(
+                    r#"
+                    UPDATE business_application_servers
+                    SET tombstoned_at = ?3
+                    WHERE ba_sys_id = ?1
+                      AND server_sys_id = ?2
+                      AND provenance <> ?4
+                      AND tombstoned_at IS NULL
+                    "#,
+                    params![
+                        &membership.ba_sys_id,
+                        &membership.server_sys_id,
+                        to_ts(membership.last_seen_at),
+                        &membership.provenance,
+                    ],
+                )?;
+            }
+
+            self.conn.execute(
+                r#"
+                INSERT INTO business_application_servers (
+                    ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                    paths_json, discovered_at, last_seen_at, tombstoned_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    COALESCE((
+                        SELECT MIN(discovered_at)
+                        FROM business_application_servers
+                        WHERE ba_sys_id = ?1
+                          AND server_sys_id = ?2
+                    ), ?7),
+                    ?8, ?9
+                )
+                ON CONFLICT(ba_sys_id, server_sys_id, provenance) DO UPDATE SET
+                    server_table = excluded.server_table,
+                    min_depth = excluded.min_depth,
+                    paths_json = excluded.paths_json,
+                    discovered_at = MIN(business_application_servers.discovered_at, excluded.discovered_at),
+                    last_seen_at = excluded.last_seen_at,
+                    tombstoned_at = excluded.tombstoned_at
+                "#,
+                params![
+                    &membership.ba_sys_id,
+                    &membership.server_sys_id,
+                    &membership.server_table,
+                    &membership.provenance,
+                    membership.min_depth as i64,
+                    &membership.paths_json,
+                    to_ts(membership.discovered_at),
+                    to_ts(membership.last_seen_at),
+                    opt_ts(membership.tombstoned_at),
+                ],
+            )?;
+
+            let duplicate_live_pairs: i64 = self.conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM (
+                    SELECT 1
+                    FROM business_application_servers
+                    WHERE ba_sys_id = ?1
+                      AND server_sys_id = ?2
+                      AND tombstoned_at IS NULL
+                    GROUP BY ba_sys_id, server_sys_id
+                    HAVING COUNT(*) > 1
+                )
+                "#,
+                params![&membership.ba_sys_id, &membership.server_sys_id],
+                |row| row.get(0),
+            )?;
+            if duplicate_live_pairs > 0 {
+                return Err(StoreError::InvalidQuery(format!(
+                    "duplicate live BA/server membership rows for ba_sys_id={} server_sys_id={}",
+                    membership.ba_sys_id, membership.server_sys_id
+                )));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE ba_server_membership_upsert")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO ba_server_membership_upsert; RELEASE ba_server_membership_upsert",
+                );
+                Err(err)
+            }
+        }
+    }
+
+    pub fn tombstone_stale_business_application_server_memberships(
+        &self,
+        ba_sys_id: &str,
+        last_seen_before: DateTime<Utc>,
+        tombstoned_at: DateTime<Utc>,
+    ) -> Result<usize> {
+        let updated = self.conn.execute(
+            r#"
+            UPDATE business_application_servers
+            SET tombstoned_at = ?2
+            WHERE ba_sys_id = ?1
+              AND tombstoned_at IS NULL
+              AND last_seen_at < ?3
+            "#,
+            params![
+                ba_sys_id,
+                opt_ts(Some(tombstoned_at)),
+                to_ts(last_seen_before)
+            ],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn upsert_business_application_server_inventory_health(
+        &self,
+        health: &BusinessApplicationServerInventoryHealthRow,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO business_application_server_inventory_health (
+                ba_sys_id, run_started_at, run_completed_at, service_membership_status,
+                relationship_status, inventory_status, summary_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(ba_sys_id) DO UPDATE SET
+                run_started_at = excluded.run_started_at,
+                run_completed_at = excluded.run_completed_at,
+                service_membership_status = excluded.service_membership_status,
+                relationship_status = excluded.relationship_status,
+                inventory_status = excluded.inventory_status,
+                summary_json = excluded.summary_json
+            "#,
+            params![
+                &health.ba_sys_id,
+                to_ts(health.run_started_at),
+                to_ts(health.run_completed_at),
+                &health.service_membership_status,
+                &health.relationship_status,
+                &health.inventory_status,
+                &health.summary_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_business_application_server_inventory_health(
+        &self,
+        ba_sys_id: &str,
+    ) -> Result<Option<BusinessApplicationServerInventoryHealthRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT ba_sys_id, run_started_at, run_completed_at,
+                       service_membership_status, relationship_status, inventory_status,
+                       summary_json
+                FROM business_application_server_inventory_health
+                WHERE ba_sys_id = ?1
+                "#,
+                params![ba_sys_id],
+                row_to_business_application_server_inventory_health,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_business_application_server_memberships_for_ba(
+        &self,
+        ba_sys_id: &str,
+        include_tombstoned: bool,
+    ) -> Result<Vec<BusinessApplicationServerMembershipRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                   paths_json, discovered_at, last_seen_at, tombstoned_at
+            FROM business_application_servers
+            WHERE ba_sys_id = ?1
+              AND (?2 != 0 OR tombstoned_at IS NULL)
+            ORDER BY min_depth ASC, server_table ASC, server_sys_id ASC, provenance ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![ba_sys_id, bool_to_i64(include_tombstoned)],
+            row_to_business_application_server_membership,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_business_application_server_memberships_for_server(
+        &self,
+        server_sys_id: &str,
+        include_tombstoned: bool,
+    ) -> Result<Vec<BusinessApplicationServerMembershipRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                   paths_json, discovered_at, last_seen_at, tombstoned_at
+            FROM business_application_servers
+            WHERE server_sys_id = ?1
+              AND (?2 != 0 OR tombstoned_at IS NULL)
+            ORDER BY min_depth ASC, ba_sys_id ASC, provenance ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![server_sys_id, bool_to_i64(include_tombstoned)],
+            row_to_business_application_server_membership,
+        )?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -3945,6 +4486,42 @@ fn row_to_business_application_projection(
     })
 }
 
+fn row_to_business_application_server_membership(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BusinessApplicationServerMembershipRow> {
+    let discovered_at = from_ts(row.get::<_, i64>(6)?).map_err(to_sqlite_err)?;
+    let last_seen_at = from_ts(row.get::<_, i64>(7)?).map_err(to_sqlite_err)?;
+    Ok(BusinessApplicationServerMembershipRow {
+        ba_sys_id: row.get(0)?,
+        server_sys_id: row.get(1)?,
+        server_table: row.get(2)?,
+        provenance: row.get(3)?,
+        min_depth: row.get::<_, i64>(4)? as usize,
+        paths_json: row.get(5)?,
+        discovered_at,
+        last_seen_at,
+        tombstoned_at: row
+            .get::<_, Option<i64>>(8)?
+            .map(from_ts)
+            .transpose()
+            .map_err(to_sqlite_err)?,
+    })
+}
+
+fn row_to_business_application_server_inventory_health(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BusinessApplicationServerInventoryHealthRow> {
+    Ok(BusinessApplicationServerInventoryHealthRow {
+        ba_sys_id: row.get(0)?,
+        run_started_at: from_ts(row.get::<_, i64>(1)?).map_err(to_sqlite_err)?,
+        run_completed_at: from_ts(row.get::<_, i64>(2)?).map_err(to_sqlite_err)?,
+        service_membership_status: row.get(3)?,
+        relationship_status: row.get(4)?,
+        inventory_status: row.get(5)?,
+        summary_json: row.get(6)?,
+    })
+}
+
 fn row_to_projected_field(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectedFieldRow> {
     Ok(ProjectedFieldRow {
         owner_sys_id: row.get(0)?,
@@ -4784,14 +5361,17 @@ mod tests {
     }
 
     #[test]
-    fn initializes_schema_v9_business_application_projection_and_user_cache_tables() {
+    fn initializes_schema_v11_business_application_projection_user_cache_ba_server_and_health_tables()
+     {
         let store = Store::open_in_memory().expect("store");
 
-        assert_eq!(store.schema_version().expect("version"), Some(9));
+        assert_eq!(store.schema_version().expect("version"), Some(11));
         for table in [
             "business_applications",
             "business_application_fields",
             "business_application_field_dictionary",
+            "business_application_servers",
+            "business_application_server_inventory_health",
             "primitive_objects",
             "primitive_object_fields",
             "cached_users",
@@ -4802,6 +5382,9 @@ mod tests {
         for index in [
             "idx_ba_name",
             "idx_ba_fields_ref",
+            "idx_ba_servers_ba",
+            "idx_ba_servers_server",
+            "idx_ba_servers_one_live_pair",
             "idx_primitive_fields_ref",
             "idx_cached_users_user_name",
             "idx_cached_users_email",
@@ -4812,6 +5395,286 @@ mod tests {
         ] {
             assert!(store.index_exists(index).expect("index exists"), "{index}");
         }
+    }
+
+    #[test]
+    fn business_application_server_memberships_round_trip_by_ba_and_server() {
+        let store = Store::open_in_memory().expect("store");
+        let now = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let ba = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            now,
+        );
+        let server = RecordRow::active(
+            "7f4a6e2f1c23456789abcdef01234567",
+            "SRV0000001",
+            "cmdb_ci_linux_server",
+            ResourceType::Server,
+            now,
+        );
+        store.upsert_record(&ba, "", "").expect("insert BA");
+        store.upsert_record(&server, "", "").expect("insert server");
+        let membership = BusinessApplicationServerMembershipRow {
+            ba_sys_id: "54a4b61b6fe845000ed852a03f3ee4d0".to_string(),
+            server_sys_id: "7f4a6e2f1c23456789abcdef01234567".to_string(),
+            server_table: "cmdb_ci_linux_server".to_string(),
+            provenance: "cmdb_rel_ci".to_string(),
+            min_depth: 2,
+            paths_json: serde_json::json!([{
+                "edges": [{
+                    "depth": 1,
+                    "parent_sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
+                    "child_sys_id": "7f4a6e2f1c23456789abcdef01234567",
+                    "direction": "parent_to_child",
+                    "relationship_type": {
+                        "value": "Depends on::Used by"
+                    }
+                }]
+            }])
+            .to_string(),
+            discovered_at: now,
+            last_seen_at: now,
+            tombstoned_at: None,
+        };
+
+        store
+            .upsert_business_application_server_membership(&membership)
+            .expect("upsert membership");
+
+        let by_ba = store
+            .list_business_application_server_memberships_for_ba(&membership.ba_sys_id, false)
+            .expect("list by BA");
+        assert_eq!(by_ba, vec![membership.clone()]);
+
+        let by_server = store
+            .list_business_application_server_memberships_for_server(
+                &membership.server_sys_id,
+                false,
+            )
+            .expect("list by server");
+        assert_eq!(by_server, vec![membership]);
+    }
+
+    #[test]
+    fn tombstones_stale_business_application_server_memberships_and_reactivates_on_upsert() {
+        let store = Store::open_in_memory().expect("store");
+        let old = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let cutoff = Utc.timestamp_opt(1_779_843_600, 0).unwrap();
+        let tombstoned_at = Utc.timestamp_opt(1_779_847_200, 0).unwrap();
+        let ba = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            old,
+        );
+        let server = RecordRow::active(
+            "7f4a6e2f1c23456789abcdef01234567",
+            "SRV0000001",
+            "cmdb_ci_linux_server",
+            ResourceType::Server,
+            old,
+        );
+        store.upsert_record(&ba, "", "").expect("insert BA");
+        store.upsert_record(&server, "", "").expect("insert server");
+        let mut membership = BusinessApplicationServerMembershipRow {
+            ba_sys_id: ba.sys_id.clone(),
+            server_sys_id: server.sys_id.clone(),
+            server_table: server.table_name.clone(),
+            provenance: "relationship".to_string(),
+            min_depth: 1,
+            paths_json: "[]".to_string(),
+            discovered_at: old,
+            last_seen_at: old,
+            tombstoned_at: None,
+        };
+        store
+            .upsert_business_application_server_membership(&membership)
+            .expect("upsert membership");
+
+        let pruned = store
+            .tombstone_stale_business_application_server_memberships(
+                &ba.sys_id,
+                cutoff,
+                tombstoned_at,
+            )
+            .expect("tombstone stale");
+        assert_eq!(pruned, 1);
+        assert!(
+            store
+                .list_business_application_server_memberships_for_ba(&ba.sys_id, false)
+                .expect("active memberships")
+                .is_empty()
+        );
+        let tombstoned = store
+            .list_business_application_server_memberships_for_ba(&ba.sys_id, true)
+            .expect("tombstoned memberships");
+        assert_eq!(tombstoned.len(), 1);
+        assert_eq!(tombstoned[0].tombstoned_at, Some(tombstoned_at));
+
+        membership.last_seen_at = cutoff;
+        store
+            .upsert_business_application_server_membership(&membership)
+            .expect("reactivate membership");
+        let active = store
+            .list_business_application_server_memberships_for_ba(&ba.sys_id, false)
+            .expect("active memberships after re-seen");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].tombstoned_at, None);
+    }
+
+    #[test]
+    fn business_application_server_membership_transition_keeps_one_live_pair_and_first_seen() {
+        let store = Store::open_in_memory().expect("store");
+        let first_seen = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let later_seen = Utc.timestamp_opt(1_779_843_600, 0).unwrap();
+        let ba = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            first_seen,
+        );
+        let server = RecordRow::active(
+            "7f4a6e2f1c23456789abcdef01234567",
+            "SRV0000001",
+            "cmdb_ci_linux_server",
+            ResourceType::Server,
+            first_seen,
+        );
+        store.upsert_record(&ba, "", "").expect("insert BA");
+        store.upsert_record(&server, "", "").expect("insert server");
+
+        let relationship = BusinessApplicationServerMembershipRow {
+            ba_sys_id: ba.sys_id.clone(),
+            server_sys_id: server.sys_id.clone(),
+            server_table: server.table_name.clone(),
+            provenance: "relationship".to_string(),
+            min_depth: 2,
+            paths_json: "[]".to_string(),
+            discovered_at: first_seen,
+            last_seen_at: first_seen,
+            tombstoned_at: None,
+        };
+        store
+            .upsert_business_application_server_membership(&relationship)
+            .expect("insert relationship membership");
+
+        let mut both = relationship.clone();
+        both.provenance = "both".to_string();
+        both.min_depth = 1;
+        both.discovered_at = later_seen;
+        both.last_seen_at = later_seen;
+        store
+            .upsert_business_application_server_membership(&both)
+            .expect("transition to both");
+
+        let active = store
+            .list_business_application_server_memberships_for_ba(&ba.sys_id, false)
+            .expect("active memberships");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].provenance, "both");
+        assert_eq!(active[0].discovered_at, first_seen);
+        assert_eq!(active[0].last_seen_at, later_seen);
+
+        let all = store
+            .list_business_application_server_memberships_for_ba(&ba.sys_id, true)
+            .expect("all memberships");
+        assert_eq!(all.len(), 2);
+        let tombstoned = all
+            .iter()
+            .find(|row| row.provenance == "relationship")
+            .expect("relationship history row");
+        assert_eq!(tombstoned.tombstoned_at, Some(later_seen));
+    }
+
+    #[test]
+    fn business_application_server_membership_unique_index_rejects_duplicate_live_pair() {
+        let store = Store::open_in_memory().expect("store");
+        let now = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let ba = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            now,
+        );
+        let server = RecordRow::active(
+            "7f4a6e2f1c23456789abcdef01234567",
+            "SRV0000001",
+            "cmdb_ci_linux_server",
+            ResourceType::Server,
+            now,
+        );
+        store.upsert_record(&ba, "", "").expect("insert BA");
+        store.upsert_record(&server, "", "").expect("insert server");
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO business_application_servers (
+                    ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                    paths_json, discovered_at, last_seen_at, tombstoned_at
+                ) VALUES (?1, ?2, ?3, 'relationship', 1, '[]', ?4, ?4, NULL)
+                "#,
+                params![&ba.sys_id, &server.sys_id, &server.table_name, to_ts(now)],
+            )
+            .expect("insert relationship");
+        let err = store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO business_application_servers (
+                    ba_sys_id, server_sys_id, server_table, provenance, min_depth,
+                    paths_json, discovered_at, last_seen_at, tombstoned_at
+                ) VALUES (?1, ?2, ?3, 'service_membership', 1, '[]', ?4, ?4, NULL)
+                "#,
+                params![&ba.sys_id, &server.sys_id, &server.table_name, to_ts(now)],
+            )
+            .expect_err("duplicate live pair rejected");
+        assert!(err.to_string().contains("UNIQUE constraint failed"));
+    }
+
+    #[test]
+    fn business_application_server_inventory_health_round_trips() {
+        let store = Store::open_in_memory().expect("store");
+        let started = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let completed = Utc.timestamp_opt(1_779_840_030, 0).unwrap();
+        let ba = RecordRow::active(
+            "54a4b61b6fe845000ed852a03f3ee4d0",
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+            started,
+        );
+        store.upsert_record(&ba, "", "").expect("insert BA");
+
+        let health = BusinessApplicationServerInventoryHealthRow {
+            ba_sys_id: ba.sys_id.clone(),
+            run_started_at: started,
+            run_completed_at: completed,
+            service_membership_status: "acl_restricted".to_string(),
+            relationship_status: "ok".to_string(),
+            inventory_status: "service_membership_degraded".to_string(),
+            summary_json: serde_json::json!({
+                "service_membership_status": "acl_restricted",
+                "acl_restricted_count": 1
+            })
+            .to_string(),
+        };
+        store
+            .upsert_business_application_server_inventory_health(&health)
+            .expect("upsert health");
+
+        assert_eq!(
+            store
+                .get_business_application_server_inventory_health(&ba.sys_id)
+                .expect("get health"),
+            Some(health)
+        );
     }
 
     #[test]
@@ -5122,7 +5985,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate store");
-        assert_eq!(store.schema_version().expect("version"), Some(9));
+        assert_eq!(store.schema_version().expect("version"), Some(11));
         assert!(
             store
                 .table_has_column("fts_records", "tag_tokens")
@@ -5217,7 +6080,7 @@ mod tests {
         drop(conn);
 
         let store = Store::open(&path).expect("migrate unversioned legacy kb store");
-        assert_eq!(store.schema_version().expect("version"), Some(9));
+        assert_eq!(store.schema_version().expect("version"), Some(11));
         assert!(
             store
                 .table_has_column("knowledge_articles", "sys_updated_on")
@@ -5510,7 +6373,7 @@ mod tests {
                 category_sys_id: "kb-cat-1".to_string(),
                 category_name: "Network".to_string(),
                 author_sys_id: Some("user-1".to_string()),
-                author_name: Some("Jared Jennings".to_string()),
+                author_name: Some("Casey User".to_string()),
                 published_at: Some("2026-04-10 09:00:00".to_string()),
                 valid_to: Some("2027-01-01".to_string()),
                 article_type: "text".to_string(),
@@ -5549,7 +6412,7 @@ mod tests {
             .expect("query")
             .expect("row");
         assert_eq!(loaded.title, "VPN Runbook");
-        assert_eq!(loaded.author_name.as_deref(), Some("Jared Jennings"));
+        assert_eq!(loaded.author_name.as_deref(), Some("Casey User"));
 
         let bases = store.list_knowledge_bases().expect("bases");
         assert_eq!(

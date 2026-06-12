@@ -163,6 +163,15 @@ impl McpServer {
                 self.call_business_application_search(id, params).await
             }
             "business_application_query" => self.call_business_application_query(id, params).await,
+            "business_application_servers" => {
+                self.call_business_application_servers(id, params).await
+            }
+            "business_application_servers_cached" => {
+                self.call_business_application_servers_cached(id, params).await
+            }
+            "business_applications_for_server" => {
+                self.call_business_applications_for_server(id, params).await
+            }
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
@@ -213,8 +222,8 @@ impl McpServer {
                     },
                     Err(err) => return service_failure(id, err),
                 };
-                let approvals = match self.state.core.my_approvals().await {
-                    Ok(records) => match wrap_approvals(&transport, records) {
+                let approvals = match self.state.core.my_approvals_with_routing_fresh().await {
+                    Ok(response) => match wrap_approvals(&transport, response.records) {
                         Ok(records) => records,
                         Err(err) => return service_failure(id, err),
                     },
@@ -246,16 +255,19 @@ impl McpServer {
                 Some(json!({ "details": "missing arguments" })),
             );
         };
-        let Some(number) = arguments.get("number").and_then(Value::as_str) else {
-            return JsonRpcResponse::error(
-                id,
-                -32602,
-                "invalid params",
-                Some(json!({ "details": "missing number" })),
-            );
+        let lookup = match extract_record_lookup(arguments) {
+            Ok(lookup) => lookup,
+            Err(err) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "invalid params",
+                    Some(json!({ "details": err.to_string() })),
+                );
+            }
         };
 
-        match get_record_cached_or_fresh(self.state.core.as_ref(), number).await {
+        match get_record_by_lookup_cached_or_fresh(self.state.core.as_ref(), lookup).await {
             Ok(Some(record)) => match transport.record(&record) {
                 Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
                 Err(err) => service_failure(id, err),
@@ -314,18 +326,18 @@ impl McpServer {
 
     async fn call_list_my_approvals(&self, id: Option<Value>) -> JsonRpcResponse {
         let transport = DaemonTransport::new(self.state.core.as_ref());
-        match self.state.core.my_approvals().await {
-            Ok(records) if !records.is_empty() => match wrap_approvals(&transport, records) {
-                Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
+        match self.state.core.my_approvals_with_routing_fresh().await {
+            Ok(response) => match wrap_approvals(&transport, response.records) {
+                Ok(records) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "records": records,
+                        "query_summary": response.query_summary,
+                    }),
+                ),
                 Err(err) => service_failure(id, err),
             },
-            Ok(_) | Err(_) => match self.state.core.my_approvals_fresh().await {
-                Ok(records) => match wrap_approvals(&transport, records) {
-                    Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
-                    Err(err) => service_failure(id, err),
-                },
-                Err(err) => service_failure(id, err),
-            },
+            Err(err) => service_failure(id, err),
         }
     }
 
@@ -554,6 +566,206 @@ impl McpServer {
         JsonRpcResponse::ok(id, json!({ "business_applications": applications }))
     }
 
+    async fn call_business_application_servers(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed = match parse_business_application_servers_mcp_arguments(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+
+        let result = match self.state.core.business_application_servers(parsed).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(id, -32004, "business application not found", None);
+            }
+            Err(err) => return service_failure(id, err),
+        };
+
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for server in result.servers {
+            match transport.server(&server.record) {
+                Ok(mut server_value) => {
+                    if let (Some(source), Some(object)) = (
+                        result.server_sources.get(&server.record.sys_id),
+                        server_value.as_object_mut(),
+                    ) {
+                        object.insert("source".to_string(), json!(source.as_str()));
+                    }
+                    servers.push(server_value);
+                }
+                Err(err) => return service_failure(id, err),
+            }
+        }
+
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "business_application": result.business_application,
+                "servers": servers,
+                "server_provenance": result.server_provenance,
+                "inventory_health": result.inventory_health,
+                "relationship_summary": result.relationship_summary,
+                "diagnostics": result.diagnostics,
+                "server_paths": result.server_paths,
+            }),
+        )
+    }
+
+    async fn call_business_application_servers_cached(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::BusinessApplicationServersCachedParams =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+        let result = match self
+            .state
+            .core
+            .business_application_servers_cached(parsed)
+            .await
+        {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32004,
+                    "business application not found",
+                    Some(json!({
+                        "endpoint_status": "live_confirmation_not_attempted",
+                        "relationship_status": "unknown_not_synced"
+                    })),
+                );
+            }
+            Err(err) => return service_failure(id, err),
+        };
+        let business_application = match transport.business_application(&result.business_application) {
+            Ok(application) => application,
+            Err(err) => return service_failure(id, err),
+        };
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for relationship in result.servers {
+            let server = match transport.server(&relationship.server) {
+                Ok(server) => server,
+                Err(err) => return service_failure(id, err),
+            };
+            servers.push(json!({
+                "server": server,
+                "server_table": relationship.server_table,
+                "provenance": relationship.provenance,
+                "min_depth": relationship.min_depth,
+                "paths": relationship.paths,
+                "tombstoned_at": relationship.tombstoned_at,
+            }));
+        }
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "business_application": business_application,
+                "servers": servers,
+                "endpoint_status": result.endpoint_status,
+                "relationship_status": result.relationship_status,
+                "inventory_health": result.inventory_health,
+            }),
+        )
+    }
+
+    async fn call_business_applications_for_server(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::BusinessApplicationsForServerParams =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+        let result = match self
+            .state
+            .core
+            .business_applications_for_server(parsed)
+            .await
+        {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32004,
+                    "server not found",
+                    Some(json!({
+                        "endpoint_status": "live_confirmation_not_attempted",
+                        "relationship_status": "unknown_not_synced"
+                    })),
+                );
+            }
+            Err(err) => return service_failure(id, err),
+        };
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for server_relationships in result.servers {
+            let server = match transport.server(&server_relationships.server) {
+                Ok(server) => server,
+                Err(err) => return service_failure(id, err),
+            };
+            let mut business_applications =
+                Vec::with_capacity(server_relationships.business_applications.len());
+            for relationship in server_relationships.business_applications {
+                let business_application =
+                    match transport.business_application(&relationship.business_application) {
+                        Ok(application) => application,
+                        Err(err) => return service_failure(id, err),
+                    };
+                    business_applications.push(json!({
+                        "business_application": business_application,
+                        "provenance": relationship.provenance,
+                        "min_depth": relationship.min_depth,
+                        "paths": relationship.paths,
+                        "inventory_health": relationship.inventory_health,
+                        "tombstoned_at": relationship.tombstoned_at,
+                    }));
+            }
+            servers.push(json!({
+                "server": server,
+                "business_applications": business_applications,
+                "endpoint_status": server_relationships.endpoint_status,
+                "relationship_status": server_relationships.relationship_status,
+            }));
+        }
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "servers": servers,
+                "endpoint_status": result.endpoint_status,
+                "relationship_status": result.relationship_status,
+            }),
+        )
+    }
+
     async fn call_business_application_fields(
         &self,
         id: Option<Value>,
@@ -638,29 +850,40 @@ impl McpServer {
             Ok(records) => records,
             Err(err) => return service_failure(id, err),
         };
-        let record = match (
+        let (record, core_lookup) = match (
             sys_id.filter(|value| !value.is_empty()),
             name.filter(|value| !value.is_empty()),
             ip_address.filter(|value| !value.is_empty()),
         ) {
             (Some(sys_id), None, None) => match snow_core::normalize_record_lookup_sys_id(sys_id) {
-                Ok(sys_id) => records
-                    .into_iter()
-                    .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id)),
+                Ok(sys_id) => {
+                    let hit = records
+                        .into_iter()
+                        .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id));
+                    (hit, snow_core::ServerLookup::SysId(sys_id))
+                }
                 Err(err) => return invalid_params(id, err),
             },
-            (None, Some(name), None) => records.into_iter().find(|record| server_name(record) == name),
-            (None, None, Some(ip_address)) => records.into_iter().find(|record| {
-                server_field(record, "ip_address")
-                    .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
-            }),
+            (None, Some(name), None) => {
+                let hit = records
+                    .into_iter()
+                    .find(|record| server_name(record) == name);
+                (hit, snow_core::ServerLookup::exact_name(name))
+            }
+            (None, None, Some(ip_address)) => {
+                let hit = records.into_iter().find(|record| {
+                    server_field(record, "ip_address")
+                        .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
+                });
+                (hit, snow_core::ServerLookup::ip_address(ip_address))
+            }
             (None, None, None) => {
                 return invalid_params(id, "missing required lookup: sys_id, name, or ip_address");
             }
             _ => return invalid_params(id, "provide exactly one of sys_id, name, or ip_address"),
         };
-        match record {
-            Some(record) => match transport.server(&record) {
+        if let Some(record) = record {
+            return match transport.server(&record) {
                 Ok(server) => JsonRpcResponse::ok(
                     id,
                     json!({
@@ -669,8 +892,21 @@ impl McpServer {
                     }),
                 ),
                 Err(err) => service_failure(id, err),
+            };
+        }
+        match self.state.core.get_server_live(core_lookup, false).await {
+            Ok(Some(server)) => match transport.server(&server.record) {
+                Ok(server_json) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "server": server_json,
+                        "markdown": render_snow_record(&server.record),
+                    }),
+                ),
+                Err(err) => service_failure(id, err),
             },
-            None => JsonRpcResponse::error(id, -32004, "server not found", None),
+            Ok(None) => JsonRpcResponse::error(id, -32004, "server not found", None),
+            Err(err) => server_get_error_response(id, err),
         }
     }
 
@@ -1212,18 +1448,10 @@ impl McpServer {
         vec![
             McpTool {
                 name: "get_record".to_string(),
-                description: "Retrieve a generic ServiceNow record by number. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.".to_string(),
-                input_schema: json!({
-                    "type":"object",
-                    "description":"Generic ServiceNow record lookup. Do not use for APM Business Application numbers such as APM0002456; use business_application_query with field=number.",
-                    "properties":{
-                        "number":{
-                            "type":"string",
-                            "description":"Generic ServiceNow work-record number, for example TASK3497879. Not for APM Business Application identifiers such as APM0002456; route those to business_application_query/search."
-                        }
-                    },
-                    "required":["number"]
-                }),
+                description: "Retrieve a generic ServiceNow record by number or allowed table/sys_id. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.".to_string(),
+                input_schema: snow_mcp::tools::records::record_lookup_arg_schema(
+                    snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+                ),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1274,6 +1502,24 @@ impl McpServer {
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
+                name: "business_application_servers".to_string(),
+                description: "Read servers associated with a Business Application by Business Application number or cmdb_ci_business_app sys_id using bounded live CMDB relationship traversal. Traversal-only: does not persist, prune, or write vault data.".to_string(),
+                input_schema: snow_mcp::tools::records::business_application_servers_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "business_application_servers_cached".to_string(),
+                description: "Read cached server relationships for one Business Application by Business Application number, exact name, or cmdb_ci_business_app sys_id. Cache-only: does not call ServiceNow and does not mutate the cache.".to_string(),
+                input_schema: snow_mcp::tools::records::business_application_servers_cached_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "business_applications_for_server".to_string(),
+                description: "Cache-only reverse lookup: read cached Business Application relationships for one server by exact server name, IP address, or sys_id. Does not call ServiceNow and does not mutate the cache.".to_string(),
+                input_schema: snow_mcp::tools::records::business_applications_for_server_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
                 name: "business_application_fields".to_string(),
                 description: "List observed Business Application fields from the local projection, including owner-related fields when field mapping for an APM lookup is unclear."
                     .to_string(),
@@ -1306,7 +1552,7 @@ impl McpServer {
             },
             McpTool {
                 name: "search_knowledge".to_string(),
-                description: "Search knowledge articles".to_string(),
+                description: "Daemon-native knowledge search. Product-facing MCP callers should prefer knowledge_search when available.".to_string(),
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1321,7 +1567,7 @@ impl McpServer {
             },
             McpTool {
                 name: "get_article".to_string(),
-                description: "Get a knowledge article".to_string(),
+                description: "Daemon-native article fetch. Product-facing MCP callers should prefer knowledge_fetch when available.".to_string(),
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -1404,8 +1650,10 @@ impl McpServer {
             },
             McpTool {
                 name: "list_my_approvals".to_string(),
-                description: "List pending approvals".to_string(),
-                input_schema: json!({"type":"object"}),
+                description:
+                    "List pending direct and group-routed approvals for the current user"
+                        .to_string(),
+                input_schema: json!({"type":"object","additionalProperties":false,"properties":{}}),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -1623,6 +1871,24 @@ fn strip_business_application_hydration(mut arguments: Value) -> Value {
     arguments
 }
 
+fn parse_business_application_servers_mcp_arguments(
+    arguments: Value,
+) -> std::result::Result<snow_core::BusinessApplicationServersParams, String> {
+    if let Value::Object(map) = &arguments {
+        for forbidden in ["persist", "prune_stale"] {
+            if map.contains_key(forbidden) {
+                return Err(format!(
+                    "`{forbidden}` is not accepted by MCP business_application_servers"
+                ));
+            }
+        }
+    }
+    let params: snow_core::BusinessApplicationServersParams =
+        serde_json::from_value(arguments).map_err(|err| err.to_string())?;
+    params.validate().map_err(|err| err.to_string())?;
+    Ok(params)
+}
+
 fn business_application_name(record: &SnowRecord) -> String {
     record
         .fields
@@ -1686,6 +1952,38 @@ fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
     )
 }
 
+fn server_get_error_response(
+    id: Option<Value>,
+    err: snow_core::ServerGetError,
+) -> JsonRpcResponse {
+    use snow_core::ServerGetError;
+    match err {
+        ServerGetError::NotFound => {
+            JsonRpcResponse::error(id, -32004, "server not found", None)
+        }
+        ServerGetError::AclRestricted(detail) => JsonRpcResponse::error(
+            id,
+            -32003,
+            "server is ACL-restricted",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Network(detail) => JsonRpcResponse::error(
+            id,
+            -32001,
+            "network error reaching ServiceNow",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Disambiguation { selector, matched } => JsonRpcResponse::error(
+            id,
+            -32005,
+            "multiple servers matched selector",
+            Some(json!({ "selector": selector, "matched": matched })),
+        ),
+        ServerGetError::Hydration(detail) => service_failure(id, detail),
+        ServerGetError::Other(detail) => service_failure(id, detail),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,11 +1997,39 @@ mod tests {
     #[test]
     fn tool_catalog_contains_core_tools() {
         let tools = McpServer::tools_catalog();
-        assert!(tools.iter().any(|tool| tool.name == "get_record"));
+        let get_record = tools
+            .iter()
+            .find(|tool| tool.name == "get_record")
+            .expect("get_record tool");
+        assert!(
+            get_record.input_schema.get("required").is_none(),
+            "get_record must accept number or table+sys_id without schema-level required fields"
+        );
+        assert!(
+            get_record.input_schema["properties"]["table"]["enum"]
+                .as_array()
+                .expect("table enum")
+                .contains(&json!("change_request"))
+        );
         assert!(tools.iter().any(|tool| tool.name == "user_lookup"));
         assert!(tools.iter().any(|tool| tool.name == "list_my_approvals"));
         assert!(tools.iter().any(|tool| tool.name == "list_my_projects"));
         assert!(tools.iter().any(|tool| tool.name == "verify_vault"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "business_application_servers")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "business_application_servers_cached")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "business_applications_for_server")
+        );
         assert!(tools.iter().any(|tool| tool.name == "list_knowledge_bases"));
         assert!(tools.iter().any(|tool| tool.name == "list_categories"));
         assert!(tools.iter().any(|tool| tool.name == "kb_sync"));
@@ -1725,6 +2051,61 @@ mod tests {
                 .and_then(Value::as_str),
             Some("boolean")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_mcp_get_record_fetches_change_request_by_table_sys_id() {
+        let sys_id = "0123456789abcdef0123456789abcdef";
+        let response = json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "<CHG_NUMBER>",
+                "short_description": "<SHORT_DESC>",
+                "description": "<CHANGE_DESCRIPTION>",
+                "state": "scheduled"
+            }
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let server = McpServer::new(Arc::clone(&fixture.state), McpTransport::Stdio);
+
+        let response = server
+            .dispatch(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "get_record",
+                    "arguments": {
+                        "table": "change_request",
+                        "sys_id": "0123456789ABCDEF0123456789ABCDEF"
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        let record = response
+            .result
+            .expect("record result")
+            .get("record")
+            .cloned()
+            .expect("wrapped record");
+        assert_eq!(record.get("sys_id").and_then(Value::as_str), Some(sys_id));
+        assert_eq!(
+            record.get("number").and_then(Value::as_str),
+            Some("<CHG_NUMBER>")
+        );
+        assert_eq!(
+            record.get("resource_type").and_then(Value::as_str),
+            Some("change")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/change_request/"));
+        assert!(request_line.contains(sys_id));
     }
 
     #[test]

@@ -87,6 +87,8 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "business_application_search",
         "business_application_query",
         "business_application_servers",
+        "business_application_servers_cached",
+        "business_applications_for_server",
         "business_application_fields",
         "server_get",
         "server_search",
@@ -190,6 +192,7 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
             "dmn_demand_task",
             "resource_plan",
             "pm_project",
+            "change_request",
             "business_application",
             "business_app",
             "cmdb_ci_business_app",
@@ -304,8 +307,15 @@ fn business_application_schemas_advertise_apm_number_routing() {
 
     let servers = tool("business_application_servers");
     assert!(servers.description.contains("CMDB relationship traversal"));
+    assert!(servers.description.contains("does not persist"));
     assert_no_top_level_schema_composition(&servers.input_schema);
     assert!(servers.input_schema.get("required").is_none());
+    for forbidden in ["persist", "prune_stale"] {
+        assert!(
+            servers.input_schema["properties"].get(forbidden).is_none(),
+            "business_application_servers must remain traversal-only and not expose {forbidden}"
+        );
+    }
     assert_eq!(
         servers.input_schema["properties"]["number"]["description"],
         json!(
@@ -333,6 +343,14 @@ fn business_application_schemas_advertise_apm_number_routing() {
         json!(20000)
     );
     assert_eq!(
+        servers.input_schema["properties"]["max_service_membership_associations"]["maximum"],
+        json!(20000)
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["max_service_membership_pages"]["maximum"],
+        json!(200)
+    );
+    assert_eq!(
         servers.input_schema["properties"]["relationship_type"]["items"]["type"],
         json!("string")
     );
@@ -340,6 +358,65 @@ fn business_application_schemas_advertise_apm_number_routing() {
         servers.input_schema["properties"]["include_paths"]["default"],
         json!(false)
     );
+    // The CMDB-gap fallback is advertised, opt-in, and defaults to none.
+    assert_eq!(
+        servers.input_schema["properties"]["fallback_strategy"]["default"],
+        json!("none")
+    );
+    assert_eq!(
+        servers.input_schema["properties"]["fallback_strategy"]["enum"],
+        json!(["none", "ci_owner_group"])
+    );
+
+    let cached = tool("business_application_servers_cached");
+    assert!(cached.description.contains("Cache-only"));
+    assert_no_top_level_schema_composition(&cached.input_schema);
+    assert!(cached.input_schema.get("required").is_none());
+    assert!(
+        cached.input_schema["description"]
+            .as_str()
+            .expect("cached BA servers schema description")
+            .contains("does not call ServiceNow")
+    );
+    for forbidden in ["persist", "prune_stale"] {
+        assert!(
+            cached.input_schema["properties"].get(forbidden).is_none(),
+            "business_application_servers_cached must remain cache-only and not expose {forbidden}"
+        );
+    }
+    for field in ["number", "sys_id", "name", "include_tombstoned"] {
+        assert!(
+            cached.input_schema["properties"].get(field).is_some(),
+            "business_application_servers_cached missing {field}"
+        );
+    }
+
+    let reverse_cached = tool("business_applications_for_server");
+    assert!(reverse_cached.description.contains("Cache-only"));
+    assert_no_top_level_schema_composition(&reverse_cached.input_schema);
+    assert!(reverse_cached.input_schema.get("required").is_none());
+    assert!(
+        reverse_cached.input_schema["description"]
+            .as_str()
+            .expect("reverse cached schema description")
+            .contains("does not call ServiceNow")
+    );
+    for forbidden in ["persist", "prune_stale"] {
+        assert!(
+            reverse_cached.input_schema["properties"]
+                .get(forbidden)
+                .is_none(),
+            "business_applications_for_server must remain cache-only and not expose {forbidden}"
+        );
+    }
+    for field in ["sys_id", "name", "ip_address", "include_tombstoned"] {
+        assert!(
+            reverse_cached.input_schema["properties"]
+                .get(field)
+                .is_some(),
+            "business_applications_for_server missing {field}"
+        );
+    }
 
     let fields = tool("business_application_fields");
     assert!(fields.description.contains("owner-related fields"));
@@ -824,15 +901,26 @@ fn schemas_include_required_fields_for_create_update_apply() {
 
     let approval_approve = &tool("approval_approve").input_schema;
     assert_eq!(approval_approve["type"], "object");
-    assert_eq!(approval_approve["required"], json!(["number"]));
+    assert_eq!(approval_approve["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(approval_approve);
     assert_eq!(
         approval_approve["properties"]["number"]["type"],
         json!("string")
     );
+    assert_eq!(
+        approval_approve["properties"]["approval_sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
 
     let approval_reject = &tool("approval_reject").input_schema;
     assert_eq!(approval_reject["type"], "object");
-    assert_eq!(approval_reject["required"], json!(["number", "reason"]));
+    assert_eq!(approval_reject["additionalProperties"], json!(false));
+    assert_eq!(approval_reject["required"], json!(["reason"]));
+    assert_no_top_level_schema_composition(approval_reject);
+    assert_eq!(
+        approval_reject["properties"]["approval_sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
     assert_eq!(
         approval_reject["properties"]["reason"]["minLength"],
         json!(1)

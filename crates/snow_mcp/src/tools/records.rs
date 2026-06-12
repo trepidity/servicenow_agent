@@ -56,8 +56,18 @@ pub fn register(registry: &mut ToolRegistry) {
         ),
         (
             "business_application_servers",
-            "Read servers associated with a Business Application by Business Application number or cmdb_ci_business_app sys_id using bounded CMDB relationship traversal.",
+            "Read servers associated with a Business Application by Business Application number or cmdb_ci_business_app sys_id using bounded live CMDB relationship traversal. Traversal-only: does not persist, prune, or write vault data.",
             business_application_servers_arg_schema(),
+        ),
+        (
+            "business_application_servers_cached",
+            "Read cached server relationships for one Business Application by Business Application number, exact name, or cmdb_ci_business_app sys_id. Cache-only: does not call ServiceNow and does not mutate the cache.",
+            business_application_servers_cached_arg_schema(),
+        ),
+        (
+            "business_applications_for_server",
+            "Cache-only reverse lookup: read cached Business Application relationships for one server by exact server name, IP address, or sys_id. Does not call ServiceNow and does not mutate the cache.",
+            business_applications_for_server_arg_schema(),
         ),
         (
             "business_application_fields",
@@ -96,8 +106,8 @@ pub fn register(registry: &mut ToolRegistry) {
         ),
         (
             "list_my_approvals",
-            "List pending approvals",
-            object_schema(),
+            "List pending direct and group-routed approvals for the current user",
+            json!({"type":"object","additionalProperties":false,"properties":{}}),
         ),
         (
             "list_my_projects",
@@ -127,15 +137,15 @@ pub fn register(registry: &mut ToolRegistry) {
 
     registry.add(ToolMetadata {
         name: "approval_approve".to_string(),
-        description: "Approve a ServiceNow approval target by record number through the current user's approval row".to_string(),
-        input_schema: number_arg_schema(),
+        description: "Approve a ServiceNow approval by approval_sys_id from list_my_approvals, or by target record number".to_string(),
+        input_schema: approval_action_arg_schema(),
         output_schema: object_schema(),
         default_enabled: false,
         requires_confirmation: true,
     });
     registry.add(ToolMetadata {
         name: "approval_reject".to_string(),
-        description: "Reject a ServiceNow approval target by record number through the current user's approval row".to_string(),
+        description: "Reject a ServiceNow approval by approval_sys_id from list_my_approvals, or by target record number".to_string(),
         input_schema: approval_reject_arg_schema(),
         output_schema: object_schema(),
         default_enabled: false,
@@ -190,19 +200,46 @@ pub fn search_records_arg_schema() -> Value {
     })
 }
 
+fn approval_action_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Provide exactly one of number or approval_sys_id. Prefer approval_sys_id from list_my_approvals.records[].record.sys_id for the shortest caller-scoped approval path.",
+        "properties": {
+            "number": {
+                "type": "string",
+                "description": "Target record number, for example CHANGE0010001. This legacy path resolves the target and then finds the current user's pending approval row."
+            },
+            "approval_sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "sysapproval_approver.sys_id returned by list_my_approvals.records[].record.sys_id."
+            }
+        }
+    })
+}
+
 fn approval_reject_arg_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
+        "description": "Provide exactly one of number or approval_sys_id plus a rejection reason. Prefer approval_sys_id from list_my_approvals.records[].record.sys_id for the shortest caller-scoped rejection path.",
         "properties": {
             "number": {
-                "type": "string"
+                "type": "string",
+                "description": "Target record number. This legacy path resolves the target and then finds the current user's pending approval row."
+            },
+            "approval_sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "sysapproval_approver.sys_id returned by list_my_approvals.records[].record.sys_id."
             },
             "reason": {
                 "type": "string",
                 "minLength": 1
             }
         },
-        "required": ["number", "reason"]
+        "required": ["reason"]
     })
 }
 
@@ -457,10 +494,18 @@ pub fn business_application_servers_arg_schema() -> Value {
     let default_cis = snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS;
     let max_edges = snow_core::BUSINESS_APPLICATION_SERVERS_MAX_EDGES;
     let default_edges = snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES;
+    let max_service_membership_associations =
+        snow_core::BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS;
+    let default_service_membership_associations =
+        snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS;
+    let max_service_membership_pages =
+        snow_core::BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_PAGES;
+    let default_service_membership_pages =
+        snow_core::BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES;
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Reads Server CIs associated with one Business Application via bounded CMDB relationship traversal. Provide exactly one of number or sys_id. Runtime validation enforces the selector XOR and traversal bounds. Server detection is class-hierarchy aware: any CMDB class extending cmdb_ci_server (the canonical cmdb_ci_server/cmdb_ci_linux_server/cmdb_ci_win_server tables plus subclasses such as cmdb_ci_esx_server, cmdb_ci_aix_server, cmdb_ci_solaris_server, and instance-specific cmdb_ci_*_server classes) is returned as a server.",
+        "description": "Reads Server CIs associated with one Business Application via bounded live CMDB relationship traversal. Provide exactly one of number or sys_id. Runtime validation enforces the selector XOR and traversal bounds. Traversal-only: does not persist, prune, or write vault data. Server detection is class-hierarchy aware: any CMDB class extending cmdb_ci_server (the canonical cmdb_ci_server/cmdb_ci_linux_server/cmdb_ci_win_server tables plus subclasses such as cmdb_ci_esx_server, cmdb_ci_aix_server, cmdb_ci_solaris_server, and instance-specific cmdb_ci_*_server classes) is returned as a server.",
         "properties": {
             "number": {
                 "type": "string",
@@ -492,18 +537,94 @@ pub fn business_application_servers_arg_schema() -> Value {
                 "default": default_edges,
                 "description": format!("Maximum number of cmdb_rel_ci relationship edges examined across the whole traversal. Edge reads are paginated and continue until this budget is consumed or the result set is exhausted, so large graphs are not silently undercounted. Range 1-{max_edges}, default {default_edges}.")
             },
+            "max_service_membership_associations": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_service_membership_associations,
+                "default": default_service_membership_associations,
+                "description": format!("Maximum number of svc_ci_assoc service-membership associations examined across the whole traversal. Range 1-{max_service_membership_associations}, default {default_service_membership_associations}.")
+            },
+            "max_service_membership_pages": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": max_service_membership_pages,
+                "default": default_service_membership_pages,
+                "description": format!("Maximum number of svc_ci_assoc service-membership pages examined across the whole traversal. Range 1-{max_service_membership_pages}, default {default_service_membership_pages}.")
+            },
             "relationship_type": {
                 "type": "array",
                 "items": {
                     "type": "string"
                 },
                 "default": [],
-                "description": "Optional allowlist of CMDB relationship types (cmdb_rel_type names or sys_ids) that gate which edges are traversed. When omitted/empty, the default set (Depends on::Used by, Runs on::Runs, Contains::Contained by, Hosted on::Hosts) is used, resolved to stable cmdb_rel_type sys_id identities so a renamed or localized display label still matches. An explicit non-empty list is matched against both each edge's raw value and its display label."
+                "description": "Optional allowlist of CMDB relationship types (cmdb_rel_type names or sys_ids) that gate which edges are traversed. When omitted/empty, the default set (Depends on::Used by, Runs on::Runs, Contains::Contained by, Hosted on::Hosts, Instantiates::Instantiated by, Members::Member of) is used, resolved to stable cmdb_rel_type sys_id identities so a renamed or localized display label still matches. An explicit non-empty list is matched against both each edge's raw value and its display label."
             },
             "include_paths": {
                 "type": "boolean",
                 "default": false,
                 "description": "When true, the result includes server_paths: every route (chain of relationship edges) from the root Business Application to each server, reporting multiple alternate paths when a server is reachable via different parents (diamond topology). One server result is still returned per server regardless of path count. Default false."
+            },
+            "fallback_strategy": {
+                "type": "string",
+                "enum": ["none", "ci_owner_group"],
+                "default": "none",
+                "description": "Strategy to use when the CMDB relationship traversal finds 0 servers. 'none' (default) preserves current behavior exactly: a 0-server traversal returns servers:[] with no new fields. 'ci_owner_group' queries cmdb_ci_server by the BA's raw u_ci_owner_group field when traversal returns empty, returning servers tagged source:ci_owner_group_fallback (live-only, never persisted) and surfacing the CMDB data-quality gap via relationship_summary.degraded_reasons.cmdb_relationships_unmapped. The fallback never fires when traversal finds one or more servers."
+            }
+        }
+    })
+}
+
+pub fn business_application_servers_cached_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Reads locally cached Server relationships for one Business Application. Provide exactly one of number, sys_id, or exact name. This tool is cache-only: it does not call ServiceNow, does not run live traversal, and does not persist or prune data.",
+        "properties": {
+            "number": {
+                "type": "string",
+                "description": "Business Application number, for example <APM_NUMBER>."
+            },
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "32-character cmdb_ci_business_app sys_id."
+            },
+            "name": {
+                "type": "string",
+                "description": "Exact Business Application name. Ambiguous duplicate names are rejected."
+            },
+            "include_tombstoned": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include tombstoned relationship rows and tombstoned endpoint records. Pruned records are never returned."
+            }
+        }
+    })
+}
+
+pub fn business_applications_for_server_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Cache-only reverse lookup for locally cached Business Application relationships for one Server. Provide exactly one of sys_id, exact name, or ip_address. Exact name can return multiple cached server matches. This tool does not call ServiceNow, does not run live traversal, and does not persist or prune data.",
+        "properties": {
+            "sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "32-character Server sys_id."
+            },
+            "name": {
+                "type": "string",
+                "description": "Exact Server name. Duplicate cached names return multiple matched servers."
+            },
+            "ip_address": {
+                "type": "string",
+                "description": "Exact Server IP address."
+            },
+            "include_tombstoned": {
+                "type": "boolean",
+                "default": false,
+                "description": "Include tombstoned relationship rows and tombstoned endpoint records. Pruned records are never returned."
             }
         }
     })

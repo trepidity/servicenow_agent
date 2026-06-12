@@ -49,6 +49,14 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
         "business_application_servers",
         "business_application_servers",
     ),
+    (
+        "business_application_servers_cached",
+        "business_application_servers_cached",
+    ),
+    (
+        "business_applications_for_server",
+        "business_applications_for_server",
+    ),
     ("business_application_fields", "business_application_fields"),
     ("server_get", "server_get"),
     ("server_search", "server_search"),
@@ -877,6 +885,13 @@ fn daemon_params_for_tool(tool: &str, method: &str, args: Value) -> Result<Value
         "story_tasks_list" => {
             reject_table_sys_id(&object, "story_tasks_list")?;
         }
+        "business_application_servers" => {
+            object.remove("prune_stale");
+            object.insert("persist".to_string(), json!(false));
+        }
+        "server_get" => {
+            object.insert("persist".to_string(), json!(false));
+        }
         _ => {}
     }
 
@@ -1110,6 +1125,9 @@ mod tests {
             "business_application_get",
             "business_application_search",
             "business_application_query",
+            "business_application_servers",
+            "business_application_servers_cached",
+            "business_applications_for_server",
             "business_application_fields",
         ]));
         let bridge =
@@ -1137,6 +1155,9 @@ mod tests {
         assert!(names.contains(&"business_application_get"));
         assert!(names.contains(&"business_application_search"));
         assert!(names.contains(&"business_application_query"));
+        assert!(names.contains(&"business_application_servers"));
+        assert!(names.contains(&"business_application_servers_cached"));
+        assert!(names.contains(&"business_applications_for_server"));
         assert!(names.contains(&"business_application_fields"));
         assert!(!names.contains(&"get_record"));
 
@@ -1200,6 +1221,74 @@ mod tests {
         assert_eq!(calls[0].1["resolve_references"], json!(false));
         assert_eq!(calls[0].1["reference_depth"], json!(2));
         assert_eq!(calls[0].1["refresh_dictionary"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_bridge_forces_no_persist() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec![
+            "business_application_servers",
+        ]));
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "business_application_servers",
+                    "arguments": {
+                        "number": "APM0000001",
+                        "max_service_membership_associations": 10,
+                        "max_service_membership_pages": 2,
+                        "persist": true,
+                        "prune_stale": true
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls[0].0, "business_application_servers");
+        assert_eq!(calls[0].1["persist"], json!(false));
+        assert!(calls[0].1.get("prune_stale").is_none());
+        assert_eq!(calls[0].1["max_service_membership_associations"], json!(10));
+        assert_eq!(calls[0].1["max_service_membership_pages"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn server_get_bridge_forces_no_persist() {
+        let daemon = Arc::new(MockDaemon::with_supported_methods(vec!["server_get"]));
+        let bridge = DaemonBackedMcpBridge::new(
+            daemon.clone(),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/call".to_string(),
+                params: json!({
+                    "name": "server_get",
+                    "arguments": {
+                        "name": "host11.example.internal"
+                    }
+                }),
+                id: Some(json!(1)),
+            })
+            .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let calls = daemon.calls.lock().await;
+        assert_eq!(calls[0].0, "server_get");
+        assert_eq!(calls[0].1["name"], json!("host11.example.internal"));
+        assert_eq!(calls[0].1["persist"], json!(false));
     }
 
     #[tokio::test]

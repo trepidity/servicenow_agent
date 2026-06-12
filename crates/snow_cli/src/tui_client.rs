@@ -9,9 +9,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use snow_core::{
-    ApprovalRecord, AttachmentMetadata, CacheSource, FieldChoice, FieldValue, JournalEntry,
-    KnowledgeArticle, KnowledgeBaseSummary, KnowledgeCategorySummary, KnowledgeEmbeddingCoverage,
-    KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
+    ApprovalRecord, ApprovalRoutedVia, AttachmentMetadata, CacheSource, FieldChoice, FieldValue,
+    JournalEntry, KnowledgeArticle, KnowledgeBaseSummary, KnowledgeCategorySummary,
+    KnowledgeEmbeddingCoverage, KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
     KnowledgeSemanticSearchFilters, KnowledgeSemanticStatus, MatchField, RecordRef, Reference,
     ResourceType, SearchMatchReason, SemanticIndexSummary, SnowCore, SnowRecord, TaskSlaParentRef,
     TaskSlaStatus,
@@ -742,6 +742,42 @@ impl DaemonRpcClient {
             .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
     }
 
+    /// Return cached server relationships for one Business Application. The
+    /// backend owns the evolving result shape, so callers receive raw JSON.
+    pub async fn business_application_servers_cached(
+        &self,
+        args: BusinessApplicationServersCachedArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_application_servers_cached_params(args);
+        let response = self
+            .send_request(
+                "business_application_servers_cached",
+                Some(Value::Object(params)),
+            )
+            .await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
+    /// Return cached Business Application relationships for one Server. The
+    /// backend owns the evolving result shape, so callers receive raw JSON.
+    pub async fn business_applications_for_server(
+        &self,
+        args: BusinessApplicationsForServerArgs<'_>,
+    ) -> Result<Value, SnowError> {
+        let params = business_applications_for_server_params(args);
+        let response = self
+            .send_request(
+                "business_applications_for_server",
+                Some(Value::Object(params)),
+            )
+            .await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
     pub async fn server_get(
         &self,
         sys_id: Option<&str>,
@@ -1362,8 +1398,15 @@ pub struct BusinessApplicationServersArgs<'a> {
     pub max_depth: Option<usize>,
     pub max_cis: Option<usize>,
     pub max_edges: Option<usize>,
+    pub max_service_membership_associations: Option<usize>,
+    pub max_service_membership_pages: Option<usize>,
     pub relationship_type: &'a [String],
     pub include_paths: bool,
+    /// Fallback strategy wire value (`none` or `ci_owner_group`). Sent to the
+    /// daemon only when not `none`, so the default request shape is unchanged.
+    pub fallback_strategy: &'a str,
+    pub persist: bool,
+    pub prune_stale: bool,
 }
 
 pub(crate) fn business_application_servers_params(
@@ -1385,11 +1428,81 @@ pub(crate) fn business_application_servers_params(
     if let Some(max_edges) = args.max_edges {
         params.insert("max_edges".to_string(), json!(max_edges));
     }
+    if let Some(max_service_membership_associations) = args.max_service_membership_associations {
+        params.insert(
+            "max_service_membership_associations".to_string(),
+            json!(max_service_membership_associations),
+        );
+    }
+    if let Some(max_service_membership_pages) = args.max_service_membership_pages {
+        params.insert(
+            "max_service_membership_pages".to_string(),
+            json!(max_service_membership_pages),
+        );
+    }
     params.insert(
         "relationship_type".to_string(),
         json!(args.relationship_type),
     );
     params.insert("include_paths".to_string(), json!(args.include_paths));
+    // Only send fallback_strategy when explicitly non-default, keeping the
+    // default request shape (and core behavior) unchanged.
+    if !args.fallback_strategy.is_empty() && args.fallback_strategy != "none" {
+        params.insert(
+            "fallback_strategy".to_string(),
+            json!(args.fallback_strategy),
+        );
+    }
+    if !args.persist {
+        params.insert("persist".to_string(), json!(false));
+    }
+    if args.prune_stale {
+        params.insert("prune_stale".to_string(), json!(true));
+    }
+    params
+}
+
+/// Request arguments passed to `business_application_servers_cached`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationServersCachedArgs<'a> {
+    pub number: Option<&'a str>,
+    pub sys_id: Option<&'a str>,
+    pub include_tombstoned: bool,
+}
+
+pub(crate) fn business_application_servers_cached_params(
+    args: BusinessApplicationServersCachedArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(number) = args.number {
+        params.insert("number".to_string(), json!(number));
+    }
+    if let Some(sys_id) = args.sys_id {
+        params.insert("sys_id".to_string(), json!(sys_id));
+    }
+    if args.include_tombstoned {
+        params.insert("include_tombstoned".to_string(), json!(true));
+    }
+    params
+}
+
+/// Request arguments passed to `business_applications_for_server`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusinessApplicationsForServerArgs<'a> {
+    pub sys_id: Option<&'a str>,
+    pub include_tombstoned: bool,
+}
+
+pub(crate) fn business_applications_for_server_params(
+    args: BusinessApplicationsForServerArgs<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    if let Some(sys_id) = args.sys_id {
+        params.insert("sys_id".to_string(), json!(sys_id));
+    }
+    if args.include_tombstoned {
+        params.insert("include_tombstoned".to_string(), json!(true));
+    }
     params
 }
 
@@ -1723,6 +1836,10 @@ struct DaemonApprovalRecord {
     target: DaemonRecordRef,
     requested_at: DateTime<Utc>,
     due_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    routed_via: ApprovalRoutedVia,
+    #[serde(default)]
+    approver_group: Option<DaemonReference>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1924,6 +2041,8 @@ impl From<DaemonApprovalRecord> for ApprovalRecord {
             target: value.target.into(),
             requested_at: value.requested_at,
             due_date: value.due_date,
+            routed_via: value.routed_via,
+            approver_group: value.approver_group.map(Into::into),
         }
     }
 }
@@ -2154,8 +2273,13 @@ mod tests {
             max_depth: Some(2),
             max_cis: Some(500),
             max_edges: Some(2_000),
+            max_service_membership_associations: Some(3_000),
+            max_service_membership_pages: Some(30),
             relationship_type: &relationship_type,
             include_paths: true,
+            fallback_strategy: "none",
+            persist: true,
+            prune_stale: false,
         });
 
         assert_eq!(
@@ -2165,6 +2289,8 @@ mod tests {
                 "max_depth": 2,
                 "max_cis": 500,
                 "max_edges": 2000,
+                "max_service_membership_associations": 3000,
+                "max_service_membership_pages": 30,
                 "relationship_type": [
                     "<RELATIONSHIP_TYPE>",
                     "<SECOND_RELATIONSHIP_TYPE>"
@@ -2175,6 +2301,37 @@ mod tests {
     }
 
     #[test]
+    fn business_application_servers_params_emit_fallback_strategy_only_when_set() {
+        // ci_owner_group is forwarded to the daemon.
+        let params = business_application_servers_params(BusinessApplicationServersArgs {
+            number: Some("<APM_NUMBER>"),
+            relationship_type: &[],
+            fallback_strategy: "ci_owner_group",
+            persist: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            params.get("fallback_strategy"),
+            Some(&json!("ci_owner_group"))
+        );
+
+        // none / empty are omitted so the default request shape is unchanged.
+        for strategy in ["none", ""] {
+            let params = business_application_servers_params(BusinessApplicationServersArgs {
+                number: Some("<APM_NUMBER>"),
+                relationship_type: &[],
+                fallback_strategy: strategy,
+                persist: true,
+                ..Default::default()
+            });
+            assert!(
+                !params.contains_key("fallback_strategy"),
+                "fallback_strategy `{strategy}` must be omitted"
+            );
+        }
+    }
+
+    #[test]
     fn business_application_servers_params_support_sys_id_selector() {
         let params = business_application_servers_params(BusinessApplicationServersArgs {
             number: None,
@@ -2182,8 +2339,13 @@ mod tests {
             max_depth: None,
             max_cis: None,
             max_edges: None,
+            max_service_membership_associations: None,
+            max_service_membership_pages: None,
             relationship_type: &[],
             include_paths: false,
+            fallback_strategy: "none",
+            persist: true,
+            prune_stale: false,
         });
 
         assert_eq!(
@@ -2192,6 +2354,94 @@ mod tests {
                 "sys_id": "<BUSINESS_APP_SYS_ID>",
                 "relationship_type": [],
                 "include_paths": false
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_servers_params_include_opt_in_persistence_flags() {
+        let no_persist_params =
+            business_application_servers_params(BusinessApplicationServersArgs {
+                number: Some("<APM_NUMBER>"),
+                sys_id: None,
+                max_depth: None,
+                max_cis: None,
+                max_edges: None,
+                max_service_membership_associations: None,
+                max_service_membership_pages: None,
+                relationship_type: &[],
+                include_paths: false,
+                fallback_strategy: "none",
+                persist: false,
+                prune_stale: false,
+            });
+
+        assert_eq!(
+            Value::Object(no_persist_params),
+            json!({
+                "number": "<APM_NUMBER>",
+                "relationship_type": [],
+                "include_paths": false,
+                "persist": false
+            })
+        );
+
+        let prune_params = business_application_servers_params(BusinessApplicationServersArgs {
+            number: Some("<APM_NUMBER>"),
+            sys_id: None,
+            max_depth: None,
+            max_cis: None,
+            max_edges: None,
+            max_service_membership_associations: None,
+            max_service_membership_pages: None,
+            relationship_type: &[],
+            include_paths: false,
+            fallback_strategy: "none",
+            persist: true,
+            prune_stale: true,
+        });
+
+        assert_eq!(
+            Value::Object(prune_params),
+            json!({
+                "number": "<APM_NUMBER>",
+                "relationship_type": [],
+                "include_paths": false,
+                "prune_stale": true
+            })
+        );
+    }
+
+    #[test]
+    fn business_application_servers_cached_params_use_daemon_contract_keys() {
+        let params =
+            business_application_servers_cached_params(BusinessApplicationServersCachedArgs {
+                number: Some("<APM_NUMBER>"),
+                sys_id: None,
+                include_tombstoned: true,
+            });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "number": "<APM_NUMBER>",
+                "include_tombstoned": true
+            })
+        );
+    }
+
+    #[test]
+    fn business_applications_for_server_params_use_daemon_contract_keys() {
+        let params = business_applications_for_server_params(BusinessApplicationsForServerArgs {
+            sys_id: Some("<SERVER_SYS_ID>"),
+            include_tombstoned: true,
+        });
+
+        assert_eq!(
+            Value::Object(params),
+            json!({
+                "sys_id": "<SERVER_SYS_ID>",
+                "include_tombstoned": true
             })
         );
     }
@@ -2363,7 +2613,7 @@ mod tests {
             "approver": {
                 "sys_id": "user-1",
                 "table": "sys_user",
-                "display_name": "Casey User",
+                "display_name": "Example User",
                 "extra": {}
             },
             "target": {

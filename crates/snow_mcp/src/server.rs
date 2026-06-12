@@ -164,6 +164,13 @@ impl McpServer {
             "business_application_servers" => {
                 self.call_business_application_servers(id, params).await
             }
+            "business_application_servers_cached" => {
+                self.call_business_application_servers_cached(id, params)
+                    .await
+            }
+            "business_applications_for_server" => {
+                self.call_business_applications_for_server(id, params).await
+            }
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
@@ -253,8 +260,8 @@ impl McpServer {
                     Ok(records) => records,
                     Err(err) => return service_failure(id, err),
                 };
-                let approvals = match self.core.my_approvals().await {
-                    Ok(records) => records,
+                let approvals = match self.core.my_approvals_with_routing_fresh().await {
+                    Ok(response) => response.records,
                     Err(err) => return service_failure(id, err),
                 };
                 JsonRpcResponse::ok(
@@ -385,14 +392,15 @@ impl McpServer {
     }
 
     async fn call_list_my_approvals(&self, id: Option<Value>) -> JsonRpcResponse {
-        match self.core.my_approvals().await {
-            Ok(records) if !records.is_empty() => {
-                JsonRpcResponse::ok(id, json!({ "records": records }))
-            }
-            Ok(_) | Err(_) => match self.core.my_approvals_fresh().await {
-                Ok(records) => JsonRpcResponse::ok(id, json!({ "records": records })),
-                Err(err) => service_failure(id, err),
-            },
+        match self.core.my_approvals_with_routing_fresh().await {
+            Ok(response) => JsonRpcResponse::ok(
+                id,
+                json!({
+                    "records": response.records,
+                    "query_summary": response.query_summary,
+                }),
+            ),
+            Err(err) => service_failure(id, err),
         }
     }
 
@@ -647,7 +655,18 @@ impl McpServer {
         let mut servers = Vec::with_capacity(result.servers.len());
         for server in result.servers {
             match self.server_json(&server.record) {
-                Ok(server) => servers.push(server),
+                Ok(mut server_value) => {
+                    // Per-server `source` tag. Only `ci_owner_group` fallback
+                    // servers are recorded in `server_sources`; traversal servers
+                    // are the default and omit the field.
+                    if let (Some(source), Some(object)) = (
+                        result.server_sources.get(&server.record.sys_id),
+                        server_value.as_object_mut(),
+                    ) {
+                        object.insert("source".to_string(), json!(source.as_str()));
+                    }
+                    servers.push(server_value);
+                }
                 Err(err) => return service_failure(id, err),
             }
         }
@@ -657,9 +676,153 @@ impl McpServer {
             json!({
                 "business_application": result.business_application,
                 "servers": servers,
+                "server_provenance": result.server_provenance,
+                "inventory_health": result.inventory_health,
                 "relationship_summary": result.relationship_summary,
                 "diagnostics": result.diagnostics,
                 "server_paths": result.server_paths,
+            }),
+        )
+    }
+
+    async fn call_business_application_servers_cached(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::BusinessApplicationServersCachedParams =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+
+        let result = match self.core.business_application_servers_cached(parsed).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32004,
+                    "business application not found",
+                    Some(json!({
+                        "endpoint_status": "live_confirmation_not_attempted",
+                        "relationship_status": "unknown_not_synced"
+                    })),
+                );
+            }
+            Err(err) => return service_failure(id, err),
+        };
+
+        let business_application =
+            match self.business_application_json(&result.business_application) {
+                Ok(application) => application,
+                Err(err) => return service_failure(id, err),
+            };
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for relationship in result.servers {
+            let server = match self.server_json(&relationship.server) {
+                Ok(server) => server,
+                Err(err) => return service_failure(id, err),
+            };
+            servers.push(json!({
+                "server": server,
+                "server_table": relationship.server_table,
+                "provenance": relationship.provenance,
+                "min_depth": relationship.min_depth,
+                "paths": relationship.paths,
+                "tombstoned_at": relationship.tombstoned_at,
+            }));
+        }
+
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "business_application": business_application,
+                "servers": servers,
+                "endpoint_status": result.endpoint_status,
+                "relationship_status": result.relationship_status,
+                "inventory_health": result.inventory_health,
+            }),
+        )
+    }
+
+    async fn call_business_applications_for_server(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::BusinessApplicationsForServerParams =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = parsed.validate() {
+            return invalid_params(id, err);
+        }
+
+        let result = match self.core.business_applications_for_server(parsed).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32004,
+                    "server not found",
+                    Some(json!({
+                        "endpoint_status": "live_confirmation_not_attempted",
+                        "relationship_status": "unknown_not_synced"
+                    })),
+                );
+            }
+            Err(err) => return service_failure(id, err),
+        };
+
+        let mut servers = Vec::with_capacity(result.servers.len());
+        for server_relationships in result.servers {
+            let server = match self.server_json(&server_relationships.server) {
+                Ok(server) => server,
+                Err(err) => return service_failure(id, err),
+            };
+            let mut business_applications =
+                Vec::with_capacity(server_relationships.business_applications.len());
+            for relationship in server_relationships.business_applications {
+                let business_application =
+                    match self.business_application_json(&relationship.business_application) {
+                        Ok(application) => application,
+                        Err(err) => return service_failure(id, err),
+                    };
+                business_applications.push(json!({
+                "business_application": business_application,
+                    "provenance": relationship.provenance,
+                    "min_depth": relationship.min_depth,
+                    "paths": relationship.paths,
+                    "inventory_health": relationship.inventory_health,
+                    "tombstoned_at": relationship.tombstoned_at,
+                }));
+            }
+            servers.push(json!({
+                "server": server,
+                "business_applications": business_applications,
+                "endpoint_status": server_relationships.endpoint_status,
+                "relationship_status": server_relationships.relationship_status,
+            }));
+        }
+
+        JsonRpcResponse::ok(
+            id,
+            json!({
+                "servers": servers,
+                "endpoint_status": result.endpoint_status,
+                "relationship_status": result.relationship_status,
             }),
         )
     }
@@ -746,31 +909,44 @@ impl McpServer {
             Ok(records) => records,
             Err(err) => return service_failure(id, err),
         };
-        let record = match (
+        // Resolve the selector into both a cache match (if any) and the typed
+        // core lookup used for the live fallback. Exactly one selector must be
+        // supplied.
+        let (record, core_lookup) = match (
             sys_id.filter(|value| !value.is_empty()),
             name.filter(|value| !value.is_empty()),
             ip_address.filter(|value| !value.is_empty()),
         ) {
             (Some(sys_id), None, None) => match snow_core::normalize_record_lookup_sys_id(sys_id) {
-                Ok(sys_id) => records
-                    .into_iter()
-                    .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id)),
+                Ok(sys_id) => {
+                    let hit = records
+                        .into_iter()
+                        .find(|record| record.sys_id.eq_ignore_ascii_case(&sys_id));
+                    (hit, snow_core::ServerLookup::SysId(sys_id))
+                }
                 Err(err) => return invalid_params(id, err),
             },
-            (None, Some(name), None) => records
-                .into_iter()
-                .find(|record| server_name(record) == name),
-            (None, None, Some(ip_address)) => records.into_iter().find(|record| {
-                server_field(record, "ip_address")
-                    .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
-            }),
+            (None, Some(name), None) => {
+                let hit = records
+                    .into_iter()
+                    .find(|record| server_name(record) == name);
+                (hit, snow_core::ServerLookup::exact_name(name))
+            }
+            (None, None, Some(ip_address)) => {
+                let hit = records.into_iter().find(|record| {
+                    server_field(record, "ip_address")
+                        .is_some_and(|value| value.eq_ignore_ascii_case(ip_address))
+                });
+                (hit, snow_core::ServerLookup::ip_address(ip_address))
+            }
             (None, None, None) => {
                 return invalid_params(id, "missing required lookup: sys_id, name, or ip_address");
             }
             _ => return invalid_params(id, "provide exactly one of sys_id, name, or ip_address"),
         };
-        match record {
-            Some(record) => match self.server_json(&record) {
+        // Cache hit: return without a live query.
+        if let Some(record) = record {
+            return match self.server_json(&record) {
                 Ok(server) => JsonRpcResponse::ok(
                     id,
                     json!({
@@ -779,8 +955,27 @@ impl McpServer {
                     }),
                 ),
                 Err(err) => service_failure(id, err),
+            };
+        }
+        // Cache miss: live exact fallback. Per the completion plan's MCP
+        // mutation boundary (Work Package G) the MCP tool is read/cache-write
+        // free, so persist = false — the live record is returned but never
+        // written to the local cache. A confirmed 404 is the only -32004;
+        // ACL / network / duplicate failures map to distinct codes.
+        match self.core.get_server_live(core_lookup, false).await {
+            Ok(Some(server)) => match self.server_json(&server.record) {
+                Ok(server_json) => JsonRpcResponse::ok(
+                    id,
+                    json!({
+                        "server": server_json,
+                        "markdown": render_snow_record(&server.record),
+                    }),
+                ),
+                Err(err) => service_failure(id, err),
             },
-            None => JsonRpcResponse::error(id, -32004, "server not found", None),
+            // get_server_live never returns Ok(None); NotFound is an Err.
+            Ok(None) => JsonRpcResponse::error(id, -32004, "server not found", None),
+            Err(err) => server_get_error_response(id, err),
         }
     }
 
@@ -1687,6 +1882,15 @@ fn strip_business_application_hydration(mut arguments: Value) -> Value {
 fn parse_business_application_servers_arguments(
     arguments: Value,
 ) -> std::result::Result<snow_core::BusinessApplicationServersParams, String> {
+    if let Value::Object(map) = &arguments {
+        for forbidden in ["persist", "prune_stale"] {
+            if map.contains_key(forbidden) {
+                return Err(format!(
+                    "`{forbidden}` is not accepted by MCP business_application_servers"
+                ));
+            }
+        }
+    }
     let params: snow_core::BusinessApplicationServersParams =
         serde_json::from_value(arguments).map_err(|err| err.to_string())?;
     params.validate().map_err(|err| err.to_string())?;
@@ -1914,4 +2118,35 @@ fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "service failure",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+/// Map a structured [`snow_core::ServerGetError`] from the MCP `server_get`
+/// live fallback onto a distinct JSON-RPC error, mirroring the daemon mapping.
+/// Only a ServiceNow-confirmed not-found is `-32004`; ACL, network, and
+/// duplicate-CI disambiguation get their own codes.
+fn server_get_error_response(id: Option<Value>, err: snow_core::ServerGetError) -> JsonRpcResponse {
+    use snow_core::ServerGetError;
+    match err {
+        ServerGetError::NotFound => JsonRpcResponse::error(id, -32004, "server not found", None),
+        ServerGetError::AclRestricted(detail) => JsonRpcResponse::error(
+            id,
+            -32003,
+            "server is ACL-restricted",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Network(detail) => JsonRpcResponse::error(
+            id,
+            -32001,
+            "network error reaching ServiceNow",
+            Some(json!({ "details": detail })),
+        ),
+        ServerGetError::Disambiguation { selector, matched } => JsonRpcResponse::error(
+            id,
+            -32005,
+            "multiple servers matched selector",
+            Some(json!({ "selector": selector, "matched": matched })),
+        ),
+        ServerGetError::Hydration(detail) => service_failure(id, detail),
+        ServerGetError::Other(detail) => service_failure(id, detail),
+    }
 }

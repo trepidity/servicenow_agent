@@ -3,7 +3,8 @@ use servicenow_rs::model::value::parse_servicenow_timestamp;
 use servicenow_rs::prelude::Record;
 
 use crate::{
-    ApprovalRecord, CacheSource, FieldValue, RecordRef, Reference, ResourceType, SnowRecord,
+    ApprovalRecord, ApprovalRoutedVia, CacheSource, FieldValue, RecordRef, Reference, ResourceType,
+    SnowRecord,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -11,6 +12,15 @@ pub struct ApprovalResource;
 
 impl ApprovalResource {
     pub fn from_servicenow(record: &Record, approver: Reference) -> ApprovalRecord {
+        Self::from_servicenow_with_routing(record, approver, ApprovalRoutedVia::Direct, None)
+    }
+
+    pub fn from_servicenow_with_routing(
+        record: &Record,
+        approver: Reference,
+        routed_via: ApprovalRoutedVia,
+        approver_group: Option<Reference>,
+    ) -> ApprovalRecord {
         let target = target_reference(record);
         ApprovalRecord {
             record: Self::record_model(record, &approver, &target),
@@ -19,6 +29,8 @@ impl ApprovalResource {
             requested_at: parse_servicenow_timestamp(record.get_str("sys_created_on"))
                 .unwrap_or_else(Utc::now),
             due_date: parse_servicenow_timestamp(record.get_str("due_date")),
+            routed_via,
+            approver_group,
         }
     }
 
@@ -45,6 +57,10 @@ impl ApprovalResource {
 
     pub fn approver_reference(record: &Record) -> Option<Reference> {
         reference_from_record(record, "approver", "sys_user")
+    }
+
+    pub fn group_approver_reference(record: &Record) -> Option<Reference> {
+        reference_from_record(record, "approver", "sys_user_group")
     }
 
     pub fn field_values(record: &Record) -> std::collections::HashMap<String, FieldValue> {
@@ -75,10 +91,13 @@ fn target_reference(record: &Record) -> RecordRef {
     let sysapproval_sys_id = record
         .get_raw("sysapproval")
         .or_else(|| record.get_str("sysapproval"))
+        .or_else(|| record.get_raw("document_id"))
+        .or_else(|| record.get_str("document_id"))
         .unwrap_or_default()
         .to_string();
     let number = record
         .get_str("sysapproval.number")
+        .or_else(|| record.get_display("sysapproval"))
         .or_else(|| record.get_str("document_id"))
         .unwrap_or_default()
         .to_string();

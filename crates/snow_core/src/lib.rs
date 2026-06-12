@@ -34,20 +34,35 @@ pub use kb::{
 };
 pub(crate) use reference::*;
 pub use resource::business_application::{
+    BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD,
+    BUSINESS_APPLICATION_DEGRADED_REASON_CMDB_RELATIONSHIPS_UNMAPPED,
     BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_CIS, BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_DEPTH,
     BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_EDGES,
+    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+    BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES,
     BUSINESS_APPLICATION_SERVERS_DEFAULT_RELATIONSHIP_TYPES, BUSINESS_APPLICATION_SERVERS_MAX_CIS,
     BUSINESS_APPLICATION_SERVERS_MAX_DEPTH, BUSINESS_APPLICATION_SERVERS_MAX_EDGES,
-    BusinessApplication, BusinessApplicationFieldAliases, BusinessApplicationFieldValue,
+    BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+    BUSINESS_APPLICATION_SERVERS_MAX_SERVICE_MEMBERSHIP_PAGES,
+    BUSINESS_APPLICATION_SERVICE_DISCOVERY_RELATIONSHIP_TYPES, BusinessApplication,
+    BusinessApplicationFieldAliases, BusinessApplicationFieldValue,
     BusinessApplicationHydrationOptions, BusinessApplicationLookup,
     BusinessApplicationRelationshipDirection, BusinessApplicationRelationshipType,
-    BusinessApplicationServerApplication, BusinessApplicationServerPath,
-    BusinessApplicationServerPathEdge, BusinessApplicationServersOptions,
-    BusinessApplicationServersParams, BusinessApplicationServersResult,
-    BusinessApplicationServersSelector, BusinessApplicationServersSummary,
-    BusinessApplicationSyncSummary, ChoiceValue, ReferencePrimitiveDescriptor,
-    ReferencePrimitiveType, ReferenceResolutionDiagnostic, ReferenceResolutionReason,
-    ReferenceResolutionStatus,
+    BusinessApplicationServerApplication, BusinessApplicationServerInventoryHealth,
+    BusinessApplicationServerPath, BusinessApplicationServerPathEdge,
+    BusinessApplicationServerPathEdgeSource, BusinessApplicationServerProvenance,
+    BusinessApplicationServersCachedOptions, BusinessApplicationServersCachedParams,
+    BusinessApplicationServersCachedResult, BusinessApplicationServersCachedSelector,
+    BusinessApplicationServersOptions, BusinessApplicationServersParams,
+    BusinessApplicationServersResult, BusinessApplicationServersSelector,
+    BusinessApplicationServersSummary, BusinessApplicationSyncSummary,
+    BusinessApplicationsForServerOptions, BusinessApplicationsForServerParams,
+    BusinessApplicationsForServerResult, BusinessApplicationsForServerSelector,
+    CachedBusinessApplicationForServer, CachedBusinessApplicationServer,
+    CachedServerBusinessApplications, ChoiceValue, CiOwnerGroupRef, EndpointResolutionStatus,
+    FallbackStrategy, ReferencePrimitiveDescriptor, ReferencePrimitiveType,
+    ReferenceResolutionDiagnostic, ReferenceResolutionReason, ReferenceResolutionStatus,
+    RelationshipKnowledgeStatus, ServerResultSource,
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
@@ -82,11 +97,12 @@ use servicenow_rs::prelude::{
 use servicenow_rs::query::TableApi;
 
 use crate::cache::store::{
-    AliasRow, BusinessApplicationFieldDictionaryRow, CachedUserRow, KeywordRow, PrimitiveObjectRow,
+    AliasRow, BusinessApplicationFieldDictionaryRow, BusinessApplicationServerInventoryHealthRow,
+    BusinessApplicationServerMembershipRow, CachedUserRow, KeywordRow, PrimitiveObjectRow,
     PrimitiveResolutionStatus, ProjectedFieldRow, RecordRow, TagRow,
 };
 use crate::enrich::derive_for_record;
-use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
+use crate::query::filter::{BusinessApplicationQuery, ListQuery};
 use crate::resource::approval::ApprovalResource;
 use crate::resource::server::{SERVER_LEAF_TABLES, canonical_server_class, is_server_class};
 use crate::semantic::{
@@ -98,6 +114,33 @@ use crate::vault::manager::VaultManager;
 use crate::vault::{VaultDocument, VaultScanFailure, scan_documents, scan_documents_detailed};
 
 const USER_RECORD_HYDRATE_LIMIT: u32 = 200;
+pub const APPROVAL_GROUP_IN_BATCH_SIZE: usize = 20;
+const APPROVAL_QUERY_PAGE_SIZE: usize = 200;
+const APPROVAL_QUERY_MAX_PAGES: usize = 50;
+const APPROVAL_GROUP_MEMBERSHIP_PAGE_SIZE: usize = 500;
+const APPROVAL_GROUP_MEMBERSHIP_MAX_PAGES: usize = 50;
+const APPROVAL_LIST_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "state",
+    "approver",
+    "source_table",
+    "sysapproval",
+    "document_id",
+    "due_date",
+    "sys_created_on",
+];
+const APPROVAL_LIST_DOT_WALK: &[&str] = &[
+    "approver.name",
+    "approver.user_name",
+    "approver.sys_class_name",
+    "sysapproval.number",
+    "sysapproval.short_description",
+    "sysapproval.state",
+    "sysapproval.sys_class_name",
+];
+const APPROVAL_GROUP_MEMBERSHIP_FIELDS: &[&str] = &["sys_id", "user", "group"];
+const APPROVAL_GROUP_MEMBERSHIP_DOT_WALK: &[&str] = &["group.name"];
 const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
     "sys_id",
     "number",
@@ -171,6 +214,7 @@ const BUSINESS_APPLICATION_SYNC_ALL_PAGE_SIZE: usize = BUSINESS_APPLICATION_MAX_
 const CMDB_CI_TABLE: &str = "cmdb_ci";
 const CMDB_REL_CI_TABLE: &str = "cmdb_rel_ci";
 const CMDB_REL_TYPE_TABLE: &str = "cmdb_rel_type";
+const SVC_CI_ASSOC_TABLE: &str = "svc_ci_assoc";
 const BUSINESS_APPLICATION_RELATIONSHIP_FIELDS: &[&str] = &[
     "sys_id",
     "parent",
@@ -180,12 +224,20 @@ const BUSINESS_APPLICATION_RELATIONSHIP_FIELDS: &[&str] = &[
     "child.sys_class_name",
 ];
 const BUSINESS_APPLICATION_CI_CLASS_FIELDS: &[&str] = &["sys_id", "name", "sys_class_name"];
+const BUSINESS_APPLICATION_SERVICE_MEMBERSHIP_FIELDS: &[&str] = &[
+    "sys_id",
+    "service_id",
+    "service_id.sys_class_name",
+    "ci_id",
+    "ci_id.sys_class_name",
+];
 /// Page size for paginated `cmdb_rel_ci` edge reads. Kept well below the typical
 /// `glide.rest.table.max_record_count` server cap (default 10000) so the read
 /// never relies on a single oversized request that the instance could silently
 /// truncate. The paginator continues across pages until the `max_edges` budget
 /// is reached or the result set is exhausted.
 const BUSINESS_APPLICATION_RELATIONSHIP_PAGE_SIZE: usize = 1000;
+const BUSINESS_APPLICATION_SERVICE_MEMBERSHIP_PAGE_SIZE: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserLookupCandidate {
@@ -692,12 +744,45 @@ pub struct FieldChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRoutedVia {
+    Direct,
+    Group,
+}
+
+impl Default for ApprovalRoutedVia {
+    fn default() -> Self {
+        Self::Direct
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ApprovalQuerySummary {
+    pub direct_approvals_found: usize,
+    pub group_approvals_found: usize,
+    pub total_approvals: usize,
+    pub caller_group_memberships_resolved: usize,
+    pub group_query_batches: usize,
+    pub deduplication_removed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListMyApprovalsResponse {
+    pub records: Vec<ApprovalRecord>,
+    pub query_summary: ApprovalQuerySummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
     pub record: SnowRecord,
     pub approver: Reference,
     pub target: RecordRef,
     pub requested_at: DateTime<Utc>,
     pub due_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub routed_via: ApprovalRoutedVia,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver_group: Option<Reference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1017,6 +1102,7 @@ pub fn is_record_lookup_table_allowed(table: &str) -> bool {
             | "dmn_demand_task"
             | "resource_plan"
             | "pm_project"
+            | "change_request"
             | "business_application"
             | "business_app"
             | "cmdb_ci_business_app"
@@ -1230,6 +1316,7 @@ pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
     "dmn_demand_task",
     "resource_plan",
     "pm_project",
+    "change_request",
     "business_application",
     "business_app",
     "cmdb_ci_business_app",
@@ -1367,6 +1454,78 @@ struct BusinessApplicationDirectionRead {
     acl_restricted: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BusinessApplicationServiceMembershipRead {
+    records: Vec<Record>,
+    pages_examined: usize,
+    association_limit_reached: bool,
+    page_limit_reached: bool,
+    acl_restricted: bool,
+}
+
+impl BusinessApplicationServiceMembershipRead {
+    fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            pages_examined: 0,
+            association_limit_reached: false,
+            page_limit_reached: false,
+            acl_restricted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BusinessApplicationServerDiscovery {
+    server: Server,
+    provenance: BusinessApplicationServerProvenance,
+    relationship_paths: Vec<BusinessApplicationServerPath>,
+    service_membership_paths: Vec<BusinessApplicationServerPath>,
+}
+
+impl BusinessApplicationServerDiscovery {
+    fn new(
+        server: Server,
+        provenance: BusinessApplicationServerProvenance,
+        paths: Vec<BusinessApplicationServerPath>,
+    ) -> Self {
+        let mut discovery = Self {
+            server,
+            provenance,
+            relationship_paths: Vec::new(),
+            service_membership_paths: Vec::new(),
+        };
+        discovery.add_paths(provenance, paths);
+        discovery
+    }
+
+    fn add_paths(
+        &mut self,
+        provenance: BusinessApplicationServerProvenance,
+        paths: Vec<BusinessApplicationServerPath>,
+    ) {
+        self.provenance = self.provenance.merge(provenance);
+        match provenance {
+            BusinessApplicationServerProvenance::Relationship => {
+                self.relationship_paths.extend(paths);
+            }
+            BusinessApplicationServerProvenance::ServiceMembership => {
+                self.service_membership_paths.extend(paths);
+            }
+            BusinessApplicationServerProvenance::Both => {
+                self.relationship_paths.extend(paths.clone());
+                self.service_membership_paths.extend(paths);
+            }
+        }
+    }
+
+    fn paths(&self) -> Vec<BusinessApplicationServerPath> {
+        let mut paths = self.relationship_paths.clone();
+        paths.extend(self.service_membership_paths.clone());
+        paths
+    }
+}
+
 impl BusinessApplicationDirectionRead {
     fn new(field: &'static str) -> Self {
         Self {
@@ -1426,6 +1585,7 @@ impl BusinessApplicationRelationshipEdge {
             child_sys_id: self.child_sys_id.clone(),
             direction,
             relationship_type: self.relationship_type.clone(),
+            edge_source: BusinessApplicationServerPathEdgeSource::Relationship,
         }
     }
 }
@@ -1510,6 +1670,81 @@ fn path_chains_contain_ancestor(
         .any(|chain| chain_node_sys_ids(chain).contains(adjacent_sys_id))
 }
 
+fn business_application_server_paths_for(
+    paths_by_ci: &HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    sys_id: &str,
+) -> Vec<BusinessApplicationServerPath> {
+    paths_by_ci
+        .get(sys_id)
+        .map(|chains| {
+            chains
+                .iter()
+                .map(|chain| BusinessApplicationServerPath {
+                    edges: chain.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn business_application_service_membership_paths_for(
+    service_paths_by_ci: &HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    service_sys_id: &str,
+    server_sys_id: &str,
+) -> Vec<BusinessApplicationServerPath> {
+    let base_chains = service_paths_by_ci
+        .get(service_sys_id)
+        .cloned()
+        .unwrap_or_default();
+    if base_chains.is_empty() {
+        return vec![BusinessApplicationServerPath {
+            edges: vec![BusinessApplicationServerPathEdge {
+                depth: 1,
+                parent_sys_id: service_sys_id.to_string(),
+                child_sys_id: server_sys_id.to_string(),
+                direction: BusinessApplicationRelationshipDirection::ParentToChild,
+                relationship_type: BusinessApplicationRelationshipType {
+                    value: "service_member_of".to_string(),
+                    display_value: Some("service_member_of".to_string()),
+                },
+                edge_source: BusinessApplicationServerPathEdgeSource::ServiceMembership,
+            }],
+        }];
+    }
+
+    base_chains
+        .into_iter()
+        .map(|mut chain| {
+            let depth = chain.len() + 1;
+            chain.push(BusinessApplicationServerPathEdge {
+                depth,
+                parent_sys_id: service_sys_id.to_string(),
+                child_sys_id: server_sys_id.to_string(),
+                direction: BusinessApplicationRelationshipDirection::ParentToChild,
+                relationship_type: BusinessApplicationRelationshipType {
+                    value: "service_member_of".to_string(),
+                    display_value: Some("service_member_of".to_string()),
+                },
+                edge_source: BusinessApplicationServerPathEdgeSource::ServiceMembership,
+            });
+            BusinessApplicationServerPath { edges: chain }
+        })
+        .collect()
+}
+
+fn merge_business_application_server_discovery(
+    discoveries: &mut BTreeMap<String, BusinessApplicationServerDiscovery>,
+    server: Server,
+    provenance: BusinessApplicationServerProvenance,
+    paths: Vec<BusinessApplicationServerPath>,
+) {
+    let sys_id = server.record.sys_id.clone();
+    discoveries
+        .entry(sys_id)
+        .and_modify(|entry| entry.add_paths(provenance, paths.clone()))
+        .or_insert_with(|| BusinessApplicationServerDiscovery::new(server, provenance, paths));
+}
+
 /// Extend every recorded route chain of `parent_sys_id` by `edge` and append the
 /// resulting chains to `child_sys_id`'s recorded routes.
 ///
@@ -1521,25 +1756,42 @@ fn extend_path_chains(
     parent_sys_id: &str,
     child_sys_id: &str,
     edge: BusinessApplicationServerPathEdge,
-) {
-    let parent_chains = paths_by_ci.get(parent_sys_id).cloned().unwrap_or_default();
-    let new_chains: Vec<Vec<BusinessApplicationServerPathEdge>> = if parent_chains.is_empty() {
-        // Parent has no recorded chain (e.g. paths disabled): record a
-        // single-edge chain so traversal bookkeeping still has one route.
-        vec![vec![edge]]
-    } else {
-        parent_chains
-            .into_iter()
-            .map(|mut chain| {
-                chain.push(edge.clone());
-                chain
-            })
-            .collect()
-    };
+) -> bool {
+    let new_chains = extended_path_chains(paths_by_ci, parent_sys_id, edge);
+    if new_chains.is_empty() {
+        return false;
+    }
     paths_by_ci
         .entry(child_sys_id.to_string())
         .or_default()
         .extend(new_chains);
+    true
+}
+
+fn extended_path_chains(
+    paths_by_ci: &HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+    parent_sys_id: &str,
+    edge: BusinessApplicationServerPathEdge,
+) -> Vec<Vec<BusinessApplicationServerPathEdge>> {
+    let parent_chains = paths_by_ci.get(parent_sys_id).cloned().unwrap_or_default();
+    if parent_chains.is_empty() {
+        // Parent has no recorded chain (e.g. paths disabled): record a
+        // single-edge chain so traversal bookkeeping still has one route.
+        return vec![vec![edge]];
+    } else {
+        return parent_chains
+            .into_iter()
+            .filter_map(|mut chain| {
+                if let Some(first) = chain.first()
+                    && first.direction != edge.direction
+                {
+                    return None;
+                }
+                chain.push(edge.clone());
+                Some(chain)
+            })
+            .collect();
+    }
 }
 
 /// Emit any not-yet-recorded route chains for an already-collected server.
@@ -1608,6 +1860,57 @@ fn servicenow_record_display_text(record: &Record, field: &str) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn approval_group_reference_from_membership(record: &Record) -> Result<Reference> {
+    let sys_id = servicenow_reference_sys_id(record, "group").ok_or_else(|| {
+        anyhow::anyhow!(
+            "sys_user_grmember row {} is missing a readable group reference",
+            record.sys_id
+        )
+    })?;
+    let display_name = first_non_empty_str([
+        record.get_display("group"),
+        record.get_str("group.name"),
+        record.get_raw("group"),
+        record.get_str("group"),
+    ])
+    .map(ToOwned::to_owned)
+    .unwrap_or_else(|| sys_id.clone());
+    Ok(Reference {
+        sys_id,
+        table: "sys_user_group".to_string(),
+        display_name,
+        extra: HashMap::new(),
+    })
+}
+
+fn approval_group_reference_from_approval(
+    record: &Record,
+    groups_by_sys_id: &HashMap<String, Reference>,
+) -> Result<Reference> {
+    let sys_id = servicenow_reference_sys_id(record, "approver").ok_or_else(|| {
+        anyhow::anyhow!(
+            "group approval row {} is missing a readable approver reference",
+            record.sys_id
+        )
+    })?;
+    let approval_display = servicenow_record_text(record, "approver");
+    let mut group = groups_by_sys_id.get(&sys_id).cloned().unwrap_or_else(|| {
+        ApprovalResource::group_approver_reference(record).unwrap_or_else(|| Reference {
+            sys_id: sys_id.clone(),
+            table: "sys_user_group".to_string(),
+            display_name: approval_display.clone().unwrap_or_else(|| sys_id.clone()),
+            extra: HashMap::new(),
+        })
+    });
+    group.table = "sys_user_group".to_string();
+    if (group.display_name.trim().is_empty() || group.display_name == group.sys_id)
+        && let Some(display) = approval_display
+    {
+        group.display_name = display;
+    }
+    Ok(group)
+}
+
 fn mark_business_application_edge_limit(
     summary: &mut BusinessApplicationServersSummary,
     diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
@@ -1653,6 +1956,95 @@ fn is_business_application_reference_table_resolvable(table: &str) -> bool {
         || table == BUSINESS_APPLICATION_TABLE
         || table.contains("portfolio")
 }
+
+fn is_application_service_class(class_name: Option<&str>) -> bool {
+    let Some(class_name) = class_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let normalized = class_name.to_ascii_lowercase();
+    normalized == "cmdb_ci_service"
+        || normalized.starts_with("cmdb_ci_service_")
+        || normalized.contains("_application_service")
+}
+
+fn is_servicenow_acl_error(err: &SnowApiError) -> bool {
+    match err {
+        SnowApiError::Api { status, .. } if *status == 401 || *status == 403 => true,
+        _ => {
+            let message = err.to_string().to_ascii_lowercase();
+            message.contains("authentication failed")
+                || message.contains("forbidden")
+                || message.contains("unauthorized")
+        }
+    }
+}
+
+/// Structured outcome for a live `server_get` fetch.
+///
+/// The read-through `server_get` contract distinguishes authoritative
+/// not-found (ServiceNow confirmed the CI does not exist or is unreadable for
+/// ACL reasons) from transient failures. Collapsing all of these into a single
+/// `anyhow` error would make a network blip indistinguishable from a real
+/// not-found, which the FR explicitly forbids. Each variant carries enough to
+/// let the daemon and MCP layers map it to a distinct JSON-RPC error code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerGetError {
+    /// ServiceNow confirmed the record does not exist (HTTP 404 on a sys_id
+    /// read, or an empty exact-match result set for a name / IP query).
+    NotFound,
+    /// The caller's ACL prevents reading the record (HTTP 401/403 or an
+    /// authentication/authorization failure). The CI may exist.
+    AclRestricted(String),
+    /// A transport-level / timeout failure reaching ServiceNow. Never
+    /// conflated with not-found.
+    Network(String),
+    /// More than one CI matched an exact name / IP selector (duplicate CIs in
+    /// CMDB). Surfaced as a structured disambiguation signal, not a generic
+    /// internal error.
+    Disambiguation { selector: String, matched: usize },
+    /// A row was returned but could not be parsed into the typed `Server`
+    /// shape.
+    Hydration(String),
+    /// Any other failure (validation, cache write, etc.).
+    Other(String),
+}
+
+impl ServerGetError {
+    /// Classify a `servicenow_rs` API error into the structured variant.
+    /// (HTTP 404 is handled by the caller and never reaches here.)
+    fn from_api(err: SnowApiError) -> Self {
+        match &err {
+            SnowApiError::Api {
+                status: 401 | 403, ..
+            } => Self::AclRestricted(err.to_string()),
+            SnowApiError::Auth { .. } => Self::AclRestricted(err.to_string()),
+            SnowApiError::Http(_) | SnowApiError::RateLimited { .. } => {
+                Self::Network(err.to_string())
+            }
+            _ if is_servicenow_acl_error(&err) => Self::AclRestricted(err.to_string()),
+            _ => Self::Other(err.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ServerGetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "server not found"),
+            Self::AclRestricted(detail) => {
+                write!(f, "server is ACL-restricted: {detail}")
+            }
+            Self::Network(detail) => write!(f, "network error reaching ServiceNow: {detail}"),
+            Self::Disambiguation { selector, matched } => {
+                write!(f, "multiple servers matched {selector} ({matched} matches)")
+            }
+            Self::Hydration(detail) => write!(f, "server record failed hydration: {detail}"),
+            Self::Other(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ServerGetError {}
 
 /// Build a cached dictionary row from a `sys_dictionary` record.
 ///
@@ -2464,6 +2856,12 @@ impl SnowCore {
         let allowed_relationship_types = self
             .resolve_relationship_type_allowlist(&options, defaults_when_empty)
             .await?;
+        let service_discovery_relationship_types =
+            BUSINESS_APPLICATION_SERVICE_DISCOVERY_RELATIONSHIP_TYPES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
+        let run_started_at = Utc::now();
         let mut summary = BusinessApplicationServersSummary::new(&options);
         let mut diagnostics = Vec::new();
         let mut visited = HashSet::from([application.record.sys_id.clone()]);
@@ -2479,6 +2877,9 @@ impl SnowCore {
         // reporting). The root has a single empty chain.
         let mut paths_by_ci: HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>> =
             HashMap::from([(application.record.sys_id.clone(), vec![Vec::new()])]);
+        let mut service_paths_by_ci: HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>> =
+            HashMap::from([(application.record.sys_id.clone(), vec![Vec::new()])]);
+        let mut service_membership_seed_sys_ids = HashSet::new();
         let mut servers_by_sys_id: BTreeMap<String, Server> = BTreeMap::new();
         let mut server_paths: BTreeMap<String, Vec<BusinessApplicationServerPath>> =
             BTreeMap::new();
@@ -2505,12 +2906,6 @@ impl SnowCore {
             let mut newly_seen = Vec::new();
 
             for relationship in relationships {
-                if !relationship
-                    .relationship_type
-                    .matches_any(&allowed_relationship_types)
-                {
-                    continue;
-                }
                 if let Some(class_name) = relationship.parent_class.as_deref() {
                     ci_classes
                         .entry(relationship.parent_sys_id.clone())
@@ -2520,6 +2915,49 @@ impl SnowCore {
                     ci_classes
                         .entry(relationship.child_sys_id.clone())
                         .or_insert_with(|| class_name.to_string());
+                }
+
+                if depth == 1
+                    && relationship
+                        .relationship_type
+                        .matches_any(&service_discovery_relationship_types)
+                    && let Some((current_sys_id, adjacent_sys_id, direction)) =
+                        relationship.traversal_endpoint(&frontier_set)
+                {
+                    let adjacent_class = if adjacent_sys_id == relationship.parent_sys_id {
+                        relationship.parent_class.as_deref()
+                    } else {
+                        relationship.child_class.as_deref()
+                    };
+                    if is_application_service_class(adjacent_class) {
+                        let edge = relationship.path_edge(depth, direction);
+                        if extend_path_chains(
+                            &mut service_paths_by_ci,
+                            &current_sys_id,
+                            &adjacent_sys_id,
+                            edge,
+                        ) {
+                            service_membership_seed_sys_ids.insert(adjacent_sys_id.clone());
+                        } else {
+                            summary.cycle_count += 1;
+                            push_business_application_server_diagnostic(
+                                &mut summary,
+                                &mut diagnostics,
+                                "cmdb_rel_ci",
+                                CMDB_REL_CI_TABLE,
+                                &adjacent_sys_id,
+                                ReferenceResolutionReason::CycleDetected,
+                                "service discovery skipped a mixed-direction route",
+                            );
+                        }
+                    }
+                }
+
+                if !relationship
+                    .relationship_type
+                    .matches_any(&allowed_relationship_types)
+                {
+                    continue;
                 }
 
                 let Some((current_sys_id, adjacent_sys_id, direction)) =
@@ -2564,25 +3002,40 @@ impl SnowCore {
                             ReferenceResolutionReason::CycleDetected,
                             "relationship traversal skipped a CI that was already visited",
                         );
-                    } else if options.include_paths {
+                    } else if options.include_paths || options.persist {
                         // Record the alternate route(s) into the adjacent CI by
                         // extending each of the current CI's chains with this edge.
                         let edge = relationship.path_edge(depth, direction.clone());
-                        extend_path_chains(
+                        let extended = extend_path_chains(
                             &mut paths_by_ci,
                             &current_sys_id,
                             &adjacent_sys_id,
                             edge,
                         );
-                        // A server reached again via an alternate route needs its
-                        // new route emitted now, since it will not pass through the
-                        // per-depth server-hydration loop again.
-                        emit_alternate_server_path(
-                            &servers_by_sys_id,
-                            &paths_by_ci,
-                            &mut server_paths,
-                            &adjacent_sys_id,
-                        );
+                        if extended {
+                            // A server reached again via an alternate route needs its
+                            // new route emitted now, since it will not pass through the
+                            // per-depth server-hydration loop again.
+                            if options.include_paths {
+                                emit_alternate_server_path(
+                                    &servers_by_sys_id,
+                                    &paths_by_ci,
+                                    &mut server_paths,
+                                    &adjacent_sys_id,
+                                );
+                            }
+                        } else {
+                            summary.cycle_count += 1;
+                            push_business_application_server_diagnostic(
+                                &mut summary,
+                                &mut diagnostics,
+                                "cmdb_rel_ci",
+                                CMDB_REL_CI_TABLE,
+                                &adjacent_sys_id,
+                                ReferenceResolutionReason::CycleDetected,
+                                "relationship traversal skipped a mixed-direction alternate route",
+                            );
+                        }
                     } else {
                         // include_paths off: an alternate route adds no result, so
                         // it is neither a traversal target nor recorded.
@@ -2610,11 +3063,23 @@ impl SnowCore {
                     continue;
                 }
 
-                visited.insert(adjacent_sys_id.clone());
                 let edge = relationship.path_edge(depth, direction);
                 // First discovery: seed the adjacent CI's routes from the current
                 // CI's routes extended by this edge.
-                extend_path_chains(&mut paths_by_ci, &current_sys_id, &adjacent_sys_id, edge);
+                if !extend_path_chains(&mut paths_by_ci, &current_sys_id, &adjacent_sys_id, edge) {
+                    summary.cycle_count += 1;
+                    push_business_application_server_diagnostic(
+                        &mut summary,
+                        &mut diagnostics,
+                        "cmdb_rel_ci",
+                        CMDB_REL_CI_TABLE,
+                        &adjacent_sys_id,
+                        ReferenceResolutionReason::CycleDetected,
+                        "relationship traversal skipped a mixed-direction route",
+                    );
+                    continue;
+                }
+                visited.insert(adjacent_sys_id.clone());
                 newly_seen.push(adjacent_sys_id);
             }
 
@@ -2695,15 +3160,371 @@ impl SnowCore {
         }
 
         summary.cis_examined = visited.len();
-        summary.servers_found = servers_by_sys_id.len();
+        let mut discoveries: BTreeMap<String, BusinessApplicationServerDiscovery> = BTreeMap::new();
+        for server in servers_by_sys_id.into_values() {
+            let paths =
+                business_application_server_paths_for(&paths_by_ci, server.record.sys_id.as_str());
+            merge_business_application_server_discovery(
+                &mut discoveries,
+                server,
+                BusinessApplicationServerProvenance::Relationship,
+                paths,
+            );
+        }
+
+        let service_membership_servers = self
+            .business_application_service_membership_servers(
+                &service_membership_seed_sys_ids,
+                &service_paths_by_ci,
+                &options,
+                &mut summary,
+                &mut diagnostics,
+                &mut server_class_cache,
+            )
+            .await?;
+        for (server, paths) in service_membership_servers {
+            merge_business_application_server_discovery(
+                &mut discoveries,
+                server,
+                BusinessApplicationServerProvenance::ServiceMembership,
+                paths,
+            );
+        }
+
+        summary.servers_found = discoveries.len();
+        let mut servers = Vec::with_capacity(discoveries.len());
+        let mut server_provenance = BTreeMap::new();
+        let mut persisted_server_paths = BTreeMap::new();
+        let mut server_paths = BTreeMap::new();
+        for (sys_id, discovery) in discoveries {
+            server_provenance.insert(sys_id.clone(), discovery.provenance);
+            let paths = discovery.paths();
+            if !paths.is_empty() {
+                persisted_server_paths.insert(sys_id.clone(), paths.clone());
+            }
+            if options.include_paths {
+                if !paths.is_empty() {
+                    server_paths.insert(sys_id.clone(), paths);
+                }
+            }
+            servers.push(discovery.server);
+        }
+        if options.persist {
+            self.persist_business_application_server_traversal(
+                &application.record,
+                &servers,
+                &server_provenance,
+                &persisted_server_paths,
+                run_started_at,
+                &options,
+                &mut summary,
+            )?;
+        }
+
+        // CMDB-gap fallback. Runs strictly AFTER persistence so that
+        // fallback-discovered servers are never written to the durable BA↔server
+        // membership or inventory-health tables: the persisting call above sees
+        // only the traversal `servers`/`server_provenance`, and a 0-server
+        // traversal persists 0 membership rows regardless of what the fallback
+        // returns. Fallback results are appended to the live response below and
+        // tagged via `server_sources`; they are live-only by construction.
+        let mut server_sources: BTreeMap<String, ServerResultSource> = BTreeMap::new();
+        if options.fallback_strategy.is_enabled() {
+            // Pre-fallback traversal count. Always present (even when the
+            // fallback does not fire) once a strategy is requested.
+            summary.cmdb_servers_found = Some(summary.servers_found);
+            summary.fallback_strategy = Some(options.fallback_strategy.as_str().to_string());
+        }
+        if options.fallback_strategy == FallbackStrategy::CiOwnerGroup && summary.servers_found == 0
+        {
+            let fallback_servers = self
+                .business_application_ci_owner_group_fallback(
+                    &application,
+                    &options,
+                    &mut summary,
+                    &mut diagnostics,
+                    &mut server_class_cache,
+                )
+                .await?;
+            for server in fallback_servers {
+                let sys_id = server.record.sys_id.clone();
+                server_sources.insert(sys_id, ServerResultSource::CiOwnerGroupFallback);
+                servers.push(server);
+            }
+            // `servers_found` reflects the TOTAL servers returned (traversal +
+            // fallback). In the fallback case the traversal count is 0, so this
+            // equals the fallback count while `cmdb_servers_found` stays 0.
+            summary.servers_found = servers.len();
+        }
+
+        let inventory_health = if options.persist {
+            self.query
+                .store()
+                .get_business_application_server_inventory_health(&application.record.sys_id)?
+                .map(|row| BusinessApplicationServerInventoryHealth {
+                    ba_sys_id: row.ba_sys_id,
+                    run_started_at: row.run_started_at,
+                    run_completed_at: row.run_completed_at,
+                    service_membership_status: row.service_membership_status,
+                    relationship_status: row.relationship_status,
+                    inventory_status: row.inventory_status,
+                    summary: serde_json::from_str(&row.summary_json)
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+                })
+        } else {
+            None
+        };
 
         Ok(Some(BusinessApplicationServersResult {
             business_application: BusinessApplicationServerApplication::from(&application),
-            servers: servers_by_sys_id.into_values().collect(),
+            servers,
+            server_sources,
+            server_provenance,
+            inventory_health,
             relationship_summary: summary,
             diagnostics,
             server_paths,
         }))
+    }
+
+    /// `ci_owner_group` CMDB-gap fallback: when the `cmdb_rel_ci` traversal found
+    /// 0 servers, query `cmdb_ci_server` by the BA's raw `u_ci_owner_group` field
+    /// and return the matched servers, live-only (never persisted).
+    ///
+    /// Field mapping (the load-bearing correctness point): the group sys_id is
+    /// sourced from the BA's raw `u_ci_owner_group` column via
+    /// [`BusinessApplication::ci_owner_group_raw`] and filtered with an EXACT
+    /// `u_ci_owner_group = <sys_id>` predicate on the server side. Neither side
+    /// uses the `ci_owner_group`/`managed_by_group` typed alias, which is empty on
+    /// live data.
+    ///
+    /// Bounds and degradation reuse the traversal contract:
+    /// - the result set is bounded by `options.max_cis` and truncation is marked
+    ///   via [`BusinessApplicationServersSummary::mark_truncated`];
+    /// - HTTP 401/403 increments `acl_restricted_count` with a
+    ///   `ReferenceAclRestricted` diagnostic and returns no servers
+    ///   (`fallback_used = false`);
+    /// - a BA with no `u_ci_owner_group`, or a tombstoned/unreadable group, emits a
+    ///   structured diagnostic and returns `servers: []`, `fallback_used = false`
+    ///   — never a panic or hard error;
+    /// - returned rows are classified with the hierarchy-aware
+    ///   [`is_server_class`], not `is_server_table`.
+    async fn business_application_ci_owner_group_fallback(
+        &self,
+        application: &BusinessApplication,
+        options: &BusinessApplicationServersOptions,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+        server_class_cache: &mut HashMap<String, bool>,
+    ) -> Result<Vec<Server>> {
+        // 1. Source the group from the RAW `u_ci_owner_group` field. Absent/empty
+        //    is a clean diagnostic, not an error: fallback simply does not fire.
+        let Some(group) = application.ci_owner_group_raw() else {
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD,
+                BUSINESS_APPLICATION_TABLE,
+                &application.record.sys_id,
+                ReferenceResolutionReason::ReferenceNotFound,
+                "ci_owner_group fallback requested but BA has no u_ci_owner_group set",
+            );
+            return Ok(Vec::new());
+        };
+
+        // 2. EXACT filter on the raw `u_ci_owner_group` column. The fallback page
+        //    size is the BA traversal's `max_cis` budget (default 500, ceiling
+        //    5000) — NOT ServerSearchParams' SERVER_MAX_LIMIT (100). One extra row
+        //    beyond the budget is requested so over-budget result sets can be
+        //    detected and truncation marked deterministically.
+        let limit = options.max_cis;
+        let fetch_limit = limit.saturating_add(1).min(u32::MAX as usize) as u32;
+        let response = self
+            .client
+            .table(SERVER_TABLE)
+            .equals(BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD, &group.sys_id)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .order_by("name", Order::Asc)
+            .limit(fetch_limit)
+            .execute()
+            .await;
+
+        let mut records = match response {
+            Ok(response) => response.records,
+            Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
+                summary.acl_restricted_count += 1;
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD,
+                    SERVER_TABLE,
+                    &group.sys_id,
+                    ReferenceResolutionReason::ReferenceAclRestricted,
+                    "ACL restricted ci_owner_group fallback server query",
+                );
+                return Ok(Vec::new());
+            }
+            Err(err) if is_servicenow_acl_error(&err) => {
+                summary.acl_restricted_count += 1;
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD,
+                    SERVER_TABLE,
+                    &group.sys_id,
+                    ReferenceResolutionReason::ReferenceAclRestricted,
+                    "ACL restricted ci_owner_group fallback server query",
+                );
+                return Ok(Vec::new());
+            }
+            Err(SnowApiError::Api { status: 404, .. }) => {
+                // Tombstoned/unreadable group: structured diagnostic, no servers,
+                // no panic.
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD,
+                    SERVER_TABLE,
+                    &group.sys_id,
+                    ReferenceResolutionReason::ReferenceNotFound,
+                    "ci_owner_group fallback group is tombstoned or unreadable",
+                );
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        // The fallback fired: record the group identity. `fallback_used` stays true
+        // even when the group owns zero servers (the data-quality gap is real).
+        summary.fallback_used = true;
+        summary.fallback_group_sys_id = Some(group.sys_id.clone());
+        summary.fallback_group_display_name = group.display_name.clone();
+        summary.record_cmdb_relationships_unmapped();
+
+        // Bound to `max_cis`; mark truncation for any rows beyond the budget.
+        if records.len() > limit {
+            let skipped = records.len() - limit;
+            records.truncate(limit);
+            summary.mark_truncated(skipped);
+        }
+
+        let mut servers = Vec::with_capacity(records.len());
+        for record in records {
+            // Hierarchy-aware class gate. The query targets the base
+            // `cmdb_ci_server` table, so non-servers should not appear; this is a
+            // defensive consistency check using `is_server_class` (not the narrow
+            // `is_server_table`) so custom `cmdb_ci_*_server` subclasses are kept.
+            let class_name = servicenow_record_text(&record, "sys_class_name");
+            let is_server = match class_name.as_deref() {
+                Some(class_name) => {
+                    self.business_application_class_is_server(
+                        class_name,
+                        server_class_cache,
+                        summary,
+                        diagnostics,
+                    )
+                    .await?
+                }
+                // No class on a base-table row is unexpected but harmless: the row
+                // came from cmdb_ci_server, so treat it as a server.
+                None => true,
+            };
+            if !is_server {
+                continue;
+            }
+            servers.push(Server::from_servicenow(&record)?);
+        }
+        Ok(servers)
+    }
+
+    fn persist_business_application_server_traversal(
+        &self,
+        application: &SnowRecord,
+        servers: &[Server],
+        server_provenance: &BTreeMap<String, BusinessApplicationServerProvenance>,
+        server_paths: &BTreeMap<String, Vec<BusinessApplicationServerPath>>,
+        run_started_at: DateTime<Utc>,
+        options: &BusinessApplicationServersOptions,
+        summary: &mut BusinessApplicationServersSummary,
+    ) -> Result<()> {
+        self.persist_snow_records(std::slice::from_ref(application))?;
+        let server_records = servers
+            .iter()
+            .map(|server| server.record.clone())
+            .collect::<Vec<_>>();
+        summary.persisted_servers = self.persist_snow_records(&server_records)?;
+
+        let store = self.query.store();
+        let now = Utc::now();
+        for server in servers {
+            let paths = server_paths
+                .get(&server.record.sys_id)
+                .cloned()
+                .unwrap_or_default();
+            let min_depth = paths
+                .iter()
+                .map(BusinessApplicationServerPath::depth)
+                .min()
+                .unwrap_or(0);
+            let provenance = server_provenance
+                .get(&server.record.sys_id)
+                .copied()
+                .unwrap_or(BusinessApplicationServerProvenance::Relationship);
+            let server_table = server
+                .class_name
+                .as_deref()
+                .and_then(|value| non_empty_owned(Some(value)))
+                .or_else(|| non_empty_owned(Some(server.record.table.as_str())))
+                .unwrap_or_else(|| SERVER_TABLE.to_string());
+            let membership = BusinessApplicationServerMembershipRow {
+                ba_sys_id: application.sys_id.clone(),
+                server_sys_id: server.record.sys_id.clone(),
+                server_table,
+                provenance: provenance.as_str().to_string(),
+                min_depth,
+                paths_json: serde_json::to_string(&paths)?,
+                discovered_at: now,
+                last_seen_at: now,
+                tombstoned_at: None,
+            };
+            store.upsert_business_application_server_membership(&membership)?;
+            summary.membership_upserts += 1;
+        }
+
+        if options.prune_stale {
+            summary.membership_pruned = store
+                .tombstone_stale_business_application_server_memberships(
+                    application.sys_id.as_str(),
+                    run_started_at,
+                    Utc::now(),
+                )?;
+        }
+        let run_completed_at = Utc::now();
+        let service_membership_status =
+            Self::business_application_service_membership_health_status(summary);
+        let relationship_status = Self::business_application_relationship_health_status(summary);
+        let inventory_status = Self::business_application_inventory_health_status(
+            relationship_status,
+            &service_membership_status,
+            summary,
+        );
+        summary.service_membership_status = Some(service_membership_status.to_string());
+        summary.relationship_status = Some(relationship_status.to_string());
+        summary.inventory_status = Some(inventory_status.to_string());
+        store.upsert_business_application_server_inventory_health(
+            &BusinessApplicationServerInventoryHealthRow {
+                ba_sys_id: application.sys_id.clone(),
+                run_started_at,
+                run_completed_at,
+                service_membership_status: service_membership_status.to_string(),
+                relationship_status: relationship_status.to_string(),
+                inventory_status: inventory_status.to_string(),
+                summary_json: serde_json::to_string(summary)?,
+            },
+        )?;
+        Ok(())
     }
 
     pub async fn get_business_application_servers(
@@ -2711,6 +3532,63 @@ impl SnowCore {
         params: BusinessApplicationServersParams,
     ) -> Result<Option<BusinessApplicationServersResult>> {
         self.business_application_servers(params).await
+    }
+
+    fn business_application_relationship_health_status(
+        summary: &BusinessApplicationServersSummary,
+    ) -> &'static str {
+        if summary.depth_limit_reached {
+            "depth_limited"
+        } else if summary.edge_limit_reached {
+            "edge_budget_exhausted"
+        } else if summary.ci_limit_reached {
+            "ci_budget_exhausted"
+        } else if summary.relationship_acl_restricted_count > 0 {
+            "acl_restricted"
+        } else if summary.truncated {
+            "truncated"
+        } else {
+            "ok"
+        }
+    }
+
+    fn business_application_service_membership_health_status(
+        summary: &BusinessApplicationServersSummary,
+    ) -> String {
+        if let Some(status) = summary.service_membership_status.as_deref() {
+            return match status {
+                "ok" => "ok",
+                "acl_restricted" => "acl_restricted",
+                "association_budget_exhausted" => "association_budget_exhausted",
+                "page_budget_exhausted" => "page_budget_exhausted",
+                "not_attempted" => "not_attempted",
+                _ => "not_attempted",
+            }
+            .to_string();
+        }
+        if summary.service_membership_association_limit_reached {
+            "association_budget_exhausted".to_string()
+        } else if summary.service_membership_page_limit_reached {
+            "page_budget_exhausted".to_string()
+        } else {
+            "not_attempted".to_string()
+        }
+    }
+
+    fn business_application_inventory_health_status(
+        relationship_status: &str,
+        service_membership_status: &str,
+        summary: &BusinessApplicationServersSummary,
+    ) -> &'static str {
+        if summary.truncated {
+            "truncated"
+        } else if relationship_status != "ok" {
+            "relationship_degraded"
+        } else if !matches!(service_membership_status, "ok" | "not_attempted") {
+            "service_membership_degraded"
+        } else {
+            "complete"
+        }
     }
 
     /// Resolve the relationship-type allowlist used to filter `cmdb_rel_ci`
@@ -2921,6 +3799,7 @@ impl SnowCore {
     ) -> usize {
         if read.acl_restricted {
             summary.acl_restricted_count += 1;
+            summary.relationship_acl_restricted_count += 1;
             push_business_application_server_diagnostic(
                 summary,
                 diagnostics,
@@ -3004,7 +3883,7 @@ impl SnowCore {
             let page = match paginator.next_page().await {
                 Ok(Some(page)) => page,
                 Ok(None) => break,
-                Err(SnowApiError::Api { status, .. }) if status == 401 || status == 403 => {
+                Err(err) if is_servicenow_acl_error(&err) => {
                     read.acl_restricted = true;
                     return Ok(read);
                 }
@@ -3018,6 +3897,245 @@ impl SnowCore {
             if over_budget {
                 rows.truncate(room);
                 read.edge_limit_reached = true;
+            }
+            collected += rows.len();
+            read.records.extend(rows);
+            if over_budget {
+                break;
+            }
+        }
+        Ok(read)
+    }
+
+    async fn business_application_service_membership_servers(
+        &self,
+        service_sys_ids: &HashSet<String>,
+        service_paths_by_ci: &HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>>,
+        options: &BusinessApplicationServersOptions,
+        summary: &mut BusinessApplicationServersSummary,
+        diagnostics: &mut Vec<ReferenceResolutionDiagnostic>,
+        server_class_cache: &mut HashMap<String, bool>,
+    ) -> Result<Vec<(Server, Vec<BusinessApplicationServerPath>)>> {
+        if service_sys_ids.is_empty() {
+            summary.service_membership_status = Some("not_attempted".to_string());
+            return Ok(Vec::new());
+        }
+
+        let read = self
+            .business_application_service_membership_read(service_sys_ids, options)
+            .await?;
+        summary.service_membership_pages_examined += read.pages_examined;
+        if read.acl_restricted {
+            summary.acl_restricted_count += 1;
+            summary.service_membership_status = Some("acl_restricted".to_string());
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                "svc_ci_assoc",
+                SVC_CI_ASSOC_TABLE,
+                "",
+                ReferenceResolutionReason::ReferenceAclRestricted,
+                "ACL restricted svc_ci_assoc service membership read",
+            );
+            return Ok(Vec::new());
+        }
+        if read.association_limit_reached {
+            summary.service_membership_association_limit_reached = true;
+            summary.mark_truncated(1);
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                "svc_ci_assoc",
+                SVC_CI_ASSOC_TABLE,
+                "",
+                ReferenceResolutionReason::FanoutLimitExceeded,
+                "max_service_membership_associations prevented reading more associations",
+            );
+        }
+        if read.page_limit_reached {
+            summary.service_membership_page_limit_reached = true;
+            summary.mark_truncated(1);
+            push_business_application_server_diagnostic(
+                summary,
+                diagnostics,
+                "svc_ci_assoc",
+                SVC_CI_ASSOC_TABLE,
+                "",
+                ReferenceResolutionReason::FanoutLimitExceeded,
+                "max_service_membership_pages prevented reading more association pages",
+            );
+        }
+        summary.service_membership_associations_examined += read.records.len();
+
+        let mut server_ids = Vec::new();
+        let mut server_paths_by_sys_id: BTreeMap<String, Vec<BusinessApplicationServerPath>> =
+            BTreeMap::new();
+        let mut examined_member_cis = HashSet::new();
+        for record in read.records {
+            let Some(service_sys_id) = servicenow_reference_sys_id(&record, "service_id") else {
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    "service_id",
+                    SVC_CI_ASSOC_TABLE,
+                    "",
+                    ReferenceResolutionReason::ReferenceResolutionFailed,
+                    "svc_ci_assoc row was missing a readable service_id reference",
+                );
+                continue;
+            };
+            let Some(ci_sys_id) = servicenow_reference_sys_id(&record, "ci_id") else {
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    "ci_id",
+                    SVC_CI_ASSOC_TABLE,
+                    "",
+                    ReferenceResolutionReason::ReferenceResolutionFailed,
+                    "svc_ci_assoc row was missing a readable ci_id reference",
+                );
+                continue;
+            };
+            if examined_member_cis.insert(ci_sys_id.clone()) {
+                if summary.cis_examined.saturating_sub(1) >= options.max_cis {
+                    summary.ci_limit_reached = true;
+                    summary.mark_truncated(1);
+                    push_business_application_server_diagnostic(
+                        summary,
+                        diagnostics,
+                        "ci_id",
+                        SVC_CI_ASSOC_TABLE,
+                        &ci_sys_id,
+                        ReferenceResolutionReason::FanoutLimitExceeded,
+                        "max_cis prevented examining another service member CI",
+                    );
+                    continue;
+                }
+                summary.cis_examined += 1;
+            }
+
+            let Some(class_name) = servicenow_record_text(&record, "ci_id.sys_class_name") else {
+                summary.missing_ci_count += 1;
+                push_business_application_server_diagnostic(
+                    summary,
+                    diagnostics,
+                    "ci_id.sys_class_name",
+                    SVC_CI_ASSOC_TABLE,
+                    &ci_sys_id,
+                    ReferenceResolutionReason::ReferenceResolutionFailed,
+                    "svc_ci_assoc member CI class could not be read",
+                );
+                continue;
+            };
+            let is_server = self
+                .business_application_class_is_server(
+                    &class_name,
+                    server_class_cache,
+                    summary,
+                    diagnostics,
+                )
+                .await?;
+            if !is_server {
+                continue;
+            }
+            if !server_ids.contains(&ci_sys_id) {
+                server_ids.push(ci_sys_id.clone());
+            }
+            server_paths_by_sys_id
+                .entry(ci_sys_id.clone())
+                .or_default()
+                .extend(business_application_service_membership_paths_for(
+                    service_paths_by_ci,
+                    &service_sys_id,
+                    &ci_sys_id,
+                ));
+        }
+
+        let servers = self
+            .business_application_hydrate_servers(&server_ids, summary, diagnostics)
+            .await?;
+        if summary.service_membership_status.is_none() {
+            if summary.service_membership_association_limit_reached {
+                summary.service_membership_status =
+                    Some("association_budget_exhausted".to_string());
+            } else if summary.service_membership_page_limit_reached {
+                summary.service_membership_status = Some("page_budget_exhausted".to_string());
+            } else {
+                summary.service_membership_status = Some("ok".to_string());
+            }
+        }
+
+        Ok(servers
+            .into_iter()
+            .map(|server| {
+                let paths = server_paths_by_sys_id
+                    .remove(&server.record.sys_id)
+                    .unwrap_or_default();
+                (server, paths)
+            })
+            .collect())
+    }
+
+    async fn business_application_service_membership_read(
+        &self,
+        service_sys_ids: &HashSet<String>,
+        options: &BusinessApplicationServersOptions,
+    ) -> Result<BusinessApplicationServiceMembershipRead> {
+        let mut read = BusinessApplicationServiceMembershipRead::new();
+        if service_sys_ids.is_empty() {
+            return Ok(read);
+        }
+
+        let mut service_refs = service_sys_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        service_refs.sort_unstable();
+        let page_size = BUSINESS_APPLICATION_SERVICE_MEMBERSHIP_PAGE_SIZE
+            .min(options.max_service_membership_associations.max(1));
+        let mut paginator = self
+            .client
+            .table(SVC_CI_ASSOC_TABLE)
+            .in_list("service_id", &service_refs)
+            .fields(BUSINESS_APPLICATION_SERVICE_MEMBERSHIP_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(page_size as u32)
+            .paginate()?;
+
+        let mut collected = 0usize;
+        loop {
+            if collected >= options.max_service_membership_associations {
+                if !paginator.is_done() {
+                    read.association_limit_reached = true;
+                }
+                break;
+            }
+            if read.pages_examined >= options.max_service_membership_pages {
+                if !paginator.is_done() {
+                    read.page_limit_reached = true;
+                }
+                break;
+            }
+            let page = match paginator.next_page().await {
+                Ok(Some(page)) => page,
+                Ok(None) => break,
+                Err(err) if is_servicenow_acl_error(&err) => {
+                    read.acl_restricted = true;
+                    return Ok(read);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            read.pages_examined += 1;
+            let mut rows = page.records;
+            let room = options
+                .max_service_membership_associations
+                .saturating_sub(collected);
+            let over_budget = rows.len() > room;
+            if over_budget {
+                rows.truncate(room);
+                read.association_limit_reached = true;
             }
             collected += rows.len();
             read.records.extend(rows);
@@ -3245,62 +4363,128 @@ impl SnowCore {
         Ok(servers)
     }
 
+    /// Force-live exact server fetch, persisting the hit to the local cache.
+    ///
+    /// Back-compat wrapper around [`SnowCore::get_server_live`] with
+    /// `persist = true`; flattens the structured [`ServerGetError`] into the
+    /// crate's `anyhow` error so existing callers (the daemon
+    /// `server_get_fresh` RPC) keep their current signature. New read-through
+    /// callers that need to distinguish not-found / ACL / network / duplicate
+    /// should call [`SnowCore::get_server_live`] directly.
     pub async fn get_server_fresh(&self, lookup: ServerLookup) -> Result<Option<Server>> {
+        match self.get_server_live(lookup, true).await {
+            Ok(server) => Ok(server),
+            Err(ServerGetError::NotFound) => Ok(None),
+            Err(other) => Err(anyhow::anyhow!(other.to_string())),
+        }
+    }
+
+    /// Live, exact-match server fetch against `cmdb_ci_server` (base table, so
+    /// all server subclasses are returned transparently). This is the single
+    /// shared live code path behind the read-through `server_get`: the daemon /
+    /// CLI path calls it with `persist = true`, the MCP path with
+    /// `persist = false` (mutation-free MCP per the completion plan's Work
+    /// Package G boundary).
+    ///
+    /// Returns:
+    /// - `Ok(Some(server))` when ServiceNow returns exactly one matching CI.
+    /// - `Err(ServerGetError::NotFound)` only when ServiceNow confirms absence
+    ///   (HTTP 404 for a sys_id read, or an empty result set for a name / IP
+    ///   query). This is authoritative not-found.
+    /// - `Err(ServerGetError::AclRestricted)` on HTTP 401/403 — the CI may
+    ///   exist but the caller cannot read it; distinct from not-found.
+    /// - `Err(ServerGetError::Network)` on a transport/timeout failure — never
+    ///   conflated with not-found.
+    /// - `Err(ServerGetError::Disambiguation)` when more than one CI matches an
+    ///   exact name / IP selector (duplicate CIs in CMDB).
+    /// - `Err(ServerGetError::Hydration)` when a returned row cannot be parsed
+    ///   into the typed `Server` shape.
+    ///
+    /// When `persist` is `true` and a record is found, the raw record is written
+    /// to the local cache via [`SnowCore::persist_record`].
+    pub async fn get_server_live(
+        &self,
+        lookup: ServerLookup,
+        persist: bool,
+    ) -> std::result::Result<Option<Server>, ServerGetError> {
         let record = match lookup {
-            ServerLookup::SysId(sys_id) => match self
-                .client
-                .table(SERVER_TABLE)
-                .display_value(DisplayValue::Both)
-                .exclude_reference_link(true)
-                .get(&normalize_record_lookup_sys_id(&sys_id)?)
-                .await
-            {
-                Ok(record) => Some(record),
-                Err(SnowApiError::Api { status: 404, .. }) => None,
-                Err(err) => return Err(err.into()),
-            },
+            ServerLookup::SysId(sys_id) => {
+                let sys_id = normalize_record_lookup_sys_id(&sys_id)
+                    .map_err(|err| ServerGetError::Other(err.to_string()))?;
+                match self
+                    .client
+                    .table(SERVER_TABLE)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .get(&sys_id)
+                    .await
+                {
+                    Ok(record) => Some(record),
+                    Err(SnowApiError::Api { status: 404, .. }) => None,
+                    Err(err) => return Err(ServerGetError::from_api(err)),
+                }
+            }
             ServerLookup::ExactName(name) => {
-                let name = non_empty_owned(Some(&name))
-                    .ok_or_else(|| anyhow::anyhow!("server name cannot be empty"))?;
-                let records = self
-                    .server_base_query(ServerSearchParams {
-                        limit: Some(2),
-                        ..Default::default()
-                    })?
-                    .equals("name", &name)
-                    .execute()
-                    .await?
-                    .records;
+                let name = non_empty_owned(Some(&name)).ok_or_else(|| {
+                    ServerGetError::Other("server name cannot be empty".to_string())
+                })?;
+                let records = self.server_exact_query("name", &name).await?;
                 if records.len() > 1 {
-                    anyhow::bail!("multiple servers matched name={name}");
+                    return Err(ServerGetError::Disambiguation {
+                        selector: format!("name={name}"),
+                        matched: records.len(),
+                    });
                 }
                 records.into_iter().next()
             }
             ServerLookup::IpAddress(ip_address) => {
-                let ip_address = non_empty_owned(Some(&ip_address))
-                    .ok_or_else(|| anyhow::anyhow!("server IP address cannot be empty"))?;
-                let records = self
-                    .server_base_query(ServerSearchParams {
-                        limit: Some(2),
-                        ..Default::default()
-                    })?
-                    .equals("ip_address", &ip_address)
-                    .execute()
-                    .await?
-                    .records;
+                let ip_address = non_empty_owned(Some(&ip_address)).ok_or_else(|| {
+                    ServerGetError::Other("server IP address cannot be empty".to_string())
+                })?;
+                let records = self.server_exact_query("ip_address", &ip_address).await?;
                 if records.len() > 1 {
-                    anyhow::bail!("multiple servers matched ip_address={ip_address}");
+                    return Err(ServerGetError::Disambiguation {
+                        selector: format!("ip_address={ip_address}"),
+                        matched: records.len(),
+                    });
                 }
                 records.into_iter().next()
             }
         };
 
         let Some(record) = record else {
-            return Ok(None);
+            return Err(ServerGetError::NotFound);
         };
-        let server = Server::from_servicenow(&record)?;
-        self.persist_record(&record)?;
+        let server = Server::from_servicenow(&record)
+            .map_err(|err| ServerGetError::Hydration(err.to_string()))?;
+        if persist {
+            self.persist_record(&record)
+                .map_err(|err| ServerGetError::Other(err.to_string()))?;
+        }
         Ok(Some(server))
+    }
+
+    /// Issue a bounded exact-match (`field = value`) query against the base
+    /// `cmdb_ci_server` table for the read-through live fallback. `limit: 2` is
+    /// sufficient to detect duplicate-CI ambiguity without fetching the whole
+    /// set. Transport / ACL failures are classified into [`ServerGetError`].
+    async fn server_exact_query(
+        &self,
+        field: &str,
+        value: &str,
+    ) -> std::result::Result<Vec<Record>, ServerGetError> {
+        let query = self
+            .client
+            .table(SERVER_TABLE)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(2)
+            .order_by("name", Order::Asc)
+            .equals(field, value);
+        match query.execute().await {
+            Ok(result) => Ok(result.records),
+            Err(err) => Err(ServerGetError::from_api(err)),
+        }
     }
 
     pub async fn search_servers(&self, params: ServerSearchParams) -> Result<Vec<SnowRecord>> {
@@ -3326,6 +4510,20 @@ impl SnowCore {
 
     pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
         self.query.query_servers(query).await
+    }
+
+    pub async fn business_application_servers_cached(
+        &self,
+        params: BusinessApplicationServersCachedParams,
+    ) -> Result<Option<BusinessApplicationServersCachedResult>> {
+        self.query.business_application_servers_cached(params).await
+    }
+
+    pub async fn business_applications_for_server(
+        &self,
+        params: BusinessApplicationsForServerParams,
+    ) -> Result<Option<BusinessApplicationsForServerResult>> {
+        self.query.business_applications_for_server(params).await
     }
 
     fn server_base_query(&self, params: ServerSearchParams) -> Result<TableApi> {
@@ -5118,14 +6316,51 @@ impl SnowCore {
     }
 
     pub async fn my_approvals_fresh(&self) -> Result<Vec<ApprovalRecord>> {
+        Ok(self.my_approvals_with_routing_fresh().await?.records)
+    }
+
+    pub async fn my_approvals_with_routing_fresh(&self) -> Result<ListMyApprovalsResponse> {
         let user_sys_id = self.current_user_sys_id().await?;
-        self.hydrate_pending_approvals(&user_sys_id).await?;
-        let mut approvals = self
-            .query
-            .approvals(ApprovalQuery::pending().approver_sys_id(user_sys_id))
-            .await?;
-        approvals.sort_by(|left, right| left.target.number.cmp(&right.target.number));
-        Ok(approvals)
+        let direct_rows = self
+            .pending_approval_rows_for_approver(&user_sys_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("direct approval query failure: {err}"))?;
+        let group_memberships = self
+            .approval_group_memberships_for_user(&user_sys_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("group membership lookup failure: {err}"))?;
+
+        let mut group_refs = group_memberships
+            .iter()
+            .map(|group| group.sys_id.as_str())
+            .collect::<Vec<_>>();
+        group_refs.sort_unstable();
+
+        let mut group_rows = Vec::new();
+        let mut group_query_batches = 0usize;
+        for batch in group_refs.chunks(APPROVAL_GROUP_IN_BATCH_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            group_query_batches += 1;
+            let mut rows = self
+                .pending_approval_rows_for_groups(batch)
+                .await
+                .map_err(|err| anyhow::anyhow!("group approval query failure: {err}"))?;
+            group_rows.append(&mut rows);
+        }
+
+        let summary = ApprovalQuerySummary {
+            direct_approvals_found: direct_rows.len(),
+            group_approvals_found: group_rows.len(),
+            caller_group_memberships_resolved: group_memberships.len(),
+            group_query_batches,
+            ..ApprovalQuerySummary::default()
+        };
+
+        self.persist_records(&direct_rows)?;
+
+        self.materialize_my_approvals_response(direct_rows, group_rows, group_memberships, summary)
     }
 
     pub async fn my_approvals(&self) -> Result<Vec<ApprovalRecord>> {
@@ -5854,6 +7089,15 @@ impl SnowCore {
         self.get_record_fresh(number).await
     }
 
+    pub async fn approve_approval(
+        &self,
+        approval_sys_id: &str,
+        comment: Option<&str>,
+    ) -> Result<Option<SnowRecord>> {
+        self.update_approval_row_state(approval_sys_id, "approved", comment)
+            .await
+    }
+
     pub async fn reject(&self, number: &str, reason: &str) -> Result<Option<SnowRecord>> {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
@@ -5865,6 +7109,15 @@ impl SnowCore {
             .execute()
             .await?;
         self.get_record_fresh(number).await
+    }
+
+    pub async fn reject_approval(
+        &self,
+        approval_sys_id: &str,
+        reason: &str,
+    ) -> Result<Option<SnowRecord>> {
+        self.update_approval_row_state(approval_sys_id, "rejected", Some(reason))
+            .await
     }
 
     pub fn browser_url(&self, number: &str) -> String {
@@ -5977,6 +7230,59 @@ impl SnowCore {
             }
         }
         Ok(())
+    }
+
+    fn persist_snow_records(&self, records: &[SnowRecord]) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let mut entries = Vec::with_capacity(records.len());
+        let mut persisted_docs = Vec::with_capacity(records.len());
+
+        for record in records {
+            self.cache.invalidate(&record.number);
+            let document = VaultDocument::Record(record.clone());
+            let persisted = self.persist_runtime_document(&document)?;
+            let row = record_row_from_runtime_record(
+                record,
+                Some(persisted.relative_path.clone()),
+                serialize_vault_document(&document).to_string(),
+            );
+            let content = document_content(&document);
+            let tag_tokens = document_tag_tokens(&document);
+            let work_notes = document_work_notes(record);
+            entries.push((row, work_notes, content, tag_tokens));
+            persisted_docs.push(persisted);
+        }
+
+        let batch: Vec<(&RecordRow, &str, &str, &str)> = entries
+            .iter()
+            .map(|(row, work_notes, content, tag_tokens)| {
+                (
+                    row,
+                    work_notes.as_str(),
+                    content.as_str(),
+                    tag_tokens.as_str(),
+                )
+            })
+            .collect();
+        self.query
+            .store()
+            .upsert_records(&batch)
+            .map_err(anyhow::Error::from)?;
+
+        for persisted in &persisted_docs {
+            let document = &persisted.document;
+            self.cache.put(document.record().clone());
+            if let Err(err) = self.project_runtime_document(document) {
+                eprintln!("snow_core: projection refresh failed: {err}");
+            }
+            if let Err(err) = self.persist_enrichment(document.record()) {
+                eprintln!("snow_core: enrichment refresh failed: {err}");
+            }
+        }
+        Ok(records.len())
     }
 
     fn record_kb_local_file_state(&self, persisted: &PersistedRuntimeDocument) -> Result<()> {
@@ -6564,38 +7870,300 @@ impl SnowCore {
         })
     }
 
-    async fn hydrate_pending_approvals(&self, user_sys_id: &str) -> Result<()> {
-        let records = self
+    async fn pending_approval_rows_for_approver(
+        &self,
+        approver_sys_id: &str,
+    ) -> Result<Vec<Record>> {
+        let mut paginator = self
             .client
             .table("sysapproval_approver")
-            .equals("approver", user_sys_id)
+            .equals("approver", approver_sys_id)
             .equals("state", "requested")
-            .fields(&[
-                "sys_id",
-                "number",
-                "state",
-                "approver",
-                "source_table",
-                "sysapproval",
-                "document_id",
-                "due_date",
-                "sys_created_on",
-            ])
-            .dot_walk(&[
-                "sysapproval.number",
-                "sysapproval.short_description",
-                "sysapproval.state",
-                "sysapproval.sys_class_name",
-            ])
+            .fields(APPROVAL_LIST_FIELDS)
+            .dot_walk(APPROVAL_LIST_DOT_WALK)
             .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
             .order_by("sys_created_on", Order::Desc)
-            .limit(200)
-            .execute()
-            .await?
-            .records;
+            .limit(APPROVAL_QUERY_PAGE_SIZE as u32)
+            .paginate()?;
+        let mut records = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            if pages >= APPROVAL_QUERY_MAX_PAGES {
+                if !paginator.is_done() {
+                    anyhow::bail!(
+                        "direct approval query truncated after {APPROVAL_QUERY_MAX_PAGES} pages"
+                    );
+                }
+                break;
+            }
+            let Some(page) = paginator.next_page().await? else {
+                break;
+            };
+            pages += 1;
+            records.extend(page.records);
+        }
+        Ok(records)
+    }
 
-        self.persist_records(&records)?;
-        Ok(())
+    async fn pending_approval_rows_for_groups(
+        &self,
+        group_sys_ids: &[&str],
+    ) -> Result<Vec<Record>> {
+        let mut paginator = self
+            .client
+            .table("sysapproval_approver")
+            .in_list("approver", group_sys_ids)
+            .equals("state", "requested")
+            .fields(APPROVAL_LIST_FIELDS)
+            .dot_walk(APPROVAL_LIST_DOT_WALK)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .order_by("sys_created_on", Order::Desc)
+            .limit(APPROVAL_QUERY_PAGE_SIZE as u32)
+            .paginate()?;
+        let mut records = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            if pages >= APPROVAL_QUERY_MAX_PAGES {
+                if !paginator.is_done() {
+                    anyhow::bail!(
+                        "group approval query truncated after {APPROVAL_QUERY_MAX_PAGES} pages"
+                    );
+                }
+                break;
+            }
+            let Some(page) = paginator.next_page().await? else {
+                break;
+            };
+            pages += 1;
+            records.extend(page.records);
+        }
+        Ok(records)
+    }
+
+    async fn approval_group_memberships_for_user(
+        &self,
+        user_sys_id: &str,
+    ) -> Result<Vec<Reference>> {
+        let mut paginator = self
+            .client
+            .table("sys_user_grmember")
+            .equals("user", user_sys_id)
+            .fields(APPROVAL_GROUP_MEMBERSHIP_FIELDS)
+            .dot_walk(APPROVAL_GROUP_MEMBERSHIP_DOT_WALK)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(APPROVAL_GROUP_MEMBERSHIP_PAGE_SIZE as u32)
+            .paginate()?;
+        let mut groups_by_sys_id = BTreeMap::new();
+        let mut pages = 0usize;
+        loop {
+            if pages >= APPROVAL_GROUP_MEMBERSHIP_MAX_PAGES {
+                if !paginator.is_done() {
+                    anyhow::bail!(
+                        "group membership lookup truncated after {APPROVAL_GROUP_MEMBERSHIP_MAX_PAGES} pages"
+                    );
+                }
+                break;
+            }
+            let Some(page) = paginator.next_page().await? else {
+                break;
+            };
+            pages += 1;
+            for record in page.records {
+                let group = approval_group_reference_from_membership(&record)?;
+                groups_by_sys_id
+                    .entry(group.sys_id.clone())
+                    .or_insert(group);
+            }
+        }
+        Ok(groups_by_sys_id.into_values().collect())
+    }
+
+    async fn pending_approval_row_by_sys_id(
+        &self,
+        approval_sys_id: &str,
+    ) -> Result<Option<Record>> {
+        let approval_sys_id = normalize_record_lookup_sys_id(approval_sys_id)?;
+        self.client
+            .table("sysapproval_approver")
+            .equals("sys_id", &approval_sys_id)
+            .fields(APPROVAL_LIST_FIELDS)
+            .dot_walk(APPROVAL_LIST_DOT_WALK)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(1)
+            .first()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    async fn update_approval_row_state(
+        &self,
+        approval_sys_id: &str,
+        state: &str,
+        comment: Option<&str>,
+    ) -> Result<Option<SnowRecord>> {
+        let approval_sys_id = normalize_record_lookup_sys_id(approval_sys_id)?;
+        let Some(approval_row) = self
+            .pending_approval_row_by_sys_id(&approval_sys_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let target = self
+            .authorize_approval_row_for_current_user(&approval_row)
+            .await?;
+
+        let mut body = serde_json::json!({ "state": state });
+        if let Some(comment) = comment {
+            body["comments"] = serde_json::json!(comment);
+        }
+        let updated = self
+            .client
+            .table("sysapproval_approver")
+            .display_value(DisplayValue::Both)
+            .fields(APPROVAL_LIST_FIELDS)
+            .update(&approval_sys_id, body)
+            .await?;
+        self.persist_record(&updated)?;
+
+        if !target.sys_id.trim().is_empty()
+            && let Ok(table) = normalize_record_lookup_table(&target.table)
+            && let Ok(record) = self
+                .get_record_by_table_sys_id_fresh(&table, &target.sys_id)
+                .await
+        {
+            return Ok(record);
+        }
+        if !target.number.trim().is_empty() {
+            return self.get_record_fresh(&target.number).await;
+        }
+        Ok(None)
+    }
+
+    async fn authorize_approval_row_for_current_user(&self, record: &Record) -> Result<RecordRef> {
+        let state = servicenow_record_raw_text(record, "state")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if state != "requested" {
+            anyhow::bail!(
+                "approval row {} is not pending; current state is {state}",
+                record.sys_id
+            );
+        }
+
+        let approver_sys_id = servicenow_reference_sys_id(record, "approver").ok_or_else(|| {
+            anyhow::anyhow!(
+                "approval row {} is missing a readable approver reference",
+                record.sys_id
+            )
+        })?;
+        let user_sys_id = self.current_user_sys_id().await?;
+        if approver_sys_id == user_sys_id {
+            let approver =
+                ApprovalResource::approver_reference(record).unwrap_or_else(|| Reference {
+                    sys_id: user_sys_id,
+                    table: "sys_user".to_string(),
+                    display_name: servicenow_record_text(record, "approver")
+                        .unwrap_or_else(|| approver_sys_id.clone()),
+                    extra: HashMap::new(),
+                });
+            return Ok(ApprovalResource::from_servicenow_with_routing(
+                record,
+                approver,
+                ApprovalRoutedVia::Direct,
+                None,
+            )
+            .target);
+        }
+
+        let group_memberships = self
+            .approval_group_memberships_for_user(&user_sys_id)
+            .await?;
+        let groups_by_sys_id = group_memberships
+            .into_iter()
+            .map(|group| (group.sys_id.clone(), group))
+            .collect::<HashMap<_, _>>();
+        if groups_by_sys_id.contains_key(&approver_sys_id) {
+            let group = approval_group_reference_from_approval(record, &groups_by_sys_id)?;
+            return Ok(ApprovalResource::from_servicenow_with_routing(
+                record,
+                group.clone(),
+                ApprovalRoutedVia::Group,
+                Some(group),
+            )
+            .target);
+        }
+
+        anyhow::bail!(
+            "approval row {} is not assigned to the current user or one of their groups",
+            record.sys_id
+        );
+    }
+
+    fn materialize_my_approvals_response(
+        &self,
+        direct_rows: Vec<Record>,
+        group_rows: Vec<Record>,
+        group_memberships: Vec<Reference>,
+        mut query_summary: ApprovalQuerySummary,
+    ) -> Result<ListMyApprovalsResponse> {
+        let groups_by_sys_id = group_memberships
+            .into_iter()
+            .map(|group| (group.sys_id.clone(), group))
+            .collect::<HashMap<_, _>>();
+        let mut seen = HashSet::new();
+        let mut records = Vec::new();
+
+        for row in direct_rows {
+            if !seen.insert(row.sys_id.clone()) {
+                query_summary.deduplication_removed += 1;
+                continue;
+            }
+            let approver = ApprovalResource::approver_reference(&row).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "direct approval row {} is missing a readable approver reference",
+                    row.sys_id
+                )
+            })?;
+            records.push(ApprovalResource::from_servicenow_with_routing(
+                &row,
+                approver,
+                ApprovalRoutedVia::Direct,
+                None,
+            ));
+        }
+
+        for row in group_rows {
+            if !seen.insert(row.sys_id.clone()) {
+                query_summary.deduplication_removed += 1;
+                continue;
+            }
+            let group = approval_group_reference_from_approval(&row, &groups_by_sys_id)?;
+            records.push(ApprovalResource::from_servicenow_with_routing(
+                &row,
+                group.clone(),
+                ApprovalRoutedVia::Group,
+                Some(group),
+            ));
+        }
+
+        records.sort_by(|left, right| {
+            left.target
+                .number
+                .cmp(&right.target.number)
+                .then_with(|| left.record.number.cmp(&right.record.number))
+        });
+        query_summary.total_approvals = records.len();
+        Ok(ListMyApprovalsResponse {
+            records,
+            query_summary,
+        })
     }
 
     fn infer_table(&self, number: &str) -> String {
@@ -6933,8 +8501,15 @@ mod tests {
         BasicAuth, DisplayValue, Record, ServiceNowClient, parse_servicenow_timestamp,
     };
     use tempfile::TempDir;
-    use wiremock::matchers::{body_partial_json, method, path, query_param};
+    use wiremock::matchers::{body_partial_json, method, path, query_param, query_param_contains};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mock_server_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("mock server test lock")
+    }
 
     fn sample_change_task_record() -> Record {
         let json = serde_json::json!({
@@ -7192,6 +8767,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_search_builds_supported_filters() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/cmdb_ci_server"))
@@ -7291,6 +8867,350 @@ mod tests {
         );
     }
 
+    // ----- server_get read-through (live fallback) -----
+    //
+    // These exercise the shared live path behind the read-through `server_get`
+    // (`SnowCore::get_server_live`). All fixtures use RFC-5737 documentation IPs
+    // and placeholder sys_ids/hostnames only.
+
+    fn server_result_body(sys_id: &str, name: &str, ip: &str) -> serde_json::Value {
+        server_result_body_with_class(sys_id, name, ip, "cmdb_ci_linux_server")
+    }
+
+    fn server_result_body_with_class(
+        sys_id: &str,
+        name: &str,
+        ip: &str,
+        class_name: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "result": [{
+                "sys_id": sys_id,
+                "name": name,
+                "ip_address": ip,
+                "sys_class_name": class_name,
+                "operational_status": { "value": "1", "display_value": "Operational" }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_name_cache_miss_hit_persists_and_caches() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "cccccccccccccccccccccccccccccccc";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_limit", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(server_result_body(
+                sys_id,
+                "host01.example.internal",
+                "192.0.2.20",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let found = core
+            .get_server_live(ServerLookup::exact_name("host01.example.internal"), true)
+            .await
+            .expect("live hit");
+        let found = found.expect("some server");
+        assert_eq!(found.record.sys_id, sys_id);
+
+        // Persisted to cache: a subsequent cached query resolves it locally.
+        let cached = core
+            .query_servers(ServerQuery {
+                name: Some("host01".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached query");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].sys_id, sys_id);
+        assert!(
+            tempdir
+                .path()
+                .join("vault/servers")
+                .read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_name_queries_base_table_without_leaf_class_filter() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "cacacacacacacacacacacacacacacaca";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_limit", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(server_result_body_with_class(
+                    sys_id,
+                    "esx01.example.internal",
+                    "192.0.2.24",
+                    "cmdb_ci_esx_server",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let found = core
+            .get_server_live(ServerLookup::exact_name("esx01.example.internal"), false)
+            .await
+            .expect("live hit")
+            .expect("some server");
+        assert_eq!(found.record.sys_id, sys_id);
+        assert_eq!(found.class_name.as_deref(), Some("cmdb_ci_esx_server"));
+
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/now/table/cmdb_ci_server")
+            .expect("server request");
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let sysparm_query = query
+            .get("sysparm_query")
+            .map(|value| value.as_ref())
+            .expect("sysparm_query");
+        assert_eq!(sysparm_query, "name=esx01.example.internal^ORDERBYname");
+        assert!(!sysparm_query.contains("sys_class_name"));
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_sys_id_cache_miss_hit() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "dddddddddddddddddddddddddddddddd";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/cmdb_ci_server/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "name": "host02.example.internal",
+                    "ip_address": "192.0.2.21",
+                    "sys_class_name": "cmdb_ci_linux_server",
+                    "operational_status": { "value": "1", "display_value": "Operational" }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let found = core
+            .get_server_live(ServerLookup::sys_id(sys_id).expect("sys_id"), true)
+            .await
+            .expect("live hit")
+            .expect("some server");
+        assert_eq!(found.record.sys_id, sys_id);
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_ip_cache_miss_hit() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_limit", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(server_result_body(
+                sys_id,
+                "host03.example.internal",
+                "192.0.2.22",
+            )))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let found = core
+            .get_server_live(ServerLookup::ip_address("192.0.2.22"), true)
+            .await
+            .expect("live hit")
+            .expect("some server");
+        assert_eq!(found.record.sys_id, sys_id);
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_name_empty_result_is_not_found() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "result": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let err = core
+            .get_server_live(ServerLookup::exact_name("ghost.example.internal"), true)
+            .await
+            .expect_err("not found");
+        assert_eq!(err, ServerGetError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn server_get_live_by_sys_id_404_is_not_found() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "ffffffffffffffffffffffffffffffff";
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/cmdb_ci_server/{sys_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": { "message": "No record found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let err = core
+            .get_server_live(ServerLookup::sys_id(sys_id).expect("sys_id"), true)
+            .await
+            .expect_err("not found");
+        assert_eq!(err, ServerGetError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn server_get_live_acl_403_is_acl_restricted_not_not_found() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "message": "Insufficient rights" }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let err = core
+            .get_server_live(ServerLookup::exact_name("locked.example.internal"), true)
+            .await
+            .expect_err("acl");
+        assert!(
+            matches!(err, ServerGetError::AclRestricted(_)),
+            "expected AclRestricted, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_get_live_network_failure_is_network_not_not_found() {
+        let _guard = mock_server_test_lock();
+        // Point at an address that refuses connections (127.0.0.1:1 is the
+        // reserved tcpmux port, effectively always closed for our purposes) so
+        // the transport call fails at the connection layer -> network error,
+        // never a not-found.
+        let client = ServiceNowClient::builder()
+            .instance("http://127.0.0.1:1")
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = SnowCore::builder()
+            .client(client)
+            .vault_path(tempdir.path().join("vault"))
+            .build()
+            .await
+            .expect("core");
+
+        let err = core
+            .get_server_live(ServerLookup::exact_name("host04.example.internal"), true)
+            .await
+            .expect_err("network");
+        assert!(
+            matches!(err, ServerGetError::Network(_)),
+            "expected Network, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_get_live_duplicate_name_is_disambiguation() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "sys_id": "11111111111111111111111111111111",
+                        "name": "dup.example.internal",
+                        "sys_class_name": "cmdb_ci_linux_server"
+                    },
+                    {
+                        "sys_id": "22222222222222222222222222222222",
+                        "name": "dup.example.internal",
+                        "sys_class_name": "cmdb_ci_win_server"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let err = core
+            .get_server_live(ServerLookup::exact_name("dup.example.internal"), true)
+            .await
+            .expect_err("disambiguation");
+        match err {
+            ServerGetError::Disambiguation { selector, matched } => {
+                assert_eq!(selector, "name=dup.example.internal");
+                assert_eq!(matched, 2);
+            }
+            other => panic!("expected Disambiguation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_get_live_no_persist_does_not_write_cache() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let sys_id = "99999999999999999999999999999999";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(server_result_body(
+                sys_id,
+                "host05.example.internal",
+                "192.0.2.30",
+            )))
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let found = core
+            .get_server_live(ServerLookup::exact_name("host05.example.internal"), false)
+            .await
+            .expect("live hit")
+            .expect("some server");
+        assert_eq!(found.record.sys_id, sys_id);
+
+        // persist = false: nothing written to the local cache.
+        let servers_dir = tempdir.path().join("vault/servers");
+        let has_entries = servers_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        assert!(!has_entries, "MCP no-persist path must not write the cache");
+        let cached = core
+            .query_servers(ServerQuery {
+                name: Some("host05".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached query");
+        assert!(cached.is_empty(), "no-persist record must not be cached");
+    }
+
     #[tokio::test]
     async fn user_search_builds_live_first_and_last_name_filters() {
         let server = MockServer::start().await;
@@ -7299,11 +9219,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [{
                     "sys_id": "fedcba9876543210fedcba9876543210",
-                    "user_name": "JXJ1234",
-                    "name": "Jared Jennings",
-                    "first_name": "Jared",
-                    "last_name": "Jennings",
-                    "email": "jared.jennings@example.com",
+                    "user_name": "USER1234",
+                    "name": "Casey User",
+                    "first_name": "Casey",
+                    "last_name": "User",
+                    "email": "user@example.com",
                     "employee_number": "1234",
                     "active": "true",
                     "department": "IAM",
@@ -7317,8 +9237,8 @@ mod tests {
         let (core, _tempdir) = core_for_mock_server(&server).await;
         let users = core
             .search_users(UserSearch {
-                first_name: Some("Jared".to_string()),
-                last_name: Some("Jennings".to_string()),
+                first_name: Some("Casey".to_string()),
+                last_name: Some("User".to_string()),
                 limit: Some(10),
                 ..Default::default()
             })
@@ -7326,13 +9246,13 @@ mod tests {
             .expect("users");
 
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0].first_name.as_deref(), Some("Jared"));
-        assert_eq!(users[0].last_name.as_deref(), Some("Jennings"));
+        assert_eq!(users[0].first_name.as_deref(), Some("Casey"));
+        assert_eq!(users[0].last_name.as_deref(), Some("User"));
 
         let cached_users = core
             .search_users(UserSearch {
-                first_name: Some("Jared".to_string()),
-                last_name: Some("Jennings".to_string()),
+                first_name: Some("Casey".to_string()),
+                last_name: Some("User".to_string()),
                 limit: Some(10),
                 ..Default::default()
             })
@@ -7353,7 +9273,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(
             query.get("sysparm_query").map(|value| value.as_ref()),
-            Some("active=true^first_name=Jared^last_name=Jennings^ORDERBYname")
+            Some("active=true^first_name=Casey^last_name=User^ORDERBYname")
         );
         assert_eq!(
             query.get("sysparm_limit").map(|value| value.as_ref()),
@@ -7567,8 +9487,51 @@ mod tests {
         assert!(err.contains("at most 4"));
     }
 
+    #[test]
+    fn business_application_server_path_chains_reject_mixed_directions() {
+        let root = "11111111111111111111111111111111";
+        let middle = "22222222222222222222222222222222";
+        let leaf = "33333333333333333333333333333333";
+        let rel_type = BusinessApplicationRelationshipType {
+            value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            display_value: Some("Depends on::Used by".to_string()),
+        };
+        let mut paths_by_ci: HashMap<String, Vec<Vec<BusinessApplicationServerPathEdge>>> =
+            HashMap::from([(root.to_string(), vec![Vec::new()])]);
+
+        assert!(extend_path_chains(
+            &mut paths_by_ci,
+            root,
+            middle,
+            BusinessApplicationServerPathEdge {
+                depth: 1,
+                parent_sys_id: root.to_string(),
+                child_sys_id: middle.to_string(),
+                direction: BusinessApplicationRelationshipDirection::ParentToChild,
+                relationship_type: rel_type.clone(),
+                edge_source: BusinessApplicationServerPathEdgeSource::Relationship,
+            },
+        ));
+
+        assert!(!extend_path_chains(
+            &mut paths_by_ci,
+            middle,
+            leaf,
+            BusinessApplicationServerPathEdge {
+                depth: 2,
+                parent_sys_id: leaf.to_string(),
+                child_sys_id: middle.to_string(),
+                direction: BusinessApplicationRelationshipDirection::ChildToParent,
+                relationship_type: rel_type,
+                edge_source: BusinessApplicationServerPathEdgeSource::Relationship,
+            },
+        ));
+        assert!(!paths_by_ci.contains_key(leaf));
+    }
+
     #[tokio::test]
     async fn business_application_servers_batches_bfs_levels_and_hydrates_servers() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -7675,6 +9638,7 @@ mod tests {
             .business_application_servers(BusinessApplicationServersParams {
                 number: Some("APM0000001".to_string()),
                 include_paths: true,
+                persist: Some(true),
                 ..Default::default()
             })
             .await
@@ -7686,6 +9650,9 @@ mod tests {
         assert_eq!(result.relationship_summary.relationships_examined, 4);
         assert_eq!(result.relationship_summary.cis_examined, 5);
         assert_eq!(result.relationship_summary.servers_found, 2);
+        assert_eq!(result.relationship_summary.persisted_servers, 2);
+        assert_eq!(result.relationship_summary.membership_upserts, 2);
+        assert_eq!(result.relationship_summary.membership_pruned, 0);
         assert!(!result.relationship_summary.truncated);
         assert_eq!(result.server_paths[linux][0].edges.len(), 1);
         assert_eq!(result.server_paths[windows][0].edges.len(), 2);
@@ -7699,6 +9666,66 @@ mod tests {
         assert!(!serialized.contains(rel_row_2));
         assert!(!serialized.contains(rel_row_3));
         assert!(!serialized.contains(rel_row_4));
+
+        let cached_forward = core
+            .business_application_servers_cached(BusinessApplicationServersCachedParams {
+                sys_id: Some(app.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached forward lookup")
+            .expect("business application cached");
+        assert_eq!(cached_forward.business_application.sys_id, app);
+        assert_eq!(cached_forward.servers.len(), 2);
+        assert_eq!(cached_forward.servers[0].server.sys_id, linux);
+        assert_eq!(cached_forward.servers[0].provenance, "relationship");
+        assert_eq!(cached_forward.servers[0].min_depth, 1);
+        assert_eq!(cached_forward.servers[0].paths[0].depth(), 1);
+        assert_eq!(cached_forward.servers[1].server.sys_id, windows);
+        assert_eq!(cached_forward.servers[1].min_depth, 2);
+        assert_eq!(cached_forward.servers[1].paths[0].depth(), 2);
+        assert_eq!(
+            cached_forward.relationship_status,
+            RelationshipKnowledgeStatus::KnownRelationships
+        );
+        let forward_health = cached_forward
+            .inventory_health
+            .as_ref()
+            .expect("forward inventory health");
+        assert_eq!(forward_health.ba_sys_id, app);
+        assert_eq!(forward_health.service_membership_status, "not_attempted");
+        assert_eq!(forward_health.relationship_status, "ok");
+        assert_eq!(forward_health.inventory_status, "complete");
+
+        let cached_reverse = core
+            .business_applications_for_server(BusinessApplicationsForServerParams {
+                name: Some("linux-alpha.example.com".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached reverse lookup")
+            .expect("server cached");
+        assert_eq!(cached_reverse.servers.len(), 1);
+        assert_eq!(cached_reverse.servers[0].server.sys_id, linux);
+        assert_eq!(cached_reverse.servers[0].business_applications.len(), 1);
+        assert_eq!(
+            cached_reverse.servers[0].business_applications[0]
+                .business_application
+                .sys_id,
+            app
+        );
+        assert_eq!(
+            cached_reverse.servers[0].relationship_status,
+            RelationshipKnowledgeStatus::KnownRelationships
+        );
+        assert_eq!(
+            cached_reverse.servers[0].business_applications[0]
+                .inventory_health
+                .as_ref()
+                .expect("reverse inventory health")
+                .inventory_status,
+            "complete"
+        );
 
         let requests = server.received_requests().await.expect("requests");
         let relationship_queries = requests
@@ -7730,6 +9757,7 @@ mod tests {
     /// result. The second discovery is an alternate forward path, not a cycle.
     #[tokio::test]
     async fn business_application_servers_records_diamond_alternate_paths() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let branch_a = "22222222222222222222222222222222";
@@ -7895,6 +9923,7 @@ mod tests {
     /// returned fewer rows than requested.
     #[tokio::test]
     async fn business_application_servers_edge_budget_paginates_and_truncates() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let ci_one = "22222222222222222222222222222222";
@@ -7963,6 +9992,7 @@ mod tests {
     /// exceed the shared budget, and that the merge order is deterministic.
     #[tokio::test]
     async fn business_application_servers_shared_edge_budget_splits_across_directions() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let ci_one = "22222222222222222222222222222222";
@@ -8043,6 +10073,7 @@ mod tests {
     /// caller asking for one CI is not silently short-changed to zero.
     #[tokio::test]
     async fn business_application_servers_reports_ci_limit_truncation() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -8161,6 +10192,7 @@ mod tests {
     /// subclass record would be filtered out server-side.
     #[tokio::test]
     async fn business_application_servers_collects_server_subclasses() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let esx = "66666666666666666666666666666666";
@@ -8253,6 +10285,7 @@ mod tests {
     /// the CI is collected/hydrated rather than traversed through.
     #[tokio::test]
     async fn business_application_servers_detects_custom_subclass_via_hierarchy() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let compute = "77777777777777777777777777777777";
@@ -8374,6 +10407,7 @@ mod tests {
     /// label set to sys_ids once via a `cmdb_rel_type` lookup and matches on those.
     #[tokio::test]
     async fn business_application_servers_default_types_match_by_resolved_identity() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let linux = "33333333333333333333333333333333";
@@ -8475,6 +10509,7 @@ mod tests {
     /// server collected, and no cmdb_rel_type resolution query is required.
     #[tokio::test]
     async fn business_application_servers_explicit_empty_types_match_all() {
+        let _guard = mock_server_test_lock();
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let linux = "33333333333333333333333333333333";
@@ -8547,8 +10582,15 @@ mod tests {
             max_depth: 2,
             max_cis: 500,
             max_edges: 2000,
+            max_service_membership_associations:
+                BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_ASSOCIATIONS,
+            max_service_membership_pages:
+                BUSINESS_APPLICATION_SERVERS_DEFAULT_MAX_SERVICE_MEMBERSHIP_PAGES,
             relationship_type: Vec::new(),
             include_paths: false,
+            fallback_strategy: FallbackStrategy::None,
+            persist: false,
+            prune_stale: false,
         };
         // defaults_when_empty = false => empty allowlist means "match all".
         let result = core
@@ -8562,6 +10604,949 @@ mod tests {
             1,
             "explicit empty allowlist must match all relationship types"
         );
+    }
+
+    fn service_membership_row(
+        sys_id: &str,
+        service_id: &str,
+        ci_id: &str,
+        ci_class_name: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": sys_id,
+            "service_id": {
+                "value": service_id,
+                "display_value": "Application Service"
+            },
+            "service_id.sys_class_name": "cmdb_ci_service",
+            "ci_id": {
+                "value": ci_id,
+                "display_value": "Server CI"
+            },
+            "ci_id.sys_class_name": ci_class_name
+        })
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_returns_service_membership_servers() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let linux = "33333333333333333333333333333333";
+        let consumes = "cccccccccccccccccccccccccccccccc";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        "99999999999999999999999999999991",
+                        app,
+                        service,
+                        consumes,
+                        "Consumes::Consumed by",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    )
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/svc_ci_assoc"))
+            .and(query_param(
+                "sysparm_query",
+                format!("service_idIN{service}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [service_membership_row(
+                    "88888888888888888888888888888881",
+                    service,
+                    linux,
+                    "cmdb_ci_linux_server"
+                )]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-service.example.com", "cmdb_ci_linux_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                include_paths: true,
+                persist: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(
+            result.server_provenance.get(linux),
+            Some(&BusinessApplicationServerProvenance::ServiceMembership)
+        );
+        let path = &result.server_paths[linux][0];
+        assert_eq!(path.depth(), 2);
+        assert_eq!(
+            path.edges.last().map(|edge| &edge.edge_source),
+            Some(&BusinessApplicationServerPathEdgeSource::ServiceMembership)
+        );
+        assert_eq!(
+            path.edges
+                .last()
+                .map(|edge| edge.relationship_type.value.as_str()),
+            Some("service_member_of")
+        );
+        assert_eq!(
+            result
+                .inventory_health
+                .as_ref()
+                .map(|health| health.service_membership_status.as_str()),
+            Some("ok")
+        );
+
+        let cached = core
+            .business_application_servers_cached(BusinessApplicationServersCachedParams {
+                sys_id: Some(app.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached forward lookup")
+            .expect("business application cached");
+        assert_eq!(cached.servers.len(), 1);
+        assert_eq!(cached.servers[0].provenance, "service_membership");
+        assert_eq!(cached.servers[0].min_depth, 2);
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_merges_relationship_and_service_membership_provenance() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let linux = "33333333333333333333333333333333";
+        let runs = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let consumes = "cccccccccccccccccccccccccccccccc";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        "99999999999999999999999999999991",
+                        app,
+                        linux,
+                        runs,
+                        "Runs on::Runs",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_linux_server"
+                    ),
+                    relationship_row_typed(
+                        "99999999999999999999999999999992",
+                        app,
+                        service,
+                        consumes,
+                        "Consumes::Consumed by",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    )
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/svc_ci_assoc"))
+            .and(query_param(
+                "sysparm_query",
+                format!("service_idIN{service}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [service_membership_row(
+                    "88888888888888888888888888888881",
+                    service,
+                    linux,
+                    "cmdb_ci_linux_server"
+                )]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-both.example.com", "cmdb_ci_linux_server")]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                include_paths: true,
+                persist: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(
+            result.server_provenance.get(linux),
+            Some(&BusinessApplicationServerProvenance::Both)
+        );
+        assert_eq!(result.server_paths[linux].len(), 2);
+
+        let cached = core
+            .business_application_servers_cached(BusinessApplicationServersCachedParams {
+                sys_id: Some(app.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached forward lookup")
+            .expect("business application cached");
+        assert_eq!(cached.servers.len(), 1);
+        assert_eq!(cached.servers[0].provenance, "both");
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_service_membership_acl_degrades_relationship_results() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let linux = "33333333333333333333333333333333";
+        let runs = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let consumes = "cccccccccccccccccccccccccccccccc";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        "99999999999999999999999999999991",
+                        app,
+                        linux,
+                        runs,
+                        "Runs on::Runs",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_linux_server"
+                    ),
+                    relationship_row_typed(
+                        "99999999999999999999999999999992",
+                        app,
+                        service,
+                        consumes,
+                        "Consumes::Consumed by",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    )
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/svc_ci_assoc"))
+            .and(query_param(
+                "sysparm_query",
+                format!("service_idIN{service}"),
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "message": "Forbidden" },
+                "status": "failure"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{linux}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(linux, "linux-acl.example.com", "cmdb_ci_linux_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                persist: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.servers.len(), 1);
+        let health = result.inventory_health.expect("inventory health");
+        assert_eq!(health.service_membership_status, "acl_restricted");
+        assert_eq!(health.relationship_status, "ok");
+        assert_eq!(health.inventory_status, "service_membership_degraded");
+    }
+
+    #[tokio::test]
+    async fn business_application_servers_service_membership_accepts_server_subclasses() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let app = "11111111111111111111111111111111";
+        let service = "22222222222222222222222222222222";
+        let esx = "66666666666666666666666666666666";
+        let consumes = "cccccccccccccccccccccccccccccccc";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": app,
+                    "number": "APM0000001",
+                    "name": "Application Alpha",
+                    "sys_class_name": "cmdb_ci_business_app"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("parentIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    relationship_row_typed(
+                        "99999999999999999999999999999991",
+                        app,
+                        service,
+                        consumes,
+                        "Consumes::Consumed by",
+                        "cmdb_ci_business_app",
+                        "cmdb_ci_service"
+                    )
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param("sysparm_query", format!("childIN{app}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/svc_ci_assoc"))
+            .and(query_param(
+                "sysparm_query",
+                format!("service_idIN{service}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [service_membership_row(
+                    "88888888888888888888888888888881",
+                    service,
+                    esx,
+                    "cmdb_ci_esx_server"
+                )]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{esx}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(esx, "esx-service.example.com", "cmdb_ci_esx_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("business application servers")
+            .expect("business application present");
+
+        assert_eq!(result.servers.len(), 1);
+        assert_eq!(result.servers[0].record.sys_id, esx);
+        assert_eq!(
+            result.server_provenance.get(esx),
+            Some(&BusinessApplicationServerProvenance::ServiceMembership)
+        );
+    }
+
+    // ---- ci_owner_group CMDB-gap fallback fixtures (Part 2) ----------------
+
+    const FALLBACK_APP: &str = "11111111111111111111111111111111";
+    const FALLBACK_GROUP: &str = "9999999999999999999999999999aaaa";
+    const FALLBACK_LINUX: &str = "33333333333333333333333333333333";
+    const FALLBACK_WINDOWS: &str = "44444444444444444444444444444444";
+
+    /// Mount a BA record with the RAW `u_ci_owner_group` field populated and a
+    /// present-but-empty `managed_by_group` alias — the live-data shape the
+    /// field-mapping requirement guards against.
+    async fn mount_fallback_ba(server: &MockServer, group_sys_id: Option<&str>) {
+        let mut record = serde_json::json!({
+            "sys_id": FALLBACK_APP,
+            "number": "APM0000001",
+            "name": "Application Alpha",
+            "sys_class_name": "cmdb_ci_business_app",
+            // The typed `ci_owner_group` alias maps here and is intentionally
+            // empty on live data; the fallback must NOT read it.
+            "managed_by_group": { "value": "", "display_value": "" }
+        });
+        if let Some(group_sys_id) = group_sys_id {
+            record.as_object_mut().unwrap().insert(
+                BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD.to_string(),
+                serde_json::json!({ "value": group_sys_id, "display_value": "Owner Group" }),
+            );
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_business_app"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_class_name=cmdb_ci_business_app^number=APM0000001",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [record]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount the two empty `cmdb_rel_ci` direction reads so the traversal finds 0
+    /// servers (default depth 2 only issues the depth-1 frontier reads).
+    async fn mount_empty_traversal(server: &MockServer) {
+        for direction in ["parent", "child"] {
+            Mock::given(method("GET"))
+                .and(path("/api/now/table/cmdb_rel_ci"))
+                .and(query_param(
+                    "sysparm_query",
+                    format!("{direction}IN{FALLBACK_APP}"),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "result": []
+                })))
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_returns_tagged_servers_when_traversal_empty() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!("{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    server_row(FALLBACK_LINUX, "linux-fallback.example.com", "cmdb_ci_linux_server"),
+                    server_row(FALLBACK_WINDOWS, "windows-fallback.example.com", "cmdb_ci_win_server")
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert_eq!(result.servers.len(), 2);
+        for server in &result.servers {
+            assert_eq!(
+                result.server_sources.get(&server.record.sys_id),
+                Some(&ServerResultSource::CiOwnerGroupFallback)
+            );
+        }
+        let summary = &result.relationship_summary;
+        assert!(summary.fallback_used);
+        assert_eq!(summary.cmdb_servers_found, Some(0));
+        assert_eq!(summary.servers_found, 2);
+        assert_eq!(summary.fallback_strategy.as_deref(), Some("ci_owner_group"));
+        assert_eq!(
+            summary.fallback_group_sys_id.as_deref(),
+            Some(FALLBACK_GROUP)
+        );
+        assert_eq!(
+            summary.fallback_group_display_name.as_deref(),
+            Some("Owner Group")
+        );
+        assert_eq!(
+            summary
+                .degraded_reasons
+                .get(BUSINESS_APPLICATION_DEGRADED_REASON_CMDB_RELATIONSHIPS_UNMAPPED),
+            Some(&1)
+        );
+        // Fallback never persists: no traversal servers, no membership upserts.
+        assert_eq!(summary.persisted_servers, 0);
+        assert_eq!(summary.membership_upserts, 0);
+        assert!(result.server_provenance.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_fires_even_though_managed_by_group_empty() {
+        let _guard = mock_server_test_lock();
+        // Field-mapping proof: the BA's managed_by_group alias is empty; the
+        // fallback fires because it sources/filters on the RAW u_ci_owner_group.
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        // The ONLY server query the fallback may issue is the exact raw-field
+        // filter. A managed_by_group-based query would not match this mock and
+        // the call would 404/timeout, failing the test.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!("{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(FALLBACK_LINUX, "linux-fallback.example.com", "cmdb_ci_linux_server")]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert_eq!(result.servers.len(), 1);
+        assert!(result.relationship_summary.fallback_used);
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_does_not_fire_when_traversal_finds_servers() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("parentIN{FALLBACK_APP}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [relationship_row(
+                    "99999999999999999999999999999991",
+                    FALLBACK_APP,
+                    FALLBACK_LINUX,
+                    rel_type,
+                    "cmdb_ci_business_app",
+                    "cmdb_ci_linux_server"
+                )]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_rel_ci"))
+            .and(query_param(
+                "sysparm_query",
+                format!("childIN{FALLBACK_APP}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param("sysparm_query", format!("sys_idIN{FALLBACK_LINUX}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(FALLBACK_LINUX, "linux-real.example.com", "cmdb_ci_linux_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert_eq!(result.servers.len(), 1);
+        // Fallback did NOT fire: no fallback servers, no degraded gap reason.
+        assert!(!result.relationship_summary.fallback_used);
+        assert!(result.server_sources.is_empty());
+        // cmdb_servers_found still reported (strategy requested) and equals the
+        // traversal count.
+        assert_eq!(result.relationship_summary.cmdb_servers_found, Some(1));
+        assert_eq!(
+            result.server_sources.get(FALLBACK_LINUX),
+            None,
+            "traversal servers are not tagged as fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_no_group_emits_clean_diagnostic() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, None).await;
+        mount_empty_traversal(&server).await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert!(result.servers.is_empty());
+        assert!(!result.relationship_summary.fallback_used);
+        assert_eq!(result.relationship_summary.cmdb_servers_found, Some(0));
+        // Clean structured diagnostic, not an error.
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD
+        }));
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_strategy_none_adds_no_fields() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                // default: FallbackStrategy::None
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert!(result.servers.is_empty());
+        assert!(result.server_sources.is_empty());
+        let summary = &result.relationship_summary;
+        assert!(!summary.fallback_used);
+        assert_eq!(summary.cmdb_servers_found, None);
+        assert_eq!(summary.fallback_strategy, None);
+        assert_eq!(summary.fallback_group_sys_id, None);
+        // No new fields appear in the default-path serialization.
+        let serialized = serde_json::to_value(summary).expect("serialize summary");
+        let object = serialized.as_object().expect("summary object");
+        assert!(!object.contains_key("cmdb_servers_found"));
+        assert!(!object.contains_key("fallback_used"));
+        assert!(!object.contains_key("fallback_strategy"));
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_group_with_zero_servers() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!(
+                    "{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"
+                ),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert!(result.servers.is_empty());
+        // The owner group exists and was queried, so the data-quality gap is real:
+        // fallback_used is true even though it returned no servers.
+        assert!(result.relationship_summary.fallback_used);
+        assert_eq!(result.relationship_summary.cmdb_servers_found, Some(0));
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_acl_restricted_query() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!(
+                    "{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"
+                ),
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "message": "ACL restricted" }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert!(result.servers.is_empty());
+        assert!(!result.relationship_summary.fallback_used);
+        assert!(result.relationship_summary.acl_restricted_count >= 1);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason == ReferenceResolutionReason::ReferenceAclRestricted
+        }));
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_tombstoned_group_no_panic() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!(
+                    "{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"
+                ),
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": { "message": "No record found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        assert!(result.servers.is_empty());
+        assert!(!result.relationship_summary.fallback_used);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD
+                && diagnostic.reason == ReferenceResolutionReason::ReferenceNotFound
+        }));
+    }
+
+    #[tokio::test]
+    async fn ci_owner_group_fallback_writes_no_durable_membership_rows() {
+        let _guard = mock_server_test_lock();
+        // Load-bearing live-only assertion: a fallback-triggering run leaves the
+        // durable BA↔server inventory tables unchanged. We run with persist=true
+        // (the CLI/daemon default) so the only writes would come from the
+        // traversal path; the fallback servers must not appear in the cached
+        // forward/reverse projections or the inventory-health row.
+        let server = MockServer::start().await;
+        mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
+        mount_empty_traversal(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/cmdb_ci_server"))
+            .and(query_param(
+                "sysparm_query",
+                format!("{BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD}={FALLBACK_GROUP}^ORDERBYname"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [server_row(FALLBACK_LINUX, "linux-fallback.example.com", "cmdb_ci_linux_server")]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .business_application_servers(BusinessApplicationServersParams {
+                number: Some("APM0000001".to_string()),
+                fallback_strategy: FallbackStrategy::CiOwnerGroup,
+                persist: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("ba servers")
+            .expect("ba present");
+
+        // The live response carries the fallback server...
+        assert_eq!(result.servers.len(), 1);
+        assert!(result.relationship_summary.fallback_used);
+        // ...but nothing was persisted: 0 membership upserts, 0 persisted servers.
+        assert_eq!(result.relationship_summary.persisted_servers, 0);
+        assert_eq!(result.relationship_summary.membership_upserts, 0);
+
+        // The durable forward projection has NO servers for this BA.
+        let cached_forward = core
+            .business_application_servers_cached(BusinessApplicationServersCachedParams {
+                sys_id: Some(FALLBACK_APP.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached forward");
+        match cached_forward {
+            Some(cached) => assert!(
+                cached.servers.is_empty(),
+                "fallback server must not be persisted to the forward projection"
+            ),
+            None => {}
+        }
+
+        // The durable reverse projection has NO BA for the fallback server.
+        let cached_reverse = core
+            .business_applications_for_server(BusinessApplicationsForServerParams {
+                sys_id: Some(FALLBACK_LINUX.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("cached reverse");
+        match cached_reverse {
+            Some(cached) => {
+                for entry in &cached.servers {
+                    assert!(
+                        entry.business_applications.is_empty(),
+                        "fallback server must not gain a durable BA association"
+                    );
+                }
+            }
+            None => {}
+        }
     }
 
     fn relationship_row(
@@ -9427,7 +12412,7 @@ mod tests {
                     "author".to_string(),
                     FieldValue {
                         value: "user-kb".to_string(),
-                        display_value: Some("Jared Jennings".to_string()),
+                        display_value: Some("Casey User".to_string()),
                     },
                 ),
             ]),
@@ -9440,7 +12425,7 @@ mod tests {
                 Reference {
                     sys_id: "user-kb".to_string(),
                     table: "sys_user".to_string(),
-                    display_name: "Jared Jennings".to_string(),
+                    display_name: "Casey User".to_string(),
                     extra: HashMap::new(),
                 },
             )]),
@@ -9494,7 +12479,7 @@ mod tests {
             author: Some(Reference {
                 sys_id: "user-kb".to_string(),
                 table: "sys_user".to_string(),
-                display_name: "Jared Jennings".to_string(),
+                display_name: "Casey User".to_string(),
                 extra: HashMap::new(),
             }),
             valid_to: Some(chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
@@ -10744,7 +13729,7 @@ mod tests {
         assert_eq!(loaded.number, "KB002");
         assert_eq!(loaded.knowledge_base_name, "IT");
         assert_eq!(loaded.category_name, "Access");
-        assert_eq!(loaded.author_name.as_deref(), Some("Jared Jennings"));
+        assert_eq!(loaded.author_name.as_deref(), Some("Casey User"));
         assert_eq!(loaded.published_at.as_deref(), Some("2026-04-10 09:00:00"));
         assert_eq!(loaded.valid_to.as_deref(), Some("2027-01-01"));
     }
@@ -11310,6 +14295,449 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn my_approvals_with_routing_fresh_unions_direct_and_group_rows() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let user_sys_id = "11111111111111111111111111111111";
+        let group_sys_id = "22222222222222222222222222222222";
+        let direct_approval_sys_id = "33333333333333333333333333333333";
+        let group_approval_sys_id = "44444444444444444444444444444444";
+        let direct_target_sys_id = "55555555555555555555555555555555";
+        let group_target_sys_id = "66666666666666666666666666666666";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(query_param("sysparm_query", "user_name=test_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": user_sys_id,
+                    "user_name": "test_user",
+                    "name": "Example User"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sysapproval_approver"))
+            .and(query_param_contains("sysparm_query", format!("approver={user_sys_id}")))
+            .and(query_param_contains("sysparm_query", "state=requested"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": direct_approval_sys_id,
+                    "number": "APPROVAL_DIRECT",
+                    "state": "requested",
+                    "approver": { "value": user_sys_id, "display_value": "Example User" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": direct_target_sys_id, "display_value": "CHANGE_DIRECT" },
+                    "sysapproval.number": "CHANGE_DIRECT",
+                    "sysapproval.short_description": "Direct approval target",
+                    "sysapproval.state": "scheduled",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-06-10 10:00:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_grmember"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("user={user_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "77777777777777777777777777777777",
+                    "user": { "value": user_sys_id, "display_value": "Example User" },
+                    "group": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                    "group.name": "Example Approval Group"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sysapproval_approver"))
+            .and(query_param_contains("sysparm_query", format!("approverIN{group_sys_id}")))
+            .and(query_param_contains("sysparm_query", "state=requested"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "sys_id": direct_approval_sys_id,
+                        "number": "APPROVAL_DIRECT",
+                        "state": "requested",
+                        "approver": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                        "source_table": "change_request",
+                        "sysapproval": { "value": direct_target_sys_id, "display_value": "CHANGE_DIRECT" },
+                        "sysapproval.number": "CHANGE_DIRECT",
+                        "sysapproval.short_description": "Duplicate direct approval target",
+                        "sysapproval.state": "scheduled",
+                        "sysapproval.sys_class_name": "change_request",
+                        "sys_created_on": "2026-06-10 10:00:00"
+                    },
+                    {
+                        "sys_id": group_approval_sys_id,
+                        "number": "APPROVAL_GROUP",
+                        "state": "requested",
+                        "approver": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                        "source_table": "change_request",
+                        "sysapproval": { "value": group_target_sys_id, "display_value": "CHANGE_GROUP" },
+                        "sysapproval.number": "CHANGE_GROUP",
+                        "sysapproval.short_description": "Group approval target",
+                        "sysapproval.state": "scheduled",
+                        "sysapproval.sys_class_name": "change_request",
+                        "sys_created_on": "2026-06-10 10:01:00"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let response = core
+            .my_approvals_with_routing_fresh()
+            .await
+            .expect("approvals");
+
+        assert_eq!(response.records.len(), 2);
+        assert_eq!(response.query_summary.direct_approvals_found, 1);
+        assert_eq!(response.query_summary.group_approvals_found, 2);
+        assert_eq!(response.query_summary.total_approvals, 2);
+        assert_eq!(response.query_summary.caller_group_memberships_resolved, 1);
+        assert_eq!(response.query_summary.group_query_batches, 1);
+        assert_eq!(response.query_summary.deduplication_removed, 1);
+
+        let direct = response
+            .records
+            .iter()
+            .find(|approval| approval.record.sys_id == direct_approval_sys_id)
+            .expect("direct approval");
+        assert_eq!(direct.routed_via, ApprovalRoutedVia::Direct);
+        assert!(direct.approver_group.is_none());
+        assert_eq!(direct.approver.table, "sys_user");
+
+        let group = response
+            .records
+            .iter()
+            .find(|approval| approval.record.sys_id == group_approval_sys_id)
+            .expect("group approval");
+        assert_eq!(group.routed_via, ApprovalRoutedVia::Group);
+        assert_eq!(group.approver.table, "sys_user_group");
+        assert_eq!(group.approver.sys_id, group_sys_id);
+        assert_eq!(
+            group.approver_group.as_ref().map(|approver_group| (
+                approver_group.table.as_str(),
+                approver_group.sys_id.as_str(),
+                approver_group.display_name.as_str()
+            )),
+            Some(("sys_user_group", group_sys_id, "Example Approval Group"))
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_approval_updates_pending_direct_row_by_sys_id() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let user_sys_id = "11111111111111111111111111111111";
+        let approval_sys_id = "22222222222222222222222222222222";
+        let target_sys_id = "33333333333333333333333333333333";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sysapproval_approver"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("sys_id={approval_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": approval_sys_id,
+                    "number": "APPROVAL_DIRECT",
+                    "state": "requested",
+                    "approver": { "value": user_sys_id, "display_value": "Example User" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": target_sys_id, "display_value": "CHANGE0010001" },
+                    "sysapproval.number": "CHANGE0010001",
+                    "sysapproval.short_description": "Direct approval target",
+                    "sysapproval.state": "scheduled",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-06-10 10:00:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(query_param("sysparm_query", "user_name=test_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": user_sys_id,
+                    "user_name": "test_user",
+                    "name": "Example User"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/api/now/table/sysapproval_approver/{approval_sys_id}"
+            )))
+            .and(body_partial_json(
+                serde_json::json!({ "state": "approved" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": approval_sys_id,
+                    "number": "APPROVAL_DIRECT",
+                    "state": "approved",
+                    "approver": { "value": user_sys_id, "display_value": "Example User" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": target_sys_id, "display_value": "CHANGE0010001" },
+                    "sys_created_on": "2026-06-10 10:00:00"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/now/table/change_request/{target_sys_id}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": target_sys_id,
+                    "number": "CHANGE0010001",
+                    "short_description": "Direct approval target",
+                    "state": "scheduled"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "change_request", target_sys_id).await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let record = core
+            .approve_approval(approval_sys_id, None)
+            .await
+            .expect("approval action")
+            .expect("target record");
+
+        assert_eq!(record.number, "CHANGE0010001");
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests.iter().all(|request| {
+                !request
+                    .url
+                    .query()
+                    .unwrap_or_default()
+                    .contains("(document_id=")
+            }),
+            "approval_sys_id path must not use target/approver reverse lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_approval_allows_current_user_group_row_by_sys_id() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let user_sys_id = "11111111111111111111111111111111";
+        let group_sys_id = "22222222222222222222222222222222";
+        let membership_sys_id = "33333333333333333333333333333333";
+        let approval_sys_id = "44444444444444444444444444444444";
+        let target_sys_id = "55555555555555555555555555555555";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sysapproval_approver"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("sys_id={approval_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": approval_sys_id,
+                    "number": "APPROVAL_GROUP",
+                    "state": "requested",
+                    "approver": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": target_sys_id, "display_value": "CHANGE0010002" },
+                    "sysapproval.number": "CHANGE0010002",
+                    "sysapproval.short_description": "Group approval target",
+                    "sysapproval.state": "scheduled",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-06-10 10:01:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(query_param("sysparm_query", "user_name=test_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": user_sys_id,
+                    "user_name": "test_user",
+                    "name": "Example User"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_grmember"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("user={user_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": membership_sys_id,
+                    "user": { "value": user_sys_id, "display_value": "Example User" },
+                    "group": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                    "group.name": "Example Approval Group"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(format!(
+                "/api/now/table/sysapproval_approver/{approval_sys_id}"
+            )))
+            .and(body_partial_json(serde_json::json!({
+                "state": "rejected",
+                "comments": "Insufficient detail."
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": approval_sys_id,
+                    "number": "APPROVAL_GROUP",
+                    "state": "rejected",
+                    "approver": { "value": group_sys_id, "display_value": "Example Approval Group" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": target_sys_id, "display_value": "CHANGE0010002" },
+                    "sys_created_on": "2026-06-10 10:01:00"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/now/table/change_request/{target_sys_id}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": target_sys_id,
+                    "number": "CHANGE0010002",
+                    "short_description": "Group approval target",
+                    "state": "scheduled"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_empty_journal_fetch(&server, "change_request", target_sys_id).await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let record = core
+            .reject_approval(approval_sys_id, "Insufficient detail.")
+            .await
+            .expect("approval action")
+            .expect("target record");
+
+        assert_eq!(record.number, "CHANGE0010002");
+    }
+
+    #[tokio::test]
+    async fn my_approvals_with_routing_fresh_fails_closed_when_group_lookup_fails() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let user_sys_id = "11111111111111111111111111111111";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(query_param("sysparm_query", "user_name=test_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": user_sys_id,
+                    "user_name": "test_user",
+                    "name": "Example User"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sysapproval_approver"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("approver={user_sys_id}"),
+            ))
+            .and(query_param_contains("sysparm_query", "state=requested"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "33333333333333333333333333333333",
+                    "number": "APPROVAL_DIRECT",
+                    "state": "requested",
+                    "approver": { "value": user_sys_id, "display_value": "Example User" },
+                    "source_table": "change_request",
+                    "sysapproval": { "value": "55555555555555555555555555555555", "display_value": "CHANGE_DIRECT" },
+                    "sysapproval.number": "CHANGE_DIRECT",
+                    "sysapproval.short_description": "Direct approval target",
+                    "sysapproval.state": "scheduled",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-06-10 10:00:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_grmember"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("user={user_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "denied",
+                    "detail": "sys_user_grmember read denied"
+                },
+                "status": "failure"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let err = core
+            .my_approvals_with_routing_fresh()
+            .await
+            .expect_err("group lookup failure must fail closed");
+        assert!(
+            err.to_string().contains("group membership lookup failure"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn my_projects_fresh_hydrates_projects_and_demands() {
         let server = MockServer::start().await;
 
@@ -11426,7 +14854,7 @@ mod tests {
                     "state": "2",
                     "assigned_to": {
                         "value": "user-sys",
-                        "display_value": "Jared Jennings"
+                        "display_value": "Casey User"
                     }
                 }]
             })))
@@ -11650,7 +15078,7 @@ mod tests {
                     "short_description": "Switch port flapping",
                     "description": "Multiple ports down",
                     "state": { "value": "2", "display_value": "In Progress" },
-                    "assigned_to": { "value": "user-sys", "display_value": "Jared Jennings" },
+                    "assigned_to": { "value": "user-sys", "display_value": "Casey User" },
                     "assignment_group": { "value": "group-sys", "display_value": "Network Operations" },
                     "work_notes": "",
                     "comments": ""
@@ -11668,7 +15096,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": [{
                     "sys_id": "inc-journal-sys",
-                    "work_notes": "2026-04-10 09:15:00 - Jared Jennings (Work notes)\nCurrent status: Smart hand ticket has been created for the FS to get the switch details.\n\n",
+                    "work_notes": "2026-04-10 09:15:00 - Casey User (Work notes)\nCurrent status: Smart hand ticket has been created for the FS to get the switch details.\n\n",
                     "comments": ""
                 }]
             })))
@@ -11700,13 +15128,13 @@ mod tests {
 
         assert_eq!(record.work_notes.len(), 1);
         assert!(record.work_notes[0].body.contains("Smart hand ticket"));
-        assert_eq!(record.work_notes[0].author, "Jared Jennings");
+        assert_eq!(record.work_notes[0].author, "Casey User");
         assert_eq!(
             record
                 .fields
                 .get("assigned_to")
                 .and_then(|field| field.display_value.as_deref()),
-            Some("Jared Jennings")
+            Some("Casey User")
         );
         assert_eq!(
             record

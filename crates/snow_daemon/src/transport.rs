@@ -5,11 +5,11 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use snow_core::{
-    ApprovalRecord, CacheSource, FieldValue, JournalEntry, KnowledgeArticle, KnowledgeBaseSummary,
-    KnowledgeCategorySummary, KnowledgeEmbeddingCoverage, KnowledgeSearchHit, KnowledgeSearchMode,
-    KnowledgeSemanticStatus, KnowledgeStatus, KnowledgeSyncMode, KnowledgeSyncOutcome,
-    KnowledgeTagLayer, KnowledgeTagSummary, MatchField, RecordRef, Reference, ResourceType,
-    SearchMatchReason, SearchResult, SemanticIndexSummary, SnowCore, SnowRecord,
+    ApprovalRecord, ApprovalRoutedVia, CacheSource, FieldValue, JournalEntry, KnowledgeArticle,
+    KnowledgeBaseSummary, KnowledgeCategorySummary, KnowledgeEmbeddingCoverage, KnowledgeSearchHit,
+    KnowledgeSearchMode, KnowledgeSemanticStatus, KnowledgeStatus, KnowledgeSyncMode,
+    KnowledgeSyncOutcome, KnowledgeTagLayer, KnowledgeTagSummary, MatchField, RecordRef, Reference,
+    ResourceType, SearchMatchReason, SearchResult, SemanticIndexSummary, SnowCore, SnowRecord,
 };
 
 pub struct DaemonTransport<'a> {
@@ -92,6 +92,8 @@ impl<'a> DaemonTransport<'a> {
             target: self.record_ref(&approval.target),
             requested_at: approval.requested_at,
             due_date: approval.due_date,
+            routed_via: approval.routed_via.clone(),
+            approver_group: approval.approver_group.clone().map(Into::into),
         })
     }
 
@@ -389,6 +391,8 @@ pub struct DaemonApprovalRecord {
     pub requested_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_date: Option<DateTime<Utc>>,
+    pub routed_via: ApprovalRoutedVia,
+    pub approver_group: Option<DaemonReference>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

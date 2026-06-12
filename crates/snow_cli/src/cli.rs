@@ -374,6 +374,27 @@ pub enum BusinessAppExportFormat {
     Csv,
 }
 
+/// Fallback strategy for `business-app servers` when the CMDB traversal finds 0
+/// servers. Mirrors `snow_core::FallbackStrategy`; default is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Default)]
+pub enum BusinessAppFallbackStrategy {
+    /// No fallback (exact current behavior; no new response fields).
+    #[default]
+    None,
+    /// Query servers by the BA's CI owner group when traversal returns empty.
+    CiOwnerGroup,
+}
+
+impl BusinessAppFallbackStrategy {
+    /// Wire value sent to the daemon `fallback_strategy` param.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CiOwnerGroup => "ci_owner_group",
+        }
+    }
+}
+
 /// One Business Application query filter parsed from a single `--filter` token.
 ///
 /// The CLI surface intentionally couples the field, operator, and value into a
@@ -498,18 +519,53 @@ pub enum BusinessAppCommand {
             long,
             value_name = "APM_NUMBER",
             value_parser = parse_business_app_number,
-            required_unless_present = "sys_id",
-            conflicts_with = "sys_id"
+            conflicts_with_all = ["sys_id", "for_server"]
         )]
         number: Option<String>,
         /// Business Application sys_id.
         #[arg(
             long = "sys-id",
             value_name = "BUSINESS_APP_SYS_ID",
-            required_unless_present = "number",
-            conflicts_with = "number"
+            conflicts_with_all = ["number", "for_server"]
         )]
         sys_id: Option<String>,
+        /// Read cached Business Application-to-Server relationships instead of running live traversal.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "for_server",
+                "max_depth",
+                "max_cis",
+                "max_edges",
+                "max_service_membership_associations",
+                "max_service_membership_pages",
+                "relationship_type",
+                "include_paths",
+                "no_persist",
+                "prune_stale"
+            ]
+        )]
+        cached: bool,
+        /// Read cached Business Applications associated with this Server sys_id.
+        #[arg(
+            long = "for-server",
+            value_name = "SERVER_SYS_ID",
+            conflicts_with_all = [
+                "number",
+                "sys_id",
+                "cached",
+                "max_depth",
+                "max_cis",
+                "max_edges",
+                "max_service_membership_associations",
+                "max_service_membership_pages",
+                "relationship_type",
+                "include_paths",
+                "no_persist",
+                "prune_stale"
+            ]
+        )]
+        for_server: Option<String>,
         /// Maximum relationship traversal depth.
         #[arg(long = "max-depth", value_name = "N")]
         max_depth: Option<usize>,
@@ -519,12 +575,37 @@ pub enum BusinessAppCommand {
         /// Maximum relationship edges to examine during traversal.
         #[arg(long = "max-edges", value_name = "N")]
         max_edges: Option<usize>,
+        /// Maximum svc_ci_assoc service-membership associations to examine during traversal.
+        #[arg(long = "max-service-membership-associations", value_name = "N")]
+        max_service_membership_associations: Option<usize>,
+        /// Maximum svc_ci_assoc service-membership pages to examine during traversal.
+        #[arg(long = "max-service-membership-pages", value_name = "N")]
+        max_service_membership_pages: Option<usize>,
         /// Relationship type to include during traversal. Repeat to include multiple types.
         #[arg(long = "relationship-type", value_name = "TYPE")]
         relationship_type: Vec<String>,
         /// Include relationship path metadata for each server when supported by the daemon.
         #[arg(long)]
         include_paths: bool,
+        /// Fallback used only when the live CMDB traversal finds 0 servers. `none` (default)
+        /// preserves current behavior; `ci-owner-group` queries servers by the BA's CI owner
+        /// group and returns them tagged and live-only, surfacing the CMDB relationship gap.
+        #[arg(
+            long = "fallback-strategy",
+            value_enum,
+            default_value_t = BusinessAppFallbackStrategy::None,
+            conflicts_with_all = ["cached", "for_server"]
+        )]
+        fallback_strategy: BusinessAppFallbackStrategy,
+        /// Do not persist live traversal results into the local cache.
+        #[arg(long = "no-persist", conflicts_with = "prune_stale")]
+        no_persist: bool,
+        /// Prune stale cached Business Application server relationships after a persisting live traversal.
+        #[arg(long = "prune-stale", conflicts_with_all = ["cached", "for_server", "no_persist"])]
+        prune_stale: bool,
+        /// Include tombstoned cached relationship rows and endpoint records when supported.
+        #[arg(long = "include-tombstoned")]
+        include_tombstoned: bool,
         /// Emit the raw daemon JSON payload.
         #[arg(long)]
         json: bool,
@@ -973,6 +1054,10 @@ mod tests {
             "500",
             "--max-edges",
             "2000",
+            "--max-service-membership-associations",
+            "3000",
+            "--max-service-membership-pages",
+            "30",
             "--relationship-type",
             "<RELATIONSHIP_TYPE>",
             "--relationship-type",
@@ -986,11 +1071,19 @@ mod tests {
                 action: BusinessAppCommand::Servers {
                     number: Some(number),
                     sys_id: None,
+                    cached: false,
+                    for_server: None,
                     max_depth: Some(2),
                     max_cis: Some(500),
                     max_edges: Some(2000),
+                    max_service_membership_associations: Some(3000),
+                    max_service_membership_pages: Some(30),
                     relationship_type,
                     include_paths: true,
+                    fallback_strategy: BusinessAppFallbackStrategy::None,
+                    no_persist: false,
+                    prune_stale: false,
+                    include_tombstoned: false,
                     json: true,
                 },
             } if number == "<APM_NUMBER>"
@@ -999,6 +1092,58 @@ mod tests {
                     "<SECOND_RELATIONSHIP_TYPE>".to_string()
                 ]
         ));
+
+        // --fallback-strategy parses to the typed enum; default is None.
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--fallback-strategy",
+            "ci-owner-group",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    fallback_strategy: BusinessAppFallbackStrategy::CiOwnerGroup,
+                    ..
+                },
+            }
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    fallback_strategy: BusinessAppFallbackStrategy::None,
+                    ..
+                },
+            }
+        ));
+
+        // --fallback-strategy conflicts with --cached.
+        assert!(
+            Cli::try_parse_from([
+                "snow",
+                "business-app",
+                "servers",
+                "--number",
+                "<APM_NUMBER>",
+                "--cached",
+                "--fallback-strategy",
+                "ci-owner-group",
+            ])
+            .is_err()
+        );
 
         let cli = Cli::parse_from([
             "snow",
@@ -1013,11 +1158,64 @@ mod tests {
                 action: BusinessAppCommand::Servers {
                     number: None,
                     sys_id: Some(sys_id),
+                    cached: false,
+                    for_server: None,
                     include_paths: false,
+                    no_persist: false,
+                    prune_stale: false,
+                    include_tombstoned: false,
                     json: false,
                     ..
                 },
             } if sys_id == "<BUSINESS_APP_SYS_ID>"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--cached",
+            "--include-tombstoned",
+            "--json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    number: Some(number),
+                    sys_id: None,
+                    cached: true,
+                    for_server: None,
+                    include_tombstoned: true,
+                    json: true,
+                    ..
+                },
+            } if number == "<APM_NUMBER>"
+        ));
+
+        let cli = Cli::parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--for-server",
+            "<SERVER_SYS_ID>",
+            "--include-tombstoned",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::BusinessApp {
+                action: BusinessAppCommand::Servers {
+                    number: None,
+                    sys_id: None,
+                    cached: false,
+                    for_server: Some(server_sys_id),
+                    include_tombstoned: true,
+                    json: false,
+                    ..
+                },
+            } if server_sys_id == "<SERVER_SYS_ID>"
         ));
 
         let cli = Cli::parse_from([
@@ -1231,13 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn business_app_servers_requires_exactly_one_selector() {
-        let err = match Cli::try_parse_from(["snow", "business-app", "servers"]) {
-            Ok(_) => panic!("servers without selector should fail"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-
+    fn business_app_servers_rejects_multiple_ba_selectors() {
         let err = match Cli::try_parse_from([
             "snow",
             "business-app",
@@ -1248,6 +1440,66 @@ mod tests {
             "<BUSINESS_APP_SYS_ID>",
         ]) {
             Ok(_) => panic!("servers with both selectors should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn business_app_servers_rejects_incompatible_cached_and_reverse_flags() {
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--cached",
+            "--max-depth",
+            "2",
+        ]) {
+            Ok(_) => panic!("cached read with live traversal flag should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--cached",
+            "--max-service-membership-associations",
+            "10",
+        ]) {
+            Ok(_) => panic!("cached read with service-membership budget should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--for-server",
+            "<SERVER_SYS_ID>",
+            "--include-paths",
+        ]) {
+            Ok(_) => panic!("reverse cached read with live traversal flag should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = match Cli::try_parse_from([
+            "snow",
+            "business-app",
+            "servers",
+            "--number",
+            "<APM_NUMBER>",
+            "--prune-stale",
+            "--no-persist",
+        ]) {
+            Ok(_) => panic!("prune-stale without persistence should fail"),
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);

@@ -148,6 +148,22 @@ fn foreground_record_lookup_parser_accepts_generic_table_sys_id_and_rejects_mixe
 
     let lookup = parse_record_lookup(
         &json!({
+            "table": "CHANGE_REQUEST",
+            "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
+        }),
+        snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
+    )
+    .expect("change_request lookup");
+    assert_eq!(
+        lookup,
+        RecordLookup::TableSysId {
+            table: "change_request".to_string(),
+            sys_id: "7f029b89c3e7565067bdfd73e40131a1".to_string(),
+        }
+    );
+
+    let lookup = parse_record_lookup(
+        &json!({
             "table": "resource_plan",
             "sys_id": "7F029B89C3E7565067BDFD73E40131A1"
         }),

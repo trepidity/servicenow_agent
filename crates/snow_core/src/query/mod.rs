@@ -10,17 +10,28 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::cache::store::{KnowledgeBaseSummaryRow, KnowledgeCategorySummaryRow, RecordRow, Store};
+use crate::cache::store::{
+    BusinessApplicationServerInventoryHealthRow, BusinessApplicationServerMembershipRow,
+    KnowledgeBaseSummaryRow, KnowledgeCategorySummaryRow, RecordLifecycle, RecordRow, Store,
+};
 use crate::query::filter::{ApprovalQuery, BusinessApplicationQuery, ListQuery};
 use crate::query::resolver::ReferenceResolver;
 use crate::vault::VaultManager;
 use servicenow_rs::model::value::parse_servicenow_timestamp;
 
 use crate::{
-    ApprovalRecord, CacheSource, DegradedReadDiagnostic, DegradedReadReason, FieldValue,
-    JournalEntry, KnowledgeArticle, KnowledgeSearchFilters, MatchField, RecordRef, Reference,
-    ResourceType, SearchMatchReason, SearchResult, SearchScope, ServerQuery, SnowRecord,
+    ApprovalRecord, ApprovalRoutedVia, CacheSource, DegradedReadDiagnostic, DegradedReadReason,
+    FieldValue, JournalEntry, KnowledgeArticle, KnowledgeSearchFilters, MatchField, RecordRef,
+    Reference, ResourceType, SearchMatchReason, SearchResult, SearchScope, ServerQuery, SnowRecord,
     choose_reference_display_name, normalize_knowledge_article,
+};
+use crate::{
+    BusinessApplicationServerInventoryHealth, BusinessApplicationServerPath,
+    BusinessApplicationServersCachedParams, BusinessApplicationServersCachedResult,
+    BusinessApplicationServersCachedSelector, BusinessApplicationsForServerParams,
+    BusinessApplicationsForServerResult, BusinessApplicationsForServerSelector,
+    CachedBusinessApplicationForServer, CachedBusinessApplicationServer,
+    CachedServerBusinessApplications, EndpointResolutionStatus, RelationshipKnowledgeStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -213,6 +224,143 @@ impl QueryEngine {
         let offset = query.offset.unwrap_or(0).min(records.len());
         let limit = query.limit.unwrap_or(20);
         Ok(records.into_iter().skip(offset).take(limit).collect())
+    }
+
+    pub async fn business_application_servers_cached(
+        &self,
+        params: BusinessApplicationServersCachedParams,
+    ) -> Result<Option<BusinessApplicationServersCachedResult>> {
+        let options = params.validate()?;
+        let Some(business_application) = self
+            .resolve_cached_business_application(&options.selector, options.include_tombstoned)?
+        else {
+            return Ok(None);
+        };
+
+        let memberships = self
+            .store
+            .list_business_application_server_memberships_for_ba(
+                &business_application.sys_id,
+                options.include_tombstoned,
+            )?;
+        let inventory_health = self
+            .store
+            .get_business_application_server_inventory_health(&business_application.sys_id)?
+            .map(business_application_inventory_health_from_row);
+        let relationship_status =
+            cached_relationship_status(!memberships.is_empty(), inventory_health.as_ref());
+        let mut servers = Vec::with_capacity(memberships.len());
+        for membership in memberships {
+            let Some(server) = self.cached_record_by_sys_id(
+                &membership.server_sys_id,
+                ResourceType::Server,
+                options.include_tombstoned,
+            )?
+            else {
+                continue;
+            };
+            servers.push(CachedBusinessApplicationServer {
+                server,
+                server_table: membership.server_table.clone(),
+                provenance: membership.provenance.clone(),
+                min_depth: membership.min_depth,
+                paths: parse_cached_business_application_server_paths(&membership)?,
+                tombstoned_at: membership.tombstoned_at,
+            });
+        }
+        servers.sort_by(|left, right| {
+            left.min_depth
+                .cmp(&right.min_depth)
+                .then_with(|| server_name(&left.server).cmp(&server_name(&right.server)))
+                .then_with(|| left.server.sys_id.cmp(&right.server.sys_id))
+                .then_with(|| left.provenance.cmp(&right.provenance))
+        });
+
+        Ok(Some(BusinessApplicationServersCachedResult {
+            business_application,
+            servers,
+            endpoint_status: EndpointResolutionStatus::CacheHit,
+            relationship_status,
+            inventory_health,
+        }))
+    }
+
+    pub async fn business_applications_for_server(
+        &self,
+        params: BusinessApplicationsForServerParams,
+    ) -> Result<Option<BusinessApplicationsForServerResult>> {
+        let options = params.validate()?;
+        let server_records =
+            self.resolve_cached_servers(&options.selector, options.include_tombstoned)?;
+        if server_records.is_empty() {
+            return Ok(None);
+        }
+
+        let mut servers = Vec::with_capacity(server_records.len());
+        for server in server_records {
+            let memberships = self
+                .store
+                .list_business_application_server_memberships_for_server(
+                    &server.sys_id,
+                    options.include_tombstoned,
+                )?;
+            let mut business_applications = Vec::with_capacity(memberships.len());
+            for membership in memberships {
+                let Some(business_application) = self.cached_record_by_sys_id(
+                    &membership.ba_sys_id,
+                    ResourceType::BusinessApplication,
+                    options.include_tombstoned,
+                )?
+                else {
+                    continue;
+                };
+                let inventory_health = self
+                    .store
+                    .get_business_application_server_inventory_health(&membership.ba_sys_id)?
+                    .map(business_application_inventory_health_from_row);
+                business_applications.push(CachedBusinessApplicationForServer {
+                    business_application,
+                    provenance: membership.provenance.clone(),
+                    min_depth: membership.min_depth,
+                    paths: parse_cached_business_application_server_paths(&membership)?,
+                    inventory_health,
+                    tombstoned_at: membership.tombstoned_at,
+                });
+            }
+            business_applications.sort_by(|left, right| {
+                left.min_depth
+                    .cmp(&right.min_depth)
+                    .then_with(|| {
+                        business_application_name(&left.business_application)
+                            .cmp(&business_application_name(&right.business_application))
+                    })
+                    .then_with(|| {
+                        left.business_application
+                            .sys_id
+                            .cmp(&right.business_application.sys_id)
+                    })
+                    .then_with(|| left.provenance.cmp(&right.provenance))
+            });
+            let relationship_status = cached_server_relationship_status(&business_applications);
+            servers.push(CachedServerBusinessApplications {
+                server,
+                business_applications,
+                endpoint_status: EndpointResolutionStatus::CacheHit,
+                relationship_status,
+            });
+        }
+        servers.sort_by(|left, right| {
+            server_name(&left.server)
+                .cmp(&server_name(&right.server))
+                .then_with(|| left.server.sys_id.cmp(&right.server.sys_id))
+        });
+
+        let relationship_status = cached_result_relationship_status(&servers);
+        Ok(Some(BusinessApplicationsForServerResult {
+            servers,
+            endpoint_status: EndpointResolutionStatus::CacheHit,
+            relationship_status,
+        }))
     }
 
     pub async fn approvals(&self, query: ApprovalQuery) -> Result<Vec<ApprovalRecord>> {
@@ -434,6 +582,107 @@ impl QueryEngine {
         self.materialize_record_from_json(row)
     }
 
+    fn resolve_cached_business_application(
+        &self,
+        selector: &BusinessApplicationServersCachedSelector,
+        include_tombstoned: bool,
+    ) -> Result<Option<SnowRecord>> {
+        match selector {
+            BusinessApplicationServersCachedSelector::Number(number) => {
+                let Some(row) = self
+                    .store
+                    .get_record_by_number_and_type(number, ResourceType::BusinessApplication)?
+                else {
+                    return Ok(None);
+                };
+                if !record_visible_for_cached_relationship_lookup(&row, include_tombstoned) {
+                    return Ok(None);
+                }
+                Ok(Some(self.materialize_record(&row)?))
+            }
+            BusinessApplicationServersCachedSelector::SysId(sys_id) => self
+                .cached_record_by_sys_id(
+                    sys_id,
+                    ResourceType::BusinessApplication,
+                    include_tombstoned,
+                ),
+            BusinessApplicationServersCachedSelector::ExactName(name) => {
+                let mut matches = self
+                    .cached_resource_records(ResourceType::BusinessApplication, include_tombstoned)?
+                    .into_iter()
+                    .filter(|record| business_application_name(record) == name.trim())
+                    .collect::<Vec<_>>();
+                if matches.len() > 1 {
+                    anyhow::bail!(
+                        "multiple Business Applications matched name={}",
+                        name.trim()
+                    );
+                }
+                Ok(matches.pop())
+            }
+        }
+    }
+
+    fn resolve_cached_servers(
+        &self,
+        selector: &BusinessApplicationsForServerSelector,
+        include_tombstoned: bool,
+    ) -> Result<Vec<SnowRecord>> {
+        match selector {
+            BusinessApplicationsForServerSelector::SysId(sys_id) => Ok(self
+                .cached_record_by_sys_id(sys_id, ResourceType::Server, include_tombstoned)?
+                .into_iter()
+                .collect()),
+            BusinessApplicationsForServerSelector::ExactName(name) => Ok(self
+                .cached_resource_records(ResourceType::Server, include_tombstoned)?
+                .into_iter()
+                .filter(|record| server_name(record) == name.trim())
+                .collect()),
+            BusinessApplicationsForServerSelector::IpAddress(ip_address) => Ok(self
+                .cached_resource_records(ResourceType::Server, include_tombstoned)?
+                .into_iter()
+                .filter(|record| {
+                    server_field_text(record, "ip_address")
+                        .is_some_and(|value| value.eq_ignore_ascii_case(ip_address.trim()))
+                })
+                .collect()),
+        }
+    }
+
+    fn cached_record_by_sys_id(
+        &self,
+        sys_id: &str,
+        resource_type: ResourceType,
+        include_tombstoned: bool,
+    ) -> Result<Option<SnowRecord>> {
+        let Some(row) = self.store.get_record_by_sys_id(sys_id)? else {
+            return Ok(None);
+        };
+        if row.resource_type != resource_type
+            || !record_visible_for_cached_relationship_lookup(&row, include_tombstoned)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.materialize_record(&row)?))
+    }
+
+    fn cached_resource_records(
+        &self,
+        resource_type: ResourceType,
+        include_tombstoned: bool,
+    ) -> Result<Vec<SnowRecord>> {
+        let rows = if include_tombstoned {
+            self.store
+                .list_records_by_resource_type(resource_type.clone())?
+        } else {
+            self.store.list_active_records(Some(resource_type))?
+        };
+        rows.into_iter()
+            .filter(|row| record_visible_for_cached_relationship_lookup(row, include_tombstoned))
+            .map(|row| self.materialize_record(&row))
+            .collect()
+    }
+
     fn materialize_record_from_json(&self, row: &RecordRow) -> Result<SnowRecord> {
         let json =
             serde_json::from_str::<Value>(&row.raw_json).unwrap_or(Value::Object(Map::new()));
@@ -522,6 +771,8 @@ impl QueryEngine {
             target,
             requested_at,
             due_date,
+            routed_via: ApprovalRoutedVia::Direct,
+            approver_group: None,
         })
     }
 
@@ -879,6 +1130,107 @@ fn server_matches_query(record: &SnowRecord, query: &ServerQuery) -> bool {
             query.ci_owner_group.as_deref(),
         )
         && optional_contains(server_search_text(record), query.text.as_deref())
+}
+
+fn parse_cached_business_application_server_paths(
+    membership: &BusinessApplicationServerMembershipRow,
+) -> Result<Vec<BusinessApplicationServerPath>> {
+    serde_json::from_str(&membership.paths_json).map_err(Into::into)
+}
+
+fn business_application_inventory_health_from_row(
+    row: BusinessApplicationServerInventoryHealthRow,
+) -> BusinessApplicationServerInventoryHealth {
+    let summary = serde_json::from_str(&row.summary_json).unwrap_or(Value::Object(Map::new()));
+    BusinessApplicationServerInventoryHealth {
+        ba_sys_id: row.ba_sys_id,
+        run_started_at: row.run_started_at,
+        run_completed_at: row.run_completed_at,
+        service_membership_status: row.service_membership_status,
+        relationship_status: row.relationship_status,
+        inventory_status: row.inventory_status,
+        summary,
+    }
+}
+
+fn cached_relationship_status(
+    has_memberships: bool,
+    health: Option<&BusinessApplicationServerInventoryHealth>,
+) -> RelationshipKnowledgeStatus {
+    match health {
+        Some(health) if health.inventory_status == "complete" && has_memberships => {
+            RelationshipKnowledgeStatus::KnownRelationships
+        }
+        Some(health) if health.inventory_status == "complete" => {
+            RelationshipKnowledgeStatus::NoCachedRelationships
+        }
+        Some(_) => RelationshipKnowledgeStatus::Degraded,
+        None if has_memberships => RelationshipKnowledgeStatus::KnownRelationships,
+        None => RelationshipKnowledgeStatus::UnknownNotSynced,
+    }
+}
+
+fn cached_server_relationship_status(
+    business_applications: &[CachedBusinessApplicationForServer],
+) -> RelationshipKnowledgeStatus {
+    if business_applications.is_empty() {
+        return RelationshipKnowledgeStatus::NoCachedRelationships;
+    }
+    if business_applications.iter().any(|application| {
+        application
+            .inventory_health
+            .as_ref()
+            .is_some_and(|health| health.inventory_status != "complete")
+    }) {
+        return RelationshipKnowledgeStatus::Degraded;
+    }
+    RelationshipKnowledgeStatus::KnownRelationships
+}
+
+fn cached_result_relationship_status(
+    servers: &[CachedServerBusinessApplications],
+) -> RelationshipKnowledgeStatus {
+    if servers
+        .iter()
+        .any(|server| server.relationship_status == RelationshipKnowledgeStatus::Degraded)
+    {
+        return RelationshipKnowledgeStatus::Degraded;
+    }
+    if servers
+        .iter()
+        .any(|server| server.relationship_status == RelationshipKnowledgeStatus::KnownRelationships)
+    {
+        return RelationshipKnowledgeStatus::KnownRelationships;
+    }
+    RelationshipKnowledgeStatus::NoCachedRelationships
+}
+
+fn record_visible_for_cached_relationship_lookup(
+    row: &RecordRow,
+    include_tombstoned: bool,
+) -> bool {
+    if matches!(row.lifecycle(), RecordLifecycle::Pruned) {
+        return false;
+    }
+    include_tombstoned || matches!(row.lifecycle(), RecordLifecycle::Active)
+}
+
+fn business_application_name(record: &SnowRecord) -> String {
+    record
+        .fields
+        .get("name")
+        .and_then(|field| {
+            field
+                .display_value
+                .as_ref()
+                .or(Some(&field.value))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            (!record.short_description.trim().is_empty()).then(|| record.short_description.clone())
+        })
+        .unwrap_or_else(|| record.sys_id.clone())
 }
 
 fn server_name(record: &SnowRecord) -> String {
@@ -1603,7 +1955,9 @@ pub(crate) fn is_exact_record_number(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::store::{AliasRow, KeywordRow, RecordRow, Store, TagRow};
+    use crate::cache::store::{
+        AliasRow, BusinessApplicationServerMembershipRow, KeywordRow, RecordRow, Store, TagRow,
+    };
     use crate::vault::VaultManager;
     use crate::{ApprovalRecord, CacheSource, FieldValue, KnowledgeArticle, RecordRef, Reference};
     use chrono::TimeZone;
@@ -1732,7 +2086,7 @@ mod tests {
             author: Some(Reference {
                 sys_id: "user-1".to_string(),
                 table: "sys_user".to_string(),
-                display_name: "Jared Jennings".to_string(),
+                display_name: "Casey User".to_string(),
                 extra: HashMap::new(),
             }),
             valid_to: Some(chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
@@ -1771,6 +2125,8 @@ mod tests {
             },
             requested_at: Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
             due_date: None,
+            routed_via: ApprovalRoutedVia::Direct,
+            approver_group: None,
         }
     }
 
@@ -2044,7 +2400,7 @@ mod tests {
                 .author
                 .as_ref()
                 .map(|author| author.display_name.as_str()),
-            Some("Jared Jennings")
+            Some("Casey User")
         );
         assert_eq!(loaded.published_at, article.published_at);
     }
@@ -2134,7 +2490,7 @@ mod tests {
             "published": "2026-04-10 09:00:00",
             "knowledge_base": { "sys_id": "kb-base", "display_value": "IT", "table": "kb_knowledge_base" },
             "category": { "sys_id": "kb-net", "display_value": "Network", "table": "kb_category" },
-            "author": { "sys_id": "user-1", "display_value": "Jared Jennings", "table": "sys_user" }
+            "author": { "sys_id": "user-1", "display_value": "Casey User", "table": "sys_user" }
         })
         .to_string();
         store
@@ -2151,7 +2507,7 @@ mod tests {
                 category_sys_id: "kb-net".to_string(),
                 category_name: "Network".to_string(),
                 author_sys_id: Some("user-1".to_string()),
-                author_name: Some("Jared Jennings".to_string()),
+                author_name: Some("Casey User".to_string()),
                 published_at: Some("2026-04-10 09:00:00".to_string()),
                 valid_to: None,
                 article_type: "text".to_string(),
@@ -2466,6 +2822,122 @@ mod tests {
                 (MatchField::Alias, "gateway"),
                 (MatchField::Keyword, "gateway"),
             ]
+        );
+    }
+
+    #[test]
+    fn query_engine_reads_cached_business_application_server_relationships_both_directions() {
+        let store = Store::open_in_memory().expect("store");
+        let now = Utc.timestamp_opt(1_779_840_000, 0).unwrap();
+        let ba_sys_id = "54a4b61b6fe845000ed852a03f3ee4d0";
+        let server_sys_id = "7f4a6e2f1c23456789abcdef01234567";
+
+        let mut application = sample_row(
+            ba_sys_id,
+            "APM0000001",
+            "cmdb_ci_business_app",
+            ResourceType::BusinessApplication,
+        );
+        application.short_desc = Some("Payments Platform".to_string());
+        application.raw_json = serde_json::json!({
+            "sys_id": ba_sys_id,
+            "number": "APM0000001",
+            "name": "Payments Platform",
+            "short_description": "Payments Platform",
+            "business_owner": {
+                "value": "6816f79cc0a8016401c5a33be04be441",
+                "display_value": "Example Owner"
+            }
+        })
+        .to_string();
+        store
+            .upsert_record(&application, "", "")
+            .expect("insert application");
+
+        let mut server = sample_row(
+            server_sys_id,
+            "SRV0000001",
+            "cmdb_ci_linux_server",
+            ResourceType::Server,
+        );
+        server.short_desc = Some("app-server-01".to_string());
+        server.raw_json = serde_json::json!({
+            "sys_id": server_sys_id,
+            "number": "SRV0000001",
+            "name": "app-server-01",
+            "ip_address": "10.0.0.10",
+            "sys_class_name": "cmdb_ci_linux_server"
+        })
+        .to_string();
+        store.upsert_record(&server, "", "").expect("insert server");
+
+        store
+            .upsert_business_application_server_membership(
+                &BusinessApplicationServerMembershipRow {
+                    ba_sys_id: ba_sys_id.to_string(),
+                    server_sys_id: server_sys_id.to_string(),
+                    server_table: "cmdb_ci_linux_server".to_string(),
+                    provenance: "cmdb_rel_ci".to_string(),
+                    min_depth: 1,
+                    paths_json: serde_json::json!([{
+                        "edges": [{
+                            "depth": 1,
+                            "parent_sys_id": ba_sys_id,
+                            "child_sys_id": server_sys_id,
+                            "direction": "parent_to_child",
+                            "relationship_type": {
+                                "value": "Depends on::Used by"
+                            }
+                        }]
+                    }])
+                    .to_string(),
+                    discovered_at: now,
+                    last_seen_at: now,
+                    tombstoned_at: None,
+                },
+            )
+            .expect("insert membership");
+
+        let engine = QueryEngine::from_store(store);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        let forward = runtime
+            .block_on(engine.business_application_servers_cached(
+                BusinessApplicationServersCachedParams {
+                    number: Some("APM0000001".to_string()),
+                    ..Default::default()
+                },
+            ))
+            .expect("forward query")
+            .expect("application found");
+        assert_eq!(forward.business_application.sys_id, ba_sys_id);
+        assert_eq!(forward.servers.len(), 1);
+        assert_eq!(server_name(&forward.servers[0].server), "app-server-01");
+        assert_eq!(forward.servers[0].provenance, "cmdb_rel_ci");
+        assert_eq!(forward.servers[0].min_depth, 1);
+        assert_eq!(forward.servers[0].paths[0].depth(), 1);
+
+        let reverse = runtime
+            .block_on(engine.business_applications_for_server(
+                BusinessApplicationsForServerParams {
+                    name: Some("app-server-01".to_string()),
+                    ..Default::default()
+                },
+            ))
+            .expect("reverse query")
+            .expect("server found");
+        assert_eq!(reverse.servers.len(), 1);
+        assert_eq!(reverse.servers[0].server.sys_id, server_sys_id);
+        assert_eq!(reverse.servers[0].business_applications.len(), 1);
+        assert_eq!(
+            reverse.servers[0].business_applications[0]
+                .business_application
+                .number,
+            "APM0000001"
+        );
+        assert_eq!(
+            reverse.servers[0].business_applications[0].provenance,
+            "cmdb_rel_ci"
         );
     }
 

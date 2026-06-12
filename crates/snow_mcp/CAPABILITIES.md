@@ -27,8 +27,8 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 |---|---|---|---|---|---|
 | Catalog request (`sc_req_item`) | `catalog_submit_request` | **Create** | ✅ (test/training) | yes | requires KB evidence |
 | Catalog request (`sc_req_item`) | `catalog_cancel_request` | **Delete** (cancel) | ❌ | yes | |
-| Approval (`sysapproval_approver`) | `approval_approve` | **Update** | ❌ | yes | target record number; daemon required |
-| Approval (`sysapproval_approver`) | `approval_reject` | **Update** | ❌ | yes | target record number plus reason; daemon required |
+| Approval (`sysapproval_approver`) | `approval_approve` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals`; target record number still accepted; daemon required |
+| Approval (`sysapproval_approver`) | `approval_reject` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals` plus reason; target record number still accepted; daemon required |
 | Work note / journal | `work_note_apply_add` | **Create** | ✅ (test/training) | yes | `work_notes` only |
 | Story (`rm_story`) | `story_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |
@@ -86,10 +86,21 @@ work_record_ttl = "60m"
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`
+
+`list_my_approvals` is read-only and returns pending direct approvals plus
+pending approvals routed to direct `sys_user_group` memberships for the
+daemon-authenticated ServiceNow user. It reads `sys_user_grmember` to resolve
+those memberships, accepts no caller-supplied user or approver override, keeps
+the approval collection under `records`, and includes a top-level
+`query_summary` on successful responses.
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,
   `kb_semantic_status`, `kb_list_tags`, `verify_vault`
+
+For product-facing MCP calls, prefer `knowledge_search` and `knowledge_fetch`.
+`search_knowledge` and `get_article` remain compatibility aliases for daemon-era
+callers and map to the same daemon methods.
 - **Catalog / plans:** `catalog_items_search`, `catalog_item_get`, `catalog_plan_request`,
   `resource_plan_get`, `story_get`, `story_tasks_list`, `timecard_list`,
   `timecard_plan_set_hours`, `change_request_plan_create`, `change_request_plan_update`,
@@ -337,6 +348,8 @@ no persistence, no prune, and no vault writes.
 Reads locally cached Business Application relationships for one Server. This is
 a cache-only local read: no ServiceNow API call, no live relationship traversal,
 no persistence, no prune, and no vault writes.
+The name predates the `_cached` suffix used by `business_application_servers_cached`;
+treat this reverse lookup as cache-only despite the asymmetric name.
 
 - **Params:** exactly one of `sys_id` (32-hex Server sys_id), `name` (exact
   Server name), or `ip_address` (exact Server IP address); optional

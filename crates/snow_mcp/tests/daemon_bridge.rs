@@ -31,6 +31,10 @@ impl MockDaemon {
             .map(|(method, _)| method.clone())
             .collect()
     }
+
+    async fn calls(&self) -> Vec<(String, Value)> {
+        self.calls.lock().await.clone()
+    }
 }
 
 #[async_trait]
@@ -158,7 +162,7 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
             "tools/call",
             json!({
                 "name": "get_record",
-                "arguments": { "table": "dmn_demand", "sys_id": sys_id }
+                "arguments": { "table": "change_request", "sys_id": sys_id }
             }),
         ))
         .await;
@@ -170,7 +174,7 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
     assert_eq!(
         calls[1].1,
         json!({
-            "table": "dmn_demand",
+            "table": "change_request",
             "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
         })
     );
@@ -186,7 +190,7 @@ async fn bridge_forwards_user_lookup() {
             "tools/call",
             json!({
                 "name": "user_lookup",
-                "arguments": { "query": "JOW2145" }
+                "arguments": { "query": "USER1234" }
             }),
         ))
         .await;
@@ -195,7 +199,7 @@ async fn bridge_forwards_user_lookup() {
     let calls = daemon.calls.lock().await;
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0, "user_lookup");
-    assert_eq!(calls[1].1, json!({ "query": "JOW2145" }));
+    assert_eq!(calls[1].1, json!({ "query": "USER1234" }));
 }
 
 #[tokio::test]
@@ -213,6 +217,8 @@ async fn bridge_forwards_business_application_servers_flat_params() {
                     "max_depth": 2,
                     "max_cis": 500,
                     "max_edges": 2000,
+                    "max_service_membership_associations": 3000,
+                    "max_service_membership_pages": 30,
                     "relationship_type": ["<RELATIONSHIP_TYPE>"],
                     "include_paths": true
                 }
@@ -231,8 +237,11 @@ async fn bridge_forwards_business_application_servers_flat_params() {
             "max_depth": 2,
             "max_cis": 500,
             "max_edges": 2000,
+            "max_service_membership_associations": 3000,
+            "max_service_membership_pages": 30,
             "relationship_type": ["<RELATIONSHIP_TYPE>"],
-            "include_paths": true
+            "include_paths": true,
+            "persist": false
         })
     );
 }
@@ -603,7 +612,7 @@ async fn bridge_forwards_approval_actions_to_daemon_policy_methods() {
             json!({
                 "name": "approval_approve",
                 "arguments": {
-                    "number": "RITM0010001"
+                    "approval_sys_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 }
             }),
         ))
@@ -638,6 +647,10 @@ async fn bridge_forwards_approval_actions_to_daemon_policy_methods() {
             "approval_approve".to_string(),
             "approval_reject".to_string()
         ]
+    );
+    assert_eq!(
+        daemon.calls().await[1].1["approval_sys_id"],
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     );
 }
 

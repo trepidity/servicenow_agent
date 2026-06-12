@@ -119,4 +119,19 @@ fn example_policy_parses() {
             "example policy {tool} allowlist missing requested_by_date"
         );
     }
+
+    let read_only_agent = cfg
+        .roles
+        .get("read_only_agent")
+        .expect("example policy missing read_only_agent role");
+    for tool in [
+        "business_application_servers",
+        "business_application_servers_cached",
+        "business_applications_for_server",
+    ] {
+        assert!(
+            read_only_agent.read_tools.contains(tool),
+            "example policy read_only_agent role missing cache-safe BA relationship read tool {tool}"
+        );
+    }
 }

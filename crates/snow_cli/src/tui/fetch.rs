@@ -2593,6 +2593,8 @@ mod tests {
             },
             requested_at: chrono::Utc::now(),
             due_date: None,
+            routed_via: snow_core::ApprovalRoutedVia::Direct,
+            approver_group: None,
         };
 
         let row = map_approval_row(approval);

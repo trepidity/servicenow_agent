@@ -50,8 +50,9 @@ use cli::{
 use error::SnowError;
 use tui_client::{
     BusinessApplicationQueryArgs, BusinessApplicationQueryFilter, BusinessApplicationQueryPageArgs,
-    BusinessApplicationServersArgs, BusinessApplicationSyncArgs, DaemonRpcClient, ServerQueryArgs,
-    TuiClient,
+    BusinessApplicationServersArgs, BusinessApplicationServersCachedArgs,
+    BusinessApplicationSyncArgs, BusinessApplicationsForServerArgs, DaemonRpcClient,
+    ServerQueryArgs, TuiClient,
 };
 
 struct AuthContext {
@@ -1664,13 +1665,35 @@ fn format_business_application_servers_result(result: &serde_json::Value) -> Str
     let max_depth = summary.and_then(|summary| json_display_from_paths(summary, &[&["max_depth"]]));
     let degraded_reasons = collect_business_application_servers_degraded_reasons(payload);
 
+    // Fallback signals (present only when fallback_strategy != none).
+    let fallback_used = summary
+        .and_then(|summary| json_bool(summary, "fallback_used"))
+        .unwrap_or(false);
+    let fallback_requested = summary
+        .and_then(|summary| summary.get("fallback_strategy"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|strategy| !strategy.is_empty() && strategy != "none");
+    let cmdb_servers_found = summary.and_then(|summary| json_usize(summary, "cmdb_servers_found"));
+    let fallback_group = summary
+        .and_then(|summary| json_display_from_paths(summary, &[&["fallback_group_display_name"]]));
+
     let mut out = String::new();
     let app = payload
         .get("business_application")
         .map(format_business_application_servers_root)
         .unwrap_or_else(|| "-".to_string());
     let _ = writeln!(out, "Business Application: {app}");
-    let _ = writeln!(out, "Servers found: {server_count}");
+    if fallback_used {
+        let _ = writeln!(
+            out,
+            "Servers found: {server_count}  (via ci_owner_group fallback -- CMDB relationships unmapped)"
+        );
+        if let Some(group) = &fallback_group {
+            let _ = writeln!(out, "Group: {group}");
+        }
+    } else {
+        let _ = writeln!(out, "Servers found: {server_count}");
+    }
     if let Some(max_depth) = &max_depth {
         let _ = writeln!(out, "Max depth: {max_depth}");
     }
@@ -1694,6 +1717,24 @@ fn format_business_application_servers_result(result: &serde_json::Value) -> Str
     );
 
     if servers.is_empty() {
+        // Fallback requested but produced no servers: explain why so an empty
+        // result is not mistaken for "no fallback attempted".
+        if fallback_requested && !fallback_used {
+            let _ = writeln!(out, "CMDB traversal: 0 servers found.");
+            let _ = writeln!(
+                out,
+                "Fallback: ci_owner_group requested but BA has no u_ci_owner_group set."
+            );
+            return out;
+        }
+        if fallback_used {
+            let _ = writeln!(out, "CMDB traversal: 0 servers found.");
+            let _ = writeln!(
+                out,
+                "Fallback: ci_owner_group returned no servers for the BA's owner group."
+            );
+            return out;
+        }
         match max_depth {
             Some(max_depth) => {
                 let _ = writeln!(
@@ -1737,11 +1778,152 @@ fn format_business_application_servers_result(result: &serde_json::Value) -> Str
         let _ = writeln!(out, "{name}  {class_name}  {ip_address}  {status}");
     }
 
+    if fallback_used {
+        let cmdb_count = cmdb_servers_found.unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "\nWarning: {cmdb_count} servers found via CMDB traversal. Results are from CI owner group\nfallback and may not reflect all servers supporting this application.\nCMDB relationships should be reviewed and populated."
+        );
+    }
+
+    out
+}
+
+fn format_business_application_servers_cached_result(result: &serde_json::Value) -> String {
+    let payload = business_application_servers_cached_payload(result);
+    let servers = payload
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let mut out = String::new();
+    let app = payload
+        .get("business_application")
+        .map(format_business_application_servers_root)
+        .unwrap_or_else(|| "-".to_string());
+    let _ = writeln!(out, "Business Application: {app}");
+    let _ = writeln!(out, "Cached servers found: {}", servers.len());
+
+    if servers.is_empty() {
+        let _ = writeln!(out, "No cached associated server CIs found.");
+        return out;
+    }
+
+    for relationship in servers {
+        let server = relationship.get("server").unwrap_or(relationship);
+        let mut suffix = Vec::new();
+        if let Some(depth) = json_usize(relationship, "min_depth") {
+            suffix.push(format!("depth {depth}"));
+        }
+        if let Some(provenance) = json_display_from_paths(relationship, &[&["provenance"]]) {
+            suffix.push(provenance);
+        }
+        if relationship
+            .get("tombstoned_at")
+            .is_some_and(|value| !value.is_null())
+        {
+            suffix.push("tombstoned".to_string());
+        }
+        let suffix = if suffix.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", suffix.join(", "))
+        };
+        let _ = writeln!(out, "{}{}", format_cached_server_row(server), suffix);
+    }
+
+    out
+}
+
+fn format_business_applications_for_server_result(result: &serde_json::Value) -> String {
+    let payload = business_applications_for_server_payload(result);
+    let servers = payload
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let app_count: usize = servers
+        .iter()
+        .map(|server| {
+            server
+                .get("business_applications")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        })
+        .sum();
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Matched servers: {}", servers.len());
+    let _ = writeln!(out, "Cached Business Applications found: {app_count}");
+
+    if servers.is_empty() {
+        let _ = writeln!(out, "No cached Server found.");
+        return out;
+    }
+
+    for server_relationships in servers {
+        let server = server_relationships
+            .get("server")
+            .unwrap_or(server_relationships);
+        let _ = writeln!(out, "Server: {}", format_cached_server_identity(server));
+        let applications = server_relationships
+            .get("business_applications")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if applications.is_empty() {
+            let _ = writeln!(out, "  No cached Business Applications found.");
+            continue;
+        }
+        for relationship in applications {
+            let app = relationship
+                .get("business_application")
+                .unwrap_or(relationship);
+            let mut suffix = Vec::new();
+            if let Some(depth) = json_usize(relationship, "min_depth") {
+                suffix.push(format!("depth {depth}"));
+            }
+            if let Some(provenance) = json_display_from_paths(relationship, &[&["provenance"]]) {
+                suffix.push(provenance);
+            }
+            if relationship
+                .get("tombstoned_at")
+                .is_some_and(|value| !value.is_null())
+            {
+                suffix.push("tombstoned".to_string());
+            }
+            let suffix = if suffix.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", suffix.join(", "))
+            };
+            let _ = writeln!(
+                out,
+                "  {}{}",
+                format_business_application_servers_root(app),
+                suffix
+            );
+        }
+    }
+
     out
 }
 
 fn business_application_servers_payload(result: &serde_json::Value) -> &serde_json::Value {
     result.get("business_application_servers").unwrap_or(result)
+}
+
+fn business_application_servers_cached_payload(result: &serde_json::Value) -> &serde_json::Value {
+    result
+        .get("business_application_servers_cached")
+        .unwrap_or(result)
+}
+
+fn business_applications_for_server_payload(result: &serde_json::Value) -> &serde_json::Value {
+    result
+        .get("business_applications_for_server")
+        .unwrap_or(result)
 }
 
 fn format_business_application_servers_root(app: &serde_json::Value) -> String {
@@ -1754,6 +1936,38 @@ fn format_business_application_servers_root(app: &serde_json::Value) -> String {
         _ => json_display_from_paths(app, &[&["sys_id"], &["record", "sys_id"]])
             .unwrap_or_else(|| "-".to_string()),
     }
+}
+
+fn format_cached_server_row(server: &serde_json::Value) -> String {
+    let name = format_cached_server_identity(server);
+    let class_name = json_display_from_paths(server, &[&["class_name"], &["record", "table"]])
+        .unwrap_or_else(|| "-".to_string());
+    let ip_address = json_display_from_paths(server, &[&["ip_address"], &["fields", "ip_address"]])
+        .unwrap_or_else(|| "-".to_string());
+    let status = json_display_from_paths(
+        server,
+        &[
+            &["operational_status"],
+            &["fields", "operational_status"],
+            &["fields", "install_status"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string());
+    format!("{name}  {class_name}  {ip_address}  {status}")
+}
+
+fn format_cached_server_identity(server: &serde_json::Value) -> String {
+    json_display_from_paths(
+        server,
+        &[
+            &["name"],
+            &["record", "short_description"],
+            &["record", "number"],
+            &["record", "sys_id"],
+            &["sys_id"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string())
 }
 
 fn collect_business_application_servers_degraded_reasons(
@@ -1950,20 +2164,98 @@ async fn cmd_business_app(
         BusinessAppCommand::Servers {
             number,
             sys_id,
+            cached,
+            for_server,
             max_depth,
             max_cis,
             max_edges,
+            max_service_membership_associations,
+            max_service_membership_pages,
             relationship_type,
             include_paths,
+            fallback_strategy,
+            no_persist,
+            prune_stale,
+            include_tombstoned,
             json,
         } => {
-            let selector_count = [number.is_some(), sys_id.is_some()]
+            let ba_selector_count = [number.is_some(), sys_id.is_some()]
                 .into_iter()
                 .filter(|selected| *selected)
                 .count();
-            if selector_count != 1 {
+            if for_server.is_some() {
+                if ba_selector_count != 0
+                    || cached
+                    || max_depth.is_some()
+                    || max_cis.is_some()
+                    || max_edges.is_some()
+                    || max_service_membership_associations.is_some()
+                    || max_service_membership_pages.is_some()
+                    || !relationship_type.is_empty()
+                    || include_paths
+                    || no_persist
+                    || prune_stale
+                {
+                    return Err(SnowError::Api(
+                        "business-app servers --for-server cannot combine with BA selectors or live traversal flags".to_string(),
+                    ));
+                }
+                let result = client
+                    .business_applications_for_server(BusinessApplicationsForServerArgs {
+                        sys_id: for_server.as_deref(),
+                        include_tombstoned,
+                    })
+                    .await?;
+                if json {
+                    print_full_dump_or_inline(&result);
+                } else {
+                    print!(
+                        "{}",
+                        format_business_applications_for_server_result(&result)
+                    );
+                }
+                return Ok(());
+            }
+            if cached {
+                if ba_selector_count != 1 {
+                    return Err(SnowError::Api(
+                        "business-app servers --cached requires exactly one of --number or --sys-id"
+                            .to_string(),
+                    ));
+                }
+                let result = client
+                    .business_application_servers_cached(BusinessApplicationServersCachedArgs {
+                        number: number.as_deref(),
+                        sys_id: sys_id.as_deref(),
+                        include_tombstoned,
+                    })
+                    .await?;
+                if json {
+                    print_full_dump_or_inline(&result);
+                } else {
+                    print!(
+                        "{}",
+                        format_business_application_servers_cached_result(&result)
+                    );
+                }
+                return Ok(());
+            }
+            if ba_selector_count != 1 {
                 return Err(SnowError::Api(
-                    "business-app servers requires exactly one of --number or --sys-id".to_string(),
+                    "business-app servers requires exactly one of --number, --sys-id, or --for-server"
+                        .to_string(),
+                ));
+            }
+            if prune_stale && no_persist {
+                return Err(SnowError::Api(
+                    "business-app servers --prune-stale requires a persisting live traversal"
+                        .to_string(),
+                ));
+            }
+            if include_tombstoned {
+                return Err(SnowError::Api(
+                    "business-app servers --include-tombstoned is only valid with --cached or --for-server"
+                        .to_string(),
                 ));
             }
             let result = client
@@ -1973,8 +2265,13 @@ async fn cmd_business_app(
                     max_depth,
                     max_cis,
                     max_edges,
+                    max_service_membership_associations,
+                    max_service_membership_pages,
                     relationship_type: &relationship_type,
                     include_paths,
+                    fallback_strategy: fallback_strategy.as_wire(),
+                    persist: !no_persist,
+                    prune_stale,
                 })
                 .await?;
             if json {
@@ -3189,6 +3486,17 @@ fn print_approval_record(approval: &ApprovalRecord) {
     );
     println!("approver: {}", approval.approver.display_name);
     println!("target: {}", approval.target.number);
+    match approval.routed_via {
+        snow_core::ApprovalRoutedVia::Direct => println!("routed via: direct"),
+        snow_core::ApprovalRoutedVia::Group => {
+            let group = approval
+                .approver_group
+                .as_ref()
+                .map(|group| group.display_name.as_str())
+                .unwrap_or(approval.approver.display_name.as_str());
+            println!("routed via: group ({group})");
+        }
+    }
     println!("requested at: {}", approval.requested_at);
     if let Some(due_date) = approval.due_date {
         println!("due date: {due_date}");
@@ -4333,7 +4641,8 @@ mod tests {
     use super::{
         BusinessAppFilter, KnowledgeStatusSnapshot, ShowTarget, TimecardSelectorShape,
         business_app_export, classify_show_target, classify_timecard_selector,
-        collect_timecard_updates, format_business_application_servers_result,
+        collect_timecard_updates, format_business_application_servers_cached_result,
+        format_business_application_servers_result, format_business_applications_for_server_result,
         format_task_sla_status, is_show_sla_alias, load_knowledge_status, load_knowledge_tags,
         normalize_hours, weekday_index,
     };
@@ -4471,6 +4780,80 @@ mod tests {
         assert!(out.contains("acl_restricted"));
         assert!(out.contains("reference_acl_restricted"));
         assert!(out.contains("No associated server CIs found within max depth 2."));
+    }
+
+    #[test]
+    fn business_app_servers_cached_human_output_summarizes_relationships() {
+        let result = serde_json::json!({
+            "business_application": {
+                "sys_id": "<BUSINESS_APP_SYS_ID>",
+                "number": "<APM_NUMBER>",
+                "name": "<BUSINESS_APP_NAME>"
+            },
+            "servers": [
+                {
+                    "server": {
+                        "sys_id": "<SERVER_SYS_ID>",
+                        "name": "<SERVER_NAME>",
+                        "class_name": "cmdb_ci_linux_server",
+                        "ip_address": "<SERVER_IP>",
+                        "operational_status": {
+                            "value": "<STATUS_VALUE>",
+                            "display_value": "<STATUS_DISPLAY>"
+                        }
+                    },
+                    "provenance": "live_traversal",
+                    "min_depth": 2,
+                    "tombstoned_at": null
+                }
+            ]
+        });
+
+        let out = format_business_application_servers_cached_result(&result);
+
+        assert!(out.contains("Business Application: <APM_NUMBER> <BUSINESS_APP_NAME>"));
+        assert!(out.contains("Cached servers found: 1"));
+        assert!(out.contains("<SERVER_NAME>"));
+        assert!(out.contains("cmdb_ci_linux_server"));
+        assert!(out.contains("<SERVER_IP>"));
+        assert!(out.contains("<STATUS_DISPLAY>"));
+        assert!(out.contains("[depth 2, live_traversal]"));
+    }
+
+    #[test]
+    fn business_applications_for_server_human_output_summarizes_reverse_relationships() {
+        let result = serde_json::json!({
+            "servers": [
+                {
+                    "server": {
+                        "sys_id": "<SERVER_SYS_ID>",
+                        "name": "<SERVER_NAME>",
+                        "class_name": "cmdb_ci_linux_server",
+                        "ip_address": "<SERVER_IP>"
+                    },
+                    "business_applications": [
+                        {
+                            "business_application": {
+                                "sys_id": "<BUSINESS_APP_SYS_ID>",
+                                "number": "<APM_NUMBER>",
+                                "name": "<BUSINESS_APP_NAME>"
+                            },
+                            "provenance": "live_traversal",
+                            "min_depth": 1,
+                            "tombstoned_at": "<TOMBSTONED_AT>"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let out = format_business_applications_for_server_result(&result);
+
+        assert!(out.contains("Matched servers: 1"));
+        assert!(out.contains("Cached Business Applications found: 1"));
+        assert!(out.contains("Server: <SERVER_NAME>"));
+        assert!(out.contains("<APM_NUMBER> <BUSINESS_APP_NAME>"));
+        assert!(out.contains("[depth 1, live_traversal, tombstoned]"));
     }
 
     #[test]
@@ -4991,7 +5374,7 @@ mod tests {
             author: Some(Reference {
                 sys_id: "user-1".to_string(),
                 table: "sys_user".to_string(),
-                display_name: "Jared Jennings".to_string(),
+                display_name: "Casey User".to_string(),
                 extra: HashMap::new(),
             }),
             valid_to: Some(chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
@@ -5000,7 +5383,7 @@ mod tests {
         let rendered = super::format_knowledge_article(&article, true);
         assert!(rendered.contains("KB0105015 [published] Windows server admin access"));
         assert!(rendered.contains("knowledge base: IT Operations"));
-        assert!(rendered.contains("author: Jared Jennings (user-1)"));
+        assert!(rendered.contains("author: Casey User (user-1)"));
         assert!(rendered.contains("published: "));
         assert!(rendered.contains("valid to: 2027-01-01"));
         assert!(rendered.contains("Summary:"));

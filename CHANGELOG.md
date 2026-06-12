@@ -27,6 +27,10 @@ the `snow` CLI going forward. The format follows
 - New daemon JSON-RPC methods and MCP tools: `business_application_servers`,
   `business_application_servers_cached`, `business_applications_for_server`, and
   `server_get`.
+- Approval actions now support `approval_sys_id` from `list_my_approvals` on
+  `approval_approve` and `approval_reject`, allowing callers to approve or
+  reject the selected `sysapproval_approver` row directly after a caller-scoped
+  approval listing.
 - Durable BA↔server inventory: a membership + path projection carrying
   provenance (`relationship`, `service_membership`, or `both`). A
   `ci_owner_group` fallback (`source: ci_owner_group_fallback`, live-only and
@@ -41,6 +45,16 @@ the `snow` CLI going forward. The format follows
 - Local cache schema migrated to **v11** (auto-migrated forward-only on open):
   v10 added `business_application_servers`; v11 added
   `business_application_server_inventory_health`.
+- `list_my_approvals` now returns pending direct approvals plus approvals routed
+  to the daemon-authenticated user's direct `sys_user_group` memberships, with a
+  `query_summary` describing direct/group counts and deduplication.
+- Legacy daemon JSON-RPC `approve` and `reject` methods remain parseable but are
+  deprecated aliases for `approval_approve` and `approval_reject`; they are no
+  longer advertised as canonical `supported_methods` and share the same approval
+  write policy gate.
+- Knowledge MCP naming now documents `knowledge_search` and `knowledge_fetch` as
+  product-facing canonical names, while `search_knowledge` and `get_article`
+  remain compatibility aliases.
 
 ### Breaking
 
