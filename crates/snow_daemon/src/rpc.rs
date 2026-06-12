@@ -5650,7 +5650,43 @@ story_board_id = "board-sys"
 
     #[tokio::test(flavor = "current_thread")]
     async fn direct_rpc_nabu_startup_sequence_smoke_test() {
-        let fixture = build_fixture_state().await.expect("fixture");
+        // `list_my_approvals` is live-only since group-routed listing landed
+        // (cache rows carry no group routing), so the startup sequence needs a
+        // mock instance serving the user lookup, direct approval rows, and an
+        // empty group-membership result; every other method below is
+        // cache-served from the fixture.
+        let (instance_url, _approval_requests) = spawn_json_http_sequence_server(vec![
+            json!({
+                "result": [{
+                    "sys_id": "user-1",
+                    "user_name": "tester",
+                    "email": "tester@example.com",
+                    "name": "Example User"
+                }]
+            }),
+            json!({
+                "result": [{
+                    "sys_id": "apr-sys",
+                    "number": "APR001",
+                    "state": "requested",
+                    "short_description": "Approval for CHG001",
+                    "approver": { "value": "user-1", "display_value": "Example User" },
+                    "source_table": { "value": "change_request", "display_value": "Change Request" },
+                    "sysapproval": { "value": "chg-sys", "display_value": "CHG001" },
+                    "sysapproval.number": "CHG001",
+                    "sysapproval.short_description": "Example change",
+                    "sysapproval.state": "assess",
+                    "sysapproval.sys_class_name": "change_request",
+                    "sys_created_on": "2026-04-09 10:11:12"
+                }]
+            }),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("approval http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
         seed_kb_runtime_state(&fixture).expect("seed kb runtime state");
 
         for (method, params) in [
