@@ -1736,6 +1736,10 @@ fn enforce_story_payload_scope(
     payload: &Value,
     binding: &BoardBinding,
 ) -> std::result::Result<(), PlanBuildError> {
+    // Unrestricted binding — no board scope enforcement.
+    if binding.allowed_sprints.is_empty() {
+        return Ok(());
+    }
     let snapshot = in_scope_snapshot_from_json(payload).ok_or_else(|| {
         PlanBuildError::GuardFailed(InScopeFailure::WrongAssignmentGroup {
             expected: binding.assignment_group.clone(),
@@ -1753,6 +1757,10 @@ fn enforce_story_record_scope(
     record: &SnowRecord,
     binding: &BoardBinding,
 ) -> std::result::Result<(), PlanBuildError> {
+    // Unrestricted binding — no board scope enforcement.
+    if binding.allowed_sprints.is_empty() {
+        return Ok(());
+    }
     story_record_in_scope(record, binding).map_err(PlanBuildError::GuardFailed)
 }
 
@@ -1774,6 +1782,10 @@ fn enforce_task_parent_payload_scope(
     parent: &SnowRecord,
     binding: &BoardBinding,
 ) -> std::result::Result<(), PlanBuildError> {
+    // Unrestricted binding — no board scope enforcement.
+    if binding.allowed_sprints.is_empty() {
+        return Ok(());
+    }
     let snapshot = in_scope_snapshot_from_snow_record(parent).ok_or_else(|| {
         PlanBuildError::GuardFailed(InScopeFailure::TaskParentOutOfScope {
             cause: Box::new(InScopeFailure::WrongAssignmentGroup {
@@ -1796,6 +1808,10 @@ fn enforce_task_record_scope(
     task: &SnowRecord,
     binding: &BoardBinding,
 ) -> std::result::Result<(), PlanBuildError> {
+    // Unrestricted binding — no board scope enforcement.
+    if binding.allowed_sprints.is_empty() {
+        return Ok(());
+    }
     task_record_in_scope(task, binding).map_err(PlanBuildError::GuardFailed)
 }
 
@@ -2281,6 +2297,15 @@ async fn enforce_apply_guard(
     binding: &BoardBinding,
     state: &DaemonState,
 ) -> std::result::Result<(), InScopeFailure> {
+    // When allowed_sprints is empty the board binding is unrestricted — any
+    // story on any sprint/board is permitted.  Skip the board-membership guard
+    // entirely so writes to stories that live on a different squad board are
+    // not rejected.  A non-empty allowed_sprints list re-enables the full
+    // scope check, constraining writes to the configured board only.
+    if binding.allowed_sprints.is_empty() {
+        return Ok(());
+    }
+
     match tool {
         "story_apply_create" => {
             let snapshot = in_scope_snapshot_from_json(&plan.planned_changes).ok_or_else(|| {

@@ -316,19 +316,22 @@ pub fn story_in_scope(
         });
     }
 
-    let Some(sprint) = snapshot.sprint_sys_id else {
-        return Err(InScopeFailure::MissingSprint);
-    };
+    // Empty allowed_sprints means "any sprint is permitted" — skip the check entirely.
+    if !binding.allowed_sprints.is_empty() {
+        let Some(sprint) = snapshot.sprint_sys_id else {
+            return Err(InScopeFailure::MissingSprint);
+        };
 
-    if !binding
-        .allowed_sprints
-        .iter()
-        .any(|allowed| equal_sys_id(sprint, allowed))
-    {
-        return Err(InScopeFailure::SprintNotAllowed {
-            observed: sprint.to_string(),
-            allowed: binding.allowed_sprints.clone(),
-        });
+        if !binding
+            .allowed_sprints
+            .iter()
+            .any(|allowed| equal_sys_id(sprint, allowed))
+        {
+            return Err(InScopeFailure::SprintNotAllowed {
+                observed: sprint.to_string(),
+                allowed: binding.allowed_sprints.clone(),
+            });
+        }
     }
 
     Ok(())

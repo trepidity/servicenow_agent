@@ -238,15 +238,23 @@ impl PolicyConfig {
             return Ok(None);
         };
 
+        // When allowed_sprints is empty the board binding is intentionally
+        // unrestricted — any story on any sprint/board is permitted.  In that
+        // mode skip the environment-label-source gate and the production scope
+        // gate so that a daemon started without an explicit SNOW_ENV still
+        // allows writes.  A non-empty allowed_sprints list re-enables both
+        // gates, enforcing the narrower "this board only" contract.
+        let unrestricted = binding.allowed_sprints.is_empty();
+
         let label = environment.label.as_str();
-        if is_story_apply_tool(tool) && !environment.has_explicit_label_source() {
+        if !unrestricted && is_story_apply_tool(tool) && !environment.has_explicit_label_source() {
             return Err(BoardPolicyError::ImplicitEnvironmentLabel {
                 tool: tool.to_string(),
                 environment: label.to_string(),
             });
         }
 
-        if self.is_story_production_context(environment, binding) {
+        if !unrestricted && self.is_story_production_context(environment, binding) {
             self.validate_story_production_gate(tool, binding)?;
         }
 
