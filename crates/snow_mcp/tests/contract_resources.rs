@@ -23,14 +23,19 @@ async fn resources_list_and_read_match_core_markdown_rendering() {
     assert!(
         resources
             .iter()
-            .any(|r| r["uri"] == "snow://records/{number}")
+            .any(|r| r["name"] == "ServiceNow record" && r["uri"] == "snow://records/{number}")
     );
     assert!(
         resources
             .iter()
-            .any(|r| r["uri"] == "snow://knowledge/{number}")
+            .any(|r| r["name"] == "ServiceNow knowledge article"
+                && r["uri"] == "snow://knowledge/{number}")
     );
-    assert!(resources.iter().any(|r| r["uri"] == "snow://dashboard"));
+    assert!(
+        resources
+            .iter()
+            .any(|r| r["name"] == "ServiceNow dashboard" && r["uri"] == "snow://dashboard")
+    );
 
     let record = fixture
         .core

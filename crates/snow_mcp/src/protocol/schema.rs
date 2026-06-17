@@ -76,6 +76,7 @@ pub struct McpToolDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpResourceDescriptor {
+    pub name: String,
     pub uri: String,
     pub description: String,
     pub mime_type: String,

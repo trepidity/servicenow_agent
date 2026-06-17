@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Protocol-level MCP tools/list schema smoke.
+"""Protocol-level MCP tools/list and resources/list schema smoke.
 
 This script launches an MCP server command, requests tools/list, and fails if
 any advertised tool uses top-level JSON Schema composition keywords that model
-clients reject during tool registration.
+clients reject during tool registration. It also requests resources/list and
+fails if advertised resources omit client-required identity fields.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any
 
 COMPOSITION_KEYWORDS = ("oneOf", "anyOf", "allOf")
 TOOLS_LIST_ID = 2
+RESOURCES_LIST_ID = 3
 
 
 class SmokeError(Exception):
@@ -39,6 +41,7 @@ def request_payload() -> str:
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         {"jsonrpc": "2.0", "id": TOOLS_LIST_ID, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": RESOURCES_LIST_ID, "method": "resources/list", "params": {}},
     ]
     return "".join(f"{json.dumps(message, separators=(',', ':'))}\n" for message in messages)
 
@@ -58,11 +61,11 @@ def parse_json_lines(output: str) -> list[dict[str, Any]]:
     return messages
 
 
-def tools_list_message(messages: list[dict[str, Any]]) -> dict[str, Any]:
+def response_message(messages: list[dict[str, Any]], response_id: int, label: str) -> dict[str, Any]:
     for message in messages:
-        if message.get("id") == TOOLS_LIST_ID:
+        if message.get("id") == response_id:
             return message
-    raise SmokeError("MCP tools/list response was not returned")
+    raise SmokeError(f"MCP {label} response was not returned")
 
 
 def validate_tools_list(message: dict[str, Any]) -> int:
@@ -103,6 +106,32 @@ def validate_tools_list(message: dict[str, Any]) -> int:
     return len(tools)
 
 
+def validate_resources_list(message: dict[str, Any]) -> int:
+    if "error" in message:
+        raise SmokeError(f"MCP resources/list returned error: {json.dumps(message['error'])}")
+
+    result = message.get("result")
+    if not isinstance(result, dict):
+        raise SmokeError("MCP resources/list result is not an object")
+
+    resources = result.get("resources")
+    if not isinstance(resources, list):
+        raise SmokeError("MCP resources/list result.resources is not an array")
+
+    offenders: list[str] = []
+    for index, resource in enumerate(resources):
+        if not isinstance(resource, dict):
+            raise SmokeError(f"MCP resources[{index}] is not an object")
+        for field in ("name", "uri"):
+            value = resource.get(field)
+            if not isinstance(value, str) or not value:
+                offenders.append(f"resources[{index}].{field}")
+
+    if offenders:
+        raise SmokeError("MCP resources with missing/non-string fields: " + ", ".join(offenders))
+    return len(resources)
+
+
 def run_smoke(command: list[str], timeout: float) -> int:
     if not command:
         raise SmokeError("missing MCP command after --", code=2)
@@ -125,13 +154,16 @@ def run_smoke(command: list[str], timeout: float) -> int:
     if not messages and completed.stderr:
         raise SmokeError(f"MCP command produced no JSON responses; stderr: {completed.stderr.strip()}")
 
-    count = validate_tools_list(tools_list_message(messages))
+    tool_count = validate_tools_list(response_message(messages, TOOLS_LIST_ID, "tools/list"))
+    resource_count = validate_resources_list(
+        response_message(messages, RESOURCES_LIST_ID, "resources/list")
+    )
     if completed.returncode not in (0, -15):
         raise SmokeError(
-            "MCP command exited after tools/list with nonzero status "
+            "MCP command exited after protocol smoke with nonzero status "
             f"{completed.returncode}; stderr: {completed.stderr.strip()}"
         )
-    return count
+    return tool_count, resource_count
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -156,11 +188,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        count = run_smoke(args.command, args.timeout)
+        tool_count, resource_count = run_smoke(args.command, args.timeout)
     except SmokeError as exc:
         print(f"mcp schema smoke failed: {exc}", file=sys.stderr)
         return exc.code
-    print(f"mcp schema smoke passed: {count} tools, no top-level schema composition")
+    print(
+        "mcp schema smoke passed: "
+        f"{tool_count} tools, {resource_count} resources, no top-level schema composition"
+    )
     return 0
 
 

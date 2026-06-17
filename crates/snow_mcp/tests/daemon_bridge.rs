@@ -850,7 +850,8 @@ async fn bridge_advertised_dashboard_resource_is_readable() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|resource| resource["uri"] == json!("snow://dashboard"))
+            .any(|resource| resource["name"] == json!("ServiceNow dashboard")
+                && resource["uri"] == json!("snow://dashboard"))
     );
 
     let response = server

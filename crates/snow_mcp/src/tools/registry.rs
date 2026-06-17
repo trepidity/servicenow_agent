@@ -71,16 +71,19 @@ impl ToolRegistry {
         crate::tools::governance::register(&mut registry);
         registry.resources = vec![
             McpResourceDescriptor {
+                name: "ServiceNow record".to_string(),
                 uri: "snow://records/{number}".to_string(),
                 description: "Record as markdown".to_string(),
                 mime_type: "text/markdown".to_string(),
             },
             McpResourceDescriptor {
+                name: "ServiceNow knowledge article".to_string(),
                 uri: "snow://knowledge/{number}".to_string(),
                 description: "Knowledge article as markdown".to_string(),
                 mime_type: "text/markdown".to_string(),
             },
             McpResourceDescriptor {
+                name: "ServiceNow dashboard".to_string(),
                 uri: "snow://dashboard".to_string(),
                 description: "Current user's task summary".to_string(),
                 mime_type: "application/json".to_string(),

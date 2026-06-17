@@ -41,6 +41,7 @@ pub struct McpTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpResource {
+    pub name: String,
     pub uri: String,
     pub description: String,
     pub mime_type: String,
@@ -1757,16 +1758,19 @@ impl McpServer {
     fn resource_catalog() -> Vec<McpResource> {
         vec![
             McpResource {
+                name: "ServiceNow record".to_string(),
                 uri: "snow://records/{number}".to_string(),
                 description: "Record as markdown".to_string(),
                 mime_type: "text/markdown".to_string(),
             },
             McpResource {
+                name: "ServiceNow knowledge article".to_string(),
                 uri: "snow://knowledge/{number}".to_string(),
                 description: "Knowledge article as markdown".to_string(),
                 mime_type: "text/markdown".to_string(),
             },
             McpResource {
+                name: "ServiceNow dashboard".to_string(),
                 uri: "snow://dashboard".to_string(),
                 description: "Current user's task summary".to_string(),
                 mime_type: "application/json".to_string(),
@@ -2114,12 +2118,14 @@ mod tests {
         assert!(
             resources
                 .iter()
-                .any(|resource| resource.uri == "snow://dashboard")
+                .any(|resource| resource.name == "ServiceNow dashboard"
+                    && resource.uri == "snow://dashboard")
         );
         assert!(
             resources
                 .iter()
-                .any(|resource| resource.uri == "snow://records/{number}")
+                .any(|resource| resource.name == "ServiceNow record"
+                    && resource.uri == "snow://records/{number}")
         );
     }
 
