@@ -11,6 +11,7 @@ const STORY_APPLY_CREATE_FIELDS: &[&str] = &[
     "acceptance_criteria",
     "cmdb_ci",
     "u_story_owner",
+    "backlog_type",
     "sprint",
     "assignment_group",
     "parent",

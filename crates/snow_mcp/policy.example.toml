@@ -42,7 +42,7 @@ environments = ["test", "training"]        # never callable in production
 confirmation_ttl_seconds = 600
 field_allowlist = [                        # only these fields may be written
     "short_description", "description", "acceptance_criteria",
-    "cmdb_ci", "u_story_owner", "sprint", "assignment_group", "state",
+    "cmdb_ci", "u_story_owner", "backlog_type", "sprint", "assignment_group", "state",
     "parent", "vendor", "team", "release_scrum",
     "u_impacted_users", "u_release_notes", "u_lead_dev",
     "u_division", "u_region", "u_location", "u_type", "u_moscow",

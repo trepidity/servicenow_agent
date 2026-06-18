@@ -116,6 +116,7 @@ fn story_plan_create_input_schema() -> Value {
             "acceptance_criteria": {"type": "string", "maxLength": 16000},
             "cmdb_ci": {"type": "string"},
             "u_story_owner": {"type": "string"},
+            "backlog_type": {"type": "string", "enum": ["product"]},
             "sprint": {"type": "string"},
             "assignment_group": {"type": "string"},
             "parent": {"type": "string"},

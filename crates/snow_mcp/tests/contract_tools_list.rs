@@ -693,9 +693,14 @@ fn schemas_include_required_fields_for_create_update_apply() {
         "string"
     );
     assert_eq!(story_create["properties"]["description"]["type"], "string");
+    assert_eq!(
+        story_create["properties"]["backlog_type"]["enum"],
+        json!(["product"])
+    );
     for field in [
         "cmdb_ci",
         "u_story_owner",
+        "backlog_type",
         "sprint",
         "assignment_group",
         "parent",
@@ -1000,6 +1005,7 @@ fn policy_defaults_allow_full_story_form_fields() {
         "acceptance_criteria",
         "cmdb_ci",
         "u_story_owner",
+        "backlog_type",
         "sprint",
         "assignment_group",
         "parent",
@@ -1032,11 +1038,15 @@ fn policy_defaults_allow_full_story_form_fields() {
             create.contains(field),
             "story_apply_create allowlist missing {field}"
         );
+        if field == "backlog_type" {
+            continue;
+        }
         assert!(
             update.contains(field),
             "story_apply_update allowlist missing {field}"
         );
     }
+    assert!(!update.contains("backlog_type"));
     assert!(update.contains("percent_complete"));
 }
 
