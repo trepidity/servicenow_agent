@@ -40,11 +40,14 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Change request (`change_request`) | `change_request_apply_update` | **Update** | ❌ | yes | governed; daemon required; field allowlist |
 | Change task (`change_task`) | `change_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Change task (`change_task`) | `change_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; terminal records skipped by policy |
+| Resource plan (`resource_plan`) | `resource_plan_apply_create` | **Create** | ❌ | yes | governed; daemon required; writes `task`,`group_resource` or `user_resource`,`resource_type`,`state`,`planned_hours`,`notes`,`start_date`,`end_date` |
+| Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `state`,`planned_hours`,`notes`,`start_date`,`end_date` only |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
 
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_request_plan_create`, `change_request_plan_update`,
 `change_task_plan_create`, `change_task_plan_update`,
+`resource_plan_plan_create`, `resource_plan_plan_update`,
 `timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 `*_submit_*` tool executes the plan.
@@ -52,8 +55,43 @@ build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 **Enforcement at runtime:**
 - Default posture is `read_only` (`default_mode`, `policy.rs:495`).
 - The daemon bridge rejects all non-governed write tools — `-32040 policy denied` (`daemon_bridge.rs`).
-- Governed Story, Change, and time-card writes need an attached daemon, else `-32044 DAEMON_REQUIRED_FOR_WRITE` (`server.rs`).
+- Governed Story, Change, Resource Plan, and time-card writes need an attached daemon, else `-32044 DAEMON_REQUIRED_FOR_WRITE` (`server.rs`).
 - A disabled tool returns `-32040 policy denied`.
+
+### Resource Plan Writes
+
+`resource_plan_plan_create`, `resource_plan_apply_create`,
+`resource_plan_plan_update`, and `resource_plan_apply_update` are governed
+daemon-backed writes for the `resource_plan` table.
+
+- **Parent model:** create sets the single polymorphic `task` field from
+  `parent_sys_id` after the daemon reads the parent and verifies
+  `parent_type = demand` maps to `dmn_demand` or `parent_type = project` maps
+  to `pm_project`. There is no writable `parent` or `parent_table` column.
+- **Resource model:** create accepts `resource_type = group|user` and
+  `resource_sys_id`, then writes `group_resource` or `user_resource` plus
+  `resource_type`. Update does not allow changing `task`, resource assignment,
+  or `resource_type`.
+- **State model:** `state` accepts a raw integer string or the known labels
+  `Planning` and `Allocated`. Unknown raw integers pass through; unknown labels
+  are rejected at plan time.
+- **Notes:** caller `notes` maps to the ServiceNow `notes` column. `work_notes`
+  is intentionally absent from schemas and allowlists because Resource Plan
+  journal writes no-op in ServiceNow.
+- **Period and hours:** `start_date` and `end_date` are date strings. v1 writes
+  `planned_hours` as a direct scalar and does not manage allocation child rows
+  or rollups.
+- **Concurrency:** update apply requires the plan-issued concurrency token
+  (`sys_updated_on` plus optional `sys_mod_count`). A missing/mismatched caller
+  token returns `CONCURRENCY_TOKEN_INVALID` (`-32061`); a changed record returns
+  `CONCURRENCY_CONFLICT` (`-32053`).
+- **Kill switch:** `SNOW_RESOURCE_PLAN_WRITE_KILL_SWITCH=1|true|yes` denies
+  every Resource Plan apply with `KILL_SWITCH` (`-32057`).
+- **ACLs:** the daemon service account needs create/update ACLs on
+  `resource_plan`, read ACLs on `dmn_demand` and `pm_project` for parent
+  validation, and read access to `sys_user_group` / `sys_user` if deployment
+  policy validates resources outside the write payload. A 401/403 write failure
+  is surfaced as `UPSTREAM_PERMISSION_DENIED` (`-32063`).
 
 ---
 
@@ -85,7 +123,7 @@ work_record_ttl = "60m"
   `business_application_fields`,
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
-  `get_work_notes`, `attachment_list`
+  `get_work_notes`, `attachment_list`, `resource_plan_list`
 
 `list_my_approvals` is read-only and returns pending direct approvals plus
 pending approvals routed to direct `sys_user_group` memberships for the
@@ -93,6 +131,32 @@ daemon-authenticated ServiceNow user. It reads `sys_user_grmember` to resolve
 those memberships, accepts no caller-supplied user or approver override, keeps
 the approval collection under `records`, and includes a top-level
 `query_summary` on successful responses.
+
+### `resource_plan_list`
+
+`resource_plan_list` is a read-only, default-enabled live query against
+`resource_plan`. It issues one Table API query to `resource_plan`; when
+`parent_number` is supplied, it may first resolve the parent number to a sys_id
+on `dmn_demand` or `pm_project`, then the resource-plan query filters
+`task=<sys_id>`.
+
+- **Params:** all optional. `parent_number` xor `task_sys_id`; `resource_sys_id`
+  requires `resource_type` (`group` or `user`); `state` is one raw integer or an
+  array of raw integers; `limit` defaults to `50` and clamps at `200` with a
+  `LIMIT_CLAMPED` warning.
+- **Filters:** parent filters use the `task` field. Group resources filter
+  `group_resource`; user resources filter `user_resource`; `resource_type`
+  alone filters the raw `resource_type` choice. Multiple states use a
+  builder-generated `stateIN...` query.
+- **Response:** `{ records, query_summary }`. Each record includes optional
+  `browser_url`, optional `vault_relative_path`, `parent` from `task.number` and
+  `task.sys_class_name` dot-walk fields, optional `resource`, raw `state`,
+  `state_label` from ServiceNow's `state.display_value`, `planned_hours`,
+  `notes` from the `notes` field, and `context` from `u_description`.
+- **Truncation:** `query_summary.truncated` is `true` when returned rows equal
+  the effective limit.
+- **ACL:** requires read access to `resource_plan`; parent number/table labels
+  depend on read access to the `task` dot-walk fields.
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,

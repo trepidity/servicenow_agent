@@ -24,6 +24,7 @@ use snow_core::{
 pub mod catalog_write;
 pub mod change_write;
 pub mod jobs;
+pub mod resource_plan_write;
 pub mod rpc;
 pub mod story_write;
 pub mod timecard_write;

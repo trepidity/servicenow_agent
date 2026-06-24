@@ -9,7 +9,8 @@ use snow_core::{
     KnowledgeBaseSummary, KnowledgeCategorySummary, KnowledgeEmbeddingCoverage, KnowledgeSearchHit,
     KnowledgeSearchMode, KnowledgeSemanticStatus, KnowledgeStatus, KnowledgeSyncMode,
     KnowledgeSyncOutcome, KnowledgeTagLayer, KnowledgeTagSummary, MatchField, RecordRef, Reference,
-    ResourceType, SearchMatchReason, SearchResult, SemanticIndexSummary, SnowCore, SnowRecord,
+    ResourcePlanRecord, ResourceType, SearchMatchReason, SearchResult, SemanticIndexSummary,
+    SnowCore, SnowRecord,
 };
 
 pub struct DaemonTransport<'a> {
@@ -60,6 +61,12 @@ impl<'a> DaemonTransport<'a> {
             browser_url: self.browser_url(&record.table, &record.sys_id),
             vault_relative_path: self.vault_relative_path(&record.sys_id)?,
         })
+    }
+
+    pub fn resource_plan_record(&self, record: &mut ResourcePlanRecord) -> Result<()> {
+        record.browser_url = self.browser_url("resource_plan", &record.sys_id);
+        record.vault_relative_path = self.vault_relative_path(&record.sys_id)?;
+        Ok(())
     }
 
     pub fn knowledge_article(&self, article: &KnowledgeArticle) -> Result<DaemonKnowledgeArticle> {

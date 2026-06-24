@@ -77,6 +77,21 @@ const STORY_APPLY_UPDATE_FIELDS: &[&str] = &[
     "percent_complete",
 ];
 
+const RESOURCE_PLAN_APPLY_CREATE_FIELDS: &[&str] = &[
+    "task",
+    "group_resource",
+    "user_resource",
+    "resource_type",
+    "state",
+    "planned_hours",
+    "notes",
+    "start_date",
+    "end_date",
+];
+
+const RESOURCE_PLAN_APPLY_UPDATE_FIELDS: &[&str] =
+    &["state", "planned_hours", "notes", "start_date", "end_date"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyConfig {
     #[serde(default = "default_environment")]
@@ -692,6 +707,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "get_work_notes",
                     "work_note_plan_add",
                     "resource_plan_get",
+                    "resource_plan_list",
                     "story_get",
                     "story_tasks_list",
                     "user_lookup",
@@ -767,6 +783,23 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "attachment_upload",
                     "work_note_apply_add",
                 ],
+            ),
+        ),
+        (
+            "resource_plan_writer".to_string(),
+            role(
+                &[
+                    "resource_plan_get",
+                    "get_record",
+                    "user_lookup",
+                    "user_search",
+                    "resource_plan_plan_create",
+                    "resource_plan_plan_update",
+                    "plan_get",
+                    "policy_describe",
+                    "tool_capabilities",
+                ],
+                &["resource_plan_apply_create", "resource_plan_apply_update"],
             ),
         ),
         (
@@ -969,6 +1002,22 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
             ]),
         ),
         (
+            "resource_plan_plan_create".to_string(),
+            resource_plan_plan_policy(),
+        ),
+        (
+            "resource_plan_plan_update".to_string(),
+            resource_plan_plan_policy(),
+        ),
+        (
+            "resource_plan_apply_create".to_string(),
+            resource_plan_apply_policy(RESOURCE_PLAN_APPLY_CREATE_FIELDS, false),
+        ),
+        (
+            "resource_plan_apply_update".to_string(),
+            resource_plan_apply_policy(RESOURCE_PLAN_APPLY_UPDATE_FIELDS, true),
+        ),
+        (
             "work_note_apply_add".to_string(),
             ToolPolicy {
                 enabled: true,
@@ -1057,6 +1106,32 @@ fn change_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
     }
 }
 
+fn resource_plan_plan_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: true,
+        requires_confirmation: false,
+        requires_kb_evidence: false,
+        environments: default_story_environments(),
+        ..ToolPolicy::default()
+    }
+}
+
+fn resource_plan_apply_policy(field_allowlist: &[&str], skip_terminal_records: bool) -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        field_allowlist: field_allowlist
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect(),
+        environments: default_story_environments(),
+        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+        skip_terminal_records,
+        ..ToolPolicy::default()
+    }
+}
+
 fn timecard_plan_policy() -> ToolPolicy {
     ToolPolicy {
         enabled: true,
@@ -1064,6 +1139,87 @@ fn timecard_plan_policy() -> ToolPolicy {
         requires_kb_evidence: false,
         environments: default_story_environments(),
         ..ToolPolicy::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_write_tool_classifies_resource_plan_apply() {
+        assert!(is_write_tool("resource_plan_apply_create"));
+        assert!(is_write_tool("resource_plan_apply_update"));
+        assert!(!is_write_tool("resource_plan_plan_create"));
+        assert!(!is_write_tool("resource_plan_plan_update"));
+    }
+
+    #[test]
+    fn default_tools_disable_resource_plan_apply() {
+        let tools = default_tools();
+        assert!(tools["resource_plan_plan_create"].enabled);
+        assert!(tools["resource_plan_plan_update"].enabled);
+        assert!(!tools["resource_plan_apply_create"].enabled);
+        assert!(!tools["resource_plan_apply_update"].enabled);
+        assert!(tools["resource_plan_apply_create"].requires_confirmation);
+        assert!(tools["resource_plan_apply_update"].requires_confirmation);
+        assert!(!tools["resource_plan_apply_create"].skip_terminal_records);
+        assert!(tools["resource_plan_apply_update"].skip_terminal_records);
+    }
+
+    #[test]
+    fn resource_plan_apply_allowlists_match_design() {
+        let tools = default_tools();
+        assert_eq!(
+            tools["resource_plan_apply_create"].field_allowlist,
+            BTreeSet::from([
+                "task".to_string(),
+                "group_resource".to_string(),
+                "user_resource".to_string(),
+                "resource_type".to_string(),
+                "state".to_string(),
+                "planned_hours".to_string(),
+                "notes".to_string(),
+                "start_date".to_string(),
+                "end_date".to_string(),
+            ])
+        );
+        assert_eq!(
+            tools["resource_plan_apply_update"].field_allowlist,
+            BTreeSet::from([
+                "state".to_string(),
+                "planned_hours".to_string(),
+                "notes".to_string(),
+                "start_date".to_string(),
+                "end_date".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn default_roles_has_resource_plan_writer() {
+        let roles = default_roles();
+        let role = roles
+            .get("resource_plan_writer")
+            .expect("resource_plan_writer role");
+        assert!(role.read_tools.contains(&"resource_plan_get".to_string()));
+        assert!(role.read_tools.contains(&"resource_plan_list".to_string()));
+        assert!(
+            role.read_tools
+                .contains(&"resource_plan_plan_create".to_string())
+        );
+        assert!(
+            role.read_tools
+                .contains(&"resource_plan_plan_update".to_string())
+        );
+        assert!(
+            role.write_tools
+                .contains(&"resource_plan_apply_create".to_string())
+        );
+        assert!(
+            role.write_tools
+                .contains(&"resource_plan_apply_update".to_string())
+        );
     }
 }
 

@@ -284,6 +284,8 @@ fn default_roles_include_story_writer_and_developer_plan_grants() {
     for tool in STORY_PLAN_TOOL_NAMES {
         assert!(developer.read_tools.contains(*tool));
     }
+    assert!(developer.read_tools.contains("resource_plan_get"));
+    assert!(developer.read_tools.contains("resource_plan_list"));
 }
 
 #[test]
@@ -317,6 +319,7 @@ fn default_story_tool_policies_match_policy_defaults() {
         "acceptance_criteria".to_string(),
         "assigned_to".to_string(),
         "assignment_group".to_string(),
+        "backlog_type".to_string(),
         "classification".to_string(),
         "cmdb_ci".to_string(),
         "description".to_string(),

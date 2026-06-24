@@ -71,6 +71,11 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("attachment_list", "attachment_list"),
     ("attachment_upload", "attachment_upload"),
     ("resource_plan_get", "get_record"),
+    ("resource_plan_list", "resource_plan_list"),
+    ("resource_plan_plan_create", "resource_plan_plan_create"),
+    ("resource_plan_apply_create", "resource_plan_apply_create"),
+    ("resource_plan_plan_update", "resource_plan_plan_update"),
+    ("resource_plan_apply_update", "resource_plan_apply_update"),
     ("story_get", "get_record"),
     ("story_tasks_list", "get_children"),
     ("change_request_plan_create", "change_request_plan_create"),
@@ -564,8 +569,20 @@ impl DaemonBackedMcpBridge {
         // The daemon owns governed write policy. The bridge only blocks generic
         // or otherwise ungoverned writes so its static default config cannot
         // drift away from the daemon's deploy-time policy file.
-        let Some(method) = canonical_daemon_method(name) else {
+        let Some(base_method) = canonical_daemon_method(name) else {
             return JsonRpcResponse::error(id, -32601, "tool not found", None);
+        };
+
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let method = if matches!(name, "get_article" | "knowledge_fetch")
+            && args.get("fresh").and_then(Value::as_bool) == Some(true)
+        {
+            "get_article_fresh"
+        } else {
+            base_method
         };
 
         let contract = match self.contract().await {
@@ -581,10 +598,6 @@ impl DaemonBackedMcpBridge {
             );
         }
 
-        let args = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
         if name == "attachment_upload" {
             if !self
                 .config
@@ -1424,5 +1437,21 @@ mod tests {
         assert_eq!(calls[0].1["content_type"], json!("image/jpeg"));
         assert!(calls[0].1.get("confirm_upload").is_none());
         assert!(calls[0].1.get("idempotency_key").is_none());
+    }
+
+    #[test]
+    fn bridge_maps_resource_plan_write_tools() {
+        assert_eq!(
+            canonical_daemon_method("resource_plan_list"),
+            Some("resource_plan_list")
+        );
+        for tool in [
+            "resource_plan_plan_create",
+            "resource_plan_apply_create",
+            "resource_plan_plan_update",
+            "resource_plan_apply_update",
+        ] {
+            assert_eq!(canonical_daemon_method(tool), Some(tool));
+        }
     }
 }

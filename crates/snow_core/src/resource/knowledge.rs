@@ -17,6 +17,7 @@ impl KnowledgeResource {
         category: Reference,
     ) -> KnowledgeArticle {
         let content = canonical_body(record);
+        let body_cached = body_fields_present(record);
         normalize_knowledge_article(KnowledgeArticle {
             record: Self::record_model(record, knowledge_base.clone(), category.clone()),
             knowledge_base,
@@ -26,7 +27,7 @@ impl KnowledgeResource {
             sn_tags: Vec::new(),
             auto_tags: Vec::new(),
             user_tags: Vec::new(),
-            body_cached: !content.trim().is_empty(),
+            body_cached,
             published_at: parse_servicenow_timestamp(record.get_str("published")),
             author: Self::author_reference(record),
             valid_to: parse_naive_date(record.get_str("valid_to")),
@@ -129,6 +130,10 @@ fn canonical_body(record: &Record) -> String {
         .to_string()
 }
 
+fn body_fields_present(record: &Record) -> bool {
+    record.fields().contains_key("article_body") || record.fields().contains_key("text")
+}
+
 fn parse_naive_date(value: Option<&str>) -> Option<NaiveDate> {
     let value = value?.trim();
     if value.is_empty() {
@@ -142,6 +147,15 @@ fn parse_naive_date(value: Option<&str>) -> Option<NaiveDate> {
 mod tests {
     use super::*;
     use servicenow_rs::model::value::FieldValue as SnFieldValue;
+
+    fn empty_reference(table: &str) -> Reference {
+        Reference {
+            sys_id: String::new(),
+            table: table.to_string(),
+            display_name: String::new(),
+            extra: std::collections::HashMap::new(),
+        }
+    }
 
     #[test]
     fn knowledge_references_fall_back_to_kb_prefixed_fields() {
@@ -171,5 +185,53 @@ mod tests {
         assert_eq!(knowledge_base.display_name, "IT Knowledge");
         assert_eq!(category.sys_id, "kb-cat");
         assert_eq!(category.display_name, "Access/Security");
+    }
+
+    #[test]
+    fn body_cached_marks_full_body_projection_even_when_empty() {
+        let record = Record::from_json(
+            "kb_knowledge",
+            &serde_json::json!({
+                "sys_id": "kb-empty-body-sys",
+                "number": "KB0001",
+                "short_description": "Empty body",
+                "article_body": "",
+                "text": ""
+            }),
+            servicenow_rs::prelude::DisplayValue::Both,
+        )
+        .expect("knowledge record");
+
+        let article = KnowledgeResource::from_servicenow(
+            &record,
+            empty_reference("kb_knowledge_base"),
+            empty_reference("kb_category"),
+        );
+
+        assert!(article.body_cached);
+        assert!(article.content.is_empty());
+    }
+
+    #[test]
+    fn body_cached_stays_false_for_metadata_only_projection() {
+        let record = Record::from_json(
+            "kb_knowledge",
+            &serde_json::json!({
+                "sys_id": "kb-metadata-only-sys",
+                "number": "KB0001",
+                "short_description": "Metadata only"
+            }),
+            servicenow_rs::prelude::DisplayValue::Both,
+        )
+        .expect("knowledge record");
+
+        let article = KnowledgeResource::from_servicenow(
+            &record,
+            empty_reference("kb_knowledge_base"),
+            empty_reference("kb_category"),
+        );
+
+        assert!(!article.body_cached);
+        assert!(article.content.is_empty());
     }
 }

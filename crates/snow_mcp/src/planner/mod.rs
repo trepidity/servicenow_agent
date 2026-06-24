@@ -43,6 +43,13 @@ pub const GOVERNED_CHANGE_TOOL_NAMES: &[&str] = &[
     "change_task_apply_update",
 ];
 
+pub const GOVERNED_RESOURCE_PLAN_TOOL_NAMES: &[&str] = &[
+    "resource_plan_plan_create",
+    "resource_plan_apply_create",
+    "resource_plan_plan_update",
+    "resource_plan_apply_update",
+];
+
 pub fn is_governed_story_tool(tool: &str) -> bool {
     GOVERNED_STORY_TOOL_NAMES.contains(&tool)
 }
@@ -71,6 +78,10 @@ pub fn is_governed_change_tool(tool: &str) -> bool {
     GOVERNED_CHANGE_TOOL_NAMES.contains(&tool)
 }
 
+pub fn is_governed_resource_plan_tool(tool: &str) -> bool {
+    GOVERNED_RESOURCE_PLAN_TOOL_NAMES.contains(&tool)
+}
+
 pub fn is_governed_write_tool(tool: &str) -> bool {
     is_governed_story_tool(tool)
         || is_governed_timecard_tool(tool)
@@ -79,4 +90,25 @@ pub fn is_governed_write_tool(tool: &str) -> bool {
         || is_governed_catalog_tool(tool)
         || is_governed_approval_tool(tool)
         || is_governed_change_tool(tool)
+        || is_governed_resource_plan_tool(tool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_governed_resource_plan_tool_recognizes_four_names() {
+        for tool in GOVERNED_RESOURCE_PLAN_TOOL_NAMES {
+            assert!(is_governed_resource_plan_tool(tool), "{tool}");
+        }
+        assert!(!is_governed_resource_plan_tool("resource_plan_get"));
+    }
+
+    #[test]
+    fn is_governed_write_tool_includes_resource_plan_tools() {
+        for tool in GOVERNED_RESOURCE_PLAN_TOOL_NAMES {
+            assert!(is_governed_write_tool(tool), "{tool}");
+        }
+    }
 }

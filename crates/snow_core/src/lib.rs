@@ -66,6 +66,14 @@ pub use resource::business_application::{
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
+pub use resource::resource_plan::{
+    ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
+    ResourcePlanListWarning, ResourcePlanParentRef, ResourcePlanParentType,
+    ResourcePlanQuerySummary, ResourcePlanRecord, ResourcePlanResource, ResourcePlanResourceRef,
+    ResourcePlanResourceType, ResourcePlanState, ResourcePlanStateFilter,
+    ResourcePlanWriteConcurrency, ResourcePlanWriteResult, TaskSelector, ValidatedListQuery,
+    resource_plan_record_from_row, validate_list_input,
+};
 pub use resource::server::{
     LINUX_SERVER_TABLE, SERVER_RESOURCE_TYPE, SERVER_TABLE, SERVER_TABLES, Server, ServerLookup,
     ServerQuery, ServerSearchParams, WINDOWS_SERVER_TABLE,
@@ -155,9 +163,28 @@ const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
     "planned_hours",
     "allocated_hours",
     "confirmed_hours",
-    "description",
+    "notes",
     "sys_updated_on",
 ];
+const RESOURCE_PLAN_LIST_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "short_description",
+    "state",
+    "task",
+    "resource_type",
+    "user_resource",
+    "group_resource",
+    "start_date",
+    "end_date",
+    "planned_hours",
+    "allocated_hours",
+    "confirmed_hours",
+    "notes",
+    "u_description",
+    "sys_updated_on",
+];
+const RESOURCE_PLAN_LIST_DOT_WALK: &[&str] = &["task.number", "task.sys_class_name"];
 const TIME_SHEET_FIELDS: &[&str] = &[
     "sys_id",
     "user",
@@ -1329,6 +1356,14 @@ pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
 pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {
     match record_number_prefix(number)?.as_str() {
         "DMNTSK" => Some("dmn_demand_task"),
+        _ => None,
+    }
+}
+
+fn resource_plan_parent_table_for_number(number: &str) -> Option<&'static str> {
+    match record_number_prefix(number)?.as_str() {
+        "DMND" => Some("dmn_demand"),
+        "PRJ" => Some("pm_project"),
         _ => None,
     }
 }
@@ -5156,18 +5191,21 @@ impl SnowCore {
         self.query.get_knowledge_article(number).await
     }
 
-    pub async fn get_knowledge_article_fresh(
+    pub async fn get_knowledge_article_cached_or_fresh(
         &self,
         number: &str,
     ) -> Result<Option<KnowledgeArticle>> {
-        let Some(record) = self.client.get_by_number(number).await? else {
-            return Ok(None);
-        };
-        self.persist_record(&record)?;
-        let article = self.query.get_knowledge_article(number).await?;
-        self.maybe_run_inline_semantic_rebuild("fresh knowledge article")
-            .await;
-        Ok(article)
+        let cached = self.get_knowledge_article(number).await?;
+        if cached.as_ref().is_some_and(|article| article.body_cached) {
+            return Ok(cached);
+        }
+
+        match self.get_knowledge_article_fresh_inner(number, false).await {
+            Ok(Some(fresh)) => Ok(Some(fresh)),
+            Ok(None) => Ok(cached),
+            Err(_) if cached.is_some() => Ok(cached),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn search_knowledge(
@@ -5992,6 +6030,79 @@ impl SnowCore {
         Ok(cached)
     }
 
+    pub async fn resource_plan_list(
+        &self,
+        input: ResourcePlanListInput,
+    ) -> Result<ResourcePlanListResponse> {
+        let validated = validate_list_input(input)?;
+        let resolved_task_sys_id = match &validated.task_selector {
+            TaskSelector::Number(number) => {
+                Some(self.resolve_resource_plan_parent_number(number).await?)
+            }
+            TaskSelector::SysId(sys_id) => Some(sys_id.clone()),
+            TaskSelector::None => None,
+        };
+
+        let mut query = self
+            .client
+            .table("resource_plan")
+            .fields(RESOURCE_PLAN_LIST_FIELDS)
+            .dot_walk(RESOURCE_PLAN_LIST_DOT_WALK)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .order_by("number", Order::Asc)
+            .limit(validated.effective_limit as u32);
+
+        if let Some(task_sys_id) = resolved_task_sys_id.as_deref() {
+            query = query.equals("task", task_sys_id);
+        }
+
+        let resource_type_hint = match &validated.resource {
+            ResolvedResourceFilter::Group(sys_id) => {
+                query = query.equals("group_resource", sys_id);
+                Some(ResourcePlanResourceType::Group)
+            }
+            ResolvedResourceFilter::User(sys_id) => {
+                query = query.equals("user_resource", sys_id);
+                Some(ResourcePlanResourceType::User)
+            }
+            ResolvedResourceFilter::TypeOnly(resource_type) => {
+                query = query.equals("resource_type", resource_type.as_snow_str());
+                Some(*resource_type)
+            }
+            ResolvedResourceFilter::None => None,
+        };
+
+        match validated.states.as_slice() {
+            [] => {}
+            [state] => {
+                query = query.equals("state", state);
+            }
+            states => {
+                let state_refs = states.iter().map(String::as_str).collect::<Vec<_>>();
+                query = query.in_list("state", &state_refs);
+            }
+        }
+
+        let records = query.execute().await?.records;
+        let records = records
+            .iter()
+            .map(|record| resource_plan_record_from_row(record, resource_type_hint))
+            .collect::<Vec<_>>();
+        let total_returned = records.len();
+
+        Ok(ResourcePlanListResponse {
+            records,
+            query_summary: ResourcePlanQuerySummary {
+                filters_applied: validated.filters_applied,
+                total_returned,
+                limit: validated.effective_limit,
+                truncated: total_returned == validated.effective_limit,
+                warnings: validated.warnings,
+            },
+        })
+    }
+
     pub async fn list_records(&self) -> Result<Vec<SnowRecord>> {
         self.list_records_query(query::filter::ListQuery::new())
             .await
@@ -6646,6 +6757,21 @@ impl SnowCore {
         .await
     }
 
+    pub async fn create_resource_plan(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<ResourcePlanWriteResult> {
+        self.create_resource_plan_record(payload).await
+    }
+
+    pub async fn update_resource_plan(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ResourcePlanWriteResult> {
+        self.update_resource_plan_record(sys_id, payload).await
+    }
+
     async fn create_change_write_record(
         &self,
         table: &str,
@@ -6712,6 +6838,76 @@ impl SnowCore {
         }
 
         resource::change::ChangeResource::write_result_from_fresh_row(fresh_record, &fresh_row)
+    }
+
+    async fn create_resource_plan_record(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<ResourcePlanWriteResult> {
+        let table = resource::resource_plan::ResourcePlanResource::TABLE;
+        let written = self.client.table(table).create(payload).await?;
+        self.refetch_resource_plan_result(&written.sys_id, &written)
+            .await
+    }
+
+    async fn update_resource_plan_record(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ResourcePlanWriteResult> {
+        let table = resource::resource_plan::ResourcePlanResource::TABLE;
+        let written = self.client.table(table).update(sys_id, payload).await?;
+        self.refetch_resource_plan_result(sys_id, &written).await
+    }
+
+    async fn refetch_resource_plan_result(
+        &self,
+        expected_sys_id: &str,
+        write_response: &Record,
+    ) -> Result<ResourcePlanWriteResult> {
+        let table = resource::resource_plan::ResourcePlanResource::TABLE;
+        let expected_sys_id = expected_sys_id.trim();
+        if expected_sys_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} write response did not include a sys_id to refetch",
+                table
+            ));
+        }
+
+        let Some((fresh_row, fresh_record)) = self
+            .get_record_by_table_sys_id_fresh_with_source(table, expected_sys_id)
+            .await?
+        else {
+            return Err(anyhow::anyhow!(
+                "{} write response returned {}, but fresh refetch by sys_id {} found no row",
+                table,
+                write_response.sys_id,
+                expected_sys_id
+            ));
+        };
+
+        let fresh_table = canonical_record_table(&fresh_row.table);
+        if fresh_table != table {
+            return Err(anyhow::anyhow!(
+                "{} write refetched sys_id {} from unexpected table {}",
+                table,
+                expected_sys_id,
+                fresh_row.table
+            ));
+        }
+        if fresh_row.sys_id != expected_sys_id {
+            return Err(anyhow::anyhow!(
+                "{} write refetched sys_id {}, expected {}",
+                table,
+                fresh_row.sys_id,
+                expected_sys_id
+            ));
+        }
+
+        resource::resource_plan::ResourcePlanResource::write_result_from_fresh_row(
+            fresh_record,
+            &fresh_row,
+        )
     }
 
     pub async fn add_work_note(&self, number: &str, text: &str) -> Result<Option<SnowRecord>> {
@@ -7467,6 +7663,24 @@ impl SnowCore {
             return Ok(None);
         };
         Ok(Some((record.table.clone(), record.sys_id.clone())))
+    }
+
+    async fn resolve_resource_plan_parent_number(&self, number: &str) -> Result<String> {
+        let table = resource_plan_parent_table_for_number(number).ok_or_else(|| {
+            ResourcePlanListError::InvalidParams(
+                "parent_number must start with DMND or PRJ".to_string(),
+            )
+        })?;
+        let Some(record) = self
+            .client
+            .table(table)
+            .equals("number", number)
+            .first()
+            .await?
+        else {
+            anyhow::bail!("resource_plan parent {number} was not found");
+        };
+        Ok(record.sys_id)
     }
 
     fn table_for_number(&self, number: &str) -> Option<String> {
@@ -12906,6 +13120,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_resource_plan_round_trips_record() {
+        let server = MockServer::start().await;
+        let sys_id = "11111111111111111111111111111111";
+
+        Mock::given(method("POST"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(body_partial_json(serde_json::json!({
+                "task": "22222222222222222222222222222222",
+                "group_resource": "33333333333333333333333333333333",
+                "resource_type": "group",
+                "state": "1",
+                "planned_hours": 8.0,
+                "notes": "Example allocation"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "<RPLN_NUMBER_CREATE>"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/resource_plan/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "<RPLN_NUMBER_CREATE>",
+                    "short_description": "Example allocation",
+                    "state": { "value": "1", "display_value": "Planning" },
+                    "sys_updated_on": "2026-06-24 10:11:12",
+                    "sys_mod_count": "1"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .create_resource_plan(serde_json::json!({
+                "task": "22222222222222222222222222222222",
+                "group_resource": "33333333333333333333333333333333",
+                "resource_type": "group",
+                "state": "1",
+                "planned_hours": 8.0,
+                "notes": "Example allocation"
+            }))
+            .await
+            .expect("create resource plan");
+
+        assert_eq!(result.record.sys_id, sys_id);
+        assert_eq!(result.record.number, "<RPLN_NUMBER_CREATE>");
+        assert_eq!(result.concurrency.sys_updated_on, "2026-06-24 10:11:12");
+        assert_eq!(result.concurrency.sys_mod_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn update_resource_plan_captures_concurrency() {
+        let server = MockServer::start().await;
+        let sys_id = "44444444444444444444444444444444";
+
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/now/table/resource_plan/{sys_id}")))
+            .and(body_partial_json(serde_json::json!({
+                "state": "3",
+                "planned_hours": 16.0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "<RPLN_NUMBER_UPDATE>"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/resource_plan/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "<RPLN_NUMBER_UPDATE>",
+                    "short_description": "Example allocation update",
+                    "state": { "value": "3", "display_value": "Allocated" },
+                    "planned_hours": "16",
+                    "sys_updated_on": "2026-06-24 10:12:13",
+                    "sys_mod_count": "24"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": sys_id,
+                    "work_notes": "",
+                    "comments": ""
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .update_resource_plan(
+                sys_id,
+                serde_json::json!({
+                    "state": "3",
+                    "planned_hours": 16.0
+                }),
+            )
+            .await
+            .expect("update resource plan");
+
+        assert_eq!(result.record.sys_id, sys_id);
+        assert_eq!(result.record.number, "<RPLN_NUMBER_UPDATE>");
+        assert_eq!(result.concurrency.sys_updated_on, "2026-06-24 10:12:13");
+        assert_eq!(result.concurrency.sys_mod_count, Some(24));
+    }
+
+    #[tokio::test]
     async fn get_record_by_table_sys_id_fresh_allows_demand_task() {
         let server = MockServer::start().await;
         let sys_id = "22222222222222222222222222222222";
@@ -13913,6 +14269,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_knowledge_article_fresh_requests_full_body_fields() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .and(query_param("sysparm_query", "number=KB0105015"))
+            .and(query_param_contains("sysparm_fields", "article_body"))
+            .and(query_param_contains("sysparm_fields", "text"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "kb-fresh-sys",
+                    "number": "KB0105015",
+                    "short_description": "Fresh KB title",
+                    "description": "Fresh KB summary",
+                    "article_body": "",
+                    "text": "<p>Fresh KB body from text</p>",
+                    "state": "published",
+                    "workflow_state": "published",
+                    "article_type": "text",
+                    "published": "2026-04-22 10:00:00",
+                    "valid_to": "",
+                    "knowledge_base": {
+                        "value": "kb-base-sys",
+                        "display_value": "Knowledge Base"
+                    },
+                    "category": {
+                        "value": "kb-cat-sys",
+                        "display_value": "Standard"
+                    },
+                    "author": {
+                        "value": "user-sys",
+                        "display_value": "Knowledge Author"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let article = core
+            .get_knowledge_article_fresh("KB0105015")
+            .await
+            .expect("fresh article")
+            .expect("article present");
+
+        assert_eq!(article.record.number, "KB0105015");
+        assert_eq!(article.content, "<p>Fresh KB body from text</p>");
+        assert!(article.body_cached);
+    }
+
+    #[tokio::test]
+    async fn get_knowledge_article_cached_or_fresh_repairs_missing_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .and(query_param("sysparm_query", "number=KB0105015"))
+            .and(query_param_contains("sysparm_fields", "article_body"))
+            .and(query_param_contains("sysparm_fields", "text"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "kb-body-miss-sys",
+                    "number": "KB0105015",
+                    "short_description": "Cached shell",
+                    "description": "Cached summary only",
+                    "article_body": "",
+                    "text": "<p>Recovered KB body</p>",
+                    "state": "published",
+                    "workflow_state": "published",
+                    "article_type": "text",
+                    "published": "2026-04-22 10:00:00",
+                    "knowledge_base": {
+                        "value": "kb-base-sys",
+                        "display_value": "Knowledge Base"
+                    },
+                    "category": {
+                        "value": "kb-cat-sys",
+                        "display_value": "Standard"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let metadata_only_record = Record::from_json(
+            "kb_knowledge",
+            &serde_json::json!({
+                "sys_id": "kb-body-miss-sys",
+                "number": "KB0105015",
+                "short_description": "Cached shell",
+                "description": "Cached summary only",
+                "state": "published",
+                "workflow_state": "published",
+                "article_type": "text",
+                "published": "2026-04-22 10:00:00",
+                "knowledge_base": {
+                    "value": "kb-base-sys",
+                    "display_value": "Knowledge Base"
+                },
+                "category": {
+                    "value": "kb-cat-sys",
+                    "display_value": "Standard"
+                }
+            }),
+            DisplayValue::Both,
+        )
+        .expect("metadata-only knowledge record");
+        core.persist_record(&metadata_only_record)
+            .expect("persist metadata-only knowledge record");
+
+        let cached = core
+            .get_knowledge_article("KB0105015")
+            .await
+            .expect("cached article")
+            .expect("cached article present");
+        assert!(!cached.body_cached);
+
+        let article = core
+            .get_knowledge_article_cached_or_fresh("KB0105015")
+            .await
+            .expect("cached-or-fresh article")
+            .expect("article present");
+
+        assert_eq!(article.content, "<p>Recovered KB body</p>");
+        assert!(article.body_cached);
+    }
+
+    #[tokio::test]
+    async fn get_knowledge_article_cached_or_fresh_falls_back_on_live_error() {
+        let server = MockServer::start().await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let metadata_only_record = Record::from_json(
+            "kb_knowledge",
+            &serde_json::json!({
+                "sys_id": "kb-body-miss-sys",
+                "number": "KB0105015",
+                "short_description": "Cached shell",
+                "description": "Cached summary only",
+                "state": "published",
+                "workflow_state": "published",
+                "article_type": "text"
+            }),
+            DisplayValue::Both,
+        )
+        .expect("metadata-only knowledge record");
+        core.persist_record(&metadata_only_record)
+            .expect("persist metadata-only knowledge record");
+
+        let article = core
+            .get_knowledge_article_cached_or_fresh("KB0105015")
+            .await
+            .expect("cached article despite live repair failure")
+            .expect("cached article present");
+
+        assert_eq!(article.record.number, "KB0105015");
+        assert!(!article.body_cached);
+        assert_eq!(article.record.description, "Cached summary only");
+        assert!(article.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_knowledge_article_cached_or_fresh_marks_empty_full_body_as_cached() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .and(query_param("sysparm_query", "number=KB0105016"))
+            .and(query_param_contains("sysparm_fields", "article_body"))
+            .and(query_param_contains("sysparm_fields", "text"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "kb-empty-body-sys",
+                    "number": "KB0105016",
+                    "short_description": "Cached shell",
+                    "description": "Cached summary only",
+                    "article_body": "",
+                    "text": "",
+                    "state": "published",
+                    "workflow_state": "published",
+                    "article_type": "text",
+                    "published": "2026-04-22 10:00:00"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let metadata_only_record = Record::from_json(
+            "kb_knowledge",
+            &serde_json::json!({
+                "sys_id": "kb-empty-body-sys",
+                "number": "KB0105016",
+                "short_description": "Cached shell",
+                "description": "Cached summary only",
+                "state": "published",
+                "workflow_state": "published",
+                "article_type": "text"
+            }),
+            DisplayValue::Both,
+        )
+        .expect("metadata-only knowledge record");
+        core.persist_record(&metadata_only_record)
+            .expect("persist metadata-only knowledge record");
+
+        let repaired = core
+            .get_knowledge_article_cached_or_fresh("KB0105016")
+            .await
+            .expect("repaired article")
+            .expect("article present");
+        assert!(repaired.body_cached);
+        assert!(repaired.content.is_empty());
+
+        let cached = core
+            .get_knowledge_article_cached_or_fresh("KB0105016")
+            .await
+            .expect("cached article")
+            .expect("article present");
+        assert!(cached.body_cached);
+        assert!(cached.content.is_empty());
+    }
+
+    #[tokio::test]
     async fn verify_vault_reports_projection_and_orphans() {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
@@ -14180,8 +14762,8 @@ mod tests {
                     "sys_id": "rpln-sys",
                     "number": { "value": "RPLN0089255", "display_value": "RPLN0089255" },
                     "short_description": { "value": "Nursing analytics allocation", "display_value": "Nursing analytics allocation" },
-                    "description": { "value": "Resource plan record", "display_value": "Resource plan record" },
-                    "state": { "value": "11", "display_value": "Allocated" },
+                    "notes": { "value": "Resource plan notes", "display_value": "Resource plan notes" },
+                    "state": { "value": "3", "display_value": "Allocated" },
                     "task": { "value": "project-sys", "display_value": "PRJ0161206" },
                     "task.number": "PRJ0161206",
                     "task.sys_class_name": "pm_project",
@@ -14236,6 +14818,223 @@ mod tests {
                 .and_then(|field| field.display_value.as_deref()),
             Some("Allocated")
         );
+        assert_eq!(
+            children[0]
+                .fields
+                .get("notes")
+                .map(|field| field.value.as_str()),
+            Some("Resource plan notes")
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/now/table/resource_plan")
+            .expect("resource plan request");
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let fields = query
+            .get("sysparm_fields")
+            .expect("resource_plan sysparm_fields");
+        let requested_fields = fields.split(',').collect::<std::collections::HashSet<_>>();
+        assert!(requested_fields.contains("notes"));
+        assert!(!requested_fields.contains("description"));
+    }
+
+    #[tokio::test]
+    async fn resource_plan_list_queries_task_and_state_in_once() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let task_sys_id = "00000000000000000000000000000010";
+        let group_sys_id = "00000000000000000000000000000020";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("task={task_sys_id}"),
+            ))
+            .and(query_param_contains("sysparm_query", "stateIN1,3"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("group_resource={group_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": { "value": "00000000000000000000000000000001" },
+                    "number": { "value": "<RPLN_NUMBER>" },
+                    "state": { "value": "3", "display_value": "Allocated" },
+                    "task": { "value": task_sys_id },
+                    "task.number": { "value": "<PRJ_NUMBER>" },
+                    "task.sys_class_name": { "value": "pm_project" },
+                    "resource_type": { "value": "group" },
+                    "group_resource": {
+                        "value": group_sys_id,
+                        "display_value": "<GROUP_DISPLAY>"
+                    },
+                    "planned_hours": { "value": "32" },
+                    "notes": { "value": "<NOTES>" },
+                    "u_description": { "value": "<CONTEXT>" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let resp = core
+            .resource_plan_list(ResourcePlanListInput {
+                task_sys_id: Some(task_sys_id.to_string()),
+                resource_sys_id: Some(group_sys_id.to_string()),
+                resource_type: Some(ResourcePlanResourceType::Group),
+                state: Some(ResourcePlanStateFilter::Multiple(vec![1, 3])),
+                ..Default::default()
+            })
+            .await
+            .expect("resource_plan_list");
+
+        assert_eq!(resp.records.len(), 1);
+        assert_eq!(resp.records[0].state.as_deref(), Some("3"));
+        assert_eq!(resp.records[0].state_label.as_deref(), Some("Allocated"));
+        assert_eq!(resp.records[0].notes.as_deref(), Some("<NOTES>"));
+        assert_eq!(resp.records[0].context.as_deref(), Some("<CONTEXT>"));
+        assert_eq!(
+            resp.records[0]
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.table.as_deref()),
+            Some("pm_project")
+        );
+        assert_eq!(resp.query_summary.total_returned, 1);
+        assert!(!resp.query_summary.truncated);
+        assert!(
+            resp.query_summary
+                .filters_applied
+                .contains(&"task_sys_id".to_string())
+        );
+        assert!(
+            resp.query_summary
+                .filters_applied
+                .contains(&"resource_sys_id".to_string())
+        );
+        assert!(
+            resp.query_summary
+                .filters_applied
+                .contains(&"state".to_string())
+        );
+
+        let requests = server.received_requests().await.expect("requests");
+        let resource_plan_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/now/table/resource_plan")
+            .collect::<Vec<_>>();
+        assert_eq!(resource_plan_requests.len(), 1);
+        let query = resource_plan_requests[0]
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        let fields = query
+            .get("sysparm_fields")
+            .expect("resource_plan sysparm_fields");
+        let requested_fields = fields.split(',').collect::<std::collections::HashSet<_>>();
+        assert!(requested_fields.contains("notes"));
+        assert!(requested_fields.contains("u_description"));
+        assert!(requested_fields.contains("task.number"));
+        assert!(requested_fields.contains("task.sys_class_name"));
+        assert!(!requested_fields.contains("description"));
+    }
+
+    #[tokio::test]
+    async fn resource_plan_list_resolves_parent_number_to_task_sys_id() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let parent_number = "PRJ_PLACEHOLDER";
+        let parent_sys_id = "00000000000000000000000000000010";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/pm_project"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("number={parent_number}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": parent_sys_id,
+                    "number": parent_number
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("task={parent_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let resp = core
+            .resource_plan_list(ResourcePlanListInput {
+                parent_number: Some(parent_number.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("resource_plan_list");
+
+        assert_eq!(resp.records.len(), 0);
+        assert!(
+            resp.query_summary
+                .filters_applied
+                .contains(&"parent_number".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_plan_list_marks_truncated_when_rows_equal_limit() {
+        let _guard = mock_server_test_lock();
+        let server = MockServer::start().await;
+        let row_one = serde_json::json!({
+            "sys_id": { "value": "00000000000000000000000000000001" },
+            "number": { "value": "<RPLN_NUMBER_1>" },
+            "state": { "value": "1", "display_value": "Planning" }
+        });
+        let row_two = serde_json::json!({
+            "sys_id": { "value": "00000000000000000000000000000002" },
+            "number": { "value": "<RPLN_NUMBER_2>" },
+            "state": { "value": "3", "display_value": "Allocated" }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/resource_plan"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [row_one, row_two]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let resp = core
+            .resource_plan_list(ResourcePlanListInput {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("resource_plan_list");
+
+        assert_eq!(resp.records.len(), 2);
+        assert!(resp.query_summary.truncated);
+        assert_eq!(resp.query_summary.limit, 2);
     }
 
     #[tokio::test]

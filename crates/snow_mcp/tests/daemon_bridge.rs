@@ -66,6 +66,13 @@ impl DaemonJsonRpcClient for MockDaemon {
                 },
                 "markdown": "# KB article"
             })),
+            "get_article_fresh" => Ok(json!({
+                "article": {
+                    "number": params.get("number").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+                    "body_cached": true
+                },
+                "markdown": "# Fresh KB article"
+            })),
             "search_knowledge" => Ok(json!({
                 "articles": [{
                     "number": "KB001",
@@ -306,6 +313,43 @@ async fn bridge_rejects_demand_table_lookup_for_resource_plan_get() {
     assert_eq!(
         daemon.method_names().await,
         vec!["contract_info".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn bridge_forwards_resource_plan_list_flat_params() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "resource_plan_list"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "resource_plan_list",
+                "arguments": {
+                    "task_sys_id": "00000000000000000000000000000010",
+                    "resource_type": "group",
+                    "resource_sys_id": "00000000000000000000000000000020",
+                    "state": [1, 3],
+                    "limit": 25
+                }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "resource_plan_list");
+    assert_eq!(
+        calls[1].1,
+        json!({
+            "task_sys_id": "00000000000000000000000000000010",
+            "resource_type": "group",
+            "resource_sys_id": "00000000000000000000000000000020",
+            "state": [1, 3],
+            "limit": 25
+        })
     );
 }
 
@@ -794,6 +838,7 @@ async fn bridge_filters_tools_against_daemon_contract() {
             "dmn_demand_task",
             "resource_plan",
             "pm_project",
+            "change_request",
             "business_application",
             "business_app",
             "cmdb_ci_business_app",
@@ -900,6 +945,34 @@ async fn bridge_refuses_unsupported_translated_tools() {
         daemon.method_names().await,
         vec!["contract_info".to_string()]
     );
+}
+
+#[tokio::test]
+async fn bridge_routes_knowledge_fetch_fresh_to_fresh_daemon_method() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "get_article",
+        "get_article_fresh",
+    ]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "knowledge_fetch",
+                "arguments": {
+                    "number": "KB001",
+                    "fresh": true
+                }
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls().await;
+    assert_eq!(calls[1].0, "get_article_fresh");
+    assert_eq!(calls[1].1["number"], json!("KB001"));
 }
 
 #[tokio::test]

@@ -226,6 +226,43 @@ struct KnowledgeRuntimeProjection {
 }
 
 impl SnowCore {
+    pub async fn get_knowledge_article_fresh(
+        &self,
+        number: &str,
+    ) -> Result<Option<KnowledgeArticle>> {
+        self.get_knowledge_article_fresh_inner(number, true).await
+    }
+
+    pub(crate) async fn get_knowledge_article_fresh_inner(
+        &self,
+        number: &str,
+        rebuild_semantic_index: bool,
+    ) -> Result<Option<KnowledgeArticle>> {
+        let Some(record) = self
+            .client
+            .table("kb_knowledge")
+            .fields(KB_FULL_FIELDS)
+            .equals("number", number)
+            .display_value(DisplayValue::Both)
+            .first()
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.persist_record(&record)?;
+        let article = self.query.get_knowledge_article(number).await?;
+        if rebuild_semantic_index
+            && article
+                .as_ref()
+                .is_some_and(|article| article.body_cached && !article.content.trim().is_empty())
+        {
+            self.maybe_run_inline_semantic_rebuild("fresh knowledge article")
+                .await;
+        }
+        Ok(article)
+    }
+
     pub async fn sync_knowledge(
         &self,
         full: bool,

@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::tools::registry::{ToolMetadata, ToolRegistry, number_arg_schema, object_schema};
+use crate::tools::registry::{ToolMetadata, ToolRegistry, object_schema};
 
 pub fn register(registry: &mut ToolRegistry) {
     let tools = vec![
@@ -31,7 +31,7 @@ pub fn register(registry: &mut ToolRegistry) {
         ToolMetadata {
             name: "knowledge_fetch".to_string(),
             description: "Fetch a full KB article by number with the canonical product MCP nomenclature".to_string(),
-            input_schema: number_arg_schema(),
+            input_schema: json!({"type":"object","properties":{"number":{"type":"string"},"fresh":{"type":"boolean"}},"required":["number"]}),
             output_schema: object_schema(),
             default_enabled: true,
             requires_confirmation: false,

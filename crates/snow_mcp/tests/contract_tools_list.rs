@@ -112,6 +112,7 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "catalog_submit_request",
         "attachment_list",
         "attachment_upload",
+        "resource_plan_list",
         "story_get",
         "story_tasks_list",
         "story_plan_create",
@@ -516,6 +517,73 @@ fn resource_plan_schema_only_allows_resource_plan_table_sys_id_lookup() {
     assert_eq!(
         tool.input_schema["properties"]["table"]["enum"],
         json!(["resource_plan"])
+    );
+}
+
+#[test]
+fn resource_plan_list_schema_has_read_filters_only() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "resource_plan_list")
+        .expect("resource_plan_list registered");
+
+    assert!(tool.default_enabled);
+    assert!(!tool.requires_confirmation);
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    let properties = tool.input_schema["properties"]
+        .as_object()
+        .expect("properties");
+    for expected in [
+        "parent_number",
+        "task_sys_id",
+        "resource_sys_id",
+        "resource_type",
+        "state",
+        "limit",
+    ] {
+        assert!(properties.contains_key(expected), "missing {expected}");
+    }
+    for absent in ["parent_type", "parent_table", "year", "quarter"] {
+        assert!(!properties.contains_key(absent), "{absent} must be absent");
+    }
+    assert_eq!(
+        tool.input_schema["properties"]["resource_type"]["enum"],
+        json!(["group", "user"])
+    );
+}
+
+#[test]
+fn resource_plan_update_schema_documents_identity_xor_without_top_level_composition() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "resource_plan_plan_update")
+        .expect("resource_plan_plan_update registered");
+
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert!(
+        tool.input_schema["description"]
+            .as_str()
+            .expect("description")
+            .contains("Exactly one of sys_id or number is required")
+    );
+    assert!(
+        tool.input_schema["properties"]["sys_id"]["description"]
+            .as_str()
+            .expect("sys_id description")
+            .contains("exactly one")
+    );
+    assert!(
+        tool.input_schema["properties"]["number"]["description"]
+            .as_str()
+            .expect("number description")
+            .contains("exactly one")
     );
 }
 

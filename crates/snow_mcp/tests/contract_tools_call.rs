@@ -268,6 +268,65 @@ async fn foreground_rejects_table_sys_id_for_resource_plan_wrong_table_and_story
     );
 }
 
+#[tokio::test]
+async fn foreground_resource_plan_list_rejects_invalid_filters() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+
+    let response = raw_call(
+        &server,
+        "resource_plan_list",
+        json!({
+            "parent_number": "PRJ_PLACEHOLDER",
+            "task_sys_id": "00000000000000000000000000000001"
+        }),
+        43,
+    )
+    .await;
+    assert_eq!(
+        response
+            .error
+            .expect("parent selectors must be exclusive")
+            .code,
+        -32602
+    );
+
+    let response = raw_call(
+        &server,
+        "resource_plan_list",
+        json!({
+            "resource_sys_id": "00000000000000000000000000000002"
+        }),
+        44,
+    )
+    .await;
+    assert_eq!(
+        response
+            .error
+            .expect("resource_sys_id requires resource_type")
+            .code,
+        -32602
+    );
+
+    let response = raw_call(&server, "resource_plan_list", json!({ "state": [] }), 45).await;
+    assert_eq!(
+        response.error.expect("empty state array rejected").code,
+        -32602
+    );
+
+    let response = raw_call(
+        &server,
+        "resource_plan_list",
+        json!({ "parent_number": "BAD_PARENT" }),
+        46,
+    )
+    .await;
+    assert_eq!(
+        response.error.expect("unknown parent prefix rejected").code,
+        -32602
+    );
+}
+
 async fn call(
     server: &McpServer,
     name: &str,

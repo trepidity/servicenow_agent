@@ -176,6 +176,7 @@ impl McpServer {
             "business_application_fields" => {
                 self.call_business_application_fields(id, params).await
             }
+            "resource_plan_list" => self.call_resource_plan_list(id, params).await,
             "server_get" => self.call_server_get(id, params).await,
             "server_search" => self.call_server_search(id, params).await,
             "server_query" => self.call_server_query(id, params).await,
@@ -798,6 +799,32 @@ impl McpServer {
         )
     }
 
+    async fn call_resource_plan_list(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let transport = DaemonTransport::new(self.state.core.as_ref());
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::ResourcePlanListInput = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = snow_core::validate_list_input(parsed.clone()) {
+            return invalid_params(id, err);
+        }
+        match self.state.core.resource_plan_list(parsed).await {
+            Ok(mut response) => {
+                for record in &mut response.records {
+                    if let Err(err) = transport.resource_plan_record(record) {
+                        return service_failure(id, err);
+                    }
+                }
+                JsonRpcResponse::ok(id, json!(response))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
     async fn call_server_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
         let transport = DaemonTransport::new(self.state.core.as_ref());
         let arguments = params
@@ -1034,7 +1061,9 @@ impl McpServer {
         let article = if fresh {
             self.state.core.get_knowledge_article_fresh(number).await
         } else {
-            self.state.core.get_knowledge_article(number).await
+            self.state.core
+                .get_knowledge_article_cached_or_fresh(number)
+                .await
         };
 
         match article {
@@ -1525,6 +1554,12 @@ impl McpServer {
                 description: "List observed Business Application fields from the local projection, including owner-related fields when field mapping for an APM lookup is unclear."
                     .to_string(),
                 input_schema: snow_mcp::tools::records::business_application_fields_arg_schema(),
+                output_schema: json!({"type":"object"}),
+            },
+            McpTool {
+                name: "resource_plan_list".to_string(),
+                description: "List resource plans filtered by parent task, resource, and raw state. Read-only; issues one resource_plan Table API query.".to_string(),
+                input_schema: snow_mcp::tools::resource_plan::resource_plan_list_arg_schema(),
                 output_schema: json!({"type":"object"}),
             },
             McpTool {
@@ -2357,6 +2392,9 @@ mod tests {
                 let request_line = request_rx.await.expect("request line");
                 assert!(request_line.contains("/api/now/table/kb_knowledge"));
                 assert!(request_line.contains("KB0105015"));
+                assert!(request_line.contains("sysparm_fields"));
+                assert!(request_line.contains("article_body"));
+                assert!(request_line.contains("text"));
             })
             .await;
     }

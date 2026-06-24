@@ -202,6 +202,7 @@ impl McpServer {
                 self.call_get_record_with_allowed_tables(id, params, RESOURCE_PLAN_LOOKUP_TABLES)
                     .await
             }
+            "resource_plan_list" => self.call_resource_plan_list(id, params).await,
             "story_get" => self.call_get_record_number(id, params).await,
             "story_tasks_list" => self.call_get_children(id, params).await,
             "timecard_list" => self.call_timecard_list(id, params).await,
@@ -857,6 +858,33 @@ impl McpServer {
         )
     }
 
+    async fn call_resource_plan_list(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::ResourcePlanListInput = match serde_json::from_value(arguments) {
+            Ok(parsed) => parsed,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = snow_core::validate_list_input(parsed.clone()) {
+            return invalid_params(id, err);
+        }
+        match self.core.resource_plan_list(parsed).await {
+            Ok(mut response) => {
+                for record in &mut response.records {
+                    record.browser_url = self.browser_url("resource_plan", &record.sys_id);
+                    match self.core.vault_relative_path_for_sys_id(&record.sys_id) {
+                        Ok(path) => record.vault_relative_path = path,
+                        Err(err) => return service_failure(id, err),
+                    }
+                }
+                JsonRpcResponse::ok(id, json!(response))
+            }
+            Err(err) => service_failure(id, err),
+        }
+    }
+
     async fn call_server_search(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
         let arguments = params
             .get("arguments")
@@ -1077,7 +1105,9 @@ impl McpServer {
         let article = if fresh {
             self.core.get_knowledge_article_fresh(&number).await
         } else {
-            self.core.get_knowledge_article(&number).await
+            self.core
+                .get_knowledge_article_cached_or_fresh(&number)
+                .await
         };
         match article {
             Ok(Some(article)) => JsonRpcResponse::ok(

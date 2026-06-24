@@ -85,6 +85,7 @@ pub enum RpcMethod {
     BusinessApplicationsForServer,
     BusinessApplicationSync,
     BusinessApplicationFields,
+    ResourcePlanList,
     ServerGet,
     ServerGetFresh,
     ServerSearch,
@@ -153,6 +154,10 @@ pub enum RpcMethod {
     ChangeTaskApplyCreate,
     ChangeTaskPlanUpdate,
     ChangeTaskApplyUpdate,
+    ResourcePlanPlanCreate,
+    ResourcePlanApplyCreate,
+    ResourcePlanPlanUpdate,
+    ResourcePlanApplyUpdate,
     StoryPlanCreate,
     StoryApplyCreate,
     StoryPlanUpdate,
@@ -196,6 +201,7 @@ impl RpcMethod {
             "business_applications_for_server" => Self::BusinessApplicationsForServer,
             "business_application_sync" => Self::BusinessApplicationSync,
             "business_application_fields" => Self::BusinessApplicationFields,
+            "resource_plan_list" => Self::ResourcePlanList,
             "server_get" => Self::ServerGet,
             "server_get_fresh" => Self::ServerGetFresh,
             "server_search" => Self::ServerSearch,
@@ -264,6 +270,10 @@ impl RpcMethod {
             "change_task_apply_create" => Self::ChangeTaskApplyCreate,
             "change_task_plan_update" => Self::ChangeTaskPlanUpdate,
             "change_task_apply_update" => Self::ChangeTaskApplyUpdate,
+            "resource_plan_plan_create" => Self::ResourcePlanPlanCreate,
+            "resource_plan_apply_create" => Self::ResourcePlanApplyCreate,
+            "resource_plan_plan_update" => Self::ResourcePlanPlanUpdate,
+            "resource_plan_apply_update" => Self::ResourcePlanApplyUpdate,
             "story_plan_create" => Self::StoryPlanCreate,
             "story_apply_create" => Self::StoryApplyCreate,
             "story_plan_update" => Self::StoryPlanUpdate,
@@ -601,7 +611,11 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         },
         RpcMethod::GetKnowledgeArticle | RpcMethod::GetArticle => {
             match extract_number(&request.params) {
-                Ok(number) => match state.core.get_knowledge_article(&number).await {
+                Ok(number) => match state
+                    .core
+                    .get_knowledge_article_cached_or_fresh(&number)
+                    .await
+                {
                     Ok(Some(article)) => match transport.knowledge_article(&article) {
                         Ok(article_dto) => JsonRpcResponse::ok(
                             id,
@@ -852,6 +866,20 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 Err(err) => invalid_params(id, err),
             }
         }
+        RpcMethod::ResourcePlanList => match extract_resource_plan_list_params(&request.params) {
+            Ok(params) => match state.core.resource_plan_list(params).await {
+                Ok(mut response) => {
+                    for record in &mut response.records {
+                        if let Err(err) = transport.resource_plan_record(record) {
+                            return internal_error(id, err);
+                        }
+                    }
+                    JsonRpcResponse::ok(id, json!(response))
+                }
+                Err(err) => internal_error(id, err),
+            },
+            Err(err) => invalid_params(id, err),
+        },
         RpcMethod::BusinessApplicationServers => {
             // Deserialize directly into the canonical snow_core request contract
             // (which owns `deny_unknown_fields` and selector/bounds validation),
@@ -1557,6 +1585,24 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             crate::change_write::handle_change_apply(id, &request.method, &request.params, state)
                 .await
         }
+        RpcMethod::ResourcePlanPlanCreate | RpcMethod::ResourcePlanPlanUpdate => {
+            crate::resource_plan_write::handle_resource_plan_plan(
+                id,
+                &request.method,
+                &request.params,
+                state,
+            )
+            .await
+        }
+        RpcMethod::ResourcePlanApplyCreate | RpcMethod::ResourcePlanApplyUpdate => {
+            crate::resource_plan_write::handle_resource_plan_apply(
+                id,
+                &request.method,
+                &request.params,
+                state,
+            )
+            .await
+        }
         RpcMethod::StoryPlanCreate
         | RpcMethod::StoryPlanUpdate
         | RpcMethod::StoryTaskPlanCreate
@@ -1668,6 +1714,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_applications_for_server",
     "business_application_sync",
     "business_application_fields",
+    "resource_plan_list",
     "server_get",
     "server_get_fresh",
     "server_search",
@@ -1728,6 +1775,10 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "change_task_apply_create",
     "change_task_plan_update",
     "change_task_apply_update",
+    "resource_plan_plan_create",
+    "resource_plan_apply_create",
+    "resource_plan_plan_update",
+    "resource_plan_apply_update",
     "story_plan_create",
     "story_apply_create",
     "story_plan_update",
@@ -2532,6 +2583,12 @@ fn extract_business_application_fields_params(
     Ok(serde_json::from_value(params.clone())?)
 }
 
+fn extract_resource_plan_list_params(params: &Value) -> Result<snow_core::ResourcePlanListInput> {
+    let input: snow_core::ResourcePlanListInput = serde_json::from_value(params.clone())?;
+    snow_core::validate_list_input(input.clone())?;
+    Ok(input)
+}
+
 fn extract_server_lookup_params(params: &Value) -> Result<ServerLookup> {
     let Value::Object(map) = params else {
         return Err(anyhow!("expected object params"));
@@ -3324,6 +3381,10 @@ mod tests {
             RpcMethod::from_method("business_application_fields"),
             RpcMethod::BusinessApplicationFields
         );
+        assert_eq!(
+            RpcMethod::from_method("resource_plan_list"),
+            RpcMethod::ResourcePlanList
+        );
         assert_eq!(RpcMethod::from_method("vault_path"), RpcMethod::VaultPath);
         assert_eq!(
             RpcMethod::from_method("search_knowledge"),
@@ -3423,6 +3484,22 @@ mod tests {
         assert_eq!(
             RpcMethod::from_method("work_note_apply_add"),
             RpcMethod::WorkNoteApplyAdd
+        );
+        assert_eq!(
+            RpcMethod::from_method("resource_plan_plan_create"),
+            RpcMethod::ResourcePlanPlanCreate
+        );
+        assert_eq!(
+            RpcMethod::from_method("resource_plan_apply_create"),
+            RpcMethod::ResourcePlanApplyCreate
+        );
+        assert_eq!(
+            RpcMethod::from_method("resource_plan_plan_update"),
+            RpcMethod::ResourcePlanPlanUpdate
+        );
+        assert_eq!(
+            RpcMethod::from_method("resource_plan_apply_update"),
+            RpcMethod::ResourcePlanApplyUpdate
         );
         assert_eq!(
             RpcMethod::from_method("story_plan_create"),
@@ -4093,6 +4170,14 @@ story_board_id = "board-sys"
     fn extract_record_lookup_accepts_number() {
         let lookup = extract_record_lookup(&json!({ "number": "DMND0012345" })).expect("lookup");
         assert_eq!(lookup, RecordLookup::Number("DMND0012345".to_string()));
+    }
+
+    #[test]
+    fn extract_resource_plan_list_rejects_unknown_parent_prefix() {
+        let err = extract_resource_plan_list_params(&json!({ "parent_number": "BAD_PARENT" }))
+            .expect_err("invalid parent prefix");
+
+        assert!(err.to_string().contains("DMND or PRJ"));
     }
 
     #[test]
@@ -6038,10 +6123,85 @@ story_board_id = "board-sys"
                 let request_line = request_rx.await.expect("request line");
                 assert!(request_line.contains("/api/now/table/kb_knowledge"));
                 assert!(request_line.contains("KB0105015"));
+                assert!(request_line.contains("sysparm_fields"));
+                assert!(request_line.contains("article_body"));
+                assert!(request_line.contains("text"));
 
                 let _ = shutdown_tx.send(());
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_rpc_get_article_repairs_missing_body_with_live_client() {
+        let response = json!({
+            "result": [
+                {
+                    "sys_id": "kb-body-miss-sys",
+                    "number": "KB0105015",
+                    "short_description": "Cached shell",
+                    "description": "Cached summary only",
+                    "article_body": "",
+                    "text": "Recovered KB body",
+                    "state": "published",
+                    "workflow_state": "published",
+                    "article_type": "text",
+                    "valid_to": "2027-01-01",
+                    "knowledge_base": {
+                        "sys_id": "kb-base-sys",
+                        "value": "kb-base-sys",
+                        "display_value": "IT Operations",
+                        "table": "kb_knowledge_base"
+                    },
+                    "category": {
+                        "sys_id": "kb-cat-sys",
+                        "value": "kb-cat-sys",
+                        "display_value": "Networking",
+                        "table": "kb_category"
+                    }
+                }
+            ]
+        });
+        let (instance_url, request_rx) =
+            spawn_json_http_server(response).await.expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "get_article".to_string(),
+                params: json!({ "number": "KB0105015" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let result = response.result.expect("article result");
+        assert_eq!(
+            result["article"]["record"]["number"].as_str(),
+            Some("KB0105015")
+        );
+        assert_eq!(
+            result["article"]["content"].as_str(),
+            Some("Recovered KB body")
+        );
+        assert_eq!(result["article"]["body_cached"].as_bool(), Some(true));
+        assert!(
+            result["markdown"]
+                .as_str()
+                .expect("markdown")
+                .contains("Recovered KB body")
+        );
+
+        let request_line = request_rx.await.expect("request line");
+        assert!(request_line.contains("/api/now/table/kb_knowledge"));
+        assert!(request_line.contains("KB0105015"));
+        assert!(request_line.contains("sysparm_fields"));
+        assert!(request_line.contains("article_body"));
+        assert!(request_line.contains("text"));
     }
 
     #[tokio::test(flavor = "current_thread")]
