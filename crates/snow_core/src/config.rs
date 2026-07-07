@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::cache::policy::{DEFAULT_STABLE_REFERENCE_CACHE_TTL, DEFAULT_WORK_RECORD_CACHE_TTL};
-use crate::credential::CredentialProvider;
+use servicenow_rs::auth::credential::CredentialProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SnowConfig {

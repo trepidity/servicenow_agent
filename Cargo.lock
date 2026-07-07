@@ -2701,7 +2701,6 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
- "zeroize",
 ]
 
 [[package]]
