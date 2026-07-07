@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
 
 use crate::{
-    CacheSource, FieldValue, Reference, SnowRecord, normalize_record_lookup_sys_id,
-    reference::choose_reference_display_name,
+    CacheSource, FieldValue, Reference, SnowRecord, choose_reference_display_name,
+    normalize_record_lookup_sys_id,
 };
 
 pub const SERVER_TABLE: &str = "cmdb_ci_server";

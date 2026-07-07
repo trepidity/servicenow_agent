@@ -16,11 +16,12 @@ use servicenow_rs::prelude::{Record, parse_servicenow_timestamp};
 use crate::cache::store::{KnowledgeArticleRow, RecordRow, ReferenceRow};
 use crate::enrich::EnrichmentOrigin;
 use crate::reference::{
-    choose_reference_display_name, extract_reference_sys_id, normalize_reference_for_field,
-    parent_record_ref, parent_reference_for_table,
+    extract_reference_sys_id, normalize_reference_for_field, parent_record_ref,
+    parent_reference_for_table,
 };
 use crate::{
     FieldValue, JournalEntry, KnowledgeArticle, RecordRef, Reference, SnowRecord, VaultDocument,
+    choose_reference_display_name,
 };
 
 /// Converts a `servicenow_rs` `Record` into a `RecordRow` for cache storage.

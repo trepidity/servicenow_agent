@@ -83,6 +83,9 @@ pub use resource::timecard::{
     CardSelector, SetMode, SimpleRef, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector,
     Weekday,
 };
+pub use servicenow_rs::model::reference::{
+    Reference, choose_reference_display_name, is_opaque_sys_id,
+};
 pub use servicenow_rs::prelude::AttachmentMetadata;
 pub use sla::{
     TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, TaskSlaView,
@@ -547,15 +550,6 @@ pub struct UserRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub display: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Reference {
-    pub sys_id: String,
-    pub table: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub extra: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -8,36 +8,12 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use servicenow_rs::model::reference::choose_reference_display_name;
 use servicenow_rs::prelude::{
     Record, parent_reference_field, reference_default_table, reference_fields_for_table,
 };
 
 use crate::{RecordRef, Reference};
-
-/// Checks if a string looks like a raw ServiceNow sys_id (hex, 30-32 chars).
-///
-/// Used to detect unresolved display values that are just opaque identifiers
-/// rather than human-readable labels.
-pub(crate) fn is_opaque_sys_id(value: &str) -> bool {
-    let trimmed = value.trim();
-    (30..=32).contains(&trimmed.len()) && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-/// Picks the best display name from a list of candidates.
-///
-/// Skips empty strings and opaque sys_ids, returning the first
-/// human-readable candidate or an empty string if none qualify.
-pub(crate) fn choose_reference_display_name<'a>(
-    candidates: impl IntoIterator<Item = Option<&'a str>>,
-) -> String {
-    candidates
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|candidate| !candidate.is_empty() && !is_opaque_sys_id(candidate))
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// Normalizes a reference for a specific field by resolving the best display name.
 ///
