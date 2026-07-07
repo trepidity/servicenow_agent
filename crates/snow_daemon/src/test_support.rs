@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use crate::DaemonState;
 
 pub struct FixtureState {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
     pub tempdir: TempDir,
     pub state: Arc<DaemonState>,
 }
@@ -40,6 +41,7 @@ async fn build_fixture_state_with_config_instance(
     client_instance_url: &str,
     config_instance_url: &str,
 ) -> Result<FixtureState> {
+    let guard = fixture_state_lock().await;
     let tempdir = tempfile::tempdir()?;
     let vault_path = tempdir.path().join("vault");
 
@@ -252,10 +254,23 @@ async fn build_fixture_state_with_config_instance(
             body_cached: true,
         })?;
 
+    let data_dir = tempdir.path().to_path_buf();
     Ok(FixtureState {
+        _guard: guard,
         tempdir,
-        state: Arc::new(DaemonState::new(Arc::new(core))),
+        state: Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::new(core),
+            data_dir,
+            snow_mcp::McpConfig::default(),
+        )),
     })
+}
+
+async fn fixture_state_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 pub async fn spawn_json_http_server(

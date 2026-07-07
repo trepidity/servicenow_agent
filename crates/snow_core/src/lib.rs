@@ -770,17 +770,12 @@ pub struct FieldChoice {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalRoutedVia {
+    #[default]
     Direct,
     Group,
-}
-
-impl Default for ApprovalRoutedVia {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1812,9 +1807,9 @@ fn extended_path_chains(
     if parent_chains.is_empty() {
         // Parent has no recorded chain (e.g. paths disabled): record a
         // single-edge chain so traversal bookkeeping still has one route.
-        return vec![vec![edge]];
+        vec![vec![edge]]
     } else {
-        return parent_chains
+        parent_chains
             .into_iter()
             .filter_map(|mut chain| {
                 if let Some(first) = chain.first()
@@ -1825,7 +1820,7 @@ fn extended_path_chains(
                 chain.push(edge.clone());
                 Some(chain)
             })
-            .collect();
+            .collect()
     }
 }
 
@@ -3237,10 +3232,8 @@ impl SnowCore {
             if !paths.is_empty() {
                 persisted_server_paths.insert(sys_id.clone(), paths.clone());
             }
-            if options.include_paths {
-                if !paths.is_empty() {
-                    server_paths.insert(sys_id.clone(), paths);
-                }
+            if options.include_paths && !paths.is_empty() {
+                server_paths.insert(sys_id.clone(), paths);
             }
             servers.push(discovery.server);
         }
@@ -3474,6 +3467,7 @@ impl SnowCore {
         Ok(servers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_business_application_server_traversal(
         &self,
         application: &SnowRecord,
@@ -8718,11 +8712,11 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path, query_param, query_param_contains};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn mock_server_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    async fn mock_server_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
-            .expect("mock server test lock")
+            .await
     }
 
     fn sample_change_task_record() -> Record {
@@ -8981,7 +8975,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_search_builds_supported_filters() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/cmdb_ci_server"))
@@ -9110,7 +9104,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_name_cache_miss_hit_persists_and_caches() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "cccccccccccccccccccccccccccccccc";
         Mock::given(method("GET"))
@@ -9155,7 +9149,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_name_queries_base_table_without_leaf_class_filter() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "cacacacacacacacacacacacacacacaca";
         Mock::given(method("GET"))
@@ -9201,7 +9195,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_sys_id_cache_miss_hit() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "dddddddddddddddddddddddddddddddd";
         Mock::given(method("GET"))
@@ -9229,7 +9223,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_ip_cache_miss_hit() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         Mock::given(method("GET"))
@@ -9254,7 +9248,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_name_empty_result_is_not_found() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/cmdb_ci_server"))
@@ -9274,7 +9268,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_by_sys_id_404_is_not_found() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "ffffffffffffffffffffffffffffffff";
         Mock::given(method("GET"))
@@ -9295,7 +9289,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_acl_403_is_acl_restricted_not_not_found() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/cmdb_ci_server"))
@@ -9318,7 +9312,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_network_failure_is_network_not_not_found() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         // Point at an address that refuses connections (127.0.0.1:1 is the
         // reserved tcpmux port, effectively always closed for our purposes) so
         // the transport call fails at the connection layer -> network error,
@@ -9350,7 +9344,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_duplicate_name_is_disambiguation() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/cmdb_ci_server"))
@@ -9387,7 +9381,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_get_live_no_persist_does_not_write_cache() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let sys_id = "99999999999999999999999999999999";
         Mock::given(method("GET"))
@@ -9745,7 +9739,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_application_servers_batches_bfs_levels_and_hydrates_servers() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -9971,7 +9965,7 @@ mod tests {
     /// result. The second discovery is an alternate forward path, not a cycle.
     #[tokio::test]
     async fn business_application_servers_records_diamond_alternate_paths() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let branch_a = "22222222222222222222222222222222";
@@ -10137,7 +10131,7 @@ mod tests {
     /// returned fewer rows than requested.
     #[tokio::test]
     async fn business_application_servers_edge_budget_paginates_and_truncates() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let ci_one = "22222222222222222222222222222222";
@@ -10206,7 +10200,7 @@ mod tests {
     /// exceed the shared budget, and that the merge order is deterministic.
     #[tokio::test]
     async fn business_application_servers_shared_edge_budget_splits_across_directions() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let ci_one = "22222222222222222222222222222222";
@@ -10287,7 +10281,7 @@ mod tests {
     /// caller asking for one CI is not silently short-changed to zero.
     #[tokio::test]
     async fn business_application_servers_reports_ci_limit_truncation() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -10406,7 +10400,7 @@ mod tests {
     /// subclass record would be filtered out server-side.
     #[tokio::test]
     async fn business_application_servers_collects_server_subclasses() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let esx = "66666666666666666666666666666666";
@@ -10499,7 +10493,7 @@ mod tests {
     /// the CI is collected/hydrated rather than traversed through.
     #[tokio::test]
     async fn business_application_servers_detects_custom_subclass_via_hierarchy() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let compute = "77777777777777777777777777777777";
@@ -10621,7 +10615,7 @@ mod tests {
     /// label set to sys_ids once via a `cmdb_rel_type` lookup and matches on those.
     #[tokio::test]
     async fn business_application_servers_default_types_match_by_resolved_identity() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let linux = "33333333333333333333333333333333";
@@ -10723,7 +10717,7 @@ mod tests {
     /// server collected, and no cmdb_rel_type resolution query is required.
     #[tokio::test]
     async fn business_application_servers_explicit_empty_types_match_all() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let linux = "33333333333333333333333333333333";
@@ -10843,7 +10837,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_application_servers_returns_service_membership_servers() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -10969,7 +10963,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_application_servers_merges_relationship_and_service_membership_provenance() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -11087,7 +11081,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_application_servers_service_membership_acl_degrades_relationship_results() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -11187,7 +11181,7 @@ mod tests {
 
     #[tokio::test]
     async fn business_application_servers_service_membership_accepts_server_subclasses() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let app = "11111111111111111111111111111111";
         let service = "22222222222222222222222222222222";
@@ -11338,7 +11332,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_returns_tagged_servers_when_traversal_empty() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
         mount_empty_traversal(&server).await;
@@ -11402,7 +11396,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_fires_even_though_managed_by_group_empty() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         // Field-mapping proof: the BA's managed_by_group alias is empty; the
         // fallback fires because it sources/filters on the RAW u_ci_owner_group.
         let server = MockServer::start().await;
@@ -11441,7 +11435,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_does_not_fire_when_traversal_finds_servers() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let rel_type = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
@@ -11510,7 +11504,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_no_group_emits_clean_diagnostic() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, None).await;
         mount_empty_traversal(&server).await;
@@ -11537,7 +11531,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_strategy_none_adds_no_fields() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
         mount_empty_traversal(&server).await;
@@ -11570,7 +11564,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_group_with_zero_servers() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
         mount_empty_traversal(&server).await;
@@ -11608,7 +11602,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_acl_restricted_query() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
         mount_empty_traversal(&server).await;
@@ -11647,7 +11641,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_tombstoned_group_no_panic() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         mount_fallback_ba(&server, Some(FALLBACK_GROUP)).await;
         mount_empty_traversal(&server).await;
@@ -11686,7 +11680,7 @@ mod tests {
 
     #[tokio::test]
     async fn ci_owner_group_fallback_writes_no_durable_membership_rows() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         // Load-bearing live-only assertion: a fallback-triggering run leaves the
         // durable BA↔server inventory tables unchanged. We run with persist=true
         // (the CLI/daemon default) so the only writes would come from the
@@ -11734,12 +11728,11 @@ mod tests {
             })
             .await
             .expect("cached forward");
-        match cached_forward {
-            Some(cached) => assert!(
+        if let Some(cached) = cached_forward {
+            assert!(
                 cached.servers.is_empty(),
                 "fallback server must not be persisted to the forward projection"
-            ),
-            None => {}
+            );
         }
 
         // The durable reverse projection has NO BA for the fallback server.
@@ -11750,16 +11743,13 @@ mod tests {
             })
             .await
             .expect("cached reverse");
-        match cached_reverse {
-            Some(cached) => {
-                for entry in &cached.servers {
-                    assert!(
-                        entry.business_applications.is_empty(),
-                        "fallback server must not gain a durable BA association"
-                    );
-                }
+        if let Some(cached) = cached_reverse {
+            for entry in &cached.servers {
+                assert!(
+                    entry.business_applications.is_empty(),
+                    "fallback server must not gain a durable BA association"
+                );
             }
-            None => {}
         }
     }
 
@@ -14845,7 +14835,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_plan_list_queries_task_and_state_in_once() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let task_sys_id = "00000000000000000000000000000010";
         let group_sys_id = "00000000000000000000000000000020";
@@ -14948,7 +14938,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_plan_list_resolves_parent_number_to_task_sys_id() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let parent_number = "PRJ_PLACEHOLDER";
         let parent_sys_id = "00000000000000000000000000000010";
@@ -15001,7 +14991,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_plan_list_marks_truncated_when_rows_equal_limit() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let row_one = serde_json::json!({
             "sys_id": { "value": "00000000000000000000000000000001" },
@@ -15095,7 +15085,7 @@ mod tests {
 
     #[tokio::test]
     async fn my_approvals_with_routing_fresh_unions_direct_and_group_rows() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let user_sys_id = "11111111111111111111111111111111";
         let group_sys_id = "22222222222222222222222222222222";
@@ -15240,7 +15230,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_approval_updates_pending_direct_row_by_sys_id() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let user_sys_id = "11111111111111111111111111111111";
         let approval_sys_id = "22222222222222222222222222222222";
@@ -15347,7 +15337,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_approval_allows_current_user_group_row_by_sys_id() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let user_sys_id = "11111111111111111111111111111111";
         let group_sys_id = "22222222222222222222222222222222";
@@ -15464,7 +15454,7 @@ mod tests {
 
     #[tokio::test]
     async fn my_approvals_with_routing_fresh_fails_closed_when_group_lookup_fails() {
-        let _guard = mock_server_test_lock();
+        let _guard = mock_server_test_lock().await;
         let server = MockServer::start().await;
         let user_sys_id = "11111111111111111111111111111111";
 

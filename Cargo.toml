@@ -31,3 +31,6 @@ toml = "1.1.2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = "1"
+
+[patch."https://github.com/trepidity/servicenow_rs.git"]
+servicenow_rs = { path = "../../Projects/servicenow_rs" }

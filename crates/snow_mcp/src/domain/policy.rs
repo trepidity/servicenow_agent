@@ -790,6 +790,7 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
             role(
                 &[
                     "resource_plan_get",
+                    "resource_plan_list",
                     "get_record",
                     "user_lookup",
                     "user_search",
@@ -1142,6 +1143,26 @@ fn timecard_plan_policy() -> ToolPolicy {
     }
 }
 
+fn timecard_apply_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        field_allowlist: BTreeSet::from([
+            "sunday".to_string(),
+            "monday".to_string(),
+            "tuesday".to_string(),
+            "wednesday".to_string(),
+            "thursday".to_string(),
+            "friday".to_string(),
+            "saturday".to_string(),
+        ]),
+        environments: default_story_environments(),
+        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
+        ..ToolPolicy::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,43 +1223,11 @@ mod tests {
         let role = roles
             .get("resource_plan_writer")
             .expect("resource_plan_writer role");
-        assert!(role.read_tools.contains(&"resource_plan_get".to_string()));
-        assert!(role.read_tools.contains(&"resource_plan_list".to_string()));
-        assert!(
-            role.read_tools
-                .contains(&"resource_plan_plan_create".to_string())
-        );
-        assert!(
-            role.read_tools
-                .contains(&"resource_plan_plan_update".to_string())
-        );
-        assert!(
-            role.write_tools
-                .contains(&"resource_plan_apply_create".to_string())
-        );
-        assert!(
-            role.write_tools
-                .contains(&"resource_plan_apply_update".to_string())
-        );
-    }
-}
-
-fn timecard_apply_policy() -> ToolPolicy {
-    ToolPolicy {
-        enabled: false,
-        requires_confirmation: true,
-        requires_kb_evidence: false,
-        field_allowlist: BTreeSet::from([
-            "sunday".to_string(),
-            "monday".to_string(),
-            "tuesday".to_string(),
-            "wednesday".to_string(),
-            "thursday".to_string(),
-            "friday".to_string(),
-            "saturday".to_string(),
-        ]),
-        environments: default_story_environments(),
-        confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
-        ..ToolPolicy::default()
+        assert!(role.read_tools.contains("resource_plan_get"));
+        assert!(role.read_tools.contains("resource_plan_list"));
+        assert!(role.read_tools.contains("resource_plan_plan_create"));
+        assert!(role.read_tools.contains("resource_plan_plan_update"));
+        assert!(role.write_tools.contains("resource_plan_apply_create"));
+        assert!(role.write_tools.contains("resource_plan_apply_update"));
     }
 }

@@ -533,9 +533,10 @@ pub struct CachedBusinessApplicationForServer {
     pub tombstoned_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointResolutionStatus {
+    #[default]
     CacheHit,
     LiveConfirmed,
     NotFoundLiveConfirmed,
@@ -543,25 +544,14 @@ pub enum EndpointResolutionStatus {
     LiveConfirmationNotAttempted,
 }
 
-impl Default for EndpointResolutionStatus {
-    fn default() -> Self {
-        Self::CacheHit
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipKnowledgeStatus {
+    #[default]
     KnownRelationships,
     NoCachedRelationships,
     UnknownNotSynced,
     Degraded,
-}
-
-impl Default for RelationshipKnowledgeStatus {
-    fn default() -> Self {
-        Self::KnownRelationships
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -826,17 +816,12 @@ impl BusinessApplicationServerPathEdge {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BusinessApplicationServerPathEdgeSource {
+    #[default]
     Relationship,
     ServiceMembership,
-}
-
-impl Default for BusinessApplicationServerPathEdgeSource {
-    fn default() -> Self {
-        Self::Relationship
-    }
 }
 
 impl BusinessApplicationServerPathEdgeSource {

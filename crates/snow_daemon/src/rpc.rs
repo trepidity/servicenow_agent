@@ -3893,7 +3893,8 @@ story_board_id = "board-sys"
         let idempotency_key = result["idempotency_key"].as_str().expect("idempotency_key");
         let op_hash = result["op_hash"].as_str().expect("op_hash");
         assert_eq!(result["preview"]["assignment_group"], json!("group-sys"));
-        assert_eq!(result["preview"]["sprint"], json!("sprint-sys"));
+        assert!(result["preview"].get("sprint").is_none());
+        assert_eq!(result["preview"]["backlog_type"], json!("product"));
         assert_eq!(result["preview"]["active"], json!(true));
 
         let response = dispatch(
