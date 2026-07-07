@@ -1,3 +1,4 @@
+use crate::context::CoreContext;
 use crate::convert::{record_row_from_runtime_record, serialize_vault_document};
 use crate::helpers::{document_content, document_tag_tokens, document_work_notes};
 use crate::resource::knowledge::KnowledgeResource;
@@ -239,6 +240,7 @@ impl SnowCore {
         rebuild_semantic_index: bool,
     ) -> Result<Option<KnowledgeArticle>> {
         let Some(record) = self
+            .ctx
             .client
             .table("kb_knowledge")
             .fields(KB_FULL_FIELDS)
@@ -251,7 +253,7 @@ impl SnowCore {
         };
 
         self.persist_record(&record)?;
-        let article = self.query.get_knowledge_article(number).await?;
+        let article = self.ctx.query.get_knowledge_article(number).await?;
         if rebuild_semantic_index
             && article
                 .as_ref()
@@ -271,6 +273,7 @@ impl SnowCore {
         let local_ingest = self.ingest_local_knowledge_state()?;
 
         let lock_acquired = self
+            .ctx
             .query
             .store()
             .acquire_kb_sync_lock(Utc::now().timestamp_millis(), KB_LOCK_STALE_MS)?;
@@ -291,7 +294,7 @@ impl SnowCore {
         let result = self
             .sync_knowledge_locked(full, with_bodies, local_ingest)
             .await;
-        let release_result = self.query.store().release_kb_sync_lock();
+        let release_result = self.ctx.query.store().release_kb_sync_lock();
         match (result, release_result) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(err), Ok(())) => Err(err),
@@ -303,7 +306,7 @@ impl SnowCore {
     }
 
     pub fn knowledge_status(&self) -> Result<KnowledgeStatus> {
-        let store = self.query.store();
+        let store = self.ctx.query.store();
         let bases = store.list_knowledge_bases()?;
         let mut category_count = 0usize;
         for base in &bases {
@@ -334,7 +337,7 @@ impl SnowCore {
     ) -> Result<Vec<KnowledgeTagSummary>> {
         ensure!(min_count > 0, "min_count must be at least 1");
 
-        let store = self.query.store();
+        let store = self.ctx.query.store();
         match layer {
             Some(layer) => Ok(store
                 .list_knowledge_tags(layer.as_store_str(), min_count)?
@@ -377,39 +380,6 @@ impl SnowCore {
         }
     }
 
-    pub(crate) fn build_knowledge_article(&self, record: &Record) -> Result<KnowledgeArticle> {
-        let knowledge_base = KnowledgeResource::knowledge_base_reference(record)
-            .unwrap_or_else(|| empty_reference("kb_knowledge_base"));
-        let category = KnowledgeResource::category_reference(record)
-            .unwrap_or_else(|| empty_reference("kb_category"));
-        let mut article = normalize_knowledge_article(KnowledgeResource::from_servicenow(
-            record,
-            knowledge_base,
-            category,
-        ));
-
-        if let Some(existing_article) = self.load_existing_knowledge_article(&record.sys_id) {
-            if article.content.trim().is_empty()
-                && existing_article.body_cached
-                && !existing_article.content.trim().is_empty()
-            {
-                article.content = existing_article.content;
-            }
-            article.user_tags = existing_article.user_tags;
-            article.auto_tags = existing_article.auto_tags;
-            article.body_cached = article.body_cached || existing_article.body_cached;
-        } else if let Some(existing_row) =
-            self.query.store().get_knowledge_article(&record.sys_id)?
-        {
-            article.user_tags = existing_row.user_tags;
-            article.auto_tags = existing_row.auto_tags;
-            article.body_cached = article.body_cached || existing_row.body_cached;
-        }
-
-        article.sn_tags = derive_servicenow_tags(record);
-        Ok(normalize_knowledge_article(article))
-    }
-
     async fn sync_knowledge_locked(
         &self,
         requested_full: bool,
@@ -417,10 +387,11 @@ impl SnowCore {
         local_ingest: LocalKnowledgeIngest,
     ) -> Result<KnowledgeSyncOutcome> {
         let now = Utc::now();
-        let previous = self.query.store().get_kb_sync_state()?;
+        let previous = self.ctx.query.store().get_kb_sync_state()?;
         let mode = determine_sync_mode(
             requested_full,
-            self.config
+            self.ctx
+                .config
                 .refresh
                 .resources
                 .get("knowledge")
@@ -452,7 +423,8 @@ impl SnowCore {
         let watermark_sys_id = progress
             .watermark_sys_id
             .or(previous.watermark_sys_id.clone());
-        self.query
+        self.ctx
+            .query
             .store()
             .set_kb_sync_state(&crate::cache::store::KbSyncStateRow {
                 last_full_at: if matches!(mode, KnowledgeSyncMode::Full) {
@@ -537,6 +509,7 @@ impl SnowCore {
         progress: &mut WatermarkProgress,
     ) -> Result<()> {
         for row in self
+            .ctx
             .query
             .store()
             .list_records_by_resource_type(ResourceType::Knowledge)?
@@ -544,7 +517,8 @@ impl SnowCore {
             if progress.seen_sys_ids.contains(&row.sys_id) {
                 continue;
             }
-            if let Some(existing_article) = self.query.store().get_knowledge_article(&row.sys_id)?
+            if let Some(existing_article) =
+                self.ctx.query.store().get_knowledge_article(&row.sys_id)?
                 && !existing_article.knowledge_base_sys_id.is_empty()
             {
                 progress
@@ -572,8 +546,13 @@ impl SnowCore {
         let mut ingest = LocalKnowledgeIngest::default();
         let mut projections = Vec::new();
 
-        for row in self.query.store().list_active_knowledge_local_scan_rows()? {
-            let absolute_path = self.vault_path.join(&row.file_path);
+        for row in self
+            .ctx
+            .query
+            .store()
+            .list_active_knowledge_local_scan_rows()?
+        {
+            let absolute_path = self.ctx.vault_path.join(&row.file_path);
             let modified_at_ms = match file_modified_at_ms(&absolute_path) {
                 Ok(modified_at_ms) => modified_at_ms,
                 Err(_) => continue,
@@ -583,6 +562,7 @@ impl SnowCore {
             }
 
             let article = self
+                .ctx
                 .vault
                 .read_knowledge_article(&absolute_path)
                 .with_context(|| {
@@ -611,20 +591,12 @@ impl SnowCore {
     }
 
     fn load_existing_knowledge_article(&self, record_sys_id: &str) -> Option<KnowledgeArticle> {
-        let row = self
-            .query
-            .store()
-            .get_record_by_sys_id(record_sys_id)
-            .ok()
-            .flatten()?;
-        let relative_path = row.file_path?;
-        self.vault
-            .read_knowledge_article(self.vault_path.join(relative_path))
-            .ok()
+        self.ctx.load_existing_knowledge_article(record_sys_id)
     }
 
     fn base_knowledge_query(&self, with_bodies: bool) -> Result<TableApi> {
         let mut query = self
+            .ctx
             .client
             .table("kb_knowledge")
             .fields(if with_bodies {
@@ -638,6 +610,7 @@ impl SnowCore {
             .limit(KB_PAGE_SIZE);
 
         let filter = self
+            .ctx
             .config
             .refresh
             .resources
@@ -689,8 +662,9 @@ impl SnowCore {
             })
             .collect::<Vec<_>>();
         let term_stats = term_stats_from_entries(&term_entries);
-        self.query.store().replace_kb_term_stats(&term_stats)?;
-        self.query
+        self.ctx.query.store().replace_kb_term_stats(&term_stats)?;
+        self.ctx
+            .query
             .store()
             .replace_all_kb_article_terms(&term_entries)?;
 
@@ -717,14 +691,17 @@ impl SnowCore {
         local_ingest: &LocalKnowledgeIngest,
         progress: &WatermarkProgress,
     ) -> Result<usize> {
-        let active_count = self.query.store().count_knowledge_articles()?;
+        let active_count = self.ctx.query.store().count_knowledge_articles()?;
         if active_count == 0 {
-            self.query.store().replace_kb_term_stats(&HashMap::new())?;
-            self.query.store().replace_all_kb_article_terms(&[])?;
+            self.ctx
+                .query
+                .store()
+                .replace_kb_term_stats(&HashMap::new())?;
+            self.ctx.query.store().replace_all_kb_article_terms(&[])?;
             return Ok(0);
         }
 
-        let mut term_stats = self.query.store().load_kb_term_stats()?;
+        let mut term_stats = self.ctx.query.store().load_kb_term_stats()?;
         if term_stats.is_empty() {
             return self.refresh_knowledge_auto_tags_full().await;
         }
@@ -735,15 +712,18 @@ impl SnowCore {
             .cloned()
             .collect::<Vec<_>>();
         for record_sys_id in &removed_ids {
-            let old_terms = self.query.store().get_kb_article_terms(record_sys_id)?;
+            let old_terms = self.ctx.query.store().get_kb_article_terms(record_sys_id)?;
             decrement_term_stats(&mut term_stats, &old_terms);
         }
-        self.query.store().delete_kb_article_terms(&removed_ids)?;
+        self.ctx
+            .query
+            .store()
+            .delete_kb_article_terms(&removed_ids)?;
 
         let mut changed_ids = progress.changed_record_sys_ids.clone();
         changed_ids.extend(local_ingest.changed_record_sys_ids.iter().cloned());
         if changed_ids.is_empty() {
-            self.query.store().replace_kb_term_stats(&term_stats)?;
+            self.ctx.query.store().replace_kb_term_stats(&term_stats)?;
             return Ok(0);
         }
 
@@ -753,6 +733,7 @@ impl SnowCore {
         let mut term_entries = Vec::new();
         for article in &articles {
             let old_terms = self
+                .ctx
                 .query
                 .store()
                 .get_kb_article_terms(&article.record.sys_id)?;
@@ -761,8 +742,9 @@ impl SnowCore {
             increment_term_stats(&mut term_stats, &new_terms);
             term_entries.push((article.record.sys_id.clone(), new_terms));
         }
-        self.query.store().replace_kb_term_stats(&term_stats)?;
-        self.query
+        self.ctx.query.store().replace_kb_term_stats(&term_stats)?;
+        self.ctx
+            .query
             .store()
             .replace_kb_article_terms_entries(&term_entries)?;
 
@@ -794,7 +776,7 @@ impl SnowCore {
             article,
             term_stats,
             corpus_size,
-            self.config.kb.max_auto_tags.max(1),
+            self.ctx.config.kb.max_auto_tags.max(1),
         );
         match self.maybe_derive_llm_tags(article).await {
             Ok(Some(llm_tags)) => {
@@ -819,7 +801,7 @@ impl SnowCore {
         let mut projections = Vec::with_capacity(articles.len());
         for article in articles {
             let article = normalize_knowledge_article(article.clone());
-            let persisted = self.vault.persist_knowledge_article(&article)?;
+            let persisted = self.ctx.vault.persist_knowledge_article(&article)?;
             let modified_at_ms = file_modified_at_ms(&persisted.path)?;
             projections.push(KnowledgeRuntimeProjection {
                 article,
@@ -873,16 +855,17 @@ impl SnowCore {
                 )
             })
             .collect::<Vec<_>>();
-        self.query.store().upsert_records(&batch)?;
-        self.query
+        self.ctx.query.store().upsert_records(&batch)?;
+        self.ctx
+            .query
             .store()
             .upsert_kb_local_file_states(&file_states)?;
 
         for document in &documents {
             self.project_runtime_document(document)?;
             self.persist_enrichment(document.record())?;
-            self.cache.invalidate(&document.record().number);
-            self.cache.put(document.record().clone());
+            self.ctx.cache.invalidate(&document.record().number);
+            self.ctx.cache.put(document.record().clone());
         }
         Ok(())
     }
@@ -891,7 +874,7 @@ impl SnowCore {
         &self,
         article: &KnowledgeArticle,
     ) -> Result<Option<Vec<String>>> {
-        let config = &self.config.kb.llm_tags;
+        let config = &self.ctx.config.kb.llm_tags;
         if !config.enabled
             || config.endpoint.trim().is_empty()
             || config.model.trim().is_empty()
@@ -932,10 +915,10 @@ impl SnowCore {
         mode: KnowledgeSyncMode,
         changed_base_sys_ids: &HashSet<String>,
     ) -> Result<()> {
-        let layout = self.vault.layout();
+        let layout = self.ctx.vault.layout();
         let knowledge_root = layout.root().join("knowledge");
         let global_index_path = knowledge_root.join("INDEX.md");
-        let bases = self.query.store().list_knowledge_bases()?;
+        let bases = self.ctx.query.store().list_knowledge_bases()?;
         let mut grouped =
             BTreeMap::<(String, String, String), BTreeMap<(String, String), usize>>::new();
         let mut active_base_names = HashMap::new();
@@ -955,6 +938,7 @@ impl SnowCore {
                 base.knowledge_base_name.clone(),
             );
             let categories = self
+                .ctx
                 .query
                 .store()
                 .list_knowledge_categories(&base.knowledge_base_sys_id)?;
@@ -978,18 +962,18 @@ impl SnowCore {
                 let base_dir = base_dir?;
                 let file_name = base_dir.file_name().to_string_lossy().into_owned();
                 if !active_base_dirs.contains(&file_name) {
-                    self.vault.delete(base_dir.path().join("INDEX.md"))?;
+                    self.ctx.vault.delete(base_dir.path().join("INDEX.md"))?;
                 }
             }
         }
 
         let tag_summaries = self.list_knowledge_tags(None, 1)?;
-        let sync_state = self.query.store().get_kb_sync_state()?;
+        let sync_state = self.ctx.query.store().get_kb_sync_state()?;
         let last_synced = sync_state
             .last_full_at
             .or(sync_state.last_incr_at)
             .unwrap_or_else(Utc::now);
-        self.vault.write_markdown_file(
+        self.ctx.vault.write_markdown_file(
             &global_index_path,
             &render_global_index(&grouped, &tag_summaries, last_synced),
         )?;
@@ -1010,20 +994,21 @@ impl SnowCore {
                 if let Some(base_dir) =
                     find_base_directory_by_sys_id(&knowledge_root.join("bases"), &base_sys_id)?
                 {
-                    self.vault.delete(base_dir.join("INDEX.md"))?;
+                    self.ctx.vault.delete(base_dir.join("INDEX.md"))?;
                 }
                 continue;
             };
             let base_dir = layout.knowledge_base_dir(&base_sys_id, base_name);
             let rows = self
+                .ctx
                 .query
                 .store()
                 .list_active_knowledge_index_rows_for_base(&base_sys_id)?;
             if rows.is_empty() {
-                self.vault.delete(base_dir.join("INDEX.md"))?;
+                self.ctx.vault.delete(base_dir.join("INDEX.md"))?;
                 continue;
             }
-            self.vault.write_markdown_file(
+            self.ctx.vault.write_markdown_file(
                 base_dir.join("INDEX.md"),
                 &render_base_index_from_rows(self, &base_sys_id, base_name, &rows)?,
             )?;
@@ -1040,7 +1025,11 @@ impl SnowCore {
         let new_base = KnowledgeResource::knowledge_base_reference(record)
             .map(|reference| reference.sys_id)
             .unwrap_or_default();
-        if let Some(existing) = self.query.store().get_knowledge_article(&record.sys_id)?
+        if let Some(existing) = self
+            .ctx
+            .query
+            .store()
+            .get_knowledge_article(&record.sys_id)?
             && !existing.knowledge_base_sys_id.is_empty()
             && existing.knowledge_base_sys_id != new_base
         {
@@ -1053,6 +1042,7 @@ impl SnowCore {
 
     async fn load_active_knowledge_articles(&self) -> Result<Vec<KnowledgeArticle>> {
         let rows = self
+            .ctx
             .query
             .store()
             .list_active_records(Some(ResourceType::Knowledge))?;
@@ -1066,7 +1056,7 @@ impl SnowCore {
                 articles.push(article);
                 continue;
             }
-            if let Some(article) = self.query.get_knowledge_article(&row.number).await?
+            if let Some(article) = self.ctx.query.get_knowledge_article(&row.number).await?
                 && article.record.sys_id == row.sys_id
             {
                 articles.push(article);
@@ -1083,7 +1073,12 @@ impl SnowCore {
         record_sys_ids.sort();
         let mut articles = Vec::new();
         for record_sys_id in record_sys_ids {
-            let Some(row) = self.query.store().get_record_by_sys_id(&record_sys_id)? else {
+            let Some(row) = self
+                .ctx
+                .query
+                .store()
+                .get_record_by_sys_id(&record_sys_id)?
+            else {
                 continue;
             };
             if !row.in_scope {
@@ -1093,13 +1088,64 @@ impl SnowCore {
                 articles.push(article);
                 continue;
             }
-            if let Some(article) = self.query.get_knowledge_article(&row.number).await?
+            if let Some(article) = self.ctx.query.get_knowledge_article(&row.number).await?
                 && article.record.sys_id == record_sys_id
             {
                 articles.push(article);
             }
         }
         Ok(articles)
+    }
+}
+
+impl CoreContext {
+    pub(crate) fn build_knowledge_article(&self, record: &Record) -> Result<KnowledgeArticle> {
+        let knowledge_base = KnowledgeResource::knowledge_base_reference(record)
+            .unwrap_or_else(|| empty_reference("kb_knowledge_base"));
+        let category = KnowledgeResource::category_reference(record)
+            .unwrap_or_else(|| empty_reference("kb_category"));
+        let mut article = normalize_knowledge_article(KnowledgeResource::from_servicenow(
+            record,
+            knowledge_base,
+            category,
+        ));
+
+        if let Some(existing_article) = self.load_existing_knowledge_article(&record.sys_id) {
+            if article.content.trim().is_empty()
+                && existing_article.body_cached
+                && !existing_article.content.trim().is_empty()
+            {
+                article.content = existing_article.content;
+            }
+            article.user_tags = existing_article.user_tags;
+            article.auto_tags = existing_article.auto_tags;
+            article.body_cached = article.body_cached || existing_article.body_cached;
+        } else if let Some(existing_row) =
+            self.query.store().get_knowledge_article(&record.sys_id)?
+        {
+            article.user_tags = existing_row.user_tags;
+            article.auto_tags = existing_row.auto_tags;
+            article.body_cached = article.body_cached || existing_row.body_cached;
+        }
+
+        article.sn_tags = derive_servicenow_tags(record);
+        Ok(normalize_knowledge_article(article))
+    }
+
+    pub(crate) fn load_existing_knowledge_article(
+        &self,
+        record_sys_id: &str,
+    ) -> Option<KnowledgeArticle> {
+        let row = self
+            .query
+            .store()
+            .get_record_by_sys_id(record_sys_id)
+            .ok()
+            .flatten()?;
+        let relative_path = row.file_path?;
+        self.vault
+            .read_knowledge_article(self.vault_path.join(relative_path))
+            .ok()
     }
 }
 
@@ -1535,10 +1581,11 @@ fn render_base_index_from_rows(
     rows: &[crate::cache::store::KnowledgeIndexRow],
 ) -> Result<String> {
     let base_dir = core
+        .ctx
         .vault
         .layout()
         .knowledge_base_dir(base_sys_id, base_name);
-    let base_relative_root = core.vault.relative_path(&base_dir)?;
+    let base_relative_root = core.ctx.vault.relative_path(&base_dir)?;
     let mut categories = BTreeMap::<(String, String), Vec<IndexEntry>>::new();
     for row in rows {
         let article_relative =
@@ -1977,7 +2024,7 @@ mod tests {
         dataset.lock().expect("dataset").remove(1);
         core.sync_knowledge(true, true).await.expect("second sync");
 
-        let store = core.query.store();
+        let store = core.ctx.query.store();
         let missing = store
             .get_record_by_sys_id("kb-sys-00001")
             .expect("row present")
@@ -2032,6 +2079,7 @@ mod tests {
         assert!(!results.is_empty());
 
         let first_row = core
+            .ctx
             .query
             .store()
             .get_record_by_sys_id("kb-sys-00000")
@@ -2041,6 +2089,7 @@ mod tests {
             .vault_path()
             .join(first_row.file_path.expect("file path"));
         let parsed = core
+            .ctx
             .vault
             .read_knowledge_article(&first_path)
             .expect("parsed article");
@@ -2066,11 +2115,13 @@ mod tests {
         core.sync_knowledge(true, true).await.expect("full sync");
 
         let base_zero = core
+            .ctx
             .vault
             .layout()
             .knowledge_base_dir("kb-base-00", "IT Operations")
             .join("INDEX.md");
         let base_one = core
+            .ctx
             .vault
             .layout()
             .knowledge_base_dir("kb-base-01", "HR Services")

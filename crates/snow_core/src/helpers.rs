@@ -33,6 +33,20 @@ pub(crate) fn non_empty_owned(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Returns the first non-empty, trimmed string from the provided candidates.
+///
+/// Iterates the candidates in order, skipping `None` and whitespace-only
+/// values, and returns the first trimmed `&str` that has content.
+pub(crate) fn first_non_empty_str<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
 /// Checks if a state label represents a terminal (closed/completed) state.
 pub(crate) fn is_terminal_state(label: Option<&str>) -> bool {
     let Some(label) = label else {

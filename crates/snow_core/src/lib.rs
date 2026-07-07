@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod config;
+pub(crate) mod context;
 pub(crate) mod convert;
 pub mod credential;
 pub mod display;
@@ -97,23 +98,21 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use servicenow_rs::prelude::{
-    DisplayValue, Error as SnowApiError, FieldValue as SnowFieldValue, Operator, Order, Record,
-    ServiceNowClient, child_relation_for_table,
+    DisplayValue, Error as SnowApiError, Operator, Order, Record, ServiceNowClient,
+    child_relation_for_table,
 };
 use servicenow_rs::query::TableApi;
 
 use crate::cache::store::{
-    AliasRow, BusinessApplicationFieldDictionaryRow, BusinessApplicationServerInventoryHealthRow,
-    BusinessApplicationServerMembershipRow, CachedUserRow, KeywordRow, PrimitiveObjectRow,
-    PrimitiveResolutionStatus, ProjectedFieldRow, RecordRow, TagRow,
+    BusinessApplicationFieldDictionaryRow, BusinessApplicationServerInventoryHealthRow,
+    BusinessApplicationServerMembershipRow, CachedUserRow, PrimitiveObjectRow,
+    PrimitiveResolutionStatus, ProjectedFieldRow,
 };
-use crate::enrich::derive_for_record;
 use crate::query::filter::{BusinessApplicationQuery, ListQuery};
 use crate::resource::approval::ApprovalResource;
 use crate::resource::server::{SERVER_LEAF_TABLES, canonical_server_class, is_server_class};
@@ -2400,14 +2399,6 @@ fn push_unique_reference_diagnostic(
     diagnostics.push(diagnostic);
 }
 
-fn first_non_empty_str<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
-    values
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-}
-
 impl JournalEntry {
     pub fn from_servicenow(entry: servicenow_rs::prelude::JournalEntry) -> Self {
         let timestamp =
@@ -2441,13 +2432,7 @@ impl SearchResult {
 
 #[derive(Clone)]
 pub struct SnowCore {
-    config: config::SnowConfig,
-    client: Arc<ServiceNowClient>,
-    vault_path: PathBuf,
-    vault: VaultManager,
-    query: Arc<query::QueryEngine>,
-    cache: cache::CacheManager,
-    cache_policy: CacheTtlPolicy,
+    ctx: context::CoreContext,
 }
 
 impl SnowCore {
@@ -2456,15 +2441,15 @@ impl SnowCore {
     }
 
     pub fn config(&self) -> &config::SnowConfig {
-        &self.config
+        &self.ctx.config
     }
 
     pub fn client(&self) -> &Arc<ServiceNowClient> {
-        &self.client
+        &self.ctx.client
     }
 
     pub fn vault_path(&self) -> &Path {
-        &self.vault_path
+        &self.ctx.vault_path
     }
 
     fn cached_users_for_query_key(
@@ -2473,6 +2458,7 @@ impl SnowCore {
         now: DateTime<Utc>,
     ) -> Result<Option<Vec<UserRecord>>> {
         let Some(query_row) = self
+            .ctx
             .query
             .store()
             .get_cached_user_query_result(query_key, now)?
@@ -2483,6 +2469,7 @@ impl SnowCore {
             return Ok(Some(Vec::new()));
         }
         let cached_rows = self
+            .ctx
             .query
             .store()
             .list_cached_users_by_sys_ids(&query_row.result_sys_ids)?;
@@ -2491,7 +2478,7 @@ impl SnowCore {
                 !stable_reference_cache_is_fresh(
                     row.synced_at,
                     now,
-                    self.cache_policy.stable_reference_ttl(),
+                    self.ctx.cache_policy.stable_reference_ttl(),
                 )
             })
         {
@@ -2515,18 +2502,22 @@ impl SnowCore {
         let mut sys_ids = Vec::with_capacity(records.len());
         for record in records {
             let user = user_record_from_record(record);
-            self.query
+            self.ctx
+                .query
                 .store()
                 .upsert_cached_user(&cached_user_row_from_record(record, synced_at))?;
             sys_ids.push(user.sys_id.clone());
             users.push(user);
         }
-        self.query.store().put_cached_user_query_result_with_ttl(
-            query_key,
-            &sys_ids,
-            synced_at,
-            self.cache_policy.stable_reference_ttl(),
-        )?;
+        self.ctx
+            .query
+            .store()
+            .put_cached_user_query_result_with_ttl(
+                query_key,
+                &sys_ids,
+                synced_at,
+                self.ctx.cache_policy.stable_reference_ttl(),
+            )?;
         Ok(users)
     }
 
@@ -2557,6 +2548,7 @@ impl SnowCore {
                 }
             }
             let response = self
+                .ctx
                 .client
                 .table("sys_user")
                 .equals(candidate.field, &candidate.value)
@@ -2601,6 +2593,7 @@ impl SnowCore {
             return Ok(users);
         }
         let mut query = self
+            .ctx
             .client
             .table("sys_user")
             .equals(
@@ -2658,6 +2651,7 @@ impl SnowCore {
             .await;
         let record = match lookup {
             BusinessApplicationLookup::SysId(sys_id) => match self
+                .ctx
                 .client
                 .table(BUSINESS_APPLICATION_TABLE)
                 .display_value(DisplayValue::Both)
@@ -2673,6 +2667,7 @@ impl SnowCore {
                 let name = non_empty_owned(Some(&name))
                     .ok_or_else(|| anyhow::anyhow!("Business Application name cannot be empty"))?;
                 let records = self
+                    .ctx
                     .client
                     .table(BUSINESS_APPLICATION_TABLE)
                     .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
@@ -2716,6 +2711,7 @@ impl SnowCore {
             .await;
 
         let mut query = self
+            .ctx
             .client
             .table(BUSINESS_APPLICATION_TABLE)
             .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
@@ -2783,7 +2779,7 @@ impl SnowCore {
         &self,
         query: BusinessApplicationQuery,
     ) -> Result<Vec<SnowRecord>> {
-        self.query.query_business_applications(query).await
+        self.ctx.query.query_business_applications(query).await
     }
 
     pub async fn business_application_servers(
@@ -3231,7 +3227,8 @@ impl SnowCore {
         }
 
         let inventory_health = if options.persist {
-            self.query
+            self.ctx
+                .query
                 .store()
                 .get_business_application_server_inventory_health(&application.record.sys_id)?
                 .map(|row| BusinessApplicationServerInventoryHealth {
@@ -3313,6 +3310,7 @@ impl SnowCore {
         let limit = options.max_cis;
         let fetch_limit = limit.saturating_add(1).min(u32::MAX as usize) as u32;
         let response = self
+            .ctx
             .client
             .table(SERVER_TABLE)
             .equals(BUSINESS_APPLICATION_CI_OWNER_GROUP_RAW_FIELD, &group.sys_id)
@@ -3430,7 +3428,7 @@ impl SnowCore {
             .collect::<Vec<_>>();
         summary.persisted_servers = self.persist_snow_records(&server_records)?;
 
-        let store = self.query.store();
+        let store = self.ctx.query.store();
         let now = Utc::now();
         for server in servers {
             let paths = server_paths
@@ -3610,6 +3608,7 @@ impl SnowCore {
         // relationship type to its sys_id. `cmdb_rel_type.name` is the configured
         // stored name (stable), whereas the edge display value can be localized.
         let response = self
+            .ctx
             .client
             .table(CMDB_REL_TYPE_TABLE)
             .in_list("name", &label_refs)
@@ -3654,6 +3653,7 @@ impl SnowCore {
         let aliases = self.resolve_business_application_aliases(false).await;
         let record = match &options.selector {
             BusinessApplicationServersSelector::SysId(sys_id) => match self
+                .ctx
                 .client
                 .table(BUSINESS_APPLICATION_TABLE)
                 .display_value(DisplayValue::Both)
@@ -3667,6 +3667,7 @@ impl SnowCore {
             },
             BusinessApplicationServersSelector::Number(number) => {
                 let records = self
+                    .ctx
                     .client
                     .table(BUSINESS_APPLICATION_TABLE)
                     .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
@@ -3834,6 +3835,7 @@ impl SnowCore {
         // or the `remaining` budget is consumed.
         let page_size = BUSINESS_APPLICATION_RELATIONSHIP_PAGE_SIZE.min(remaining.max(1));
         let mut paginator = self
+            .ctx
             .client
             .table(CMDB_REL_CI_TABLE)
             .in_list(field, &frontier_refs)
@@ -4068,6 +4070,7 @@ impl SnowCore {
         let page_size = BUSINESS_APPLICATION_SERVICE_MEMBERSHIP_PAGE_SIZE
             .min(options.max_service_membership_associations.max(1));
         let mut paginator = self
+            .ctx
             .client
             .table(SVC_CI_ASSOC_TABLE)
             .in_list("service_id", &service_refs)
@@ -4196,6 +4199,7 @@ impl SnowCore {
 
         let pending_refs = pending.iter().map(String::as_str).collect::<Vec<_>>();
         let response = self
+            .ctx
             .client
             .table(CMDB_CI_TABLE)
             .in_list("sys_id", &pending_refs)
@@ -4283,6 +4287,7 @@ impl SnowCore {
         // both correct (non-servers simply do not exist in `cmdb_ci_server`) and
         // hierarchy-complete.
         let response = self
+            .ctx
             .client
             .table(SERVER_TABLE)
             .in_list("sys_id", &sys_id_refs)
@@ -4386,6 +4391,7 @@ impl SnowCore {
                 let sys_id = normalize_record_lookup_sys_id(&sys_id)
                     .map_err(|err| ServerGetError::Other(err.to_string()))?;
                 match self
+                    .ctx
                     .client
                     .table(SERVER_TABLE)
                     .display_value(DisplayValue::Both)
@@ -4448,6 +4454,7 @@ impl SnowCore {
         value: &str,
     ) -> std::result::Result<Vec<Record>, ServerGetError> {
         let query = self
+            .ctx
             .client
             .table(SERVER_TABLE)
             .display_value(DisplayValue::Both)
@@ -4483,25 +4490,32 @@ impl SnowCore {
     }
 
     pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
-        self.query.query_servers(query).await
+        self.ctx.query.query_servers(query).await
     }
 
     pub async fn business_application_servers_cached(
         &self,
         params: BusinessApplicationServersCachedParams,
     ) -> Result<Option<BusinessApplicationServersCachedResult>> {
-        self.query.business_application_servers_cached(params).await
+        self.ctx
+            .query
+            .business_application_servers_cached(params)
+            .await
     }
 
     pub async fn business_applications_for_server(
         &self,
         params: BusinessApplicationsForServerParams,
     ) -> Result<Option<BusinessApplicationsForServerResult>> {
-        self.query.business_applications_for_server(params).await
+        self.ctx
+            .query
+            .business_applications_for_server(params)
+            .await
     }
 
     fn server_base_query(&self, params: ServerSearchParams) -> Result<TableApi> {
         let mut query = self
+            .ctx
             .client
             .table(SERVER_TABLE)
             .display_value(DisplayValue::Both)
@@ -4609,6 +4623,7 @@ impl SnowCore {
             .resolve_business_application_aliases(live_options.refresh_dictionary)
             .await;
         let mut paginator = self
+            .ctx
             .client
             .table(BUSINESS_APPLICATION_TABLE)
             .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
@@ -4710,6 +4725,7 @@ impl SnowCore {
             }
 
             match self
+                .ctx
                 .client
                 .table(descriptor.reference_table.as_str())
                 .display_value(DisplayValue::Both)
@@ -4775,7 +4791,8 @@ impl SnowCore {
             None,
         )?;
         let synced_at = Utc::now();
-        self.query
+        self.ctx
+            .query
             .store()
             .upsert_primitive_object(&PrimitiveObjectRow {
                 sys_id: descriptor.reference_sys_id.clone(),
@@ -4808,7 +4825,8 @@ impl SnowCore {
                     raw_value,
                     synced_at,
                 );
-                self.query
+                self.ctx
+                    .query
                     .store()
                     .upsert_primitive_object_field(&descriptor.reference_sys_id, &field)?;
             }
@@ -4843,7 +4861,8 @@ impl SnowCore {
             &raw_json,
             descriptor.diagnostic.as_deref().or(last_error.as_deref()),
         )?;
-        self.query
+        self.ctx
+            .query
             .store()
             .upsert_primitive_object(&PrimitiveObjectRow {
                 sys_id: descriptor.reference_sys_id.clone(),
@@ -4878,7 +4897,7 @@ impl SnowCore {
         diagnostic: Option<&str>,
     ) -> Result<PathBuf> {
         let relative_path = reference_primitive_relative_path(descriptor, display_name);
-        let absolute_path = self.vault_path.join(&relative_path);
+        let absolute_path = self.ctx.vault_path.join(&relative_path);
         let contents = render_reference_primitive_markdown(
             descriptor,
             display_name,
@@ -4886,7 +4905,10 @@ impl SnowCore {
             raw_json,
             diagnostic,
         );
-        let persisted = self.vault.write_markdown_file(absolute_path, &contents)?;
+        let persisted = self
+            .ctx
+            .vault
+            .write_markdown_file(absolute_path, &contents)?;
         Ok(persisted.relative_path)
     }
 
@@ -4899,19 +4921,19 @@ impl SnowCore {
     /// projection back into the cache.
     pub async fn get_record(&self, number: &str) -> Result<Option<SnowRecord>> {
         let now = Utc::now();
-        if let Some(record) = self.cache.get(number) {
-            if work_record_cache_is_fresh(&record, now, self.cache_policy.work_record_ttl()) {
+        if let Some(record) = self.ctx.cache.get(number) {
+            if work_record_cache_is_fresh(&record, now, self.ctx.cache_policy.work_record_ttl()) {
                 return Ok(Some(record));
             }
-            self.cache.invalidate(number);
+            self.ctx.cache.invalidate(number);
             return self.get_record_fresh(number).await;
         }
-        let record = self.query.get_record(number).await?;
+        let record = self.ctx.query.get_record(number).await?;
         if let Some(ref record) = record {
-            if !work_record_cache_is_fresh(record, now, self.cache_policy.work_record_ttl()) {
+            if !work_record_cache_is_fresh(record, now, self.ctx.cache_policy.work_record_ttl()) {
                 return self.get_record_fresh(number).await;
             }
-            self.cache.put(record.clone());
+            self.ctx.cache.put(record.clone());
         }
         Ok(record)
     }
@@ -4929,10 +4951,7 @@ impl SnowCore {
     /// Journal enrichment is best-effort — if the inline journal fetch fails
     /// (ACL, timeout, etc.), the base record is still persisted.
     pub async fn get_record_fresh(&self, number: &str) -> Result<Option<SnowRecord>> {
-        Ok(self
-            .get_record_fresh_with_source(number)
-            .await?
-            .map(|(_, record)| record))
+        self.ctx.get_record_fresh(number).await
     }
 
     pub async fn get_record_by_lookup_fresh(
@@ -4952,54 +4971,9 @@ impl SnowCore {
         table: &str,
         sys_id: &str,
     ) -> Result<Option<SnowRecord>> {
-        let table = normalize_record_lookup_table(table)?;
-        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
-        match self
-            .get_record_by_table_sys_id_fresh_with_source(&table, &sys_id)
+        self.ctx
+            .get_record_by_table_sys_id_fresh(table, sys_id)
             .await
-        {
-            Ok(record) => Ok(record.map(|(_, snow_record)| snow_record)),
-            Err(err)
-                if err
-                    .downcast_ref::<SnowApiError>()
-                    .is_some_and(|err| matches!(err, SnowApiError::Api { status: 404, .. })) =>
-            {
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn get_record_fresh_with_source(
-        &self,
-        number: &str,
-    ) -> Result<Option<(Record, SnowRecord)>> {
-        let table = self.table_for_number(number).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
-            )
-        })?;
-        let Some(mut record) = self
-            .client
-            .table(&table)
-            .equals("number", number)
-            .display_value(DisplayValue::Both)
-            .first()
-            .await?
-        else {
-            return Ok(None);
-        };
-        // Journal enrichment is best-effort: log and continue on failure
-        // so the base record is always persisted even if journals are unavailable.
-        if let Err(err) = self.enrich_record_journals(&mut record).await {
-            eprintln!("snow_core: journal enrichment failed for {number}: {err}");
-        }
-        self.persist_record(&record)?;
-        Ok(self
-            .query
-            .get_record(number)
-            .await?
-            .map(|snow_record| (record, snow_record)))
     }
 
     async fn get_record_by_table_sys_id_fresh_with_source(
@@ -5007,127 +4981,25 @@ impl SnowCore {
         table: &str,
         sys_id: &str,
     ) -> Result<Option<(Record, SnowRecord)>> {
-        let mut record = self
-            .client
-            .table(table)
-            .display_value(DisplayValue::Both)
-            .get(sys_id)
-            .await?;
-        if record.sys_id.eq_ignore_ascii_case(sys_id) {
-            record.sys_id = sys_id.to_string();
-        }
-        let number = if resource::business_application::is_business_application_alias(&record.table)
-        {
-            resource::business_application::business_application_number(&record)
-        } else {
-            record
-                .get_raw("number")
-                .or_else(|| record.get_str("number"))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "fresh {} row {} did not include a record number",
-                        table,
-                        sys_id
-                    )
-                })?
-                .to_string()
-        };
-
-        if let Err(err) = self.enrich_record_journals(&mut record).await {
-            eprintln!("snow_core: journal enrichment failed for {number}: {err}");
-        }
-        self.persist_record(&record)?;
-        Ok(self
-            .query
-            .get_record(&number)
-            .await?
-            .map(|snow_record| (record, snow_record)))
+        self.ctx
+            .get_record_by_table_sys_id_fresh_with_source(table, sys_id)
+            .await
     }
 
-    /// Fetch journal fields (`work_notes`, `comments`) with display values
-    /// via [`ServiceNowClient::journal_inline`] and merge them into the record.
-    ///
-    /// Journal blobs can still come back empty under the detail projection, so
-    /// this method performs a second query with `DisplayValue::Display` to
-    /// retrieve the formatted journal blobs, then overwrites the corresponding
-    /// fields on the mutable `Record`.
     async fn enrich_record_journals(&self, record: &mut Record) -> Result<()> {
-        let table = record.table.clone();
-        let sys_id = record.sys_id.clone();
-        let journal_record = self
-            .client
-            .journal_inline(&table, &sys_id, &["work_notes", "comments"])
-            .first()
-            .await?;
-        if let Some(journal_record) = journal_record {
-            for field in &["work_notes", "comments"] {
-                if let Some(value) = journal_record.get(field) {
-                    let blob = value
-                        .display_value
-                        .as_deref()
-                        .or_else(|| value.value.as_ref().and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    if !blob.trim().is_empty() {
-                        record.set(
-                            *field,
-                            SnowFieldValue {
-                                value: None,
-                                display_value: Some(blob.to_string()),
-                                link: None,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.ctx.enrich_record_journals(record).await
     }
 
     pub fn tombstone_record(&self, sys_id: &str, when: DateTime<Utc>) -> Result<()> {
-        if let Ok(Some(row)) = self.query.store().get_record_by_sys_id(sys_id) {
-            self.cache.invalidate(&row.number);
-        }
-        self.query
-            .store()
-            .tombstone_record(sys_id, when)
-            .map_err(anyhow::Error::from)
+        self.ctx.tombstone_record(sys_id, when)
     }
 
     pub async fn prune_record(&self, sys_id: &str, when: DateTime<Utc>) -> Result<()> {
-        let Some(row) = self.query.store().get_record_by_sys_id(sys_id)? else {
-            return Ok(());
-        };
-        self.cache.invalidate(&row.number);
-        let Some(record) = self.query.get_record(&row.number).await? else {
-            return Ok(());
-        };
-
-        let markdown_path = self.vault.layout().record_path(&record);
-        let staged_path = stage_markdown_for_prune(&markdown_path)?;
-        let prune_result = self
-            .query
-            .store()
-            .prune_record(sys_id, when)
-            .map_err(anyhow::Error::from);
-
-        match prune_result {
-            Ok(()) => {
-                if let Some(staged_path) = staged_path {
-                    fs::remove_file(&staged_path)?;
-                }
-                Ok(())
-            }
-            Err(err) => {
-                restore_staged_markdown(staged_path.as_ref())?;
-                Err(err)
-            }
-        }
+        self.ctx.prune_record(sys_id, when).await
     }
 
     pub async fn get_knowledge_article(&self, number: &str) -> Result<Option<KnowledgeArticle>> {
-        self.query.get_knowledge_article(number).await
+        self.ctx.query.get_knowledge_article(number).await
     }
 
     pub async fn get_knowledge_article_cached_or_fresh(
@@ -5152,7 +5024,7 @@ impl SnowCore {
         query: &str,
         filters: KnowledgeSearchFilters,
     ) -> Result<Vec<KnowledgeArticle>> {
-        self.query.search_knowledge(query, filters).await
+        self.ctx.query.search_knowledge(query, filters).await
     }
 
     pub async fn search_knowledge_semantic(
@@ -5165,7 +5037,7 @@ impl SnowCore {
                 self.search_knowledge_lexical_hits(query, &filters).await
             }
             KnowledgeSearchMode::Semantic => {
-                let config = &self.config.kb.semantic_search;
+                let config = &self.ctx.config.kb.semantic_search;
                 let sanitized = sanitize_semantic_text(query, config.query_max_chars);
                 if sanitized.is_empty() {
                     return Ok(Vec::new());
@@ -5180,7 +5052,7 @@ impl SnowCore {
                     .await
             }
             KnowledgeSearchMode::Hybrid => {
-                let config = &self.config.kb.semantic_search;
+                let config = &self.ctx.config.kb.semantic_search;
                 let sanitized = sanitize_semantic_text(query, config.query_max_chars);
                 if sanitized.is_empty() {
                     return Ok(Vec::new());
@@ -5230,8 +5102,8 @@ impl SnowCore {
     }
 
     pub async fn knowledge_semantic_status(&self) -> Result<KnowledgeSemanticStatus> {
-        let config = &self.config.kb.semantic_search;
-        let embeddings = self.query.store().list_knowledge_embeddings()?;
+        let config = &self.ctx.config.kb.semantic_search;
+        let embeddings = self.ctx.query.store().list_knowledge_embeddings()?;
         let articles = self.load_active_knowledge_articles_for_semantic().await?;
         let mut stale_rows = 0usize;
         let mut dimensions = 0usize;
@@ -5260,23 +5132,31 @@ impl SnowCore {
             }
         }
 
-        let meta = self.query.store().knowledge_semantic_meta()?;
+        let meta = self.ctx.query.store().knowledge_semantic_meta()?;
         Ok(KnowledgeSemanticStatus {
             enabled: config.enabled,
             provider: config.provider.clone(),
             model: config.model.clone(),
             dimensions,
             active_kb_articles: articles.len(),
-            metadata_embeddings: self.query.store().count_knowledge_embeddings_by_coverage(
-                &config.model,
-                KnowledgeEmbeddingCoverage::Metadata,
-            )?,
-            full_text_embeddings: self.query.store().count_knowledge_embeddings_by_coverage(
-                &config.model,
-                KnowledgeEmbeddingCoverage::FullText,
-            )?,
+            metadata_embeddings: self
+                .ctx
+                .query
+                .store()
+                .count_knowledge_embeddings_by_coverage(
+                    &config.model,
+                    KnowledgeEmbeddingCoverage::Metadata,
+                )?,
+            full_text_embeddings: self
+                .ctx
+                .query
+                .store()
+                .count_knowledge_embeddings_by_coverage(
+                    &config.model,
+                    KnowledgeEmbeddingCoverage::FullText,
+                )?,
             stale_rows,
-            orphan_rows: self.query.store().count_orphan_knowledge_embeddings()?,
+            orphan_rows: self.ctx.query.store().count_orphan_knowledge_embeddings()?,
             last_rebuild_at: meta.last_rebuild_at,
             last_error: meta.last_error,
         })
@@ -5293,6 +5173,7 @@ impl SnowCore {
 
     pub fn list_knowledge_bases(&self) -> Result<Vec<KnowledgeBaseSummary>> {
         Ok(self
+            .ctx
             .query
             .list_knowledge_bases()?
             .into_iter()
@@ -5309,6 +5190,7 @@ impl SnowCore {
         knowledge_base_sys_id: &str,
     ) -> Result<Vec<KnowledgeCategorySummary>> {
         Ok(self
+            .ctx
             .query
             .list_knowledge_categories(knowledge_base_sys_id)?
             .into_iter()
@@ -5328,6 +5210,7 @@ impl SnowCore {
         limit: Option<usize>,
     ) -> Result<Vec<KnowledgeArticle>> {
         let mut numbers = self
+            .ctx
             .query
             .store()
             .list_active_records(Some(ResourceType::Knowledge))?
@@ -5338,7 +5221,7 @@ impl SnowCore {
 
         let mut articles = Vec::new();
         for number in numbers {
-            let Some(article) = self.query.get_knowledge_article(&number).await? else {
+            let Some(article) = self.ctx.query.get_knowledge_article(&number).await? else {
                 continue;
             };
             if let Some(expected) = knowledge_base_sys_id
@@ -5363,7 +5246,7 @@ impl SnowCore {
     }
 
     fn semantic_provider_from_config(&self) -> Result<Box<dyn EmbeddingProvider>> {
-        let config = &self.config.kb.semantic_search;
+        let config = &self.ctx.config.kb.semantic_search;
         anyhow::ensure!(config.enabled, "semantic KB search is not enabled");
         anyhow::ensure!(
             !config.model.trim().is_empty(),
@@ -5388,9 +5271,10 @@ impl SnowCore {
         full: bool,
         provider: &dyn EmbeddingProvider,
     ) -> Result<SemanticIndexSummary> {
-        let config = &self.config.kb.semantic_search;
+        let config = &self.ctx.config.kb.semantic_search;
         let articles = self.load_active_knowledge_articles_for_semantic().await?;
         let existing = self
+            .ctx
             .query
             .store()
             .list_knowledge_embeddings()?
@@ -5425,7 +5309,8 @@ impl SnowCore {
             let vectors = match provider.embed(&inputs).await {
                 Ok(vectors) => vectors,
                 Err(err) => {
-                    self.query
+                    self.ctx
+                        .query
                         .store()
                         .set_knowledge_semantic_meta(None, Some(&err.to_string()))?;
                     return Err(err);
@@ -5439,7 +5324,7 @@ impl SnowCore {
             );
             let now = Utc::now();
             for ((record_sys_id, coverage, hash, _), vector) in batch.iter().zip(vectors) {
-                self.query.store().upsert_knowledge_embedding(
+                self.ctx.query.store().upsert_knowledge_embedding(
                     &crate::cache::store::KnowledgeEmbeddingRow {
                         record_sys_id: record_sys_id.clone(),
                         model: provider.model().to_string(),
@@ -5455,9 +5340,10 @@ impl SnowCore {
             }
         }
 
-        self.query.store().prune_orphan_knowledge_embeddings()?;
+        self.ctx.query.store().prune_orphan_knowledge_embeddings()?;
         let completed_at = Some(Utc::now());
-        self.query
+        self.ctx
+            .query
             .store()
             .set_knowledge_semantic_meta(completed_at, None)?;
         let status = self.knowledge_semantic_status().await?;
@@ -5474,7 +5360,7 @@ impl SnowCore {
     }
 
     async fn maybe_run_inline_semantic_rebuild(&self, trigger: &str) {
-        if !self.config.kb.semantic_search.enabled {
+        if !self.ctx.config.kb.semantic_search.enabled {
             return;
         }
         if let Err(err) = self.rebuild_knowledge_semantic_index(false).await {
@@ -5484,6 +5370,7 @@ impl SnowCore {
 
     async fn load_active_knowledge_articles_for_semantic(&self) -> Result<Vec<KnowledgeArticle>> {
         let rows = self
+            .ctx
             .query
             .store()
             .list_active_records(Some(ResourceType::Knowledge))?;
@@ -5493,7 +5380,7 @@ impl SnowCore {
             if !seen.insert(row.sys_id.clone()) {
                 continue;
             }
-            if let Some(article) = self.query.get_knowledge_article(&row.number).await?
+            if let Some(article) = self.ctx.query.get_knowledge_article(&row.number).await?
                 && article.record.sys_id == row.sys_id
             {
                 articles.push(article);
@@ -5515,10 +5402,11 @@ impl SnowCore {
             return Ok(Vec::new());
         }
         let coverage = self
+            .ctx
             .query
             .store()
             .get_knowledge_embedding(&article.record.sys_id)?
-            .filter(|row| row.model == self.config.kb.semantic_search.model)
+            .filter(|row| row.model == self.ctx.config.kb.semantic_search.model)
             .map(|row| row.coverage)
             .unwrap_or_else(|| {
                 if article.body_cached {
@@ -5551,7 +5439,7 @@ impl SnowCore {
                     limit: Some(
                         filters
                             .limit
-                            .unwrap_or(self.config.kb.semantic_search.top_k),
+                            .unwrap_or(self.ctx.config.kb.semantic_search.top_k),
                     ),
                 },
             )
@@ -5594,13 +5482,13 @@ impl SnowCore {
             })?;
         let min_score = filters
             .min_score_millis
-            .unwrap_or(self.config.kb.semantic_search.min_score_millis)
+            .unwrap_or(self.ctx.config.kb.semantic_search.min_score_millis)
             as f32
             / 1000.0;
         let limit = filters
             .limit
-            .unwrap_or(self.config.kb.semantic_search.top_k);
-        let candidate_pool = self.config.kb.semantic_search.candidate_pool;
+            .unwrap_or(self.ctx.config.kb.semantic_search.top_k);
+        let candidate_pool = self.ctx.config.kb.semantic_search.candidate_pool;
         let articles = self
             .load_active_knowledge_articles_for_semantic()
             .await?
@@ -5610,6 +5498,7 @@ impl SnowCore {
             .collect::<HashMap<_, _>>();
 
         let mut ranked = self
+            .ctx
             .query
             .store()
             .list_knowledge_embeddings()?
@@ -5663,7 +5552,7 @@ impl SnowCore {
         filters: &KnowledgeSemanticSearchFilters,
         provider: &dyn EmbeddingProvider,
     ) -> Result<Vec<KnowledgeSearchHit>> {
-        let candidate_pool = self.config.kb.semantic_search.candidate_pool;
+        let candidate_pool = self.ctx.config.kb.semantic_search.candidate_pool;
         let lexical_articles = self
             .search_knowledge(
                 query,
@@ -5675,6 +5564,7 @@ impl SnowCore {
             )
             .await?;
         let has_active_embeddings = self
+            .ctx
             .query
             .store()
             .list_knowledge_embeddings()?
@@ -5741,17 +5631,17 @@ impl SnowCore {
         hits.truncate(
             filters
                 .limit
-                .unwrap_or(self.config.kb.semantic_search.top_k),
+                .unwrap_or(self.ctx.config.kb.semantic_search.top_k),
         );
         Ok(hits)
     }
 
     pub async fn get_approval(&self, number: &str) -> Result<Option<ApprovalRecord>> {
-        self.query.get_approval(number).await
+        self.ctx.query.get_approval(number).await
     }
 
     pub fn degraded_reads(&self) -> Vec<DegradedReadDiagnostic> {
-        self.query.degraded_reads()
+        self.ctx.query.degraded_reads()
     }
 
     pub async fn repair_missing_vault_files(&self) -> Result<usize> {
@@ -5759,7 +5649,7 @@ impl SnowCore {
     }
 
     pub async fn repair_vault(&self) -> Result<RepairReport> {
-        let rows = self.query.store().list_active_records(None)?;
+        let rows = self.ctx.query.store().list_active_records(None)?;
         let mut repaired = 0usize;
         let mut skipped = 0usize;
         let scanned = rows.len();
@@ -5785,7 +5675,7 @@ impl SnowCore {
             repaired_row.file_path = Some(persisted.relative_path.to_string_lossy().into_owned());
             repaired_row.raw_json = serialize_vault_document(&document).to_string();
 
-            self.query.store().upsert_record_with_tags(
+            self.ctx.query.store().upsert_record_with_tags(
                 &repaired_row,
                 &document_work_notes(document.record()),
                 &document_content(&document),
@@ -5808,7 +5698,7 @@ impl SnowCore {
     }
 
     pub fn rebuild_cache(&self) -> Result<RebuildReport> {
-        let entries = scan_documents(&self.vault_path)?;
+        let entries = scan_documents(&self.ctx.vault_path)?;
         let mut rebuilt = 0usize;
         let scanned = entries.len();
 
@@ -5819,7 +5709,7 @@ impl SnowCore {
                 Some(entry.relative_path.clone()),
                 serialize_vault_document(&document).to_string(),
             );
-            self.query.store().upsert_record_with_tags(
+            self.ctx.query.store().upsert_record_with_tags(
                 &row,
                 &document_work_notes(document.record()),
                 &document_content(&document),
@@ -5837,9 +5727,9 @@ impl SnowCore {
     }
 
     pub fn verify_vault(&self) -> Result<VaultVerificationReport> {
-        let scan_report = scan_documents_detailed(&self.vault_path)?;
+        let scan_report = scan_documents_detailed(&self.ctx.vault_path)?;
         let entries = scan_report.entries;
-        let rows = self.query.store().list_active_records(None)?;
+        let rows = self.ctx.query.store().list_active_records(None)?;
 
         let mut indexed_sys_ids = BTreeMap::new();
         let mut missing_markdown_rows = Vec::new();
@@ -5848,7 +5738,7 @@ impl SnowCore {
             indexed_sys_ids.insert(row.sys_id.clone(), row.clone());
             match row.file_path.as_deref() {
                 Some(relative_path) => {
-                    let absolute_path = self.vault_path.join(relative_path);
+                    let absolute_path = self.ctx.vault_path.join(relative_path);
                     if !absolute_path.exists() {
                         let orphan = OrphanRecordRow {
                             sys_id: row.sys_id.clone(),
@@ -5878,13 +5768,13 @@ impl SnowCore {
             }
         }
 
-        let projected_references = self.query.store().list_references()?.len();
-        let projected_relationships = self.query.store().list_relationships()?.len();
+        let projected_references = self.ctx.query.store().list_references()?.len();
+        let projected_relationships = self.ctx.query.store().list_relationships()?.len();
         let mut projected_enrichment_rows = 0usize;
         for row in &rows {
-            projected_enrichment_rows += self.query.store().list_tags(&row.sys_id)?.len();
-            projected_enrichment_rows += self.query.store().list_keywords(&row.sys_id)?.len();
-            projected_enrichment_rows += self.query.store().list_aliases(&row.sys_id)?.len();
+            projected_enrichment_rows += self.ctx.query.store().list_tags(&row.sys_id)?.len();
+            projected_enrichment_rows += self.ctx.query.store().list_keywords(&row.sys_id)?.len();
+            projected_enrichment_rows += self.ctx.query.store().list_aliases(&row.sys_id)?.len();
         }
 
         Ok(VaultVerificationReport {
@@ -5929,12 +5819,12 @@ impl SnowCore {
     }
 
     pub async fn get_children(&self, number: &str) -> Result<Vec<SnowRecord>> {
-        let mut cached = self.query.get_children(number).await?;
+        let mut cached = self.ctx.query.get_children(number).await?;
         if !cached.is_empty() {
             return Ok(cached);
         }
 
-        let Some(parent_record) = self.client.get_by_number(number).await? else {
+        let Some(parent_record) = self.ctx.client.get_by_number(number).await? else {
             return Ok(Vec::new());
         };
         self.persist_record(&parent_record)?;
@@ -5946,6 +5836,7 @@ impl SnowCore {
         };
 
         let mut query = self
+            .ctx
             .client
             .table(child_table)
             .equals(child_link_field, &parent_record.sys_id)
@@ -5965,7 +5856,7 @@ impl SnowCore {
             self.persist_record(child)?;
         }
 
-        cached = self.query.get_children(number).await?;
+        cached = self.ctx.query.get_children(number).await?;
         Ok(cached)
     }
 
@@ -5983,6 +5874,7 @@ impl SnowCore {
         };
 
         let mut query = self
+            .ctx
             .client
             .table("resource_plan")
             .fields(RESOURCE_PLAN_LIST_FIELDS)
@@ -6048,19 +5940,21 @@ impl SnowCore {
     }
 
     pub async fn list_records_query(&self, query: ListQuery) -> Result<Vec<SnowRecord>> {
-        self.query.list_records(query).await
+        self.ctx.query.list_records(query).await
     }
 
     pub async fn my_tasks(&self) -> Result<Vec<SnowRecord>> {
-        self.query.my_tasks().await
+        self.ctx.query.my_tasks().await
     }
 
     pub async fn current_user_sys_id(&self) -> Result<String> {
-        self.resolve_user_sys_id(&self.config.instance.user).await
+        self.ctx.current_user_sys_id().await
     }
 
     pub async fn list_my_timecards(&self, week: WeekSelector) -> Result<TimecardSheet> {
-        let actor = self.resolve_user_ref(&self.config.instance.user).await?;
+        let actor = self
+            .resolve_user_ref(&self.ctx.config.instance.user)
+            .await?;
         let sheet_row = self.resolve_my_timecard_sheet(week, &actor).await?;
         let sheet_ref = SimpleRef {
             sys_id: sheet_row.sys_id.clone(),
@@ -6086,6 +5980,7 @@ impl SnowCore {
             .to_string();
 
         let mut card_rows = self
+            .ctx
             .client
             .table(resource::timecard::TimecardResource::TABLE)
             .equals("time_sheet", &sheet_ref.sys_id)
@@ -6099,6 +5994,7 @@ impl SnowCore {
 
         if card_rows.is_empty() && !week_starts_on.trim().is_empty() {
             card_rows = self
+                .ctx
                 .client
                 .table(resource::timecard::TimecardResource::TABLE)
                 .equals("user", &actor.sys_id)
@@ -6134,6 +6030,7 @@ impl SnowCore {
             return Err(anyhow::anyhow!("time card sys_id cannot be empty"));
         }
         let record = match self
+            .ctx
             .client
             .table(resource::timecard::TimecardResource::TABLE)
             .fields(TIME_CARD_FIELDS)
@@ -6173,7 +6070,8 @@ impl SnowCore {
             }
         };
 
-        self.client
+        self.ctx
+            .client
             .table(resource::timecard::TimecardResource::TABLE)
             .display_value(DisplayValue::Both)
             .update(
@@ -6270,7 +6168,8 @@ impl SnowCore {
             ResourceType::ScrumTask,
         ] {
             records.extend(
-                self.query
+                self.ctx
+                    .query
                     .list_records(
                         ListQuery::new()
                             .resource_type(resource_type)
@@ -6306,6 +6205,7 @@ impl SnowCore {
         .await?;
 
         let mut records = self
+            .ctx
             .query
             .list_records(
                 ListQuery::new()
@@ -6342,6 +6242,7 @@ impl SnowCore {
         let active_scope_sys_ids = hydration.sys_ids.into_iter().collect::<HashSet<_>>();
 
         let mut records = self
+            .ctx
             .query
             .list_records(
                 ListQuery::new()
@@ -6414,14 +6315,15 @@ impl SnowCore {
     }
 
     pub async fn my_approvals(&self) -> Result<Vec<ApprovalRecord>> {
-        self.query.my_approvals().await
+        self.ctx.query.my_approvals().await
     }
 
     pub async fn my_projects(&self) -> Result<Vec<SnowRecord>> {
         let mut records = Vec::new();
         for resource_type in [ResourceType::Project, ResourceType::Demand] {
             records.extend(
-                self.query
+                self.ctx
+                    .query
                     .list_records(ListQuery::new().resource_type(resource_type))
                     .await?,
             );
@@ -6477,7 +6379,8 @@ impl SnowCore {
         let mut records = Vec::new();
         for resource_type in [ResourceType::Project, ResourceType::Demand] {
             records.extend(
-                self.query
+                self.ctx
+                    .query
                     .list_records(
                         ListQuery::new()
                             .resource_type(resource_type)
@@ -6491,11 +6394,11 @@ impl SnowCore {
     }
 
     pub async fn search(&self, query: &str, scope: SearchScope) -> Result<Vec<SearchResult>> {
-        self.query.search(query, scope).await
+        self.ctx.query.search(query, scope).await
     }
 
     pub async fn search_by_tag(&self, tag: &str, scope: SearchScope) -> Result<Vec<SearchResult>> {
-        self.query.search_by_tag(tag, scope).await
+        self.ctx.query.search_by_tag(tag, scope).await
     }
 
     pub async fn search_by_keyword(
@@ -6503,7 +6406,7 @@ impl SnowCore {
         keyword: &str,
         scope: SearchScope,
     ) -> Result<Vec<SearchResult>> {
-        self.query.search_by_keyword(keyword, scope).await
+        self.ctx.query.search_by_keyword(keyword, scope).await
     }
 
     pub async fn search_by_alias(
@@ -6511,7 +6414,7 @@ impl SnowCore {
         alias: &str,
         scope: SearchScope,
     ) -> Result<Vec<SearchResult>> {
-        self.query.search_by_alias(alias, scope).await
+        self.ctx.query.search_by_alias(alias, scope).await
     }
 
     /// Full-text search across cached records with automatic live-fetch
@@ -6530,7 +6433,7 @@ impl SnowCore {
         query: &str,
         scope: SearchScope,
     ) -> Result<Vec<SearchResult>> {
-        let results = self.query.search_enriched(query, scope.clone()).await?;
+        let results = self.ctx.query.search_enriched(query, scope.clone()).await?;
         if !results.is_empty() {
             return Ok(results);
         }
@@ -6545,7 +6448,7 @@ impl SnowCore {
             if self.table_for_number(&normalized).is_some()
                 && let Ok(Some(_)) = self.get_record_fresh(&normalized).await
             {
-                return self.query.search_enriched(&normalized, scope).await;
+                return self.ctx.query.search_enriched(&normalized, scope).await;
             }
         }
         Ok(results)
@@ -6591,7 +6494,7 @@ impl SnowCore {
         table: &str,
         payload: serde_json::Value,
     ) -> Result<StoryWriteResult> {
-        let written = self.client.table(table).create(payload).await?;
+        let written = self.ctx.client.table(table).create(payload).await?;
         self.refetch_story_write_result(table, &written.sys_id, &written)
             .await
     }
@@ -6602,7 +6505,7 @@ impl SnowCore {
         sys_id: &str,
         payload: serde_json::Value,
     ) -> Result<StoryWriteResult> {
-        let written = self.client.table(table).update(sys_id, payload).await?;
+        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
         self.refetch_story_write_result(table, sys_id, &written)
             .await
     }
@@ -6716,7 +6619,7 @@ impl SnowCore {
         table: &str,
         payload: serde_json::Value,
     ) -> Result<ChangeWriteResult> {
-        let written = self.client.table(table).create(payload).await?;
+        let written = self.ctx.client.table(table).create(payload).await?;
         self.refetch_change_write_result(table, &written.sys_id, &written)
             .await
     }
@@ -6727,7 +6630,7 @@ impl SnowCore {
         sys_id: &str,
         payload: serde_json::Value,
     ) -> Result<ChangeWriteResult> {
-        let written = self.client.table(table).update(sys_id, payload).await?;
+        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
         self.refetch_change_write_result(table, sys_id, &written)
             .await
     }
@@ -6784,7 +6687,7 @@ impl SnowCore {
         payload: serde_json::Value,
     ) -> Result<ResourcePlanWriteResult> {
         let table = resource::resource_plan::ResourcePlanResource::TABLE;
-        let written = self.client.table(table).create(payload).await?;
+        let written = self.ctx.client.table(table).create(payload).await?;
         self.refetch_resource_plan_result(&written.sys_id, &written)
             .await
     }
@@ -6795,7 +6698,7 @@ impl SnowCore {
         payload: serde_json::Value,
     ) -> Result<ResourcePlanWriteResult> {
         let table = resource::resource_plan::ResourcePlanResource::TABLE;
-        let written = self.client.table(table).update(sys_id, payload).await?;
+        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
         self.refetch_resource_plan_result(sys_id, &written).await
     }
 
@@ -6853,7 +6756,7 @@ impl SnowCore {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
         };
-        self.client.add_work_note(&table, &sys_id, text).await?;
+        self.ctx.client.add_work_note(&table, &sys_id, text).await?;
         self.get_record_fresh(number).await
     }
 
@@ -6864,6 +6767,7 @@ impl SnowCore {
         }
         let limit = limit.clamp(1, 50);
         let records = self
+            .ctx
             .client
             .table("sc_cat_item")
             .contains("name", query)
@@ -6891,6 +6795,7 @@ impl SnowCore {
     pub async fn get_catalog_item(&self, sys_id: &str) -> Result<CatalogItem> {
         let sys_id = normalize_record_lookup_sys_id(sys_id)?;
         let item = self
+            .ctx
             .client
             .table("sc_cat_item")
             .fields(&[
@@ -6939,6 +6844,7 @@ impl SnowCore {
             return Ok(Vec::new());
         }
         let mut query = self
+            .ctx
             .client
             .table("item_option_new")
             .fields(&[
@@ -6967,6 +6873,7 @@ impl SnowCore {
             Ok(result) => Ok(result.records),
             Err(_) => {
                 let mut fallback = self
+                    .ctx
                     .client
                     .table("item_option_new")
                     .fields(&[
@@ -6998,6 +6905,7 @@ impl SnowCore {
 
     async fn catalog_variable_set_ids(&self, item_sys_id: &str) -> Result<Vec<String>> {
         match self
+            .ctx
             .client
             .table("io_set_item")
             .equals("sc_cat_item", item_sys_id)
@@ -7029,6 +6937,7 @@ impl SnowCore {
         }
 
         let choices = self
+            .ctx
             .client
             .table("question_choice")
             .in_list("question", &variable_sys_ids)
@@ -7062,12 +6971,12 @@ impl SnowCore {
     ) -> Result<CatalogSubmitResult> {
         let item_sys_id = normalize_record_lookup_sys_id(item_sys_id)?;
         let path = format!("/api/sn_sc/v1/servicecatalog/items/{item_sys_id}/order_now");
-        let raw_result = self.client.post(&path, request_body).await?;
+        let raw_result = self.ctx.client.post(&path, request_body).await?;
         let mut result = catalog_submit_result_from_response(
             item_sys_id.clone(),
             raw_result,
-            self.client.base_url(),
-            &self.config.instance.portal,
+            self.ctx.client.base_url(),
+            &self.ctx.config.instance.portal,
         );
 
         if let (Some(table), Some(sys_id)) = (result.table.as_deref(), result.sys_id.as_deref()) {
@@ -7109,8 +7018,8 @@ impl SnowCore {
             result.request_item_sys_id = Some(ritm_sys_id.clone());
             result.request_item_number = ritm_number;
             result.browser_url = Some(catalog_browser_url(
-                self.client.base_url(),
-                &self.config.instance.portal,
+                self.ctx.client.base_url(),
+                &self.ctx.config.instance.portal,
                 "sc_req_item",
                 &ritm_sys_id,
             ));
@@ -7122,6 +7031,7 @@ impl SnowCore {
     async fn lookup_catalog_request_item(&self, request_sys_id: &str) -> Option<Record> {
         for attempt in 0..4 {
             match self
+                .ctx
                 .client
                 .table("sc_req_item")
                 .equals("request", request_sys_id)
@@ -7149,7 +7059,9 @@ impl SnowCore {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
         };
-        Ok(Some(self.client.list_attachments(&table, &sys_id).await?))
+        Ok(Some(
+            self.ctx.client.list_attachments(&table, &sys_id).await?,
+        ))
     }
 
     pub async fn upload_attachment_file(
@@ -7163,7 +7075,8 @@ impl SnowCore {
             return Ok(None);
         };
         Ok(Some(
-            self.client
+            self.ctx
+                .client
                 .upload_attachment_file(&table, &sys_id, path, file_name, content_type)
                 .await?,
         ))
@@ -7173,7 +7086,8 @@ impl SnowCore {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
         };
-        self.client
+        self.ctx
+            .client
             .table(&table)
             .update(&sys_id, serde_json::json!({ "state": state }))
             .await?;
@@ -7201,7 +7115,8 @@ impl SnowCore {
             return Ok(None);
         };
         let assignee_sys_id = self.resolve_user_sys_id(user).await?;
-        self.client
+        self.ctx
+            .client
             .table(&table)
             .update(
                 &sys_id,
@@ -7215,8 +7130,10 @@ impl SnowCore {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
         };
-        let approver_sys_id = self.resolve_user_sys_id(&self.config.instance.user).await?;
-        let mut builder = self.client.approve(&table, &sys_id, &approver_sys_id);
+        let approver_sys_id = self
+            .resolve_user_sys_id(&self.ctx.config.instance.user)
+            .await?;
+        let mut builder = self.ctx.client.approve(&table, &sys_id, &approver_sys_id);
         if let Some(comment) = comment {
             builder = builder.comment(comment);
         }
@@ -7237,8 +7154,11 @@ impl SnowCore {
         let Some((table, sys_id)) = self.lookup_table_and_sys_id(number).await? else {
             return Ok(None);
         };
-        let approver_sys_id = self.resolve_user_sys_id(&self.config.instance.user).await?;
-        self.client
+        let approver_sys_id = self
+            .resolve_user_sys_id(&self.ctx.config.instance.user)
+            .await?;
+        self.ctx
+            .client
             .reject(&table, &sys_id, &approver_sys_id)
             .comment(reason)
             .execute()
@@ -7258,7 +7178,7 @@ impl SnowCore {
     pub fn browser_url(&self, number: &str) -> String {
         format!(
             "{}/nav_to.do?uri={}.do?sysparm_query=number={}",
-            self.client.base_url(),
+            self.ctx.client.base_url(),
             self.infer_table(number),
             number
         )
@@ -7266,6 +7186,7 @@ impl SnowCore {
 
     pub fn vault_relative_path_for_sys_id(&self, sys_id: &str) -> Result<Option<String>> {
         Ok(self
+            .ctx
             .query
             .store()
             .get_record_by_sys_id(sys_id)?
@@ -7273,251 +7194,26 @@ impl SnowCore {
     }
 
     fn persist_record(&self, record: &Record) -> Result<()> {
-        let number = record.get_str("number").unwrap_or_default();
-        self.cache.invalidate(number);
-        let persisted = self.persist_document(record)?;
-        let row = record_row_from_snow_record(
-            persisted.record(),
-            record,
-            Some(persisted.relative_path().to_path_buf()),
-        )?;
-        let persisted_document = persisted.to_vault_document();
-        self.query
-            .store()
-            .upsert_record_with_tags(
-                &row,
-                &render_journal_entries(&collect_journal_entries(record, "work_notes")),
-                &document_content(&persisted_document),
-                &document_tag_tokens(&persisted_document),
-            )
-            .map_err(anyhow::Error::from)?;
-        if let Err(err) = self.record_kb_local_file_state(&persisted) {
-            eprintln!(
-                "snow_core: KB local file state refresh failed for {}: {err}",
-                row.number
-            );
-        }
-        if let Err(err) = self.project_runtime_document(&persisted_document) {
-            eprintln!(
-                "snow_core: projection refresh failed for {}: {err}",
-                row.number
-            );
-        }
-        if let Err(err) = self.persist_enrichment(persisted.record()) {
-            eprintln!(
-                "snow_core: enrichment refresh failed for {}: {err}",
-                row.number
-            );
-        }
-        self.cache.put(persisted.record().clone());
-        Ok(())
+        self.ctx.persist_record(record)
     }
 
-    /// Batch-persist multiple records, wrapping all SQLite writes in a single transaction.
     fn persist_records(&self, records: &[Record]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let mut entries = Vec::with_capacity(records.len());
-        let mut persisted_docs = Vec::with_capacity(records.len());
-
-        for record in records {
-            let number = record.get_str("number").unwrap_or_default();
-            self.cache.invalidate(number);
-            let persisted = self.persist_document(record)?;
-            let work_notes = render_journal_entries(&collect_journal_entries(record, "work_notes"));
-            let row = record_row_from_snow_record(
-                persisted.record(),
-                record,
-                Some(persisted.relative_path().to_path_buf()),
-            )?;
-            let persisted_document = persisted.to_vault_document();
-            let content = document_content(&persisted_document);
-            let tag_tokens = document_tag_tokens(&persisted_document);
-            entries.push((row, work_notes, content, tag_tokens));
-            persisted_docs.push(persisted);
-        }
-
-        let batch: Vec<(&RecordRow, &str, &str, &str)> = entries
-            .iter()
-            .map(|(row, wn, content, tag_tokens)| {
-                (row, wn.as_str(), content.as_str(), tag_tokens.as_str())
-            })
-            .collect();
-        self.query
-            .store()
-            .upsert_records(&batch)
-            .map_err(anyhow::Error::from)?;
-        for persisted in &persisted_docs {
-            if let Err(err) = self.record_kb_local_file_state(persisted) {
-                eprintln!("snow_core: KB local file state refresh failed: {err}");
-            }
-        }
-
-        for persisted in &persisted_docs {
-            self.cache.put(persisted.record().clone());
-            if let Err(err) = self.project_runtime_document(&persisted.to_vault_document()) {
-                eprintln!("snow_core: projection refresh failed: {err}");
-            }
-            if let Err(err) = self.persist_enrichment(persisted.record()) {
-                eprintln!("snow_core: enrichment refresh failed: {err}");
-            }
-        }
-        Ok(())
+        self.ctx.persist_records(records)
     }
 
     fn persist_snow_records(&self, records: &[SnowRecord]) -> Result<usize> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        let mut entries = Vec::with_capacity(records.len());
-        let mut persisted_docs = Vec::with_capacity(records.len());
-
-        for record in records {
-            self.cache.invalidate(&record.number);
-            let document = VaultDocument::Record(record.clone());
-            let persisted = self.persist_runtime_document(&document)?;
-            let row = record_row_from_runtime_record(
-                record,
-                Some(persisted.relative_path.clone()),
-                serialize_vault_document(&document).to_string(),
-            );
-            let content = document_content(&document);
-            let tag_tokens = document_tag_tokens(&document);
-            let work_notes = document_work_notes(record);
-            entries.push((row, work_notes, content, tag_tokens));
-            persisted_docs.push(persisted);
-        }
-
-        let batch: Vec<(&RecordRow, &str, &str, &str)> = entries
-            .iter()
-            .map(|(row, work_notes, content, tag_tokens)| {
-                (
-                    row,
-                    work_notes.as_str(),
-                    content.as_str(),
-                    tag_tokens.as_str(),
-                )
-            })
-            .collect();
-        self.query
-            .store()
-            .upsert_records(&batch)
-            .map_err(anyhow::Error::from)?;
-
-        for persisted in &persisted_docs {
-            let document = &persisted.document;
-            self.cache.put(document.record().clone());
-            if let Err(err) = self.project_runtime_document(document) {
-                eprintln!("snow_core: projection refresh failed: {err}");
-            }
-            if let Err(err) = self.persist_enrichment(document.record()) {
-                eprintln!("snow_core: enrichment refresh failed: {err}");
-            }
-        }
-        Ok(records.len())
-    }
-
-    fn record_kb_local_file_state(&self, persisted: &PersistedRuntimeDocument) -> Result<()> {
-        let PersistedRuntimeDocument::Knowledge {
-            article,
-            relative_path,
-        } = persisted
-        else {
-            return Ok(());
-        };
-        let absolute_path = self.vault_path.join(relative_path);
-        let modified_at_ms = fs::metadata(&absolute_path)?
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|err| {
-                anyhow::anyhow!("invalid file mtime for {}: {err}", absolute_path.display())
-            })?
-            .as_millis() as i64;
-        self.query.store().upsert_kb_local_file_states(&[(
-            article.record.sys_id.clone(),
-            relative_path.to_string_lossy().into_owned(),
-            modified_at_ms,
-        )])?;
-        Ok(())
-    }
-
-    fn persist_document(&self, record: &Record) -> Result<PersistedRuntimeDocument> {
-        match record.table.as_str() {
-            "kb_knowledge" => {
-                let article = self.build_knowledge_article(record)?;
-                let persisted = self.vault.persist_knowledge_article(&article)?;
-                Ok(PersistedRuntimeDocument::Knowledge {
-                    article,
-                    relative_path: persisted.relative_path,
-                })
-            }
-            "sysapproval_approver" => {
-                let approver = ApprovalResource::approver_reference(record)
-                    .unwrap_or_else(|| empty_reference("sys_user"));
-                let approval = ApprovalResource::from_servicenow(record, approver);
-                let persisted = self.vault.persist_approval(&approval)?;
-                Ok(PersistedRuntimeDocument::Approval {
-                    approval,
-                    relative_path: persisted.relative_path,
-                })
-            }
-            _ => {
-                let mut snow_record = SnowRecord::from_servicenow(record);
-                snow_record.parent = parent_record_ref(record);
-                snow_record.references =
-                    if resource::business_application::is_business_application_alias(&record.table)
-                    {
-                        resource::business_application::collect_business_application_references(
-                            record,
-                            &BusinessApplicationFieldAliases::baseline_degraded(),
-                        )
-                    } else if resource::server::is_server_table(&record.table) {
-                        resource::server::collect_server_references(record)
-                    } else {
-                        collect_record_references(record)
-                    };
-                let persisted = self.vault.persist_record(&snow_record)?;
-                Ok(PersistedRuntimeDocument::Record {
-                    record: snow_record,
-                    relative_path: persisted.relative_path,
-                })
-            }
-        }
+        self.ctx.persist_snow_records(records)
     }
 
     fn project_runtime_document(&self, document: &VaultDocument) -> Result<()> {
-        let projection = project_runtime_document(document);
-        let store = self.query.store();
-        store
-            .replace_relationships(document.record().sys_id.as_str(), &projection.relationships)?;
-        store.replace_references(&projection.references.into_values().collect::<Vec<_>>())?;
-        if let Some(article) = &projection.knowledge_article {
-            store.upsert_knowledge_article(article)?;
-        }
-        if document.record().resource_type == ResourceType::BusinessApplication {
-            store.upsert_business_application_projection(document.record(), None)?;
-        }
-        Ok(())
+        self.ctx.project_runtime_document(document)
     }
 
     fn persist_runtime_document(
         &self,
         document: &VaultDocument,
     ) -> Result<vault::rebuild::VaultDocumentEntry> {
-        let persisted = match document {
-            VaultDocument::Record(record) => self.vault.persist_record(record)?,
-            VaultDocument::Knowledge(article) => self.vault.persist_knowledge_article(article)?,
-            VaultDocument::Approval(approval) => self.vault.persist_approval(approval)?,
-        };
-
-        Ok(vault::rebuild::VaultDocumentEntry {
-            absolute_path: persisted.path,
-            relative_path: persisted.relative_path,
-            document: document.clone(),
-        })
+        self.ctx.persist_runtime_document(document)
     }
 
     async fn load_runtime_document(
@@ -7525,83 +7221,15 @@ impl SnowCore {
         number: &str,
         resource_type: &ResourceType,
     ) -> Result<Option<VaultDocument>> {
-        match resource_type {
-            ResourceType::Knowledge => self
-                .query
-                .get_knowledge_article(number)
-                .await
-                .map(|document| document.map(VaultDocument::Knowledge)),
-            ResourceType::Approval => self
-                .query
-                .get_approval(number)
-                .await
-                .map(|document| document.map(VaultDocument::Approval)),
-            _ => self
-                .query
-                .get_record(number)
-                .await
-                .map(|document| document.map(VaultDocument::Record)),
-        }
+        self.ctx.load_runtime_document(number, resource_type).await
     }
 
     fn persist_enrichment(&self, snow_record: &SnowRecord) -> Result<()> {
-        let bundle = derive_for_record(snow_record);
-        let store = self.query.store();
-        let record_sys_id = snow_record.sys_id.as_str();
-
-        let tags: Vec<TagRow> = bundle
-            .tags
-            .into_iter()
-            .map(|candidate| TagRow {
-                record_sys_id: record_sys_id.to_string(),
-                tag: candidate.value,
-                source: enrichment_origin_label(candidate.origin).to_string(),
-                weight: candidate.weight,
-            })
-            .collect();
-        let keywords: Vec<KeywordRow> = bundle
-            .keywords
-            .into_iter()
-            .map(|candidate| KeywordRow {
-                record_sys_id: record_sys_id.to_string(),
-                keyword: candidate.value,
-                source: enrichment_origin_label(candidate.origin).to_string(),
-                weight: candidate.weight,
-            })
-            .collect();
-        let aliases: Vec<AliasRow> = bundle
-            .aliases
-            .into_iter()
-            .map(|candidate| AliasRow {
-                record_sys_id: record_sys_id.to_string(),
-                alias: candidate.value,
-                kind: enrichment_origin_label(candidate.origin).to_string(),
-                source: enrichment_origin_label(candidate.origin).to_string(),
-            })
-            .collect();
-
-        store.replace_tags(record_sys_id, &tags)?;
-        store.replace_keywords(record_sys_id, &keywords)?;
-        store.replace_aliases(record_sys_id, &aliases)?;
-        Ok(())
+        self.ctx.persist_enrichment(snow_record)
     }
 
     async fn lookup_table_and_sys_id(&self, number: &str) -> Result<Option<(String, String)>> {
-        let table = self.table_for_number(number).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
-            )
-        })?;
-        let Some(record) = self
-            .client
-            .table(&table)
-            .equals("number", number)
-            .first()
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((record.table.clone(), record.sys_id.clone())))
+        self.ctx.lookup_table_and_sys_id(number).await
     }
 
     async fn resolve_resource_plan_parent_number(&self, number: &str) -> Result<String> {
@@ -7611,6 +7239,7 @@ impl SnowCore {
             )
         })?;
         let Some(record) = self
+            .ctx
             .client
             .table(table)
             .equals("number", number)
@@ -7623,103 +7252,15 @@ impl SnowCore {
     }
 
     fn table_for_number(&self, number: &str) -> Option<String> {
-        self.client
-            .table_for_number(number)
-            .map(str::to_string)
-            .or_else(|| table_for_builtin_record_number(number).map(str::to_string))
+        self.ctx.table_for_number(number)
     }
 
     async fn field_choices_for_table(&self, table: &str, field: &str) -> Result<Vec<FieldChoice>> {
-        let response = self
-            .client
-            .table("sys_choice")
-            .equals("name", table)
-            .equals("element", field)
-            .fields(&["value", "label", "sequence", "inactive", "terminal"])
-            .display_value(DisplayValue::Display)
-            .order_by("sequence", Order::Asc)
-            .limit(200)
-            .execute()
-            .await?;
-
-        let mut seen = HashSet::new();
-        let mut choices = Vec::new();
-        for record in response.records {
-            if record
-                .get_str("inactive")
-                .is_some_and(|inactive| inactive.eq_ignore_ascii_case("true"))
-            {
-                continue;
-            }
-            let value = record.get_str("value").unwrap_or("").to_string();
-            if value.is_empty() || !seen.insert(value.clone()) {
-                continue;
-            }
-            choices.push(FieldChoice {
-                label: record.get_str("label").unwrap_or(&value).to_string(),
-                value,
-                terminal: record
-                    .get_str("terminal")
-                    .is_some_and(|terminal| terminal.eq_ignore_ascii_case("true")),
-            });
-        }
-        Ok(choices)
+        self.ctx.field_choices_for_table(table, field).await
     }
 
     async fn table_ancestors(&self, table: &str) -> Result<Vec<String>> {
-        let mut ancestors = Vec::new();
-        let mut current = table.to_string();
-
-        for _ in 0..8 {
-            let record = self
-                .client
-                .table("sys_db_object")
-                .equals("name", &current)
-                .fields(&["name", "super_class"])
-                .display_value(DisplayValue::Both)
-                .limit(1)
-                .first()
-                .await?;
-
-            let Some(record) = record else {
-                break;
-            };
-
-            let Some(parent_sys_id) = record
-                .get_raw("super_class")
-                .or(record.get_str("super_class"))
-            else {
-                break;
-            };
-            if parent_sys_id.is_empty() {
-                break;
-            }
-
-            let parent = self
-                .client
-                .table("sys_db_object")
-                .equals("sys_id", parent_sys_id)
-                .fields(&["name"])
-                .display_value(DisplayValue::Both)
-                .limit(1)
-                .first()
-                .await?;
-
-            let Some(parent) =
-                parent.and_then(|record| record.get_str("name").map(ToString::to_string))
-            else {
-                break;
-            };
-
-            if ancestors.iter().any(|seen| seen == &parent) {
-                break;
-            }
-
-            current = parent.clone();
-            ancestors.push(parent);
-        }
-
-        Ok(ancestors)
+        self.ctx.table_ancestors(table).await
     }
 
     /// The Business Application table and all of its inherited tables, most
@@ -7747,6 +7288,7 @@ impl SnowCore {
             // One query per table keeps each `name=<table>` scoped and lets a
             // single failing table degrade independently of the others.
             let records = self
+                .ctx
                 .client
                 .table("sys_dictionary")
                 .equals("name", table)
@@ -7761,7 +7303,8 @@ impl SnowCore {
                 let Some(row) = dictionary_row_from_record(table, &record, synced_at) else {
                     continue;
                 };
-                self.query
+                self.ctx
+                    .query
                     .store()
                     .upsert_business_application_field_dictionary(&row)?;
                 persisted += 1;
@@ -7779,6 +7322,7 @@ impl SnowCore {
     ) -> Result<HashMap<String, BusinessApplicationFieldDictionaryRow>> {
         let tables = self.business_application_dictionary_tables().await?;
         Ok(self
+            .ctx
             .query
             .store()
             .business_application_dictionary_for_tables(&tables)?)
@@ -7819,48 +7363,11 @@ impl SnowCore {
     }
 
     async fn resolve_user_sys_id(&self, user: &str) -> Result<String> {
-        Ok(self.resolve_user_ref(user).await?.sys_id)
+        self.ctx.resolve_user_sys_id(user).await
     }
 
     async fn resolve_user_ref(&self, user: &str) -> Result<UserRef> {
-        let user = user.trim();
-        let mut candidates = Vec::new();
-        if user.contains('@') {
-            candidates.push(("email", user));
-            candidates.push(("user_name", user));
-        } else {
-            candidates.push(("user_name", user));
-            candidates.push(("email", user));
-        }
-
-        for (field, value) in candidates {
-            let Some(record) = self
-                .client
-                .table("sys_user")
-                .equals(field, value)
-                .fields(&["sys_id", "user_name", "email", "name"])
-                .limit(1)
-                .first()
-                .await?
-            else {
-                continue;
-            };
-
-            return Ok(UserRef {
-                sys_id: record.sys_id.clone(),
-                user_name: non_empty_owned(record.get_str("user_name")),
-                email: non_empty_owned(record.get_str("email")),
-                display: first_non_empty_str([
-                    record.get_str("name"),
-                    record.get_str("user_name"),
-                    record.get_str("email"),
-                ])
-                .unwrap_or(user)
-                .to_string(),
-            });
-        }
-
-        Err(anyhow::anyhow!("user not found: {user}"))
+        self.ctx.resolve_user_ref(user).await
     }
 
     async fn resolve_my_timecard_sheet(
@@ -7897,6 +7404,7 @@ impl SnowCore {
         };
 
         let rows = self
+            .ctx
             .client
             .table(resource::timecard::TimecardResource::SHEET_TABLE)
             .equals("user", &actor.sys_id)
@@ -7956,6 +7464,7 @@ impl SnowCore {
         filters: &[(&str, &str)],
     ) -> Result<HydratedRecords> {
         let mut query = self
+            .ctx
             .client
             .table(table)
             .equals(user_field, user_sys_id)
@@ -7986,6 +7495,7 @@ impl SnowCore {
             }
             Err(_) => {
                 let mut fallback = self
+                    .ctx
                     .client
                     .table(table)
                     .equals(user_field, user_sys_id)
@@ -8028,6 +7538,7 @@ impl SnowCore {
         approver_sys_id: &str,
     ) -> Result<Vec<Record>> {
         let mut paginator = self
+            .ctx
             .client
             .table("sysapproval_approver")
             .equals("approver", approver_sys_id)
@@ -8065,6 +7576,7 @@ impl SnowCore {
         group_sys_ids: &[&str],
     ) -> Result<Vec<Record>> {
         let mut paginator = self
+            .ctx
             .client
             .table("sysapproval_approver")
             .in_list("approver", group_sys_ids)
@@ -8102,6 +7614,7 @@ impl SnowCore {
         user_sys_id: &str,
     ) -> Result<Vec<Reference>> {
         let mut paginator = self
+            .ctx
             .client
             .table("sys_user_grmember")
             .equals("user", user_sys_id)
@@ -8142,7 +7655,8 @@ impl SnowCore {
         approval_sys_id: &str,
     ) -> Result<Option<Record>> {
         let approval_sys_id = normalize_record_lookup_sys_id(approval_sys_id)?;
-        self.client
+        self.ctx
+            .client
             .table("sysapproval_approver")
             .equals("sys_id", &approval_sys_id)
             .fields(APPROVAL_LIST_FIELDS)
@@ -8177,6 +7691,7 @@ impl SnowCore {
             body["comments"] = serde_json::json!(comment);
         }
         let updated = self
+            .ctx
             .client
             .table("sysapproval_approver")
             .display_value(DisplayValue::Both)
@@ -8320,8 +7835,7 @@ impl SnowCore {
     }
 
     fn infer_table(&self, number: &str) -> String {
-        self.table_for_number(number)
-            .unwrap_or_else(|| "task".to_string())
+        self.ctx.infer_table(number)
     }
 }
 
@@ -8583,20 +8097,23 @@ impl SnowCoreBuilder {
         let vault = VaultManager::new(&vault_path);
         let query = Arc::new(query::QueryEngine::open_with_vault(&db_path, &vault_path)?);
         let cache = cache::CacheManager::open(&db_path, config.cache.memory.capacity)?;
+        let store = cache.store().clone();
         let cache_policy = CacheTtlPolicy::from_ttl_strings(
             &config.cache.policy.stable_reference_ttl,
             &config.cache.policy.work_record_ttl,
         )?;
 
-        Ok(SnowCore {
-            config,
+        let ctx = context::CoreContext {
             client,
-            vault_path,
-            vault,
+            store,
             query,
             cache,
             cache_policy,
-        })
+            vault,
+            vault_path,
+            config: Arc::new(config),
+        };
+        Ok(SnowCore { ctx })
     }
 }
 
@@ -9496,6 +9013,7 @@ mod tests {
                 .all(|diagnostic| { diagnostic.reference_sys_id != owner_sys_id })
         );
         let primitive = core
+            .ctx
             .query
             .store()
             .get_primitive_object(owner_sys_id)
@@ -12694,7 +12212,8 @@ mod tests {
             Some(persisted.relative_path.clone()),
             serialize_vault_document(&document).to_string(),
         );
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record_with_tags(
                 &row,
@@ -12717,7 +12236,8 @@ mod tests {
             Some(persisted.relative_path.clone()),
             serialize_vault_document(&document).to_string(),
         );
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record_with_tags(
                 &row,
@@ -12847,7 +12367,7 @@ mod tests {
             .expect("fresh record")
             .expect("record");
 
-        let store = core.query.store();
+        let store = core.ctx.query.store();
         let row = store
             .get_record_by_number("CTASK001")
             .expect("record row")
@@ -12939,6 +12459,7 @@ mod tests {
         ));
 
         let persisted = core
+            .ctx
             .query
             .store()
             .get_record_by_number("INC002")
@@ -13737,6 +13258,7 @@ mod tests {
         );
 
         let row = core
+            .ctx
             .query
             .store()
             .get_record_by_number_and_type("TASK001", ResourceType::Task)
@@ -13837,7 +13359,8 @@ mod tests {
             Some(closed_persisted.relative_path.clone()),
             serialize_vault_document(&closed_document).to_string(),
         );
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record_with_tags(
                 &closed_row,
@@ -13860,7 +13383,8 @@ mod tests {
             Some(stale_persisted.relative_path.clone()),
             serialize_vault_document(&stale_document).to_string(),
         );
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record_with_tags(
                 &stale_row,
@@ -13875,6 +13399,7 @@ mod tests {
         assert_eq!(records[0].number, "INC5018610");
 
         let closed_row = core
+            .ctx
             .query
             .store()
             .get_record_by_number_and_type("INC4908273", ResourceType::Incident)
@@ -13884,6 +13409,7 @@ mod tests {
         assert!(closed_row.tombstoned_at.is_some());
 
         let stale_row = core
+            .ctx
             .query
             .store()
             .get_record_by_number_and_type("INC4900000", ResourceType::Incident)
@@ -13899,7 +13425,8 @@ mod tests {
         let core = build_test_core(tempdir.path().join("vault")).await;
         let record = sample_change_task_record();
         let legacy_row = record_row_from_servicenow(&record).expect("legacy row");
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record(
                 &legacy_row,
@@ -13915,6 +13442,7 @@ mod tests {
         assert_eq!(repaired, 1);
 
         let row = core
+            .ctx
             .query
             .store()
             .get_record_by_number("CTASK001")
@@ -13934,7 +13462,8 @@ mod tests {
         let core = build_test_core(tempdir.path().join("vault")).await;
         let mut record = sample_projected_record();
         record.synced_at = Utc::now();
-        core.vault
+        core.ctx
+            .vault
             .persist_record(&record)
             .expect("persist vault record");
 
@@ -13942,6 +13471,7 @@ mod tests {
         assert_eq!(rebuilt, 1);
 
         let row = core
+            .ctx
             .query
             .store()
             .get_record_by_number("INC002")
@@ -13956,19 +13486,26 @@ mod tests {
             .expect("record");
         assert_eq!(loaded.short_description, "Legacy incident");
         assert!(
-            core.query
+            core.ctx
+                .query
                 .store()
                 .list_keywords(&record.sys_id)
                 .expect("keywords")
                 .iter()
                 .any(|row| row.keyword == "legacy")
         );
-        let references = core.query.store().list_references().expect("references");
+        let references = core
+            .ctx
+            .query
+            .store()
+            .list_references()
+            .expect("references");
         assert!(references.iter().any(|row| row.sys_id == "parent-sys"));
         assert!(references.iter().any(|row| row.sys_id == "child-sys"));
         assert!(references.iter().any(|row| row.sys_id == "user-sys"));
 
         let relationships = core
+            .ctx
             .query
             .store()
             .list_relationships()
@@ -14004,7 +13541,8 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
         let article = sample_projected_knowledge_article();
-        core.vault
+        core.ctx
+            .vault
             .persist_knowledge_article(&article)
             .expect("persist knowledge article");
 
@@ -14012,6 +13550,7 @@ mod tests {
         assert_eq!(rebuilt, 1);
 
         let loaded = core
+            .ctx
             .query
             .store()
             .get_knowledge_article(&article.record.sys_id)
@@ -14434,7 +13973,8 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
         let record = sample_projected_record();
-        core.vault
+        core.ctx
+            .vault
             .persist_record(&record)
             .expect("persist vault record");
         core.rebuild_cache().expect("rebuild cache");
@@ -14456,7 +13996,8 @@ mod tests {
         let core = build_test_core(tempdir.path().join("vault")).await;
         let record = sample_change_task_record();
         let legacy_row = record_row_from_servicenow(&record).expect("legacy row");
-        core.query
+        core.ctx
+            .query
             .store()
             .upsert_record(
                 &legacy_row,
@@ -14474,7 +14015,8 @@ mod tests {
         assert!(!executed.dry_run);
         assert_eq!(executed.orphan_rows_pruned, 1);
         assert!(
-            core.query
+            core.ctx
+                .query
                 .store()
                 .get_record_by_number("CTASK001")
                 .expect("lookup row")
@@ -14549,7 +14091,7 @@ mod tests {
             .expect("fresh record")
             .expect("record");
 
-        let store = core.query.store();
+        let store = core.ctx.query.store();
         let row = store
             .get_record_by_sys_id(&record.sys_id)
             .expect("record row")

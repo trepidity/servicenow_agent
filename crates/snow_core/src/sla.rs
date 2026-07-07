@@ -106,7 +106,7 @@ impl SnowCore {
     /// product layer can preserve `ParentNotFound`, `NotApplicable`, and
     /// `EmptyOrAclRestricted` as distinct outcomes.
     pub async fn task_sla_status_for_number(&self, number: &str) -> Result<TaskSlaStatus> {
-        let Some(record) = self.client.get_by_number(number).await? else {
+        let Some(record) = self.ctx.client.get_by_number(number).await? else {
             return Ok(parent_not_found_status(number));
         };
         let parent = parent_ref_from_record(&record, number);
@@ -120,7 +120,7 @@ impl SnowCore {
 
         let task_sys_id = parent.record_sys_id.clone();
         let task_ids = [task_sys_id.as_str()];
-        let mut by_task = self.client.task_slas_for_tasks(&task_ids).await?;
+        let mut by_task = self.ctx.client.task_slas_for_tasks(&task_ids).await?;
         let slas = by_task.remove(&task_sys_id).unwrap_or_default();
 
         Ok(status_from_task_slas(parent, slas))
@@ -144,7 +144,7 @@ impl SnowCore {
         let by_task = if task_ids.is_empty() {
             HashMap::new()
         } else {
-            self.client.task_slas_for_tasks(&task_ids).await?
+            self.ctx.client.task_slas_for_tasks(&task_ids).await?
         };
 
         let mut statuses = HashMap::with_capacity(parents.len());
