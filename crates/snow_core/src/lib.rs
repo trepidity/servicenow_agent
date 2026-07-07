@@ -86,6 +86,7 @@ pub use resource::timecard::{
 pub use servicenow_rs::model::reference::{
     Reference, choose_reference_display_name, is_opaque_sys_id,
 };
+pub use servicenow_rs::model::resource::ResourceType;
 pub use servicenow_rs::prelude::AttachmentMetadata;
 pub use sla::{
     TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, TaskSlaView,
@@ -324,27 +325,6 @@ fn stable_reference_cache_is_fresh(
     ttl: chrono::Duration,
 ) -> bool {
     now.signed_duration_since(synced_at) <= ttl
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ResourceType {
-    Task,
-    Incident,
-    Change,
-    ChangeTask,
-    Request,
-    RequestTask,
-    Project,
-    Demand,
-    DemandTask,
-    ResourcePlan,
-    Story,
-    ScrumTask,
-    Timecard,
-    Knowledge,
-    Approval,
-    BusinessApplication,
-    Server,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1023,35 +1003,6 @@ impl SnowRecord {
             references: HashMap::new(),
             synced_at: Utc::now(),
             source: CacheSource::Api,
-        }
-    }
-}
-
-impl ResourceType {
-    pub fn from_table(table: &str) -> Self {
-        let table = canonical_record_table(table);
-        match table.as_str() {
-            "task" => Self::Task,
-            "incident" => Self::Incident,
-            "change_request" => Self::Change,
-            "change_task" => Self::ChangeTask,
-            "sc_request" | "sc_req_item" | "request_item" => Self::Request,
-            "sc_task" => Self::RequestTask,
-            "pm_project" => Self::Project,
-            "dmn_demand" => Self::Demand,
-            "dmn_demand_task" => Self::DemandTask,
-            "resource_plan" => Self::ResourcePlan,
-            "rm_story" => Self::Story,
-            "rm_scrum_task" => Self::ScrumTask,
-            "time_card" => Self::Timecard,
-            "kb_knowledge" => Self::Knowledge,
-            "sysapproval_approver" => Self::Approval,
-            "cmdb_ci_business_app" => Self::BusinessApplication,
-            "business_application" | "business_app" => Self::BusinessApplication,
-            "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
-                Self::Server
-            }
-            _ => Self::Change,
         }
     }
 }
