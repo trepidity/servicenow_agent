@@ -3,8 +3,8 @@
 //! Reports state based primarily on endpoint connectability, with the pidfile
 //! retained as secondary metadata:
 //!  - `running`     — pidfile present and endpoint connects
-//!  - `unreachable` — pidfile present but endpoint does not respond, or endpoint
-//!    responds without a pidfile (something is half-up)
+//!  - `running`     — endpoint connects but pidfile is missing (metadata degraded)
+//!  - `unreachable` — pidfile present but endpoint does not respond
 //!  - `stopped`     — neither pidfile nor endpoint
 //!
 //! Also prints metadata from the JSON statusfile (version, started_at) when
@@ -66,8 +66,17 @@ pub fn run() -> Result<()> {
             );
         }
         (None, true) => {
+            let v = status.as_ref().map(|s| s.version.as_str()).unwrap_or("?");
+            let started = status
+                .as_ref()
+                .map(|s| s.started_at.as_str())
+                .unwrap_or("?");
+            let env = status
+                .as_ref()
+                .and_then(|s| s.environment.as_deref())
+                .unwrap_or("?");
             println!(
-                "unreachable\n  no pidfile but endpoint {} responds",
+                "running\n  pid: ? (missing pidfile)\n  env: {env}\n  version: {v}\n  started: {started}\n  endpoint: {}\n  warning: runtime metadata is incomplete",
                 paths.endpoint
             );
         }
