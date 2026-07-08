@@ -7,10 +7,12 @@
 //! Everything here remains reachable at its existing `snow_core::*` path via
 //! the `pub use types::*;` re-export in `lib.rs`.
 //!
-//! A few of the domain types below (`BusinessApplicationSearchParams`, the
-//! `Knowledge*` types) are noted in the migration plan as relocating again
-//! later to their eventual `service::*` module homes; they land here first
-//! as an interim step, so only their type definitions moved in this pass.
+//! A few of the domain types below (the `Knowledge*` types) are noted in the
+//! migration plan as relocating again later to their eventual `service::*`
+//! module homes; they land here first as an interim step, so only their type
+//! definitions moved in this pass. `BusinessApplicationSearchParams` was one
+//! such type — it has since relocated to `service::business_application`
+//! (Task 10); see the re-export in `lib.rs`.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,46 +49,6 @@ pub struct SnowRecord {
 pub enum RecordLookup {
     Number(String),
     TableSysId { table: String, sys_id: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct BusinessApplicationSearchParams {
-    /// Substring match against cmdb_ci_business_app.name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Business Owner display name or sys_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub business_owner: Option<String>,
-    /// IS Owner / IT Application Owner display name or sys_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_owner: Option<String>,
-    /// CI owner group display name or sys_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ci_owner_group: Option<String>,
-    /// Primary Support Group display name or sys_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_support_group: Option<String>,
-    /// Operational state/status label or raw choice value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operational_state: Option<String>,
-    /// Operational state/status label or raw choice value to exclude.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operational_state_not: Option<String>,
-    /// Primary Portfolio display name or sys_id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_portfolio: Option<String>,
-    /// Exact attested date, YYYY-MM-DD.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attested_date: Option<String>,
-    /// Lower attested date bound, YYYY-MM-DD.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attested_date_on_or_after: Option<String>,
-    /// Upper attested date bound, YYYY-MM-DD.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attested_date_on_or_before: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

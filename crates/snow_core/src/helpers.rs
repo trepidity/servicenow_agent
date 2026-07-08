@@ -11,7 +11,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use serde_json::Value;
-use servicenow_rs::prelude::Record;
+use servicenow_rs::prelude::{Error as SnowApiError, Record};
+use servicenow_rs::query::TableApi;
 
 use crate::cache::store::{KnowledgeArticleRow, ReferenceRow, RelationshipRow};
 use crate::convert::{
@@ -337,6 +338,48 @@ pub(crate) fn project_record_projection(
         projection.add_reference(reference, synced_at);
         if include_reference_relationships {
             projection.add_relationship(&record.sys_id, &reference.sys_id, "reference", field_name);
+        }
+    }
+}
+
+/// Applies an equals-by-sys_id-or-contains-by-name filter for a reference
+/// field: an opaque 32-hex sys_id filters exactly, anything else filters by a
+/// `contains` match on the reference's `.name` dot-walk field.
+///
+/// Relocated from `lib.rs` in Task 10 (`BusinessApplicationService` /
+/// `ServerService` extraction): both `search_business_applications_live` and
+/// `server_base_query` call this, so it lives here rather than being moved
+/// into (or duplicated in) either service module.
+pub(crate) fn apply_reference_name_or_sys_id_filter(
+    query: TableApi,
+    field: &str,
+    value: Option<&str>,
+) -> Result<TableApi> {
+    let Some(value) = non_empty_owned(value) else {
+        return Ok(query);
+    };
+    if let Ok(sys_id) = normalize_record_lookup_sys_id(&value) {
+        Ok(query.equals(field, &sys_id))
+    } else {
+        Ok(query.contains(&format!("{field}.name"), &value))
+    }
+}
+
+/// Classifies a `servicenow_rs` API error as an ACL/authorization failure
+/// (HTTP 401/403, or an auth-flavored error message).
+///
+/// Relocated from `lib.rs` in Task 10 (`BusinessApplicationService` /
+/// `ServerService` extraction): `ServerGetError::from_api` and several BA
+/// traversal helpers all call this, so it lives here rather than being moved
+/// into (or duplicated in) either service module.
+pub(crate) fn is_servicenow_acl_error(err: &SnowApiError) -> bool {
+    match err {
+        SnowApiError::Api { status, .. } if *status == 401 || *status == 403 => true,
+        _ => {
+            let message = err.to_string().to_ascii_lowercase();
+            message.contains("authentication failed")
+                || message.contains("forbidden")
+                || message.contains("unauthorized")
         }
     }
 }

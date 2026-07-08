@@ -4,9 +4,14 @@
 //! public API methods for its domain. `SnowCore` composes the services and
 //! delegates to them (see `lib.rs`). This module is the home for the
 //! extractions performed across Tasks 8-11 of the library boundary migration;
-//! `user` (Task 8) is the first, `approval` (Task 9) is the second.
+//! `user` (Task 8) is the first, `approval` (Task 9) is the second,
+//! `business_application` and `server` (Task 10) are the third and fourth.
 
 pub(crate) mod approval;
+pub(crate) mod business_application;
+pub(crate) mod server;
 pub(crate) mod user;
 pub(crate) use approval::ApprovalService;
+pub(crate) use business_application::BusinessApplicationService;
+pub(crate) use server::ServerService;
 pub(crate) use user::UserService;
