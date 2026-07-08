@@ -515,23 +515,60 @@ pub fn match_cached_state_choice(
     choices: &[StateChoice],
 ) -> Option<StateChoiceMatch> {
     let supplied = supplied.trim();
-    choices.iter().find_map(|choice| {
-        if !state_choice_write_allowed(choice) {
-            return None;
-        }
-        if choice.value.trim().eq_ignore_ascii_case(supplied) {
-            return Some(StateChoiceMatch::Raw {
-                value: choice.value.clone(),
-            });
-        }
-        if choice.label.trim().eq_ignore_ascii_case(supplied) {
-            return Some(StateChoiceMatch::Label {
-                label: choice.label.clone(),
-                value: choice.value.clone(),
-            });
-        }
-        None
+    choices
+        .iter()
+        .find_map(|choice| {
+            if !state_choice_write_allowed(choice) {
+                return None;
+            }
+            if choice.value.trim().eq_ignore_ascii_case(supplied) {
+                return Some(StateChoiceMatch::Raw {
+                    value: choice.value.clone(),
+                });
+            }
+            if choice.label.trim().eq_ignore_ascii_case(supplied) {
+                return Some(StateChoiceMatch::Label {
+                    label: choice.label.clone(),
+                    value: choice.value.clone(),
+                });
+            }
+            None
+        })
+        .or_else(|| match_state_label_alias(supplied, choices))
+}
+
+fn match_state_label_alias(supplied: &str, choices: &[StateChoice]) -> Option<StateChoiceMatch> {
+    if normalize_state_label(supplied) != "in progress" {
+        return None;
+    }
+
+    let mut matches = choices
+        .iter()
+        .filter(|choice| state_choice_write_allowed(choice))
+        .filter(|choice| {
+            matches!(
+                normalize_state_label(&choice.label).as_str(),
+                "work in progress" | "dev in progress"
+            )
+        });
+
+    let first = matches.next()?;
+    if matches.any(|choice| !choice.value.trim().eq_ignore_ascii_case(first.value.trim())) {
+        return None;
+    }
+
+    Some(StateChoiceMatch::Label {
+        label: first.label.clone(),
+        value: first.value.clone(),
     })
+}
+
+fn normalize_state_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 pub fn resolve_state_from_cached_choices(
@@ -1066,6 +1103,21 @@ mod tests {
             resolve_state_from_cached_choices(
                 StateResolutionContext {
                     supplied: Some("work in progress"),
+                    current_state_value: None,
+                    current_state_terminal: false,
+                },
+                &choices()
+            ),
+            StateResolution::Mapped {
+                label: "Work in Progress".to_string(),
+                value: "3".to_string(),
+            }
+        );
+
+        assert_eq!(
+            resolve_state_from_cached_choices(
+                StateResolutionContext {
+                    supplied: Some("In Progress"),
                     current_state_value: None,
                     current_state_terminal: false,
                 },
