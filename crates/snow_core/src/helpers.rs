@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use serde_json::Value;
 use servicenow_rs::prelude::{Error as SnowApiError, Record};
@@ -382,4 +382,48 @@ pub(crate) fn is_servicenow_acl_error(err: &SnowApiError) -> bool {
                 || message.contains("unauthorized")
         }
     }
+}
+
+// ===== Shared record-field accessors and table constant (Task 11) =====
+// Relocated from lib.rs free-fn scope; used by service::business_application,
+// service::write, and service::record. Re-exported crate-wide via
+// `pub(crate) use helpers::*` in lib.rs so existing `crate::*` paths resolve.
+pub(crate) const BUSINESS_APPLICATION_TABLE: &str = "cmdb_ci_business_app";
+
+pub(crate) fn record_field_raw_or_display(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_raw(field)
+        .or_else(|| record.get_display(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn record_field_display_or_raw(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_display(field)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn record_bool(record: &Record, field: &str) -> bool {
+    match record_field_raw_or_display(record, field)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "1" | "yes" | "y" => true,
+        "false" | "0" | "no" | "n" | "" => false,
+        _ => false,
+    }
+}
+
+pub(crate) fn parse_servicenow_date(value: Option<&str>) -> Option<NaiveDate> {
+    let value = value?.trim();
+    let date = value.get(..10).unwrap_or(value);
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }

@@ -14,7 +14,7 @@
 //! such type — it has since relocated to `service::business_application`
 //! (Task 10); see the re-export in `lib.rs`.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
 use std::collections::HashMap;
@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use crate::vault::VaultScanFailure;
 use crate::{
-    BusinessApplicationFieldAliases, Reference, ResourceType, bool_is_false,
-    canonical_record_table_for_number, resource,
+    BusinessApplicationFieldAliases, Reference, ResourceType, canonical_record_table_for_number,
+    resource,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,109 +136,11 @@ pub struct JournalEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeArticle {
-    pub record: SnowRecord,
-    pub knowledge_base: Reference,
-    pub category: Reference,
-    pub article_type: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sn_tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub auto_tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub user_tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub body_cached: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<Reference>,
-    pub valid_to: Option<NaiveDate>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeSearchFilters {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_base: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeSearchMode {
-    Lexical,
-    Semantic,
-    #[default]
-    Hybrid,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeSemanticSearchFilters {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_base: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+pub struct FieldChoice {
+    pub label: String,
+    pub value: String,
     #[serde(default)]
-    pub mode: KnowledgeSearchMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_score_millis: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeEmbeddingCoverage {
-    Metadata,
-    FullText,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct KnowledgeSearchHit {
-    pub article: KnowledgeArticle,
-    pub mode: KnowledgeSearchMode,
-    pub score: f32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_score: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lexical_score: Option<f32>,
-    pub coverage: KnowledgeEmbeddingCoverage,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeSemanticStatus {
-    pub enabled: bool,
-    pub provider: String,
-    pub model: String,
-    pub dimensions: usize,
-    pub active_kb_articles: usize,
-    pub metadata_embeddings: usize,
-    pub full_text_embeddings: usize,
-    pub stale_rows: usize,
-    pub orphan_rows: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_rebuild_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeBaseSummary {
-    pub sys_id: String,
-    pub display_name: String,
-    pub article_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeCategorySummary {
-    pub sys_id: String,
-    pub knowledge_base_sys_id: String,
-    pub display_name: String,
-    pub article_count: usize,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

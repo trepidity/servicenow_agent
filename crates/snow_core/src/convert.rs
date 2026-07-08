@@ -19,8 +19,9 @@ use crate::reference::{
     extract_reference_sys_id, normalize_reference_for_field, parent_record_ref,
     parent_reference_for_table,
 };
+use crate::vault::VaultDocument;
 use crate::{
-    FieldValue, JournalEntry, KnowledgeArticle, RecordRef, Reference, SnowRecord, VaultDocument,
+    FieldValue, JournalEntry, KnowledgeArticle, RecordRef, Reference, SnowRecord,
     choose_reference_display_name,
 };
 

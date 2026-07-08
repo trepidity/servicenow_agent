@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -39,7 +39,7 @@ use crate::vault;
 use crate::vault::VaultDocument;
 use crate::vault::manager::VaultManager;
 use crate::{
-    BusinessApplicationFieldAliases, FieldChoice, PersistedRuntimeDocument, ResourceType,
+    ApprovalRecord, BusinessApplicationFieldAliases, FieldChoice, KnowledgeArticle, ResourceType,
     SnowRecord, UserRef, normalize_record_lookup_sys_id, normalize_record_lookup_table,
     table_for_builtin_record_number,
 };
@@ -753,6 +753,52 @@ impl CoreContext {
                 .get_record(number)
                 .await
                 .map(|document| document.map(VaultDocument::Record)),
+        }
+    }
+}
+
+/// Outcome of persisting a runtime record to the vault: the typed document
+/// plus its vault-relative path. Relocated from `lib.rs` in Task 11 because
+/// [`CoreContext::persist_document`] constructs and returns it.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PersistedRuntimeDocument {
+    Record {
+        record: SnowRecord,
+        relative_path: PathBuf,
+    },
+    Knowledge {
+        article: KnowledgeArticle,
+        relative_path: PathBuf,
+    },
+    Approval {
+        approval: ApprovalRecord,
+        relative_path: PathBuf,
+    },
+}
+
+impl PersistedRuntimeDocument {
+    fn record(&self) -> &SnowRecord {
+        match self {
+            Self::Record { record, .. } => record,
+            Self::Knowledge { article, .. } => &article.record,
+            Self::Approval { approval, .. } => &approval.record,
+        }
+    }
+
+    fn relative_path(&self) -> &Path {
+        match self {
+            Self::Record { relative_path, .. } => relative_path.as_path(),
+            Self::Knowledge { relative_path, .. } => relative_path.as_path(),
+            Self::Approval { relative_path, .. } => relative_path.as_path(),
+        }
+    }
+
+    fn to_vault_document(&self) -> VaultDocument {
+        match self {
+            Self::Record { record, .. } => VaultDocument::Record(record.clone()),
+            Self::Knowledge { article, .. } => VaultDocument::Knowledge(article.clone()),
+            Self::Approval { approval, .. } => VaultDocument::Approval(approval.clone()),
         }
     }
 }
