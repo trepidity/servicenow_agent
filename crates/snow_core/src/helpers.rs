@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+use serde_json::Value;
 use servicenow_rs::prelude::Record;
 
 use crate::cache::store::{KnowledgeArticleRow, ReferenceRow, RelationshipRow};
@@ -17,7 +18,10 @@ use crate::convert::{
     knowledge_article_row_from_article, reference_row_from_record_ref, reference_row_from_reference,
 };
 use crate::vault::VaultDocument;
-use crate::{JournalEntry, RecordRef, Reference, SnowRecord, normalize_knowledge_article};
+use crate::{
+    JournalEntry, RecordRef, Reference, SnowRecord, normalize_knowledge_article,
+    normalize_record_lookup_sys_id,
+};
 
 /// Trims a borrowed string and returns it as an owned `Option<String>`,
 /// dropping `None` and whitespace-only inputs.
@@ -45,6 +49,49 @@ pub(crate) fn first_non_empty_str<'a>(
         .flatten()
         .map(str::trim)
         .find(|value| !value.is_empty())
+}
+
+/// Extracts a `Record` field's raw value as a normalized sys_id.
+///
+/// Relocated from `lib.rs` in Task 9 (ApprovalService extraction): the
+/// approval helpers need this, but so does non-approval business-application
+/// relationship parsing elsewhere in `lib.rs`, so it lives here rather than
+/// being moved into (or duplicated in) `service::approval`.
+pub(crate) fn servicenow_reference_sys_id(record: &Record, field: &str) -> Option<String> {
+    let value = record
+        .get(field)
+        .and_then(|field_value| field_value.value.as_ref())
+        .and_then(Value::as_str)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))?;
+    normalize_record_lookup_sys_id(value).ok()
+}
+
+/// Extracts a `Record` field's display text, falling back to raw/string value.
+///
+/// Relocated from `lib.rs` in Task 9 alongside [`servicenow_reference_sys_id`]
+/// for the same reason: shared by approval and non-approval callers.
+pub(crate) fn servicenow_record_text(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_display(field)
+        .or_else(|| record.get_raw(field))
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Extracts a `Record` field's raw/string value, preferring raw over display.
+///
+/// Relocated from `lib.rs` in Task 9 alongside [`servicenow_reference_sys_id`]
+/// for the same reason: shared by approval and non-approval callers.
+pub(crate) fn servicenow_record_raw_text(record: &Record, field: &str) -> Option<String> {
+    record
+        .get_raw(field)
+        .or_else(|| record.get_str(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Checks if a state label represents a terminal (closed/completed) state.
