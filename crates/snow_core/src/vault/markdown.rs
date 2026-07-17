@@ -715,6 +715,8 @@ fn resource_type_slug(resource_type: &ResourceType) -> &'static str {
         ResourceType::Approval => "approval",
         ResourceType::BusinessApplication => "business_application",
         ResourceType::Server => "server",
+        ResourceType::PrivateTask => "private_task",
+        ResourceType::Unknown => "unknown",
     }
 }
 
@@ -741,6 +743,8 @@ fn resource_type_from_slug(slug: &str) -> Result<ResourceType> {
         "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
             ResourceType::Server
         }
+        "private_task" | "vtb_task" => ResourceType::PrivateTask,
+        "unknown" => ResourceType::Unknown,
         other => bail!("unknown resource_type slug: {other}"),
     })
 }

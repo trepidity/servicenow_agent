@@ -28,6 +28,7 @@ use servicenow_rs::prelude::{
 };
 use snow_core::cache::store::Store;
 use snow_core::display as core_display;
+use snow_core::enrich::{VtbContext, VtbSchema, enrich_vtb_context};
 use snow_core::{
     ApprovalRecord, KnowledgeArticle, KnowledgeBaseSummary, KnowledgeCategorySummary,
     KnowledgeEmbeddingCoverage, KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
@@ -75,6 +76,7 @@ enum ShowTarget {
     Task,
     Knowledge,
     ResourcePlan,
+    PrivateTask,
     Change,
 }
 
@@ -3537,6 +3539,7 @@ async fn cmd_show(
             }
         }
         ShowTarget::ResourcePlan => cmd_show_resource_plan(client, number, extras, full).await,
+        ShowTarget::PrivateTask => cmd_show_private_task(client, number, extras, full).await,
         ShowTarget::Change => cmd_show_change(client, username, number, extras, smart, full).await,
     }
 }
@@ -3566,8 +3569,93 @@ fn classify_show_target(number: &str) -> ShowTarget {
         ShowTarget::Knowledge
     } else if number.starts_with("RPLN") {
         ShowTarget::ResourcePlan
+    } else if number.starts_with("PTSK") {
+        ShowTarget::PrivateTask
     } else {
         ShowTarget::Change
+    }
+}
+
+/// Show a Visual Task Board private task (`vtb_task` / PTSK*).
+///
+/// Board/lane/checklist context comes from
+/// [`snow_core::enrich::enrich_vtb_context`], which is best-effort: an ACL
+/// miss on `vtb_card`/`checklist` degrades to omitted lines rather than
+/// failing the whole `show` command.
+async fn cmd_show_private_task(
+    client: &ServiceNowClient,
+    number: &str,
+    extras: &[String],
+    full: bool,
+) -> Result<(), SnowError> {
+    if full {
+        let task = client
+            .table("vtb_task")
+            .equals("number", number)
+            .display_value(DisplayValue::Display)
+            .limit(1)
+            .first()
+            .await?
+            .ok_or_else(|| SnowError::NotFound(format!("{number} not found.")))?;
+        display::print_full_dump(&display::record_to_json(&task));
+        return Ok(());
+    }
+
+    let fields = &[
+        "sys_id",
+        "number",
+        "short_description",
+        "state",
+        "priority",
+        "assigned_to",
+        "assignment_group",
+        "owner",
+        "opened_at",
+        "description",
+    ];
+    let task = client
+        .table("vtb_task")
+        .equals("number", number)
+        .fields(fields)
+        .display_value(DisplayValue::Display)
+        .limit(1)
+        .first()
+        .await?
+        .ok_or_else(|| SnowError::NotFound(format!("{number} not found.")))?;
+
+    // Reuse generic task-ish summary until a dedicated private-task layout lands.
+    display::print_task_summary(&task);
+    println!("resource_type: private_task");
+    println!("table: vtb_task");
+
+    let vtb_context = enrich_vtb_context(client, &VtbSchema::GATE0, &task.sys_id).await;
+    print_vtb_context(&vtb_context);
+
+    fetch_and_print_extras(client, &task, "vtb_task", extras).await?;
+    Ok(())
+}
+
+/// Render the board/lane/checklist lines for [`cmd_show_private_task`].
+///
+/// Matches that function's plain `println!("key: value")` style rather than
+/// `display`'s colored `print_field` conventions. Board/lane/swim-lane lines
+/// are omitted when unset, and the checklist block is omitted entirely when
+/// empty. [`enrich_vtb_context`] already collapsed "ACL 403"/"timeout"/
+/// "genuinely not set" into the same `None`/empty shape, so there is
+/// nothing left to distinguish at render time.
+fn print_vtb_context(context: &VtbContext) {
+    if let Some(board_name) = context.board_name.as_deref() {
+        println!("board: {board_name}");
+    }
+    if let Some(lane_name) = context.lane_name.as_deref() {
+        println!("lane: {lane_name}");
+    }
+    if let Some(swim_lane_name) = context.swim_lane_name.as_deref() {
+        println!("swim lane: {swim_lane_name}");
+    }
+    for item in &context.checklist_items {
+        let mark = if item.complete { "x" } else { " " };
+        println!("checklist: [{mark}] {}", item.name);
     }
 }
 
@@ -5151,6 +5239,7 @@ mod tests {
             classify_show_target("RPLN0091599"),
             ShowTarget::ResourcePlan
         );
+        assert_eq!(classify_show_target("PTSK0000001"), ShowTarget::PrivateTask);
     }
 
     #[test]

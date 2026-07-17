@@ -1888,6 +1888,7 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         }
         "server" | "servers" | "cmdb_ci_server" | "cmdb_ci_linux_server"
         | "cmdb_ci_win_server" | "linux_server" | "windows_server" => Ok(ResourceType::Server),
+        "private_task" | "vtb_task" => Ok(ResourceType::PrivateTask),
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }

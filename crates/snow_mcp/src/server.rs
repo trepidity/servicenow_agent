@@ -1851,6 +1851,8 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         | "cmdb_ci_win_server"
         | "linux_server"
         | "windows_server" => Ok(ResourceType::Server),
+        "private_task" | "vtb_task" => Ok(ResourceType::PrivateTask),
+        // `unknown` is not a list filter; only appears on hydrated records.
         _ => Err(Error::InvalidParams(format!(
             "unsupported resource_type `{resource_type}`"
         ))),
@@ -2070,6 +2072,8 @@ fn resource_type_json(resource_type: &ResourceType) -> &'static str {
         ResourceType::Approval => "approval",
         ResourceType::BusinessApplication => "business_application",
         ResourceType::Server => "server",
+        ResourceType::PrivateTask => "private_task",
+        ResourceType::Unknown => "unknown",
     }
 }
 

@@ -5088,6 +5088,8 @@ fn resource_type_to_str(resource_type: &ResourceType) -> &'static str {
         ResourceType::Approval => "sysapproval_approver",
         ResourceType::BusinessApplication => "business_application",
         ResourceType::Server => "server",
+        ResourceType::PrivateTask => "private_task",
+        ResourceType::Unknown => "unknown",
     }
 }
 
@@ -5114,6 +5116,8 @@ fn str_to_resource_type(input: &str) -> std::result::Result<ResourceType, StoreE
         "server" | "cmdb_ci_server" | "cmdb_ci_linux_server" | "cmdb_ci_win_server" => {
             ResourceType::Server
         }
+        "private_task" | "vtb_task" => ResourceType::PrivateTask,
+        "unknown" => ResourceType::Unknown,
         other => return Err(StoreError::InvalidResourceType(other.to_string())),
     })
 }

@@ -48,6 +48,14 @@ impl VaultLayout {
         self.root.join("approvals")
     }
 
+    pub fn private_tasks_dir(&self) -> PathBuf {
+        self.root.join("private_tasks")
+    }
+
+    pub fn unknown_records_dir(&self) -> PathBuf {
+        self.root.join("unknown")
+    }
+
     pub fn users_index_path(&self) -> PathBuf {
         self.root.join("users").join("_index.json")
     }
@@ -156,6 +164,12 @@ impl VaultLayout {
                     stable_slug("server", &record.sys_id, display_name)
                 ))
             }
+            ResourceType::PrivateTask => self
+                .private_tasks_dir()
+                .join(file_name(&record.number, &record.sys_id)),
+            ResourceType::Unknown => self
+                .unknown_records_dir()
+                .join(file_name(&record.number, &record.sys_id)),
         }
     }
 

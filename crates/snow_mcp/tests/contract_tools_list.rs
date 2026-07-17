@@ -200,7 +200,8 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
             "server",
             "cmdb_ci_server",
             "cmdb_ci_linux_server",
-            "cmdb_ci_win_server"
+            "cmdb_ci_win_server",
+            "vtb_task"
         ])
     );
     assert_eq!(

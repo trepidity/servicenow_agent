@@ -1896,6 +1896,8 @@ enum DaemonResourceType {
     Approval,
     BusinessApplication,
     Server,
+    PrivateTask,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -2116,6 +2118,8 @@ impl From<DaemonResourceType> for ResourceType {
             DaemonResourceType::Approval => Self::Approval,
             DaemonResourceType::BusinessApplication => Self::BusinessApplication,
             DaemonResourceType::Server => Self::Server,
+            DaemonResourceType::PrivateTask => Self::PrivateTask,
+            DaemonResourceType::Unknown => Self::Unknown,
         }
     }
 }

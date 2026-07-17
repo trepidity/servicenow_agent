@@ -1,10 +1,15 @@
 mod rules;
+pub mod vtb_context;
 
 use crate::SnowRecord;
 
 pub use rules::{
     derive_aliases, derive_bundle, derive_keywords, derive_tags, normalize_alias,
     normalize_keyword, tokenize_text,
+};
+pub use vtb_context::{
+    VtbCardRow, VtbChecklistItem, VtbContext, VtbSchema, enrich_vtb_context, fetch_card_for_task,
+    fetch_checklist_items,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

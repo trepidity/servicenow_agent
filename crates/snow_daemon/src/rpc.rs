@@ -555,7 +555,7 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                         Err(err) => internal_error(id, err),
                     },
                     Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                    Err(err) => internal_error(id, err),
+                    Err(err) => map_record_lookup_error(id, err),
                 }
             }
             Ok(RecordLookup::TableSysId { table, sys_id }) => match state
@@ -579,7 +579,7 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                     Err(err) => internal_error(id, err),
                 },
                 Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
+                Err(err) => map_record_lookup_error(id, err),
             },
             Ok(RecordLookup::TableSysId { table, sys_id }) => match state
                 .core
@@ -3108,6 +3108,7 @@ fn parse_resource_type(resource_type: &str) -> Result<ResourceType> {
         | "cmdb_ci_win_server"
         | "linux_server"
         | "windows_server" => Ok(ResourceType::Server),
+        "private_task" | "vtb_task" => Ok(ResourceType::PrivateTask),
         _ => Err(anyhow!("unsupported resource_type `{resource_type}`")),
     }
 }
@@ -3202,6 +3203,30 @@ fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "internal error",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+/// JSON-RPC code for an unresolvable record-number prefix (caller mistake).
+const UNKNOWN_PREFIX_CODE: i64 = -32005;
+
+/// Map core lookup failures that are caller mistakes (unknown prefix) to a
+/// structured JSON-RPC error instead of `internal_error` (-32000).
+fn map_record_lookup_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+    let details = err.to_string();
+    if is_unknown_prefix_error_message(&details) {
+        return JsonRpcResponse::error(
+            id,
+            UNKNOWN_PREFIX_CODE,
+            "unknown record prefix",
+            Some(json!({ "details": details })),
+        );
+    }
+    internal_error(id, details)
+}
+
+fn is_unknown_prefix_error_message(message: &str) -> bool {
+    // Prefer a typed snow_core error when one exists; until then match the
+    // stable substring from CoreContext::get_record_fresh_with_source.
+    message.contains("unknown ServiceNow prefix")
 }
 
 /// Map a structured [`snow_core::ServerGetError`] from the live `server_get`

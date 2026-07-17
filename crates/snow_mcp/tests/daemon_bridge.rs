@@ -845,7 +845,8 @@ async fn bridge_filters_tools_against_daemon_contract() {
             "server",
             "cmdb_ci_server",
             "cmdb_ci_linux_server",
-            "cmdb_ci_win_server"
+            "cmdb_ci_win_server",
+            "vtb_task"
         ])
     );
 }

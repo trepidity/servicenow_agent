@@ -173,6 +173,8 @@ pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
     "cmdb_ci_server",
     "cmdb_ci_linux_server",
     "cmdb_ci_win_server",
+    // Private task (vtb_task) — table/sys_id lookup for get_record / get_work_notes.
+    "vtb_task",
 ];
 
 pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {

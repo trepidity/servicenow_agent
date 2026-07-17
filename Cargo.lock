@@ -2544,8 +2544,8 @@ dependencies = [
 
 [[package]]
 name = "servicenow_rs"
-version = "0.6.0"
-source = "git+https://github.com/trepidity/servicenow_rs.git?rev=fbe27c79ff7e4ec73414512e83cd2cdbfd72c564#fbe27c79ff7e4ec73414512e83cd2cdbfd72c564"
+version = "0.7.0"
+source = "git+https://github.com/trepidity/servicenow_rs.git?rev=4d67e2bec0c5be21686a74ce51985f899d766321#4d67e2bec0c5be21686a74ce51985f899d766321"
 dependencies = [
  "async-trait",
  "base64",
