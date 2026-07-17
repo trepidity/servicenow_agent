@@ -38,7 +38,7 @@ use crate::cache::store::{
 use crate::context::CoreContext;
 use crate::convert::serialize_record_document;
 use crate::helpers::{
-    apply_reference_name_or_sys_id_filter, is_servicenow_acl_error, non_empty_owned,
+    apply_reference_name_or_sys_id_filter, is_servicenow_acl_error, non_empty_owned, parse_i64,
     servicenow_record_raw_text, servicenow_record_text, servicenow_reference_sys_id,
 };
 use crate::query::filter::BusinessApplicationQuery;
@@ -719,8 +719,7 @@ fn dictionary_row_from_record(
         choice: dictionary_flag_is_set(record, "choice"),
         mandatory: record_bool(record, "mandatory"),
         read_only: record_bool(record, "read_only"),
-        max_length: record_field_raw_or_display(record, "max_length")
-            .and_then(|value| value.parse::<i64>().ok()),
+        max_length: parse_i64(record_field_raw_or_display(record, "max_length").as_deref()),
         active: record_bool(record, "active"),
         synced_at,
         raw_json,

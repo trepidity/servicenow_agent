@@ -550,10 +550,10 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         RpcMethod::GetRecord => match extract_record_lookup(&request.params) {
             Ok(RecordLookup::Number(number)) => {
                 match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
-                    Ok(Some(record)) => match transport.record(&record) {
-                        Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                        Err(err) => internal_error(id, err),
-                    },
+                    Ok(Some(record)) => {
+                        daemon_record_response_with_private_task_context(id, &transport, &record)
+                            .await
+                    }
                     Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
                     Err(err) => map_record_lookup_error(id, err),
                 }
@@ -563,21 +563,19 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 .get_record_by_table_sys_id_fresh(&table, &sys_id)
                 .await
             {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                    Err(err) => internal_error(id, err),
-                },
+                Ok(Some(record)) => {
+                    daemon_record_response_with_private_task_context(id, &transport, &record).await
+                }
                 Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
+                Err(err) => map_record_lookup_error(id, err),
             },
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::GetRecordFresh => match extract_record_lookup(&request.params) {
             Ok(RecordLookup::Number(number)) => match state.core.get_record_fresh(&number).await {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                    Err(err) => internal_error(id, err),
-                },
+                Ok(Some(record)) => {
+                    daemon_record_response_with_private_task_context(id, &transport, &record).await
+                }
                 Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
                 Err(err) => map_record_lookup_error(id, err),
             },
@@ -586,12 +584,11 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                 .get_record_by_table_sys_id_fresh(&table, &sys_id)
                 .await
             {
-                Ok(Some(record)) => match transport.record(&record) {
-                    Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
-                    Err(err) => internal_error(id, err),
-                },
+                Ok(Some(record)) => {
+                    daemon_record_response_with_private_task_context(id, &transport, &record).await
+                }
                 Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                Err(err) => internal_error(id, err),
+                Err(err) => map_record_lookup_error(id, err),
             },
             Err(err) => invalid_params(id, err),
         },
@@ -1229,7 +1226,7 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                         Err(err) => internal_error(id, err),
                     },
                     Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-                    Err(err) => internal_error(id, err),
+                    Err(err) => map_record_lookup_error(id, err),
                 }
             }
             Err(err) => invalid_params(id, err),
@@ -1998,6 +1995,17 @@ fn daemon_record_response(
     record: &SnowRecord,
 ) -> JsonRpcResponse {
     match transport.record(record) {
+        Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
+        Err(err) => internal_error(id, err),
+    }
+}
+
+async fn daemon_record_response_with_private_task_context(
+    id: Option<Value>,
+    transport: &DaemonTransport<'_>,
+    record: &SnowRecord,
+) -> JsonRpcResponse {
+    match transport.record_with_private_task_context(record).await {
         Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
         Err(err) => internal_error(id, err),
     }
@@ -3206,7 +3214,7 @@ fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
 }
 
 /// JSON-RPC code for an unresolvable record-number prefix (caller mistake).
-const UNKNOWN_PREFIX_CODE: i64 = -32005;
+const UNKNOWN_PREFIX_CODE: i64 = -32006;
 
 /// Map core lookup failures that are caller mistakes (unknown prefix) to a
 /// structured JSON-RPC error instead of `internal_error` (-32000).
@@ -4196,6 +4204,29 @@ story_board_id = "board-sys"
     fn extract_record_lookup_accepts_number() {
         let lookup = extract_record_lookup(&json!({ "number": "DMND0012345" })).expect("lookup");
         assert_eq!(lookup, RecordLookup::Number("DMND0012345".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_lookup_methods_map_unknown_prefix_to_the_distinct_contract_error() {
+        let fixture = build_fixture_state().await.expect("fixture");
+        assert_ne!(UNKNOWN_PREFIX_CODE, -32005);
+
+        for method in ["get_record", "get_record_fresh", "get_work_notes"] {
+            let response = dispatch(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params: json!({ "number": "ZZZZ0000001" }),
+                    id: Some(json!(1)),
+                },
+                &fixture.state,
+            )
+            .await;
+
+            let error = response.error.expect("unknown-prefix error");
+            assert_eq!(error.code, UNKNOWN_PREFIX_CODE, "method={method}");
+            assert_eq!(error.message, "unknown record prefix", "method={method}");
+        }
     }
 
     #[test]
@@ -5435,6 +5466,66 @@ story_board_id = "board-sys"
         let request_line = request_rx.await.expect("request line");
         assert!(request_line.contains("/api/now/table/dmn_demand"));
         assert!(request_line.contains("DMND0320098"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_rpc_private_task_record_includes_best_effort_vtb_context() {
+        let task_sys_id = "11111111111111111111111111111111";
+        let (instance_url, request_rx) = spawn_json_http_sequence_server(vec![
+            json!({
+                "result": [{
+                    "sys_id": task_sys_id,
+                    "number": "PTSK0000001",
+                    "short_description": "Example private task",
+                    "description": "",
+                    "state": "open"
+                }]
+            }),
+            json!({ "result": [] }),
+            json!({ "result": [] }),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "get_record".to_string(),
+                params: json!({ "number": "PTSK0000001" }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let record = response
+            .result
+            .expect("record result")
+            .get("record")
+            .cloned()
+            .expect("wrapped record");
+        assert_eq!(
+            record.get("resource_type").and_then(Value::as_str),
+            Some("private_task")
+        );
+        let vtb_context = record
+            .get("vtb_context")
+            .expect("VTB context on private task");
+        assert!(vtb_context.is_object());
+        assert_eq!(vtb_context["checklist_items"], json!([]));
+
+        let requests = request_rx.await.expect("record and enrichment requests");
+        assert!(requests.iter().any(|request| request.contains("/vtb_task")));
+        assert!(requests.iter().any(|request| request.contains("/vtb_card")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("/checklist"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

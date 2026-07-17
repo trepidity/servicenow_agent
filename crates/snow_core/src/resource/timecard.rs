@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
 
-use crate::helpers::non_empty_owned;
+use crate::helpers::{non_empty_owned, parse_i64};
 use crate::{RecordRef, build_reference_json};
 
 const DAY_FIELDS: [&str; 7] = [
@@ -276,8 +276,7 @@ impl TimecardResource {
                 .unwrap_or_default()
                 .to_string(),
             sys_updated_on,
-            sys_mod_count: raw_or_display(record, "sys_mod_count")
-                .and_then(|value| value.trim().parse::<i64>().ok()),
+            sys_mod_count: parse_i64(raw_or_display(record, "sys_mod_count")),
         })
     }
 }

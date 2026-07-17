@@ -576,7 +576,7 @@ pub fn print_full_dump(value: &serde_json::Value) {
     }
 }
 
-fn print_field(label: &str, value: Option<&str>) {
+pub fn print_field(label: &str, value: Option<&str>) {
     if let Some(v) = value {
         println!("{:>13} {}", format!("{label}:").dimmed(), v);
     }

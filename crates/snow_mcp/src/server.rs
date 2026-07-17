@@ -326,9 +326,9 @@ impl McpServer {
         number: &str,
     ) -> JsonRpcResponse {
         match get_record_cached_or_fresh(self.core.as_ref(), number).await {
-            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "record": record })),
+            Ok(Some(record)) => self.record_response(id, record).await,
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-            Err(err) => service_failure(id, err),
+            Err(err) => map_record_lookup_error(id, err),
         }
     }
 
@@ -343,10 +343,29 @@ impl McpServer {
             .get_record_by_table_sys_id_fresh(table, sys_id)
             .await
         {
-            Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "record": record })),
+            Ok(Some(record)) => self.record_response(id, record).await,
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-            Err(err) => service_failure(id, err),
+            Err(err) => map_record_lookup_error(id, err),
         }
+    }
+
+    /// Serializes a generic record response, attaching best-effort VTB
+    /// metadata only when the hydrated record is a private task.
+    async fn record_response(&self, id: Option<Value>, record: SnowRecord) -> JsonRpcResponse {
+        let vtb_context = self.core.private_task_vtb_context(&record).await;
+        let mut record = match serde_json::to_value(record) {
+            Ok(Value::Object(record)) => record,
+            Ok(_) => return service_failure(id, "record serialization did not produce an object"),
+            Err(err) => return service_failure(id, err),
+        };
+        if let Some(vtb_context) = vtb_context {
+            let vtb_context = match serde_json::to_value(vtb_context) {
+                Ok(value) => value,
+                Err(err) => return service_failure(id, err),
+            };
+            record.insert("vtb_context".to_string(), vtb_context);
+        }
+        JsonRpcResponse::ok(id, json!({ "record": record }))
     }
 
     async fn call_get_approval(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
@@ -1405,7 +1424,7 @@ impl McpServer {
         match get_record_by_lookup_cached_or_fresh(self.core.as_ref(), lookup).await {
             Ok(Some(record)) => JsonRpcResponse::ok(id, json!({ "work_notes": record.work_notes })),
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-            Err(err) => service_failure(id, err),
+            Err(err) => map_record_lookup_error(id, err),
         }
     }
 
@@ -2152,6 +2171,22 @@ fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "service failure",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+/// JSON-RPC code for an unresolvable record-number prefix (caller mistake).
+const UNKNOWN_PREFIX_CODE: i64 = -32006;
+
+fn map_record_lookup_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+    let details = err.to_string();
+    if details.contains("unknown ServiceNow prefix") {
+        return JsonRpcResponse::error(
+            id,
+            UNKNOWN_PREFIX_CODE,
+            "unknown record prefix",
+            Some(json!({ "details": details })),
+        );
+    }
+    service_failure(id, details)
 }
 
 /// Map a structured [`snow_core::ServerGetError`] from the MCP `server_get`

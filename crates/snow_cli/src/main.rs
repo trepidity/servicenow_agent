@@ -3637,25 +3637,25 @@ async fn cmd_show_private_task(
 
 /// Render the board/lane/checklist lines for [`cmd_show_private_task`].
 ///
-/// Matches that function's plain `println!("key: value")` style rather than
-/// `display`'s colored `print_field` conventions. Board/lane/swim-lane lines
-/// are omitted when unset, and the checklist block is omitted entirely when
-/// empty. [`enrich_vtb_context`] already collapsed "ACL 403"/"timeout"/
-/// "genuinely not set" into the same `None`/empty shape, so there is
-/// nothing left to distinguish at render time.
+/// Reuses the command's standard field styling. Board/lane/swim-lane lines are
+/// omitted when unset, and the checklist block is omitted entirely when empty.
+/// [`enrich_vtb_context`] already collapsed "ACL 403"/"timeout"/"genuinely not
+/// set" into the same `None`/empty shape, so there is nothing left to
+/// distinguish at render time.
 fn print_vtb_context(context: &VtbContext) {
     if let Some(board_name) = context.board_name.as_deref() {
-        println!("board: {board_name}");
+        display::print_field("board", Some(board_name));
     }
     if let Some(lane_name) = context.lane_name.as_deref() {
-        println!("lane: {lane_name}");
+        display::print_field("lane", Some(lane_name));
     }
     if let Some(swim_lane_name) = context.swim_lane_name.as_deref() {
-        println!("swim lane: {swim_lane_name}");
+        display::print_field("swim lane", Some(swim_lane_name));
     }
     for item in &context.checklist_items {
         let mark = if item.complete { "x" } else { " " };
-        println!("checklist: [{mark}] {}", item.name);
+        let value = format!("[{mark}] {}", item.name);
+        display::print_field("checklist", Some(&value));
     }
 }
 

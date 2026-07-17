@@ -142,22 +142,8 @@ pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
 }
 
 pub fn is_record_lookup_table_allowed(table: &str) -> bool {
-    matches!(
-        table.trim().to_ascii_lowercase().as_str(),
-        "dmn_demand"
-            | "dmn_demand_task"
-            | "resource_plan"
-            | "pm_project"
-            | "change_request"
-            | "business_application"
-            | "business_app"
-            | "cmdb_ci_business_app"
-            | "server"
-            | "servers"
-            | "cmdb_ci_server"
-            | "cmdb_ci_linux_server"
-            | "cmdb_ci_win_server"
-    )
+    let normalized = table.trim().to_ascii_lowercase();
+    RECORD_LOOKUP_ALLOWED_TABLES.contains(&normalized.as_str()) || normalized == "servers"
 }
 
 pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
@@ -1006,6 +992,16 @@ mod tests {
             table_for_builtin_record_number("dmntsk0001122"),
             Some("dmn_demand_task")
         );
+    }
+
+    #[test]
+    fn private_task_table_is_allowed_by_the_runtime_gate_and_public_schema() {
+        assert!(is_record_lookup_table_allowed("vtb_task"));
+        assert_eq!(
+            normalize_record_lookup_table("VTB_TASK").unwrap(),
+            "vtb_task"
+        );
+        assert!(RECORD_LOOKUP_ALLOWED_TABLES.contains(&"vtb_task"));
     }
 
     #[test]

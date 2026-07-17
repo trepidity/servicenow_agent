@@ -1,6 +1,8 @@
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use snow_core::ipc::IpcEndpoint;
 
 const DEFAULT_ENV: &str = "test";
@@ -12,6 +14,7 @@ pub struct DaemonPaths {
     // Only the Unix daemon lifecycle modules read these; unused on Windows.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub statusfile: PathBuf,
+    pub runtime_lock: PathBuf,
     pub logfile: PathBuf,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub logfile_rotated: PathBuf,
@@ -32,6 +35,7 @@ impl DaemonPaths {
         Ok(Self {
             pidfile: config_dir.join("daemon.pid"),
             statusfile: config_dir.join("daemon.status"),
+            runtime_lock: config_dir.join("daemon.runtime.lock"),
             logfile: config_dir.join("daemon.log"),
             logfile_rotated: config_dir.join("daemon.log.1"),
             socket,
@@ -50,6 +54,7 @@ impl DaemonPaths {
         Self {
             pidfile: root.join("daemon.pid"),
             statusfile: root.join("daemon.status"),
+            runtime_lock: root.join("daemon.runtime.lock"),
             logfile: root.join("daemon.log"),
             logfile_rotated: root.join("daemon.log.1"),
             socket,
@@ -57,6 +62,21 @@ impl DaemonPaths {
             config_dir: root,
         }
     }
+}
+
+/// Acquires the process-shared lock that serializes daemon runtime metadata
+/// writes and cleanup. The returned file keeps the lock until dropped.
+pub(crate) fn lock_runtime_files(paths: &DaemonPaths) -> Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&paths.runtime_lock)
+        .with_context(|| format!("opening {}", paths.runtime_lock.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("locking {}", paths.runtime_lock.display()))?;
+    Ok(lock)
 }
 
 pub fn selected_env(explicit: Option<&str>) -> String {

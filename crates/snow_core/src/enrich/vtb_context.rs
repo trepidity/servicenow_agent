@@ -9,9 +9,10 @@
 //! `show` command.
 
 use anyhow::Result;
+use serde::Serialize;
 use servicenow_rs::prelude::{DisplayValue, Order, ServiceNowClient};
 
-use crate::helpers::non_empty_owned;
+use crate::helpers::{non_empty_owned, parse_i64, record_bool, servicenow_reference_sys_id};
 
 /// Polymorphic discriminator ServiceNow stores in `checklist.table` for
 /// checklists attached to private tasks (Gate 0). Not part of [`VtbSchema`]
@@ -71,7 +72,7 @@ impl VtbSchema {
     };
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct VtbContext {
     pub board_sys_id: Option<String>,
     pub board_name: Option<String>,
@@ -83,7 +84,7 @@ pub struct VtbContext {
     pub checklist_items: Vec<VtbChecklistItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VtbChecklistItem {
     pub sys_id: String,
     pub name: String,
@@ -112,9 +113,13 @@ pub async fn enrich_vtb_context(
     schema: &VtbSchema,
     task_sys_id: &str,
 ) -> VtbContext {
+    let (card, checklist_items) = tokio::join!(
+        fetch_card_for_task(client, schema, task_sys_id),
+        fetch_checklist_items(client, schema, task_sys_id)
+    );
     let mut context = VtbContext::default();
 
-    match fetch_card_for_task(client, schema, task_sys_id).await {
+    match card {
         Ok(Some(card)) => {
             context.card_order = card.order;
             context.board_sys_id = card.board_sys_id;
@@ -139,7 +144,7 @@ pub async fn enrich_vtb_context(
         }
     }
 
-    context.checklist_items = match fetch_checklist_items(client, schema, task_sys_id).await {
+    context.checklist_items = match checklist_items {
         Ok(items) => items,
         Err(err) => {
             tracing::debug!(
@@ -215,9 +220,9 @@ pub async fn fetch_card_for_task(
         .await?;
 
     Ok(record.map(|record| {
-        let board_sys_id = non_empty_owned(record.get_str(schema.card_board_field));
-        let lane_sys_id = non_empty_owned(record.get_str(schema.card_lane_field));
-        let swim_lane_sys_id = non_empty_owned(record.get_str(schema.card_swim_lane_field));
+        let board_sys_id = servicenow_reference_sys_id(&record, schema.card_board_field);
+        let lane_sys_id = servicenow_reference_sys_id(&record, schema.card_lane_field);
+        let swim_lane_sys_id = servicenow_reference_sys_id(&record, schema.card_swim_lane_field);
 
         let board_name = resolve_dot_walked_name(
             board_sys_id.as_deref(),
@@ -315,9 +320,7 @@ pub async fn fetch_checklist_items(
                 .get_str(schema.checklist_item_name_field)
                 .unwrap_or_default()
                 .to_string(),
-            complete: parse_checklist_complete(
-                record.get_str(schema.checklist_item_complete_field),
-            ),
+            complete: record_bool(&record, schema.checklist_item_complete_field),
             order: parse_i64(record.get_str(schema.checklist_item_order_field)),
         })
         .collect())
@@ -353,20 +356,6 @@ fn resolve_dot_walked_name(
     name
 }
 
-/// Parse a checklist item's `complete` field per Gate 0's boolean encoding:
-/// `"true"`/`"1"` are complete; everything else (missing, `"false"`,
-/// `"0"`, or anything unexpected) is not.
-fn parse_checklist_complete(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("true") | Some("1"))
-}
-
-/// Parse a ServiceNow integer-ish field (e.g. `order`) into `i64`,
-/// discarding anything that doesn't cleanly parse rather than failing the
-/// whole row.
-fn parse_i64(raw: Option<&str>) -> Option<i64> {
-    raw.and_then(|value| value.trim().parse::<i64>().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,18 +377,6 @@ mod tests {
         assert_eq!(s.checklist_table_field, "table");
         assert_eq!(s.checklist_item_parent_field, "checklist");
         assert_eq!(s.checklist_item_complete_field, "complete");
-    }
-
-    #[test]
-    fn parse_checklist_complete_variants() {
-        assert!(parse_checklist_complete(Some("true")));
-        assert!(parse_checklist_complete(Some("1")));
-        assert!(!parse_checklist_complete(Some("false")));
-        assert!(!parse_checklist_complete(Some("0")));
-        assert!(!parse_checklist_complete(Some("")));
-        assert!(!parse_checklist_complete(None));
-        // Unexpected values degrade to "not complete" rather than panicking.
-        assert!(!parse_checklist_complete(Some("maybe")));
     }
 
     // Placeholder sys_ids: 32-hex-char strings built from a single repeated

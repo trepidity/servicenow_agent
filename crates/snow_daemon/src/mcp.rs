@@ -270,12 +270,12 @@ impl McpServer {
         };
 
         match get_record_by_lookup_cached_or_fresh(self.state.core.as_ref(), lookup).await {
-            Ok(Some(record)) => match transport.record(&record) {
+            Ok(Some(record)) => match transport.record_with_private_task_context(&record).await {
                 Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
                 Err(err) => service_failure(id, err),
             },
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-            Err(err) => service_failure(id, err),
+            Err(err) => map_record_lookup_error(id, err),
         }
     }
 
@@ -1428,7 +1428,7 @@ impl McpServer {
                 Err(err) => service_failure(id, err),
             },
             Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
-            Err(err) => service_failure(id, err),
+            Err(err) => map_record_lookup_error(id, err),
         }
     }
 
@@ -1990,6 +1990,22 @@ fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "service failure",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+/// JSON-RPC code for an unresolvable record-number prefix (caller mistake).
+const UNKNOWN_PREFIX_CODE: i64 = -32006;
+
+fn map_record_lookup_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+    let details = err.to_string();
+    if details.contains("unknown ServiceNow prefix") {
+        return JsonRpcResponse::error(
+            id,
+            UNKNOWN_PREFIX_CODE,
+            "unknown record prefix",
+            Some(json!({ "details": details })),
+        );
+    }
+    service_failure(id, details)
 }
 
 fn server_get_error_response(

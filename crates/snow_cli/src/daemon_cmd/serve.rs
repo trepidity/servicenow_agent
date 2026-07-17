@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::paths::DaemonPaths;
+use super::paths::{DaemonPaths, lock_runtime_files};
 
 pub fn run(env_name: &str, no_idle_timeout: bool) -> Result<()> {
     set_selected_env(env_name);
@@ -31,6 +31,7 @@ fn write_runtime_files(
     env_name: &str,
     env_file: Option<&PathBuf>,
 ) -> Result<()> {
+    let _lock = lock_runtime_files(paths)?;
     let pid = std::process::id();
     std::fs::write(&paths.pidfile, format!("{pid}\n"))
         .with_context(|| format!("writing {}", paths.pidfile.display()))?;
@@ -54,6 +55,9 @@ fn cleanup_runtime_files_for_current_process(paths: &DaemonPaths) {
 }
 
 fn cleanup_runtime_files_for_pid(paths: &DaemonPaths, pid: u32) {
+    let Ok(_lock) = lock_runtime_files(paths) else {
+        return;
+    };
     if runtime_files_belong_to_pid(paths, pid) {
         let _ = std::fs::remove_file(&paths.pidfile);
         let _ = std::fs::remove_file(&paths.statusfile);
@@ -111,6 +115,9 @@ fn set_no_idle_timeout() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn cleanup_preserves_runtime_files_owned_by_successor_process() {
@@ -147,5 +154,38 @@ mod tests {
         cleanup_runtime_files_for_pid(&paths, 1111);
 
         assert!(!paths.statusfile.exists());
+    }
+
+    #[test]
+    fn cleanup_cannot_delete_successor_files_while_metadata_write_is_locked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Arc::new(DaemonPaths::under(tmp.path().to_path_buf()));
+        std::fs::write(&paths.pidfile, "1111\n").expect("pidfile");
+        std::fs::write(&paths.statusfile, r#"{"pid":1111}"#).expect("statusfile");
+
+        let lock = lock_runtime_files(paths.as_ref()).expect("runtime lock");
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let cleanup_paths = Arc::clone(&paths);
+        let cleanup = thread::spawn(move || {
+            cleanup_runtime_files_for_pid(cleanup_paths.as_ref(), 1111);
+            completed_tx.send(()).expect("signal cleanup completion");
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cleanup must wait for the metadata writer's lock"
+        );
+        std::fs::write(&paths.pidfile, "2222\n").expect("successor pidfile");
+        std::fs::write(&paths.statusfile, r#"{"pid":2222}"#).expect("successor statusfile");
+        drop(lock);
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup completes after lock release");
+        cleanup.join().expect("cleanup thread");
+        assert!(paths.pidfile.exists());
+        assert!(paths.statusfile.exists());
     }
 }

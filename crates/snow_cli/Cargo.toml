@@ -15,6 +15,7 @@ clap.workspace = true
 colored.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
+fs2.workspace = true
 open.workspace = true
 ratatui.workspace = true
 rusqlite.workspace = true

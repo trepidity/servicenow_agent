@@ -422,6 +422,12 @@ pub(crate) fn record_bool(record: &Record, field: &str) -> bool {
     }
 }
 
+/// Parses an optional ServiceNow integer field after trimming surrounding
+/// whitespace. Malformed and absent values intentionally degrade to `None`.
+pub(crate) fn parse_i64(value: Option<&str>) -> Option<i64> {
+    value.and_then(|value| value.trim().parse::<i64>().ok())
+}
+
 pub(crate) fn parse_servicenow_date(value: Option<&str>) -> Option<NaiveDate> {
     let value = value?.trim();
     let date = value.get(..10).unwrap_or(value);

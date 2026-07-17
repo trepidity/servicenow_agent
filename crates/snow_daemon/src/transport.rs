@@ -60,7 +60,20 @@ impl<'a> DaemonTransport<'a> {
             source: record.source.clone().into(),
             browser_url: self.browser_url(&record.table, &record.sys_id),
             vault_relative_path: self.vault_relative_path(&record.sys_id)?,
+            vtb_context: None,
         })
+    }
+
+    /// Adds best-effort VTB metadata to a private-task record DTO. This stays
+    /// asynchronous so generic record serialization remains cheap for list
+    /// and search responses.
+    pub async fn record_with_private_task_context(
+        &self,
+        record: &SnowRecord,
+    ) -> Result<DaemonSnowRecord> {
+        let mut dto = self.record(record)?;
+        dto.vtb_context = self.core.private_task_vtb_context(record).await;
+        Ok(dto)
     }
 
     pub fn resource_plan_record(&self, record: &mut ResourcePlanRecord) -> Result<()> {
@@ -361,6 +374,8 @@ pub struct DaemonSnowRecord {
     pub browser_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault_relative_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtb_context: Option<snow_core::enrich::VtbContext>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

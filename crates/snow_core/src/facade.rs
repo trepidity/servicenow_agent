@@ -8,6 +8,7 @@ use anyhow::Result;
 use servicenow_rs::prelude::ServiceNowClient;
 
 use crate::cache::store::BusinessApplicationFieldDictionaryRow;
+use crate::enrich::{VtbContext, VtbSchema, enrich_vtb_context};
 use crate::query::filter::{BusinessApplicationQuery, ListQuery};
 use crate::vault::manager::VaultManager;
 
@@ -194,6 +195,22 @@ impl SnowCore {
         self.records
             .get_record_by_table_sys_id_fresh(table, sys_id)
             .await
+    }
+
+    /// Returns best-effort Visual Task Board context only for private tasks.
+    ///
+    /// The result is deliberately a side channel for presentation DTOs rather
+    /// than cached on [`SnowRecord`], because board and checklist state is
+    /// live, optional metadata and must not turn a successful record read into
+    /// a failure.
+    pub async fn private_task_vtb_context(&self, record: &SnowRecord) -> Option<VtbContext> {
+        if record.resource_type == ResourceType::PrivateTask {
+            Some(
+                enrich_vtb_context(self.client().as_ref(), &VtbSchema::GATE0, &record.sys_id).await,
+            )
+        } else {
+            None
+        }
     }
 
     pub fn tombstone_record(&self, sys_id: &str, when: DateTime<Utc>) -> Result<()> {

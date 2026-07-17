@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 use anyhow::{Context, Result, bail};
 
 use super::client::endpoint_alive;
-use super::paths::DaemonPaths;
+use super::paths::{DaemonPaths, lock_runtime_files};
 
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
@@ -157,6 +157,9 @@ pub(crate) fn read_pid(paths: &DaemonPaths) -> Result<Option<u32>> {
 }
 
 pub(crate) fn scrub_stale_runtime_files(paths: &DaemonPaths) {
+    let Ok(_lock) = lock_runtime_files(paths) else {
+        return;
+    };
     let _ = std::fs::remove_file(&paths.pidfile);
     let _ = std::fs::remove_file(&paths.statusfile);
 }

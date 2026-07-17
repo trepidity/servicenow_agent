@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use servicenow_rs::prelude::Record;
 
-use crate::SnowRecord;
+use crate::{SnowRecord, parse_i64};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePlanState {
@@ -535,10 +535,8 @@ impl ResourcePlanWriteConcurrency {
 
         let sys_mod_count = record
             .get_raw("sys_mod_count")
-            .or_else(|| record.get_str("sys_mod_count"))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| value.parse::<i64>().ok());
+            .or_else(|| record.get_str("sys_mod_count"));
+        let sys_mod_count = parse_i64(sys_mod_count);
 
         Ok(Self {
             sys_updated_on,
