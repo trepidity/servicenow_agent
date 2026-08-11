@@ -696,6 +696,7 @@ async fn build_plan_input(
                 .get(apply_tool_for_plan_tool(tool))
                 .is_some_and(|policy| policy.skip_terminal_records)
                 && record_is_terminal(&record)
+                && !allows_completed_change_request_closure(tool, &record, &payload)
             {
                 return Err(PlanBuildError::TerminalRecord(number));
             }
@@ -774,6 +775,20 @@ fn record_is_terminal(record: &SnowRecord) -> bool {
     ["closed", "complete", "completed", "cancel", "cancelled"]
         .iter()
         .any(|terminal| state.contains(terminal))
+}
+
+fn allows_completed_change_request_closure(
+    tool: &str,
+    record: &SnowRecord,
+    payload: &Value,
+) -> bool {
+    tool == "change_request_plan_update"
+        && record.table == "change_request"
+        && record
+            .fields
+            .get("state")
+            .is_some_and(|state| state.value == "16")
+        && payload.get("state").and_then(Value::as_str) == Some("3")
 }
 
 fn reject_plan_input_fields(

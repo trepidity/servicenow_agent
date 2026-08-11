@@ -3745,6 +3745,205 @@ mod tests {
         }
     }
 
+    fn enabled_change_update_mcp_config() -> snow_mcp::McpConfig {
+        let mut policy = snow_mcp::domain::policy::PolicyConfig::default();
+        for tool in ["change_request_apply_update", "change_task_apply_update"] {
+            policy
+                .tools
+                .get_mut(tool)
+                .unwrap_or_else(|| panic!("{tool} policy"))
+                .enabled = true;
+        }
+
+        snow_mcp::McpConfig {
+            environment: snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago"),
+            policy,
+            ..Default::default()
+        }
+    }
+
+    fn change_update_response(number: &str, state_value: &str, state_display: &str) -> Value {
+        json!({
+            "result": [{
+                "sys_id": "change-sys",
+                "number": number,
+                "short_description": "Example change request",
+                "description": "Close after execution",
+                "state": {
+                    "value": state_value,
+                    "display_value": state_display
+                },
+                "sys_updated_on": "2026-08-11 10:11:12",
+                "sys_mod_count": "1"
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn change_request_completed_can_plan_closure() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+            change_update_response("CHG001", "16", "Completed"),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture
+                .tempdir
+                .path()
+                .join("change-request-completed-closure"),
+            enabled_change_update_mcp_config(),
+        ));
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "change_request_plan_update".to_string(),
+                params: json!({ "number": "CHG001", "state": "3" }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let result = response.result.expect("change closure plan result");
+        assert_eq!(result["preview"]["state"], json!("3"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn change_request_completed_rejects_nonclosure_update() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+            change_update_response("CHG001", "16", "Completed"),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture
+                .tempdir
+                .path()
+                .join("change-request-completed-nonclosure"),
+            enabled_change_update_mcp_config(),
+        ));
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "change_request_plan_update".to_string(),
+                params: json!({
+                    "number": "CHG001",
+                    "short_description": "Attempt a post-completion edit"
+                }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("non-closure update should remain blocked");
+        assert_eq!(error.code, -32050);
+        assert_eq!(error.message, "GUARD_FAILED");
+        assert_eq!(
+            error.data.expect("guard error data")["reason"],
+            json!("terminal_record_skipped")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn change_request_closed_remains_terminal() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+            change_update_response("CHG001", "3", "Closed"),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture
+                .tempdir
+                .path()
+                .join("change-request-closed-terminal"),
+            enabled_change_update_mcp_config(),
+        ));
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "change_request_plan_update".to_string(),
+                params: json!({ "number": "CHG001", "state": "3" }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("closed change request should be blocked");
+        assert_eq!(error.code, -32050);
+        assert_eq!(error.message, "GUARD_FAILED");
+        assert_eq!(
+            error.data.expect("guard error data")["reason"],
+            json!("terminal_record_skipped")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn change_task_completed_remains_terminal() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+            change_update_response("CTASK001", "16", "Completed"),
+            json!({ "result": [] }),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture
+                .tempdir
+                .path()
+                .join("change-task-completed-terminal"),
+            enabled_change_update_mcp_config(),
+        ));
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "change_task_plan_update".to_string(),
+                params: json!({ "number": "CTASK001", "state": "3" }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("completed change task should remain blocked");
+        assert_eq!(error.code, -32050);
+        assert_eq!(error.message, "GUARD_FAILED");
+        assert_eq!(
+            error.data.expect("guard error data")["reason"],
+            json!("terminal_record_skipped")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn timecard_apply_dispatch_returns_replay_receipt_through_rpc() {
         use chrono::Utc;
