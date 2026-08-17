@@ -43,6 +43,25 @@ A Rust CLI for ServiceNow change management. View change requests, list tasks, a
    cp .env.test target/release/.env.test
    ```
 
+## Build cache maintenance
+
+Cargo retains hashed build artifacts indefinitely across compiler, feature,
+profile, and branch changes. Check this checkout's debug cache before a long
+build or when Cargo appears to pause between test binaries:
+
+```bash
+scripts/build_cache_guard.sh --check
+```
+
+If the guard reports a stale cache, remove only the generated debug artifacts:
+
+```bash
+scripts/build_cache_guard.sh --clean
+```
+
+The next debug build will be cold. Release artifacts are not removed. Override
+the default 20,000-entry limit with `SNOW_BUILD_CACHE_MAX_ENTRIES` when needed.
+
 ## Usage
 
 By default, regular `snow` commands use the `test` environment. Daemon startup defaults to `prd`. Use `--env` or `SNOW_ENV` to override either path explicitly.

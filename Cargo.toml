@@ -32,3 +32,12 @@ toml = "1.1.2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = "1"
+
+# Keep useful line tables and backtraces without emitting full debug symbols for
+# the large workspace test harness. Full symbols remain available via an
+# explicit profile override when a debugger session requires them.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
