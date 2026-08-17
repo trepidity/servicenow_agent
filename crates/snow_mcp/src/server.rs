@@ -203,6 +203,10 @@ impl McpServer {
                     .await
             }
             "resource_plan_list" => self.call_resource_plan_list(id, params).await,
+            "incident_list_by_assignment_group" => {
+                self.call_incident_list_by_assignment_group(id, params)
+                    .await
+            }
             "story_get" => self.call_get_record_number(id, params).await,
             "story_tasks_list" => self.call_get_children(id, params).await,
             "timecard_list" => self.call_timecard_list(id, params).await,
@@ -901,6 +905,69 @@ impl McpServer {
                 JsonRpcResponse::ok(id, json!(response))
             }
             Err(err) => service_failure(id, err),
+        }
+    }
+
+    /// Direct (daemon-less) execution of the group-scoped Incident page.
+    ///
+    /// Mirrors the daemon path exactly: the same arguments, the same page
+    /// metadata, and the same structured correction data for an unresolved
+    /// state. Records are returned as-is — this read persists nothing, so
+    /// there is no vault path to attach.
+    async fn call_incident_list_by_assignment_group(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::IncidentAssignmentGroupListInput =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        if let Err(err) = snow_core::validate_incident_assignment_group_input(parsed.clone()) {
+            return invalid_params(id, err);
+        }
+        match self.core.incident_list_by_assignment_group(parsed).await {
+            Ok(page) => JsonRpcResponse::ok(
+                id,
+                json!({
+                    "records": page.records,
+                    "next_cursor": page.next_cursor,
+                    "complete": page.complete,
+                    "limit": page.limit,
+                    "rows_inspected": page.rows_inspected,
+                    "state": page.state,
+                }),
+            ),
+            Err(err) => match err.downcast_ref::<snow_core::IncidentAssignmentGroupListError>() {
+                Some(snow_core::IncidentAssignmentGroupListError::InvalidParams(_)) => {
+                    invalid_params(id, err)
+                }
+                Some(snow_core::IncidentAssignmentGroupListError::UnresolvedState {
+                    requested,
+                    ambiguous,
+                    choices,
+                }) => JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "invalid params",
+                    Some(json!({
+                        "details": err.to_string(),
+                        "field": "state",
+                        "requested": requested,
+                        "ambiguous": ambiguous,
+                        "choices": choices
+                            .iter()
+                            .map(|choice| json!({ "value": choice.value, "label": choice.label }))
+                            .collect::<Vec<_>>(),
+                    })),
+                ),
+                None => service_failure(id, err),
+            },
         }
     }
 

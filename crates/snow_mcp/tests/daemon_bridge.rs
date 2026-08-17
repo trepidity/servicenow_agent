@@ -37,6 +37,33 @@ impl MockDaemon {
     }
 }
 
+fn incident_group_page_payload() -> Value {
+    json!({
+        "records": [{
+            "sys_id": "0000000000000000000000000000aa01",
+            "number": "<INC_1>",
+            "table": "incident",
+            "resource_type": "incident",
+            "state": "Pending",
+            "short_description": "Ticket",
+            "description": "",
+            "fields": {},
+            "work_notes": [],
+            "comments": [],
+            "parent": null,
+            "children": [],
+            "references": {},
+            "synced_at": "2026-08-17T00:00:00Z",
+            "source": "servicenow"
+        }],
+        "next_cursor": "0000000000000000000000000000aa01",
+        "complete": false,
+        "limit": 25,
+        "rows_inspected": 25,
+        "state": { "value": "3", "label": "Pending" }
+    })
+}
+
 #[async_trait]
 impl DaemonJsonRpcClient for MockDaemon {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -82,6 +109,21 @@ impl DaemonJsonRpcClient for MockDaemon {
             "list_my_tasks" => Ok(json!({ "records": [{ "number": "TASK001" }] })),
             "list_my_approvals" => Ok(json!({ "records": [{ "number": "APR001" }] })),
             "list_my_projects" => Ok(json!({ "records": [{ "number": "PRJ001" }] })),
+            "incident_list_by_assignment_group"
+                if params.get("state").and_then(Value::as_str) == Some("Awaiting Vendor") =>
+            {
+                Err(Error::DaemonJsonRpc {
+                    code: -32602,
+                    message: "invalid params".to_string(),
+                    data: Some(json!({
+                        "field": "state",
+                        "requested": "Awaiting Vendor",
+                        "ambiguous": false,
+                        "choices": [{ "value": "3", "label": "Pending" }]
+                    })),
+                })
+            }
+            "incident_list_by_assignment_group" => Ok(incident_group_page_payload()),
             "story_apply_create"
                 if params.get("plan_id").and_then(Value::as_str) == Some("error-plan") =>
             {
@@ -175,6 +217,17 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
         .await;
 
     assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("MCP tool result");
+    assert_eq!(
+        result["structuredContent"],
+        incident_group_page_payload(),
+        "the bridge must preserve the daemon's page contract"
+    );
+    assert_eq!(
+        result["content"][0]["type"],
+        json!("text"),
+        "a successful MCP call needs a readable content envelope"
+    );
     let calls = daemon.calls.lock().await;
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0, "get_record");
@@ -184,6 +237,40 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
             "table": "change_request",
             "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
         })
+    );
+}
+
+/// State-correction data is a caller-recovery contract, not an implementation
+/// detail. The bridge must preserve daemon JSON-RPC error code and data.
+#[tokio::test]
+async fn bridge_preserves_incident_group_state_correction_data() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "incident_list_by_assignment_group",
+    ]));
+    let server = bridge(daemon);
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "incident_list_by_assignment_group",
+                "arguments": {
+                    "assignment_group_sys_id": "0000000000000000000000000000ab01",
+                    "state": "Awaiting Vendor"
+                }
+            }),
+        ))
+        .await;
+
+    let error = response.error.expect("unknown state must be forwarded");
+    assert_eq!(error.code, -32602);
+    let data = error.data.expect("state correction data");
+    assert_eq!(data["field"], json!("state"));
+    assert_eq!(data["requested"], json!("Awaiting Vendor"));
+    assert_eq!(
+        data["choices"],
+        json!([{ "value": "3", "label": "Pending" }])
     );
 }
 
@@ -350,6 +437,66 @@ async fn bridge_forwards_resource_plan_list_flat_params() {
             "state": [1, 3],
             "limit": 25
         })
+    );
+}
+
+/// The bridge forwards every page argument to the daemon unchanged — it does
+/// not reshape, drop, or default the caller's paging and state selectors.
+///
+/// Authority: docs/spec-incident-list-by-assignment-group.md#scope
+#[tokio::test]
+async fn bridge_forwards_incident_group_page_params_unchanged() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "incident_list_by_assignment_group",
+    ]));
+    let server = bridge(daemon.clone());
+
+    let arguments = json!({
+        "assignment_group_sys_id": "0000000000000000000000000000ab01",
+        "state": "Pending",
+        "limit": 25,
+        "cursor": "0000000000000000000000000000aa02"
+    });
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "incident_list_by_assignment_group",
+                "arguments": arguments.clone()
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "incident_list_by_assignment_group");
+    assert_eq!(calls[1].1, arguments);
+}
+
+/// A daemon whose contract lacks the method must not have the tool called
+/// against it — the bridge advertises only what the daemon supports.
+#[tokio::test]
+async fn bridge_refuses_incident_group_page_when_daemon_lacks_the_method() {
+    let daemon = MockDaemon::new(contract(&["contract_info"]));
+    let server = bridge(daemon.clone());
+
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "incident_list_by_assignment_group",
+                "arguments": { "assignment_group_sys_id": "0000000000000000000000000000ab01" }
+            }),
+        ))
+        .await;
+
+    let error = response.error.expect("unavailable method should error");
+    assert_eq!(error.code, -32041);
+    assert_eq!(
+        daemon.method_names().await,
+        vec!["contract_info".to_string()]
     );
 }
 

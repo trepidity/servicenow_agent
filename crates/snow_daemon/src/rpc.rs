@@ -86,6 +86,7 @@ pub enum RpcMethod {
     BusinessApplicationSync,
     BusinessApplicationFields,
     ResourcePlanList,
+    IncidentListByAssignmentGroup,
     ServerGet,
     ServerGetFresh,
     ServerSearch,
@@ -202,6 +203,7 @@ impl RpcMethod {
             "business_application_sync" => Self::BusinessApplicationSync,
             "business_application_fields" => Self::BusinessApplicationFields,
             "resource_plan_list" => Self::ResourcePlanList,
+            "incident_list_by_assignment_group" => Self::IncidentListByAssignmentGroup,
             "server_get" => Self::ServerGet,
             "server_get_fresh" => Self::ServerGetFresh,
             "server_search" => Self::ServerSearch,
@@ -877,6 +879,31 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
             },
             Err(err) => invalid_params(id, err),
         },
+        // Group-scoped Incident page. Arguments and successful results map 1:1
+        // onto the core contract so direct MCP and daemon-backed MCP consumers
+        // receive the same record/page shape. The daemon adds only the
+        // structured invalid-parameter mapping, never filtering or transport
+        // enrichment.
+        // Authority: docs/spec-incident-list-by-assignment-group.md#scope.
+        RpcMethod::IncidentListByAssignmentGroup => {
+            match extract_incident_list_by_assignment_group_params(&request.params) {
+                Ok(params) => match state.core.incident_list_by_assignment_group(params).await {
+                    Ok(page) => JsonRpcResponse::ok(
+                        id,
+                        json!({
+                            "records": page.records,
+                            "next_cursor": page.next_cursor,
+                            "complete": page.complete,
+                            "limit": page.limit,
+                            "rows_inspected": page.rows_inspected,
+                            "state": page.state,
+                        }),
+                    ),
+                    Err(err) => incident_group_list_error_response(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
         RpcMethod::BusinessApplicationServers => {
             // Deserialize directly into the canonical snow_core request contract
             // (which owns `deny_unknown_fields` and selector/bounds validation),
@@ -1712,6 +1739,7 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_sync",
     "business_application_fields",
     "resource_plan_list",
+    "incident_list_by_assignment_group",
     "server_get",
     "server_get_fresh",
     "server_search",
@@ -2595,6 +2623,53 @@ fn extract_resource_plan_list_params(params: &Value) -> Result<snow_core::Resour
     let input: snow_core::ResourcePlanListInput = serde_json::from_value(params.clone())?;
     snow_core::validate_list_input(input.clone())?;
     Ok(input)
+}
+
+/// Deserializes and pre-validates group-scoped Incident page arguments.
+///
+/// Validation runs here as well as inside the core so a malformed group
+/// `sys_id`, cursor, or page size surfaces as `-32602 invalid params` rather
+/// than an internal error.
+fn extract_incident_list_by_assignment_group_params(
+    params: &Value,
+) -> Result<snow_core::IncidentAssignmentGroupListInput> {
+    let input: snow_core::IncidentAssignmentGroupListInput =
+        serde_json::from_value(params.clone())?;
+    snow_core::validate_incident_assignment_group_input(input.clone())?;
+    Ok(input)
+}
+
+/// Maps a group-scoped Incident page failure onto the JSON-RPC error contract.
+///
+/// An unresolved state carries the live choice list through as structured
+/// `data` so an agent can correct its selector without a second round trip;
+/// anything that is not a caller-argument problem stays an internal error.
+fn incident_group_list_error_response(id: Option<Value>, err: anyhow::Error) -> JsonRpcResponse {
+    match err.downcast_ref::<snow_core::IncidentAssignmentGroupListError>() {
+        Some(snow_core::IncidentAssignmentGroupListError::InvalidParams(_)) => {
+            invalid_params(id, err)
+        }
+        Some(snow_core::IncidentAssignmentGroupListError::UnresolvedState {
+            requested,
+            ambiguous,
+            choices,
+        }) => JsonRpcResponse::error(
+            id,
+            -32602,
+            "invalid params",
+            Some(json!({
+                "details": err.to_string(),
+                "field": "state",
+                "requested": requested,
+                "ambiguous": ambiguous,
+                "choices": choices
+                    .iter()
+                    .map(|choice| json!({ "value": choice.value, "label": choice.label }))
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+        None => internal_error(id, err),
+    }
 }
 
 fn extract_server_lookup_params(params: &Value) -> Result<ServerLookup> {
@@ -7168,6 +7243,179 @@ story_board_id = "board-sys"
             .expect("err")
             .code,
             -32005
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // incident_list_by_assignment_group (T2)
+    //
+    // Authority: docs/spec-incident-list-by-assignment-group.md
+    // ---------------------------------------------------------------------
+
+    const INCIDENT_GROUP_TEST_SYS_ID: &str = "0000000000000000000000000000ab01";
+
+    /// A daemon consumer receives the typed records plus the page metadata it
+    /// needs to keep paging.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incident_list_by_assignment_group_returns_records_and_page_metadata() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![json!({
+            "result": [{
+                "sys_id": { "value": "0000000000000000000000000000aa01" },
+                "number": { "value": "<INC_1>" },
+                "short_description": { "value": "Ticket" },
+                "state": { "value": "3", "display_value": "Pending" },
+                "active": { "value": "true", "display_value": "true" },
+                "assignment_group": {
+                    "value": INCIDENT_GROUP_TEST_SYS_ID,
+                    "display_value": "<GROUP_DISPLAY>"
+                }
+            }]
+        })])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "incident_list_by_assignment_group".to_string(),
+                params: json!({
+                    "assignment_group_sys_id": INCIDENT_GROUP_TEST_SYS_ID,
+                    "limit": 5
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let result = response.result.expect("page result");
+        assert_eq!(
+            result["records"].as_array().expect("records").len(),
+            1,
+            "{result}"
+        );
+        assert_eq!(result["complete"], json!(true));
+        assert_eq!(result["next_cursor"], json!(null));
+        assert_eq!(result["limit"], json!(5));
+        assert_eq!(result["rows_inspected"], json!(1));
+        assert!(
+            result["records"][0].get("browser_url").is_none(),
+            "this daemon page must retain the core record contract used by direct MCP"
+        );
+        assert!(
+            result["records"][0].get("vault_relative_path").is_none(),
+            "an ephemeral group page must not acquire transport-only vault metadata"
+        );
+    }
+
+    /// An invalid exact state preserves the core correction payload across the
+    /// daemon JSON-RPC boundary, so callers can select a valid value without
+    /// guessing or issuing a separate discovery call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incident_list_by_assignment_group_preserves_state_correction_data() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![json!({
+            "result": [
+                { "value": "1", "label": "New", "sequence": "100", "inactive": "false" },
+                { "value": "3", "label": "Pending", "sequence": "200", "inactive": "false" }
+            ]
+        })])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "incident_list_by_assignment_group".to_string(),
+                params: json!({
+                    "assignment_group_sys_id": INCIDENT_GROUP_TEST_SYS_ID,
+                    "state": "Awaiting Vendor"
+                }),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let error = response.error.expect("unknown state must be rejected");
+        assert_eq!(error.code, -32602);
+        let data = error.data.expect("state correction data");
+        assert_eq!(data["field"], json!("state"));
+        assert_eq!(data["requested"], json!("Awaiting Vendor"));
+        assert_eq!(data["ambiguous"], json!(false));
+        assert_eq!(
+            data["choices"],
+            json!([
+                { "value": "1", "label": "New" },
+                { "value": "3", "label": "Pending" }
+            ])
+        );
+    }
+
+    /// Caller-argument problems are `invalid params`, not internal errors, and
+    /// never reach ServiceNow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incident_list_by_assignment_group_maps_bad_arguments_to_invalid_params() {
+        let fixture = build_fixture_state().await.expect("fixture");
+
+        for params in [
+            json!({ "assignment_group_sys_id": "Network Support" }),
+            json!({ "assignment_group_sys_id": INCIDENT_GROUP_TEST_SYS_ID, "limit": 201 }),
+            json!({ "assignment_group_sys_id": INCIDENT_GROUP_TEST_SYS_ID, "cursor": "nope" }),
+            json!({ "assignment_group_sys_id": INCIDENT_GROUP_TEST_SYS_ID, "group_name": "x" }),
+        ] {
+            let response = dispatch(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: "incident_list_by_assignment_group".to_string(),
+                    params: params.clone(),
+                    id: Some(json!(1)),
+                },
+                &fixture.state,
+            )
+            .await;
+
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{params} should be rejected"));
+            assert_eq!(error.code, -32602, "{params}");
+        }
+    }
+
+    /// The method is routable and advertised, so a bridge can discover it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn incident_list_by_assignment_group_is_routable_and_advertised() {
+        assert_eq!(
+            RpcMethod::from_method("incident_list_by_assignment_group"),
+            RpcMethod::IncidentListByAssignmentGroup
+        );
+
+        let fixture = build_fixture_state().await.expect("fixture");
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "contract_info".to_string(),
+                params: json!({}),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+
+        let result = response.result.expect("contract info result");
+        assert!(
+            result["supported_methods"]
+                .as_array()
+                .expect("supported methods")
+                .iter()
+                .any(|method| method.as_str() == Some("incident_list_by_assignment_group")),
+            "contract_info must advertise the method"
         );
     }
 }

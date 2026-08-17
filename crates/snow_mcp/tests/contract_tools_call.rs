@@ -327,6 +327,45 @@ async fn foreground_resource_plan_list_rejects_invalid_filters() {
     );
 }
 
+/// The direct (daemon-less) transport enforces the same argument contract as
+/// the daemon path: bad group, bad cursor, out-of-range page size, and unknown
+/// arguments are all caller errors, refused before any ServiceNow call.
+///
+/// Authority: docs/spec-incident-list-by-assignment-group.md#scope
+#[tokio::test]
+async fn foreground_incident_group_page_rejects_invalid_arguments() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+    let group = "0000000000000000000000000000ab01";
+
+    for (id, arguments, why) in [
+        (60, json!({}), "assignment_group_sys_id is required"),
+        (
+            61,
+            json!({ "assignment_group_sys_id": "Network Support" }),
+            "group names are not accepted",
+        ),
+        (
+            62,
+            json!({ "assignment_group_sys_id": group, "limit": 201 }),
+            "limit above the maximum is rejected, not clamped",
+        ),
+        (
+            63,
+            json!({ "assignment_group_sys_id": group, "cursor": "nope" }),
+            "cursor must be a sys_id",
+        ),
+        (
+            64,
+            json!({ "assignment_group_sys_id": group, "assignment_group": group }),
+            "unknown arguments fail closed",
+        ),
+    ] {
+        let response = raw_call(&server, "incident_list_by_assignment_group", arguments, id).await;
+        assert_eq!(response.error.expect(why).code, -32602, "{why}");
+    }
+}
+
 async fn call(
     server: &McpServer,
     name: &str,

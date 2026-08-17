@@ -7,6 +7,7 @@ snow.db
 output/
 .superpowers/
 docs/**
+!docs/spec-incident-list-by-assignment-group.md
 .claude/**
 .claude/settings.local.json
 *.swp

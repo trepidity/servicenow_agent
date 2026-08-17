@@ -69,6 +69,12 @@ pub use resource::business_application::{
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
+pub use resource::incident::{
+    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
+    IncidentAssignmentGroupListError, IncidentAssignmentGroupListInput,
+    IncidentAssignmentGroupPage, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
+    resolve_incident_state, validate_incident_assignment_group_input,
+};
 pub use resource::resource_plan::{
     ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanListWarning, ResourcePlanParentRef, ResourcePlanParentType,

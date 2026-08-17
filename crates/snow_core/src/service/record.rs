@@ -25,14 +25,35 @@ use crate::query;
 use crate::query::filter::ListQuery;
 use crate::resource;
 use crate::{
-    BUSINESS_APPLICATION_TABLE, DegradedReadDiagnostic, FieldChoice, RecordLookup,
+    BUSINESS_APPLICATION_TABLE, DegradedReadDiagnostic, FieldChoice,
+    IncidentAssignmentGroupListInput, IncidentAssignmentGroupPage, RecordLookup,
     ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanQuerySummary, ResourcePlanResourceType, ResourceType, SERVER_RESOURCE_TYPE,
     SERVER_TABLE, SearchResult, SearchScope, SnowRecord, TaskSelector, is_terminal_state,
-    resource_plan_record_from_row, sort_records_by_number, validate_list_input,
+    resolve_incident_state, resource_plan_record_from_row, sort_records_by_number,
+    validate_incident_assignment_group_input, validate_list_input,
 };
 
 const USER_RECORD_HYDRATE_LIMIT: u32 = 200;
+
+/// Fields requested for the group-scoped Incident page.
+///
+/// Deliberately narrower than the fresh single-record path: this projection is
+/// ephemeral and list-shaped, so journals are not requested. `active` and
+/// `state` are required because both drive local rejection of terminal or
+/// inactive rows.
+const INCIDENT_GROUP_LIST_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "short_description",
+    "state",
+    "priority",
+    "opened_at",
+    "assigned_to",
+    "assignment_group",
+    "active",
+    "sys_updated_on",
+];
 
 const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
     "sys_id",
@@ -634,6 +655,86 @@ impl RecordService {
         Ok(records)
     }
 
+    /// Lists one page of *active* Incidents assigned to `assignment_group`,
+    /// optionally narrowed to one exact Incident state.
+    ///
+    /// Contract highlights, all from
+    /// `docs/spec-incident-list-by-assignment-group.md`:
+    ///
+    /// - **Ephemeral.** Unlike [`Self::my_incidents_fresh`], nothing returned
+    ///   here is persisted, cached, vaulted, or indexed. Group scope has no
+    ///   tombstoning story, so nothing local is allowed to grow from it.
+    /// - **`limit` counts requested rows.** Exactly one Table API request is
+    ///   issued per page. `records` may be shorter than `rows_inspected`
+    ///   because rows that are terminal or `active=false` are rejected
+    ///   locally, mirroring the existing fresh-Incident semantics.
+    /// - **Cursor anchors to the last ServiceNow row**, not the last surviving
+    ///   record, so a page whose rows are entirely rejected locally still
+    ///   advances instead of stalling the scan.
+    /// - **Authorization is ServiceNow's.** This applies no scope narrowing of
+    ///   its own; the runtime credential's ACLs decide what is visible.
+    pub async fn incident_list_by_assignment_group(
+        &self,
+        input: IncidentAssignmentGroupListInput,
+    ) -> Result<IncidentAssignmentGroupPage> {
+        let validated = validate_incident_assignment_group_input(input)?;
+
+        // Resolved before the Incident query so an unusable selector costs one
+        // choice read instead of returning a wrongly-filtered page.
+        let resolved_state = match validated.state_selector.as_deref() {
+            Some(selector) => {
+                let choices = self.field_choices("incident", "state").await?;
+                Some(resolve_incident_state(selector, &choices)?)
+            }
+            None => None,
+        };
+
+        let mut query = self
+            .ctx
+            .client
+            .table("incident")
+            .fields(INCIDENT_GROUP_LIST_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .order_by("sys_id", Order::Asc)
+            .limit(validated.effective_limit as u32)
+            .equals("assignment_group", &validated.assignment_group_sys_id)
+            .equals("active", "true");
+
+        if let Some(state) = resolved_state.as_ref() {
+            query = query.equals("state", &state.value);
+        }
+        // Exclusive cursor: the previous page's last inspected row is not
+        // returned twice.
+        if let Some(cursor) = validated.cursor.as_deref() {
+            query = query.greater_than("sys_id", cursor);
+        }
+
+        let rows = query.execute().await?.records;
+        let rows_inspected = rows.len();
+        let complete = rows_inspected < validated.effective_limit;
+        let next_cursor = if complete {
+            None
+        } else {
+            rows.last().map(|row| row.sys_id.clone())
+        };
+
+        let records = rows
+            .iter()
+            .filter(|row| servicenow_record_is_open_user_work(row))
+            .map(resource::incident::IncidentResource::from_servicenow)
+            .collect::<Vec<_>>();
+
+        Ok(IncidentAssignmentGroupPage {
+            records,
+            next_cursor,
+            complete,
+            limit: validated.effective_limit,
+            rows_inspected,
+            state: resolved_state,
+        })
+    }
+
     pub async fn my_projects(&self) -> Result<Vec<SnowRecord>> {
         let mut records = Vec::new();
         for resource_type in [ResourceType::Project, ResourceType::Demand] {
@@ -963,6 +1064,10 @@ mod tests {
         collect_journal_entries, document_content, document_tag_tokens,
         record_row_from_runtime_record, record_row_from_servicenow, render_journal_entries,
         serialize_vault_document, work_record_ttl,
+    };
+    use crate::{
+        INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
+        IncidentAssignmentGroupListError, ResolvedIncidentState,
     };
     use chrono::TimeZone;
     use servicenow_rs::prelude::{BasicAuth, ServiceNowClient, parse_servicenow_timestamp};
@@ -2719,5 +2824,507 @@ mod tests {
                 .contains("_(none)_"),
             "vault Work Notes section should not show _(none)_"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // incident_list_by_assignment_group (T1)
+    //
+    // Authority: docs/spec-incident-list-by-assignment-group.md
+    // ---------------------------------------------------------------------
+
+    const TEST_GROUP_SYS_ID: &str = "0000000000000000000000000000ab01";
+
+    fn incident_state_choices_body() -> serde_json::Value {
+        serde_json::json!({
+            "result": [
+                { "value": "1", "label": "New", "sequence": "100", "inactive": "false" },
+                { "value": "3", "label": "Pending", "sequence": "200", "inactive": "false" },
+                { "value": "7", "label": "Closed", "sequence": "300", "inactive": "false" }
+            ]
+        })
+    }
+
+    fn incident_row(
+        sys_id: &str,
+        number: &str,
+        state: (&str, &str),
+        active: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "sys_id": { "value": sys_id },
+            "number": { "value": number },
+            "short_description": { "value": "Ticket" },
+            "state": { "value": state.0, "display_value": state.1 },
+            "active": { "value": active, "display_value": active },
+            "assignment_group": {
+                "value": TEST_GROUP_SYS_ID,
+                "display_value": "<GROUP_DISPLAY>"
+            }
+        })
+    }
+
+    fn incident_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/now/table/incident")
+            .collect()
+    }
+
+    fn sysparm(request: &wiremock::Request, key: &str) -> Option<String> {
+        request
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.into_owned())
+    }
+
+    /// A caller can page an entire assignment group: pages are `sys_id`-ordered,
+    /// the cursor is exclusive so no record is returned twice, and only the
+    /// final short page reports `complete`.
+    #[tokio::test]
+    async fn incident_group_page_scans_the_group_across_pages() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        // First page: a full page, so the scan is not complete.
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param("sysparm_limit", "2"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("assignment_group={TEST_GROUP_SYS_ID}"),
+            ))
+            .and(query_param_contains("sysparm_query", "active=true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa01", "<INC_1>", ("1", "New"), "true"),
+                    incident_row("0000000000000000000000000000aa02", "<INC_2>", ("3", "Pending"), "true"),
+                ]
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let first = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("first page");
+
+        assert_eq!(first.records.len(), 2);
+        assert_eq!(first.rows_inspected, 2);
+        assert!(!first.complete, "a full page cannot claim the scan is done");
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some("0000000000000000000000000000aa02")
+        );
+
+        // Second page: the cursor is exclusive, and a short page ends the scan.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param_contains(
+                "sysparm_query",
+                "sys_id>0000000000000000000000000000aa02",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa03", "<INC_3>", ("3", "Pending"), "true"),
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(2),
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("second page");
+
+        assert_eq!(second.records.len(), 1);
+        assert!(
+            second.complete,
+            "a short page means the scan reached the end"
+        );
+        assert_eq!(second.next_cursor, None);
+
+        let numbers = first
+            .records
+            .iter()
+            .chain(second.records.iter())
+            .map(|record| record.number.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, vec!["<INC_1>", "<INC_2>", "<INC_3>"]);
+
+        let requests = server.received_requests().await.expect("requests");
+        let incident_requests = incident_requests(&requests);
+        assert_eq!(incident_requests.len(), 1);
+        assert_eq!(
+            sysparm(incident_requests[0], "sysparm_query")
+                .as_deref()
+                .map(|query| query.contains("ORDERBYsys_id")),
+            Some(true),
+            "paging is only stable when ordered by sys_id"
+        );
+    }
+
+    /// `limit` bounds ServiceNow rows requested, not records returned: rows that
+    /// are terminal or inactive are rejected locally and the page is simply
+    /// shorter.
+    #[tokio::test]
+    async fn incident_group_page_rejects_terminal_and_inactive_rows() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa01", "<INC_ACTIVE>", ("3", "Pending"), "true"),
+                    incident_row("0000000000000000000000000000aa02", "<INC_INACTIVE>", ("3", "Pending"), "false"),
+                    incident_row("0000000000000000000000000000aa03", "<INC_CLOSED>", ("7", "Closed"), "true"),
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let page = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["<INC_ACTIVE>"]
+        );
+        assert_eq!(
+            page.rows_inspected, 3,
+            "`limit` counts rows ServiceNow returned"
+        );
+    }
+
+    /// A page whose every row is rejected locally still advances, instead of
+    /// stalling the scan on an empty page.
+    #[tokio::test]
+    async fn incident_group_page_advances_when_every_row_is_rejected() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa01", "<INC_1>", ("7", "Closed"), "true"),
+                    incident_row("0000000000000000000000000000aa02", "<INC_2>", ("7", "Closed"), "true"),
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let page = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+
+        assert!(page.records.is_empty());
+        assert!(!page.complete);
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("0000000000000000000000000000aa02"),
+            "cursor must anchor to the last ServiceNow row, not the last surviving record"
+        );
+    }
+
+    /// An exact label and the raw value it maps to select the same state and
+    /// produce the same ServiceNow filter; label matching is case-insensitive.
+    #[tokio::test]
+    async fn incident_group_page_resolves_state_label_and_raw_value_identically() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(incident_state_choices_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param_contains("sysparm_query", "state=3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa01", "<INC_1>", ("3", "Pending"), "true"),
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let by_label = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                state: Some("pending".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("label page");
+        let by_value = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                state: Some("3".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("raw page");
+
+        let expected = Some(ResolvedIncidentState {
+            value: "3".to_string(),
+            label: "Pending".to_string(),
+        });
+        assert_eq!(by_label.state, expected);
+        assert_eq!(by_value.state, expected);
+        assert_eq!(by_label.records.len(), by_value.records.len());
+    }
+
+    /// An unusable state selector fails with the live choice list attached, so
+    /// the caller can correct it without a second round trip — and no Incident
+    /// query is issued with a wrong filter.
+    #[tokio::test]
+    async fn incident_group_page_reports_choices_for_an_unknown_state() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(incident_state_choices_body()))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let err = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                state: Some("Awaiting Vendor".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("unknown state must fail");
+
+        match err.downcast_ref::<IncidentAssignmentGroupListError>() {
+            Some(IncidentAssignmentGroupListError::UnresolvedState {
+                requested,
+                ambiguous,
+                choices,
+            }) => {
+                assert_eq!(requested, "Awaiting Vendor");
+                assert!(!ambiguous);
+                assert!(
+                    choices.iter().any(|choice| choice.label == "Pending"),
+                    "the correction path must carry the live choices"
+                );
+            }
+            other => panic!("expected UnresolvedState, got {other:?}"),
+        }
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            incident_requests(&requests).is_empty(),
+            "an unresolved state must not reach the incident table"
+        );
+    }
+
+    /// A label that maps to more than one value is ambiguous, not a coin flip.
+    #[test]
+    fn incident_state_resolution_rejects_an_ambiguous_label() {
+        let choices = vec![
+            FieldChoice {
+                value: "3".to_string(),
+                label: "Pending".to_string(),
+                terminal: false,
+            },
+            FieldChoice {
+                value: "-5".to_string(),
+                label: "pending".to_string(),
+                terminal: false,
+            },
+        ];
+
+        let err = resolve_incident_state("Pending", &choices).expect_err("ambiguous label");
+        assert!(matches!(
+            err,
+            IncidentAssignmentGroupListError::UnresolvedState {
+                ambiguous: true,
+                ..
+            }
+        ));
+    }
+
+    /// Malformed arguments fail before any I/O — a bad group, a bad cursor, or
+    /// an out-of-range page size never reaches ServiceNow.
+    #[tokio::test]
+    async fn incident_group_page_rejects_bad_arguments_before_querying() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+
+        let cases = vec![
+            IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: String::new(),
+                ..Default::default()
+            },
+            IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: "Network Support".to_string(),
+                ..Default::default()
+            },
+            IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                cursor: Some("not-a-sys-id".to_string()),
+                ..Default::default()
+            },
+            IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(0),
+                ..Default::default()
+            },
+            IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                limit: Some(INCIDENT_GROUP_LIST_MAX_LIMIT + 1),
+                ..Default::default()
+            },
+        ];
+
+        for input in cases {
+            let err = core
+                .incident_list_by_assignment_group(input.clone())
+                .await
+                .expect_err(&format!("{input:?} must be rejected"));
+            assert!(
+                matches!(
+                    err.downcast_ref::<IncidentAssignmentGroupListError>(),
+                    Some(IncidentAssignmentGroupListError::InvalidParams(_))
+                ),
+                "{input:?} must fail with structured invalid parameters, got {err}"
+            );
+        }
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests.is_empty(),
+            "invalid arguments must fail before any ServiceNow request"
+        );
+    }
+
+    /// An omitted `limit` requests the approved default page size rather than
+    /// an unbounded scan.
+    #[tokio::test]
+    async fn incident_group_page_requests_the_default_page_size() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "result": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let page = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+
+        assert_eq!(page.limit, INCIDENT_GROUP_LIST_DEFAULT_LIMIT);
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            sysparm(incident_requests(&requests)[0], "sysparm_limit").as_deref(),
+            Some(INCIDENT_GROUP_LIST_DEFAULT_LIMIT.to_string().as_str())
+        );
+    }
+
+    /// Group-wide reads are ephemeral: a completed scan leaves the cache,
+    /// store, and vault exactly as it found them.
+    #[tokio::test]
+    async fn incident_group_page_persists_nothing() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    incident_row("0000000000000000000000000000aa01", "<INC_1>", ("3", "Pending"), "true"),
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, tempdir) = core_for_mock_server(&server).await;
+        let page = core
+            .incident_list_by_assignment_group(IncidentAssignmentGroupListInput {
+                assignment_group_sys_id: TEST_GROUP_SYS_ID.to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("page");
+        assert_eq!(
+            page.records.len(),
+            1,
+            "the scan must actually return a record"
+        );
+
+        let store = core.ctx.query.store();
+        assert_eq!(
+            store.count_active_records().expect("count"),
+            0,
+            "group reads must not populate the local store"
+        );
+        assert!(
+            store
+                .get_record_by_sys_id("0000000000000000000000000000aa01")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            core.ctx.cache.get("<INC_1>").is_none(),
+            "group reads must not populate the work-record cache"
+        );
+
+        let vault_path = tempdir.path().join("vault");
+        let vault_entries = std::fs::read_dir(&vault_path)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(vault_entries, 0, "group reads must not write the vault");
     }
 }

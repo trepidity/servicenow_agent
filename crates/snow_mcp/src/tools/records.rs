@@ -124,6 +124,11 @@ pub fn register(registry: &mut ToolRegistry) {
             "Get work notes for a record by number or allowed table/sys_id",
             record_lookup_arg_schema(RECORD_LOOKUP_ALLOWED_TABLES),
         ),
+        (
+            "incident_list_by_assignment_group",
+            "List one page of active Incidents for an assignment group sys_id, optionally narrowed to one exact state (raw value or exact label such as Pending). Read-only and ephemeral: nothing is cached or persisted. Page through by passing the returned next_cursor until complete is true; an unresolved state returns the valid choices for correction.",
+            incident_list_by_assignment_group_arg_schema(),
+        ),
     ] {
         registry.add(ToolMetadata {
             name: name.to_string(),
@@ -718,6 +723,43 @@ pub fn server_fields_arg_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {}
+    })
+}
+
+/// Argument schema for `incident_list_by_assignment_group`.
+///
+/// A plain object with no top-level composition, so the schema smoke check and
+/// strict MCP clients both accept it. `additionalProperties: false` mirrors the
+/// core input's `deny_unknown_fields`, and `limit`'s bounds mirror
+/// [`snow_core::INCIDENT_GROUP_LIST_MAX_LIMIT`].
+pub fn incident_list_by_assignment_group_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assignment_group_sys_id"],
+        "description": "Lists active Incidents for one assignment group. Page with next_cursor until complete is true. Results reflect the credential's ServiceNow ACLs; this tool applies no scope narrowing of its own.",
+        "properties": {
+            "assignment_group_sys_id": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "sys_user_group sys_id. Group names are not accepted."
+            },
+            "state": {
+                "type": "string",
+                "description": "Exact Incident state: a raw value such as 3, or an exact case-insensitive label such as Pending. Substring matching is not supported."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": snow_core::INCIDENT_GROUP_LIST_MAX_LIMIT,
+                "description": "ServiceNow rows requested for this page (default 50). Returned records may be fewer after inactive and closed rows are dropped."
+            },
+            "cursor": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{32}$",
+                "description": "next_cursor from the previous page. Exclusive: paging resumes after that sys_id."
+            }
+        }
     })
 }
 

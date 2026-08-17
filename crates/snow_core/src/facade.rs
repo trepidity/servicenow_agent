@@ -376,6 +376,18 @@ impl SnowCore {
         self.records.my_incidents_fresh().await
     }
 
+    /// Lists one ephemeral page of active Incidents for an assignment group.
+    ///
+    /// See [`crate::service::record::RecordService::incident_list_by_assignment_group`]
+    /// for the paging, state-resolution, persistence, and authorization
+    /// contract.
+    pub async fn incident_list_by_assignment_group(
+        &self,
+        input: IncidentAssignmentGroupListInput,
+    ) -> Result<IncidentAssignmentGroupPage> {
+        self.records.incident_list_by_assignment_group(input).await
+    }
+
     pub async fn my_approvals_fresh(&self) -> Result<Vec<ApprovalRecord>> {
         self.approvals.my_approvals_fresh().await
     }

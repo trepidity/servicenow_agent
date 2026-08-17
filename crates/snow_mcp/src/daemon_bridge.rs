@@ -72,6 +72,10 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("attachment_upload", "attachment_upload"),
     ("resource_plan_get", "get_record"),
     ("resource_plan_list", "resource_plan_list"),
+    (
+        "incident_list_by_assignment_group",
+        "incident_list_by_assignment_group",
+    ),
     ("resource_plan_plan_create", "resource_plan_plan_create"),
     ("resource_plan_apply_create", "resource_plan_apply_create"),
     ("resource_plan_plan_update", "resource_plan_plan_update"),

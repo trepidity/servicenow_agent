@@ -113,6 +113,7 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "attachment_list",
         "attachment_upload",
         "resource_plan_list",
+        "incident_list_by_assignment_group",
         "story_get",
         "story_tasks_list",
         "story_plan_create",
@@ -167,6 +168,50 @@ fn assert_no_top_level_schema_composition(schema: &serde_json::Value) {
             "tool inputSchema must not use top-level {keyword}"
         );
     }
+}
+
+/// The group-scoped Incident page is advertised as a read tool that needs no
+/// confirmation, requires the group `sys_id`, refuses unknown arguments, and
+/// bounds `limit` at the approved maximum.
+///
+/// Authority: docs/spec-incident-list-by-assignment-group.md#scope
+#[test]
+fn incident_list_by_assignment_group_is_a_bounded_read_tool() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "incident_list_by_assignment_group")
+        .expect("incident_list_by_assignment_group registered");
+
+    assert!(tool.default_enabled);
+    assert!(
+        !tool.requires_confirmation,
+        "a read tool must not demand confirmation"
+    );
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert_eq!(
+        tool.input_schema["required"],
+        json!(["assignment_group_sys_id"])
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["assignment_group_sys_id"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["cursor"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["limit"]["maximum"],
+        json!(snow_core::INCIDENT_GROUP_LIST_MAX_LIMIT)
+    );
+    assert!(
+        !snow_mcp::domain::policy::is_write_tool("incident_list_by_assignment_group"),
+        "the group Incident page must never be classified as a write"
+    );
 }
 
 #[test]

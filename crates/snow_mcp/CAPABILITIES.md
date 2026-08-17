@@ -123,7 +123,8 @@ work_record_ttl = "60m"
   `business_application_fields`,
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
-  `get_work_notes`, `attachment_list`, `resource_plan_list`
+  `get_work_notes`, `attachment_list`, `resource_plan_list`,
+  `incident_list_by_assignment_group`
 
 `list_my_approvals` is read-only and returns pending direct approvals plus
 pending approvals routed to direct `sys_user_group` memberships for the
@@ -157,6 +158,42 @@ on `dmn_demand` or `pm_project`, then the resource-plan query filters
   the effective limit.
 - **ACL:** requires read access to `resource_plan`; parent number/table labels
   depend on read access to the `task` dot-walk fields.
+### `incident_list_by_assignment_group`
+
+`incident_list_by_assignment_group` is a read-only, default-enabled live query
+against `incident`. It issues exactly one Table API query per call and returns
+one cursor page of *active* Incidents for a single assignment group.
+
+- **Params:** `assignment_group_sys_id` is required and must be a 32-hex
+  `sys_user_group` sys_id — group names are not accepted. `state` is optional
+  and exact: either a raw ServiceNow value (`3`) or an exact case-insensitive
+  choice label (`Pending`); substring and fuzzy matching are not supported.
+  `limit` defaults to `50` and is rejected above `200` — it is not clamped.
+  `cursor` is the previous page's `next_cursor`.
+- **Filters:** `assignment_group=<sys_id>` plus `active=true`, ordered by
+  `sys_id` ascending. A resolved `state` adds `state=<raw value>`. A cursor adds
+  `sys_id><cursor>`, so paging is exclusive.
+- **Paging:** `limit` bounds the ServiceNow rows *requested*, reported back as
+  `rows_inspected`. Returned `records` may be fewer, because rows that are
+  terminal or `active=false` are rejected locally. `next_cursor` is the last row
+  ServiceNow returned — not the last surviving record — so a page rejected in
+  full still advances. `complete` is `true` only when ServiceNow returned fewer
+  rows than `limit`.
+- **Response:** `{ records, next_cursor, complete, limit, rows_inspected, state }`,
+  where `state` echoes the resolved `{ value, label }` when a selector was given.
+- **State correction:** an unknown or ambiguous `state` fails with `-32602` and
+  `data` carrying `field`, `requested`, `ambiguous`, and the live `choices`, so a
+  caller can correct the selector without a second round trip.
+- **Persistence:** none. Unlike `list_my_tasks`-style reads, this operation
+  writes nothing to the cache, vault, or search index; the projection is
+  ephemeral.
+- **Consistency:** the scan is ordered but not transactional. An Incident
+  reassigned or re-stated mid-scan may be missed or repeated. The response is a
+  page, never a point-in-time inventory.
+- **ACL:** authorization is ServiceNow's alone. The tool applies no
+  assignment-group allowlist or other scope narrowing, so it returns exactly
+  what the daemon credential is permitted to read.
+
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,
   `list_categories`, `list_knowledge_articles`, `vault_path`, `kb_status`,
