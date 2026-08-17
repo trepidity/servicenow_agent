@@ -129,6 +129,16 @@ pub fn register(registry: &mut ToolRegistry) {
             "List one page of active Incidents for an assignment group sys_id, optionally narrowed to one exact state (raw value or exact label such as Pending). Read-only and ephemeral: nothing is cached or persisted. Page through by passing the returned next_cursor until complete is true; an unresolved state returns the valid choices for correction.",
             incident_list_by_assignment_group_arg_schema(),
         ),
+        (
+            "incident_assignment_groups",
+            "List the authenticated user's active direct Incident assignment-group memberships.",
+            json!({"type":"object","additionalProperties":false,"properties":{}}),
+        ),
+        (
+            "incident_assignment_group_queue",
+            "Read a membership-scoped operational Incident queue with triage filters, operational context, SLA risk, handoff counts, watermark, and departure detection.",
+            incident_assignment_group_queue_arg_schema(),
+        ),
     ] {
         registry.add(ToolMetadata {
             name: name.to_string(),
@@ -759,6 +769,34 @@ pub fn incident_list_by_assignment_group_arg_schema() -> Value {
                 "pattern": "^[0-9a-fA-F]{32}$",
                 "description": "next_cursor from the previous page. Exclusive: paging resumes after that sys_id."
             }
+        }
+    })
+}
+
+pub fn incident_assignment_group_queue_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["group"],
+        "properties": {
+            "group": {"type":"string","minLength":1,"description":"Exact active membership group name or sys_id."},
+            "state": {"type":"string"},
+            "assigned_to": {"type":"string","description":"me, unassigned, or an active user sys_id, username, or email."},
+            "priorities": {"type":"array","maxItems":5,"uniqueItems":true,"items":{"type":"integer","minimum":1,"maximum":5}},
+            "opened_after": {"type":"string","description":"YYYY-MM-DD HH:MM:SS"},
+            "opened_before": {"type":"string","description":"YYYY-MM-DD HH:MM:SS"},
+            "updated_since": {"type":"string","description":"Prior watermark or YYYY-MM-DD HH:MM:SS delta lower bound."},
+            "updated_before": {"type":"string","description":"YYYY-MM-DD HH:MM:SS"},
+            "stale_before": {"type":"string","description":"YYYY-MM-DD HH:MM:SS; defaults to 24 hours before this call."},
+            "stale_only": {"type":"boolean","default":false},
+            "sla_risk": {"type":"string","enum":["any","healthy","at_risk","breached","unavailable"],"default":"any"},
+            "sla_at_risk_percentage": {"type":"number","minimum":0,"maximum":100,"default":80},
+            "sort_by": {"type":"string","enum":["priority","opened_at","updated_at","assignee","sla_risk"],"default":"priority"},
+            "sort_direction": {"type":"string","enum":["asc","desc"],"default":"asc"},
+            "limit": {"type":"integer","minimum":1,"maximum":200},
+            "offset": {"type":"integer","minimum":0},
+            "scan_limit": {"type":"integer","minimum":1,"maximum":5000},
+            "known_sys_ids": {"type":"array","maxItems":1000,"items":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}
         }
     })
 }

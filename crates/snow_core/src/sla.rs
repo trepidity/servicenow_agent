@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::{Record, TaskSla, TaskSlaStage, TaskSlaSummary};
 
 use crate::SnowCore;
+use crate::context::CoreContext;
 
 const TASK_SLA_APPLICABLE_TABLES: &[&str] = &[
     "task",
@@ -135,36 +136,43 @@ impl SnowCore {
         &self,
         parents: &[TaskSlaParentRef],
     ) -> Result<HashMap<String, TaskSlaStatus>> {
-        let task_ids: Vec<&str> = parents
-            .iter()
-            .filter(|parent| is_task_sla_applicable_table(&parent.record_table))
-            .map(|parent| parent.record_sys_id.as_str())
-            .collect();
-
-        let by_task = if task_ids.is_empty() {
-            HashMap::new()
-        } else {
-            self.ctx.client.task_slas_for_tasks(&task_ids).await?
-        };
-
-        let mut statuses = HashMap::with_capacity(parents.len());
-        for parent in parents {
-            let status = if is_task_sla_applicable_table(&parent.record_table) {
-                status_from_task_slas(
-                    parent.clone(),
-                    by_task
-                        .get(parent.record_sys_id.as_str())
-                        .cloned()
-                        .unwrap_or_default(),
-                )
-            } else {
-                status_without_rows(parent.clone(), TaskSlaReadability::NotApplicable)
-            };
-            statuses.insert(parent.record_sys_id.clone(), status);
-        }
-
-        Ok(statuses)
+        task_sla_statuses_for_parents(&self.ctx, parents).await
     }
+}
+
+pub(crate) async fn task_sla_statuses_for_parents(
+    ctx: &CoreContext,
+    parents: &[TaskSlaParentRef],
+) -> Result<HashMap<String, TaskSlaStatus>> {
+    let task_ids: Vec<&str> = parents
+        .iter()
+        .filter(|parent| is_task_sla_applicable_table(&parent.record_table))
+        .map(|parent| parent.record_sys_id.as_str())
+        .collect();
+
+    let by_task = if task_ids.is_empty() {
+        HashMap::new()
+    } else {
+        ctx.client.task_slas_for_tasks(&task_ids).await?
+    };
+
+    let mut statuses = HashMap::with_capacity(parents.len());
+    for parent in parents {
+        let status = if is_task_sla_applicable_table(&parent.record_table) {
+            status_from_task_slas(
+                parent.clone(),
+                by_task
+                    .get(parent.record_sys_id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        } else {
+            status_without_rows(parent.clone(), TaskSlaReadability::NotApplicable)
+        };
+        statuses.insert(parent.record_sys_id.clone(), status);
+    }
+
+    Ok(statuses)
 }
 
 /// Return whether a table is Task SLA applicable for the first consumer slice.

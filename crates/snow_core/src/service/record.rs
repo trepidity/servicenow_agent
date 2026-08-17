@@ -15,8 +15,8 @@
 //! `lib.rs` so external callers keep reaching them at `snow_core::*`.
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use chrono::{DateTime, Duration, Utc};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use servicenow_rs::prelude::{DisplayValue, Order, Record, child_relation_for_table};
 
@@ -26,10 +26,17 @@ use crate::query::filter::ListQuery;
 use crate::resource;
 use crate::{
     BUSINESS_APPLICATION_TABLE, DegradedReadDiagnostic, FieldChoice,
-    IncidentAssignmentGroupListInput, IncidentAssignmentGroupPage, RecordLookup,
+    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
+    INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
+    INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup, IncidentAssignmentGroupListInput,
+    IncidentAssignmentGroupOperationsError, IncidentAssignmentGroupPage,
+    IncidentAssignmentGroupQueueAggregates, IncidentAssignmentGroupQueueInput,
+    IncidentAssignmentGroupQueueItem, IncidentAssignmentGroupQueuePage, IncidentQueueSlaRisk,
+    IncidentQueueSortBy, IncidentQueueSortDirection, JournalEntry, RecordLookup,
     ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanQuerySummary, ResourcePlanResourceType, ResourceType, SERVER_RESOURCE_TYPE,
-    SERVER_TABLE, SearchResult, SearchScope, SnowRecord, TaskSelector, is_terminal_state,
+    SERVER_TABLE, SearchResult, SearchScope, SnowRecord, TaskSelector, TaskSlaParentRef,
+    TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, is_terminal_state,
     resolve_incident_state, resource_plan_record_from_row, sort_records_by_number,
     validate_incident_assignment_group_input, validate_list_input,
 };
@@ -53,6 +60,29 @@ const INCIDENT_GROUP_LIST_FIELDS: &[&str] = &[
     "assignment_group",
     "active",
     "sys_updated_on",
+];
+
+const INCIDENT_QUEUE_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "short_description",
+    "description",
+    "state",
+    "priority",
+    "impact",
+    "urgency",
+    "opened_at",
+    "assigned_to",
+    "assignment_group",
+    "caller_id",
+    "cmdb_ci",
+    "business_service",
+    "hold_reason",
+    "active",
+    "sys_updated_on",
+    "sys_mod_count",
+    "work_notes",
+    "comments",
 ];
 
 const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
@@ -262,6 +292,283 @@ fn servicenow_record_field_is_false(record: &Record, field_name: &str) -> bool {
 struct HydratedRecords {
     sys_ids: Vec<String>,
     active_scope_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedIncidentQueueInput {
+    limit: usize,
+    offset: usize,
+    scan_limit: usize,
+    known_sys_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedIncidentAssignee {
+    Unassigned,
+    User(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum IncidentSlaBucket {
+    Unavailable,
+    Healthy,
+    AtRisk,
+    Breached,
+}
+
+impl IncidentSlaBucket {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Healthy => "healthy",
+            Self::AtRisk => "at_risk",
+            Self::Breached => "breached",
+        }
+    }
+
+    fn matches(self, filter: IncidentQueueSlaRisk) -> bool {
+        matches!(filter, IncidentQueueSlaRisk::Any)
+            || matches!(
+                (self, filter),
+                (Self::Unavailable, IncidentQueueSlaRisk::Unavailable)
+                    | (Self::Healthy, IncidentQueueSlaRisk::Healthy)
+                    | (Self::AtRisk, IncidentQueueSlaRisk::AtRisk)
+                    | (Self::Breached, IncidentQueueSlaRisk::Breached)
+            )
+    }
+}
+
+fn incident_queue_invalid(message: impl Into<String>) -> anyhow::Error {
+    IncidentAssignmentGroupOperationsError::InvalidParams(message.into()).into()
+}
+
+fn validate_incident_queue_input(
+    input: &IncidentAssignmentGroupQueueInput,
+) -> Result<ValidatedIncidentQueueInput> {
+    if input.group.trim().is_empty() {
+        return Err(incident_queue_invalid("group must not be empty"));
+    }
+    let limit = input.limit.unwrap_or(INCIDENT_GROUP_LIST_DEFAULT_LIMIT);
+    if !(1..=INCIDENT_GROUP_LIST_MAX_LIMIT).contains(&limit) {
+        return Err(incident_queue_invalid(format!(
+            "limit must be between 1 and {INCIDENT_GROUP_LIST_MAX_LIMIT}"
+        )));
+    }
+    let offset = input.offset.unwrap_or(0);
+    let scan_limit = input
+        .scan_limit
+        .unwrap_or(INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT);
+    if !(1..=INCIDENT_QUEUE_MAX_SCAN_LIMIT).contains(&scan_limit) {
+        return Err(incident_queue_invalid(format!(
+            "scan_limit must be between 1 and {INCIDENT_QUEUE_MAX_SCAN_LIMIT}"
+        )));
+    }
+    if offset >= scan_limit {
+        return Err(incident_queue_invalid(
+            "offset must be smaller than scan_limit",
+        ));
+    }
+    if input.known_sys_ids.len() > INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS {
+        return Err(incident_queue_invalid(format!(
+            "known_sys_ids must contain at most {INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS} entries"
+        )));
+    }
+    if !input.sla_at_risk_percentage.is_finite()
+        || !(0.0..=100.0).contains(&input.sla_at_risk_percentage)
+    {
+        return Err(incident_queue_invalid(
+            "sla_at_risk_percentage must be between 0 and 100",
+        ));
+    }
+    if input
+        .priorities
+        .iter()
+        .any(|priority| !(1..=5).contains(priority))
+    {
+        return Err(incident_queue_invalid(
+            "priorities must contain only values from 1 through 5",
+        ));
+    }
+    for (name, value) in [
+        ("opened_after", input.opened_after.as_deref()),
+        ("opened_before", input.opened_before.as_deref()),
+        ("updated_since", input.updated_since.as_deref()),
+        ("updated_before", input.updated_before.as_deref()),
+        ("stale_before", input.stale_before.as_deref()),
+    ] {
+        if let Some(value) = value {
+            chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S").map_err(
+                |_| incident_queue_invalid(format!("{name} must use YYYY-MM-DD HH:MM:SS")),
+            )?;
+        }
+    }
+    let mut known_sys_ids = Vec::with_capacity(input.known_sys_ids.len());
+    let mut seen = HashSet::with_capacity(input.known_sys_ids.len());
+    for sys_id in &input.known_sys_ids {
+        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
+        if seen.insert(sys_id.clone()) {
+            known_sys_ids.push(sys_id);
+        }
+    }
+    Ok(ValidatedIncidentQueueInput {
+        limit,
+        offset,
+        scan_limit,
+        known_sys_ids,
+    })
+}
+
+fn resolve_incident_queue_group(
+    selector: &str,
+    groups: &[IncidentAssignmentGroup],
+) -> Result<IncidentAssignmentGroup> {
+    let selector = selector.trim();
+    let matches = groups
+        .iter()
+        .filter(|group| {
+            group.sys_id.eq_ignore_ascii_case(selector) || group.name.eq_ignore_ascii_case(selector)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [group] => Ok(group.clone()),
+        [] => Err(IncidentAssignmentGroupOperationsError::GroupNotFound {
+            requested: selector.to_string(),
+            available: groups.to_vec(),
+        }
+        .into()),
+        _ => Err(IncidentAssignmentGroupOperationsError::AmbiguousGroup {
+            requested: selector.to_string(),
+            matches,
+        }
+        .into()),
+    }
+}
+
+fn unavailable_incident_sla(record: &SnowRecord) -> TaskSlaStatus {
+    TaskSlaStatus {
+        record_number: record.number.clone(),
+        record_table: record.table.clone(),
+        record_sys_id: record.sys_id.clone(),
+        rows: Vec::new(),
+        summary: TaskSlaSummaryView {
+            total: 0,
+            active: 0,
+            breached: 0,
+            next_breach: None,
+            highest_business_elapsed: None,
+        },
+        readable: TaskSlaReadability::EmptyOrAclRestricted,
+    }
+}
+
+fn incident_sla_bucket(status: &TaskSlaStatus, threshold: f64) -> IncidentSlaBucket {
+    if status.readable != TaskSlaReadability::ReadableRows {
+        IncidentSlaBucket::Unavailable
+    } else if status.summary.breached > 0 {
+        IncidentSlaBucket::Breached
+    } else if status
+        .summary
+        .highest_business_elapsed
+        .is_some_and(|percentage| percentage >= threshold)
+    {
+        IncidentSlaBucket::AtRisk
+    } else {
+        IncidentSlaBucket::Healthy
+    }
+}
+
+fn latest_incident_activity(record: &SnowRecord) -> Option<JournalEntry> {
+    record
+        .work_notes
+        .iter()
+        .chain(record.comments.iter())
+        .max_by_key(|entry| entry.timestamp)
+        .cloned()
+}
+
+fn incident_field_value<'a>(record: &'a SnowRecord, field: &str) -> &'a str {
+    record
+        .fields
+        .get(field)
+        .map(|value| value.value.as_str())
+        .unwrap_or_default()
+}
+
+fn incident_assignee_label(record: &SnowRecord) -> &str {
+    record
+        .references
+        .get("assigned_to")
+        .map(|reference| reference.display_name.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unassigned")
+}
+
+fn sort_incident_queue_items(
+    items: &mut [IncidentAssignmentGroupQueueItem],
+    sort_by: IncidentQueueSortBy,
+    direction: IncidentQueueSortDirection,
+    sla_threshold: f64,
+) {
+    items.sort_by(|left, right| {
+        let ordering = match sort_by {
+            IncidentQueueSortBy::Priority => incident_field_value(&left.record, "priority")
+                .parse::<u8>()
+                .unwrap_or(u8::MAX)
+                .cmp(
+                    &incident_field_value(&right.record, "priority")
+                        .parse::<u8>()
+                        .unwrap_or(u8::MAX),
+                ),
+            IncidentQueueSortBy::OpenedAt => incident_field_value(&left.record, "opened_at")
+                .cmp(incident_field_value(&right.record, "opened_at")),
+            IncidentQueueSortBy::UpdatedAt => incident_field_value(&left.record, "sys_updated_on")
+                .cmp(incident_field_value(&right.record, "sys_updated_on")),
+            IncidentQueueSortBy::Assignee => incident_assignee_label(&left.record)
+                .to_ascii_lowercase()
+                .cmp(&incident_assignee_label(&right.record).to_ascii_lowercase()),
+            IncidentQueueSortBy::SlaRisk => incident_sla_bucket(&left.sla, sla_threshold)
+                .cmp(&incident_sla_bucket(&right.sla, sla_threshold)),
+        };
+        let ordering = match direction {
+            IncidentQueueSortDirection::Asc => ordering,
+            IncidentQueueSortDirection::Desc => ordering.reverse(),
+        };
+        ordering.then_with(|| left.record.sys_id.cmp(&right.record.sys_id))
+    });
+}
+
+fn incident_queue_aggregates(
+    items: &[IncidentAssignmentGroupQueueItem],
+    stale_before: &str,
+    sla_threshold: f64,
+    complete: bool,
+) -> IncidentAssignmentGroupQueueAggregates {
+    let mut aggregates = IncidentAssignmentGroupQueueAggregates {
+        complete,
+        ..Default::default()
+    };
+    for item in items {
+        *aggregates
+            .by_state
+            .entry(item.record.state.clone())
+            .or_default() += 1;
+        *aggregates
+            .by_priority
+            .entry(incident_field_value(&item.record, "priority").to_string())
+            .or_default() += 1;
+        let assignee = incident_assignee_label(&item.record).to_string();
+        *aggregates.by_assignee.entry(assignee).or_default() += 1;
+        let sla = incident_sla_bucket(&item.sla, sla_threshold).label();
+        *aggregates.by_sla_risk.entry(sla.to_string()).or_default() += 1;
+        if incident_assignee_label(&item.record) == "unassigned" {
+            aggregates.unassigned += 1;
+        }
+        if incident_field_value(&item.record, "sys_updated_on") < stale_before {
+            aggregates.stale += 1;
+        }
+    }
+    aggregates
 }
 
 #[derive(Clone)]
@@ -733,6 +1040,300 @@ impl RecordService {
             rows_inspected,
             state: resolved_state,
         })
+    }
+
+    /// Lists the authenticated user's active direct assignment-group memberships.
+    pub async fn incident_assignment_groups(&self) -> Result<Vec<IncidentAssignmentGroup>> {
+        const PAGE_SIZE: usize = 500;
+        const MAX_PAGES: usize = 20;
+
+        let user_sys_id = self.current_user_sys_id().await?;
+        let mut paginator = self
+            .ctx
+            .client
+            .table("sys_user_grmember")
+            .equals("user", &user_sys_id)
+            .fields(&["sys_id", "group"])
+            .dot_walk(&["group.name", "group.active"])
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .no_count()
+            .limit(500)
+            .paginate()?;
+        let mut groups = BTreeMap::new();
+        let mut pages = 0usize;
+        loop {
+            if pages >= MAX_PAGES {
+                if !paginator.is_done() {
+                    anyhow::bail!(
+                        "assignment-group membership lookup exceeded {} rows",
+                        PAGE_SIZE * MAX_PAGES
+                    );
+                }
+                break;
+            }
+            let Some(page) = paginator.next_page().await? else {
+                break;
+            };
+            pages += 1;
+            for row in page.records {
+                if row
+                    .get_str("group.active")
+                    .is_some_and(|active| matches!(active.trim(), "false" | "0"))
+                {
+                    continue;
+                }
+                let Some(sys_id) = row
+                    .get_raw("group")
+                    .or_else(|| row.get_str("group"))
+                    .and_then(|value| normalize_record_lookup_sys_id(value).ok())
+                else {
+                    continue;
+                };
+                let name = row
+                    .get_str("group.name")
+                    .or_else(|| row.get_display("group"))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&sys_id)
+                    .to_string();
+                groups
+                    .entry(sys_id.clone())
+                    .or_insert(IncidentAssignmentGroup { sys_id, name });
+            }
+        }
+
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.sys_id.cmp(&right.sys_id))
+        });
+        Ok(groups)
+    }
+
+    /// Returns a bounded operational queue for one authenticated-user group.
+    pub async fn incident_assignment_group_queue(
+        &self,
+        input: IncidentAssignmentGroupQueueInput,
+    ) -> Result<IncidentAssignmentGroupQueuePage> {
+        let validated = validate_incident_queue_input(&input)?;
+        let watermark_at = Utc::now();
+        let watermark = watermark_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let groups = self.incident_assignment_groups().await?;
+        let group = resolve_incident_queue_group(&input.group, &groups)?;
+        let resolved_state = match input.state.as_deref() {
+            Some(selector) => {
+                let choices = self.field_choices("incident", "state").await?;
+                Some(resolve_incident_state(selector, &choices)?)
+            }
+            None => None,
+        };
+        let assigned_to = match input.assigned_to.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(selector) if selector.eq_ignore_ascii_case("unassigned") => {
+                Some(ResolvedIncidentAssignee::Unassigned)
+            }
+            Some(selector) if selector.eq_ignore_ascii_case("me") => Some(
+                ResolvedIncidentAssignee::User(self.current_user_sys_id().await?),
+            ),
+            Some(selector) => {
+                let sys_id = match normalize_record_lookup_sys_id(selector) {
+                    Ok(sys_id) => sys_id,
+                    Err(_) => self.ctx.resolve_user_sys_id(selector).await?,
+                };
+                Some(ResolvedIncidentAssignee::User(sys_id))
+            }
+        };
+
+        let mut query = self
+            .ctx
+            .client
+            .table("incident")
+            .fields(INCIDENT_QUEUE_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .equals("assignment_group", &group.sys_id)
+            .equals("active", "true")
+            .order_by("sys_id", Order::Asc)
+            .no_count()
+            .limit(200);
+        if let Some(state) = resolved_state.as_ref() {
+            query = query.equals("state", &state.value);
+        }
+        if let Some(assignee) = assigned_to.as_ref() {
+            query = match assignee {
+                ResolvedIncidentAssignee::Unassigned => query.is_empty_field("assigned_to"),
+                ResolvedIncidentAssignee::User(sys_id) => query.equals("assigned_to", sys_id),
+            };
+        }
+        let priority_values = input
+            .priorities
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>();
+        let priority_refs = priority_values
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !priority_refs.is_empty() {
+            query = query.in_list("priority", &priority_refs);
+        }
+        if let Some(value) = input.opened_after.as_deref() {
+            query = query.greater_than("opened_at", value);
+        }
+        if let Some(value) = input.opened_before.as_deref() {
+            query = query.less_than("opened_at", value);
+        }
+        if let Some(value) = input.updated_since.as_deref() {
+            query = query.greater_than("sys_updated_on", value);
+        }
+        if let Some(value) = input.updated_before.as_deref() {
+            query = query.less_than("sys_updated_on", value);
+        }
+        let stale_before = input.stale_before.clone().unwrap_or_else(|| {
+            (watermark_at - Duration::hours(24))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        });
+        if input.stale_only {
+            query = query.less_than("sys_updated_on", &stale_before);
+        }
+
+        let mut paginator = query.paginate()?;
+        let mut rows = Vec::with_capacity(validated.scan_limit.min(500));
+        let mut scan_complete = false;
+        while rows.len() < validated.scan_limit {
+            let Some(page) = paginator.next_page().await? else {
+                scan_complete = true;
+                break;
+            };
+            let remaining = validated.scan_limit - rows.len();
+            let page_len = page.records.len();
+            rows.extend(page.records.into_iter().take(remaining));
+            if page_len > remaining {
+                break;
+            }
+            if paginator.is_done() {
+                scan_complete = true;
+                break;
+            }
+        }
+
+        let rows_scanned = rows.len();
+        let records = rows
+            .iter()
+            .filter(|row| servicenow_record_is_open_user_work(row))
+            .map(resource::incident::IncidentResource::from_servicenow)
+            .collect::<Vec<_>>();
+        let parents = records
+            .iter()
+            .map(|record| TaskSlaParentRef {
+                record_number: record.number.clone(),
+                record_table: "incident".to_string(),
+                record_sys_id: record.sys_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut statuses = crate::sla::task_sla_statuses_for_parents(&self.ctx, &parents).await?;
+        let mut items = records
+            .into_iter()
+            .map(|record| {
+                let latest_activity = latest_incident_activity(&record);
+                let sla = statuses
+                    .remove(&record.sys_id)
+                    .unwrap_or_else(|| unavailable_incident_sla(&record));
+                IncidentAssignmentGroupQueueItem {
+                    record,
+                    sla,
+                    latest_activity,
+                }
+            })
+            .filter(|item| {
+                incident_sla_bucket(&item.sla, input.sla_at_risk_percentage).matches(input.sla_risk)
+            })
+            .collect::<Vec<_>>();
+
+        sort_incident_queue_items(
+            &mut items,
+            input.sort_by,
+            input.sort_direction,
+            input.sla_at_risk_percentage,
+        );
+        let aggregates = incident_queue_aggregates(
+            &items,
+            &stale_before,
+            input.sla_at_risk_percentage,
+            scan_complete,
+        );
+        let filtered_len = items.len();
+        let page_items = items
+            .into_iter()
+            .skip(validated.offset)
+            .take(validated.limit)
+            .collect::<Vec<_>>();
+        let consumed = validated.offset.saturating_add(page_items.len());
+        let next_offset = (consumed < filtered_len).then_some(consumed);
+        let complete = scan_complete && next_offset.is_none();
+        let departed_sys_ids = self
+            .incident_departures(&group.sys_id, &validated.known_sys_ids)
+            .await?;
+
+        Ok(IncidentAssignmentGroupQueuePage {
+            group,
+            items: page_items,
+            offset: validated.offset,
+            next_offset,
+            complete,
+            scan_complete,
+            rows_scanned,
+            watermark,
+            departed_sys_ids,
+            aggregates,
+        })
+    }
+
+    async fn incident_departures(
+        &self,
+        group_sys_id: &str,
+        known_sys_ids: &[String],
+    ) -> Result<Vec<String>> {
+        if known_sys_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut returned = HashMap::with_capacity(known_sys_ids.len());
+        for chunk in known_sys_ids.chunks(100) {
+            let refs = chunk.iter().map(String::as_str).collect::<Vec<_>>();
+            let result = self
+                .ctx
+                .client
+                .table("incident")
+                .in_list("sys_id", &refs)
+                .fields(&["sys_id", "state", "active", "assignment_group"])
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .limit(u32::try_from(chunk.len())?)
+                .execute()
+                .await?;
+            for row in result.records {
+                returned.insert(row.sys_id.clone(), row);
+            }
+        }
+
+        let mut departed = known_sys_ids
+            .iter()
+            .filter(|sys_id| {
+                returned.get(*sys_id).is_none_or(|row| {
+                    row.get_raw("assignment_group")
+                        .or_else(|| row.get_str("assignment_group"))
+                        != Some(group_sys_id)
+                        || !servicenow_record_is_open_user_work(row)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        departed.sort();
+        Ok(departed)
     }
 
     pub async fn my_projects(&self) -> Result<Vec<SnowRecord>> {
@@ -2876,6 +3477,248 @@ mod tests {
             .query_pairs()
             .find(|(name, _)| name == key)
             .map(|(_, value)| value.into_owned())
+    }
+
+    /// L0 core consumer seam: an operator sees only active direct group
+    /// memberships, with independently supplied names suitable for selecting a
+    /// queue. Removing the membership lookup or returning inactive groups makes
+    /// this fail.
+    #[tokio::test]
+    async fn incident_assignment_group_operations_discovers_active_memberships() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+        let user_sys_id = "0000000000000000000000000000ac01";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(query_param("sysparm_query", "user_name=test_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": user_sys_id,
+                    "user_name": "test_user",
+                    "name": "Example Operator"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_grmember"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("user={user_sys_id}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "sys_id": "0000000000000000000000000000ad01",
+                        "group": { "value": TEST_GROUP_SYS_ID, "display_value": "Example Operations" },
+                        "group.name": "Example Operations",
+                        "group.active": "true"
+                    },
+                    {
+                        "sys_id": "0000000000000000000000000000ad02",
+                        "group": { "value": "0000000000000000000000000000ab02", "display_value": "Retired Operations" },
+                        "group.name": "Retired Operations",
+                        "group.active": "false"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let groups = core
+            .incident_assignment_groups()
+            .await
+            .expect("active memberships");
+
+        assert_eq!(
+            groups,
+            vec![IncidentAssignmentGroup {
+                sys_id: TEST_GROUP_SYS_ID.to_string(),
+                name: "Example Operations".to_string(),
+            }]
+        );
+    }
+
+    /// L0 core consumer seam: a team lead receives a membership-scoped queue
+    /// ordered by SLA risk with context and literal handoff counts. Removing
+    /// the SLA enrichment, operational projection, sort, or aggregation makes
+    /// this fail.
+    #[tokio::test]
+    async fn incident_assignment_group_operations_returns_triage_context_and_handoff_counts() {
+        let _guard = mock_server_test_lock().await;
+        let server = MockServer::start().await;
+        let user_sys_id = "0000000000000000000000000000ac01";
+        let incident_one = "0000000000000000000000000000ae01";
+        let incident_two = "0000000000000000000000000000ae02";
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{ "sys_id": user_sys_id, "user_name": "test_user", "name": "Example Operator" }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_grmember"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "0000000000000000000000000000ad01",
+                    "group": { "value": TEST_GROUP_SYS_ID, "display_value": "Example Operations" },
+                    "group.name": "Example Operations",
+                    "group.active": "true"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param_contains(
+                "sysparm_query",
+                format!("assignment_group={TEST_GROUP_SYS_ID}"),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "sys_id": incident_one,
+                        "number": "INC0000101",
+                        "short_description": "Customer cannot sign in",
+                        "description": "Authentication fails for the customer.",
+                        "state": { "value": "1", "display_value": "New" },
+                        "priority": { "value": "3", "display_value": "3 - Moderate" },
+                        "impact": { "value": "2", "display_value": "2 - Medium" },
+                        "urgency": { "value": "2", "display_value": "2 - Medium" },
+                        "opened_at": "2026-08-17 08:00:00",
+                        "sys_updated_on": "2026-08-17 08:30:00",
+                        "sys_mod_count": "4",
+                        "active": "true",
+                        "assigned_to": "",
+                        "assignment_group": { "value": TEST_GROUP_SYS_ID, "display_value": "Example Operations" },
+                        "caller_id": { "value": "0000000000000000000000000000af01", "display_value": "Example Caller" },
+                        "cmdb_ci": { "value": "0000000000000000000000000000af02", "display_value": "Example Service CI" },
+                        "business_service": { "value": "0000000000000000000000000000af03", "display_value": "Example Service" },
+                        "hold_reason": "",
+                        "work_notes": "2026-08-17 08:25:00 - Example Operator (Work notes)\nInvestigating authentication.\n"
+                    },
+                    {
+                        "sys_id": incident_two,
+                        "number": "INC0000102",
+                        "short_description": "Critical service interruption",
+                        "description": "A shared service is unavailable.",
+                        "state": { "value": "2", "display_value": "In Progress" },
+                        "priority": { "value": "1", "display_value": "1 - Critical" },
+                        "impact": { "value": "1", "display_value": "1 - High" },
+                        "urgency": { "value": "1", "display_value": "1 - High" },
+                        "opened_at": "2026-08-17 07:00:00",
+                        "sys_updated_on": "2026-08-17 08:40:00",
+                        "sys_mod_count": "7",
+                        "active": "true",
+                        "assigned_to": { "value": user_sys_id, "display_value": "Example Operator" },
+                        "assignment_group": { "value": TEST_GROUP_SYS_ID, "display_value": "Example Operations" },
+                        "caller_id": { "value": "0000000000000000000000000000af04", "display_value": "Example Caller Two" },
+                        "cmdb_ci": { "value": "0000000000000000000000000000af05", "display_value": "Example Shared CI" },
+                        "business_service": { "value": "0000000000000000000000000000af06", "display_value": "Example Shared Service" },
+                        "hold_reason": "",
+                        "work_notes": ""
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/task_sla"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    {
+                        "sys_id": "0000000000000000000000000000b001",
+                        "task": { "value": incident_one, "display_value": "INC0000101" },
+                        "sla": { "value": "0000000000000000000000000000b101", "display_value": "Response SLA" },
+                        "stage": "in_progress",
+                        "active": "true",
+                        "has_breached": "true",
+                        "planned_end_time": "2026-08-17 08:20:00",
+                        "business_percentage": "110"
+                    },
+                    {
+                        "sys_id": "0000000000000000000000000000b002",
+                        "task": { "value": incident_two, "display_value": "INC0000102" },
+                        "sla": { "value": "0000000000000000000000000000b102", "display_value": "Resolution SLA" },
+                        "stage": "in_progress",
+                        "active": "true",
+                        "has_breached": "false",
+                        "planned_end_time": "2026-08-17 09:00:00",
+                        "business_percentage": "85"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let departed_incident = "0000000000000000000000000000d001";
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .and(query_param_contains("sysparm_query", departed_incident))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": departed_incident,
+                    "state": {"value":"2","display_value":"In Progress"},
+                    "active": "true",
+                    "assignment_group": {"value":"0000000000000000000000000000d999","display_value":"Another Group"}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let page = core
+            .incident_assignment_group_queue(IncidentAssignmentGroupQueueInput {
+                group: "example operations".to_string(),
+                sort_by: IncidentQueueSortBy::SlaRisk,
+                sort_direction: IncidentQueueSortDirection::Desc,
+                limit: Some(10),
+                updated_since: Some("2026-08-17 08:00:00".to_string()),
+                known_sys_ids: vec![departed_incident.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("operational queue");
+
+        assert_eq!(page.group.sys_id, TEST_GROUP_SYS_ID);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].record.number, "INC0000101");
+        assert_eq!(page.items[0].sla.summary.breached, 1);
+        assert_eq!(
+            page.items[0]
+                .record
+                .references
+                .get("caller_id")
+                .map(|reference| reference.display_name.as_str()),
+            Some("Example Caller")
+        );
+        assert_eq!(
+            page.items[0]
+                .latest_activity
+                .as_ref()
+                .map(|activity| activity.body.as_str()),
+            Some("Investigating authentication.")
+        );
+        assert_eq!(page.aggregates.by_priority.get("1"), Some(&1));
+        assert_eq!(page.aggregates.by_priority.get("3"), Some(&1));
+        assert_eq!(page.aggregates.by_sla_risk.get("breached"), Some(&1));
+        assert_eq!(page.aggregates.by_sla_risk.get("at_risk"), Some(&1));
+        assert_eq!(page.aggregates.unassigned, 1);
+        assert!(page.scan_complete);
+        assert!(page.complete);
+        assert_eq!(page.departed_sys_ids, vec![departed_incident]);
+        assert!(page.watermark.as_str() >= "2026-08-17 08:00:00");
     }
 
     /// A caller can page an entire assignment group: pages are `sys_id`-ordered,

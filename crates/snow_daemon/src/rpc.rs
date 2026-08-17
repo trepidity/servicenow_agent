@@ -87,6 +87,8 @@ pub enum RpcMethod {
     BusinessApplicationFields,
     ResourcePlanList,
     IncidentListByAssignmentGroup,
+    IncidentAssignmentGroups,
+    IncidentAssignmentGroupQueue,
     ServerGet,
     ServerGetFresh,
     ServerSearch,
@@ -155,6 +157,8 @@ pub enum RpcMethod {
     ChangeTaskApplyCreate,
     ChangeTaskPlanUpdate,
     ChangeTaskApplyUpdate,
+    IncidentPlanUpdate,
+    IncidentApplyUpdate,
     ResourcePlanPlanCreate,
     ResourcePlanApplyCreate,
     ResourcePlanPlanUpdate,
@@ -204,6 +208,8 @@ impl RpcMethod {
             "business_application_fields" => Self::BusinessApplicationFields,
             "resource_plan_list" => Self::ResourcePlanList,
             "incident_list_by_assignment_group" => Self::IncidentListByAssignmentGroup,
+            "incident_assignment_groups" => Self::IncidentAssignmentGroups,
+            "incident_assignment_group_queue" => Self::IncidentAssignmentGroupQueue,
             "server_get" => Self::ServerGet,
             "server_get_fresh" => Self::ServerGetFresh,
             "server_search" => Self::ServerSearch,
@@ -272,6 +278,8 @@ impl RpcMethod {
             "change_task_apply_create" => Self::ChangeTaskApplyCreate,
             "change_task_plan_update" => Self::ChangeTaskPlanUpdate,
             "change_task_apply_update" => Self::ChangeTaskApplyUpdate,
+            "incident_plan_update" => Self::IncidentPlanUpdate,
+            "incident_apply_update" => Self::IncidentApplyUpdate,
             "resource_plan_plan_create" => Self::ResourcePlanPlanCreate,
             "resource_plan_apply_create" => Self::ResourcePlanApplyCreate,
             "resource_plan_plan_update" => Self::ResourcePlanPlanUpdate,
@@ -900,6 +908,30 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
                         }),
                     ),
                     Err(err) => incident_group_list_error_response(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        RpcMethod::IncidentAssignmentGroups => {
+            match state.core.incident_assignment_groups().await {
+                Ok(groups) => JsonRpcResponse::ok(id, json!({"groups": groups})),
+                Err(err) => internal_error(id, err),
+            }
+        }
+        RpcMethod::IncidentAssignmentGroupQueue => {
+            match serde_json::from_value::<snow_core::IncidentAssignmentGroupQueueInput>(
+                request.params.clone(),
+            ) {
+                Ok(params) => match state.core.incident_assignment_group_queue(params).await {
+                    Ok(page) => JsonRpcResponse::ok(id, json!(page)),
+                    Err(err)
+                        if err
+                            .downcast_ref::<snow_core::IncidentAssignmentGroupOperationsError>()
+                            .is_some() =>
+                    {
+                        invalid_params(id, err)
+                    }
+                    Err(err) => internal_error(id, err),
                 },
                 Err(err) => invalid_params(id, err),
             }
@@ -1598,14 +1630,16 @@ async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcR
         RpcMethod::ChangeRequestPlanCreate
         | RpcMethod::ChangeRequestPlanUpdate
         | RpcMethod::ChangeTaskPlanCreate
-        | RpcMethod::ChangeTaskPlanUpdate => {
+        | RpcMethod::ChangeTaskPlanUpdate
+        | RpcMethod::IncidentPlanUpdate => {
             crate::change_write::handle_change_plan(id, &request.method, &request.params, state)
                 .await
         }
         RpcMethod::ChangeRequestApplyCreate
         | RpcMethod::ChangeRequestApplyUpdate
         | RpcMethod::ChangeTaskApplyCreate
-        | RpcMethod::ChangeTaskApplyUpdate => {
+        | RpcMethod::ChangeTaskApplyUpdate
+        | RpcMethod::IncidentApplyUpdate => {
             crate::change_write::handle_change_apply(id, &request.method, &request.params, state)
                 .await
         }
@@ -1740,6 +1774,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_fields",
     "resource_plan_list",
     "incident_list_by_assignment_group",
+    "incident_assignment_groups",
+    "incident_assignment_group_queue",
     "server_get",
     "server_get_fresh",
     "server_search",
@@ -1800,6 +1836,8 @@ const SUPPORTED_RPC_METHODS: &[&str] = &[
     "change_task_apply_create",
     "change_task_plan_update",
     "change_task_apply_update",
+    "incident_plan_update",
+    "incident_apply_update",
     "resource_plan_plan_create",
     "resource_plan_apply_create",
     "resource_plan_plan_update",
@@ -3822,7 +3860,11 @@ mod tests {
 
     fn enabled_change_update_mcp_config() -> snow_mcp::McpConfig {
         let mut policy = snow_mcp::domain::policy::PolicyConfig::default();
-        for tool in ["change_request_apply_update", "change_task_apply_update"] {
+        for tool in [
+            "change_request_apply_update",
+            "change_task_apply_update",
+            "incident_apply_update",
+        ] {
             policy
                 .tools
                 .get_mut(tool)
@@ -3852,6 +3894,67 @@ mod tests {
                 "sys_mod_count": "1"
             }]
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incident_plan_update_normalizes_unassign_and_issues_concurrency() {
+        let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+            json!({
+                "result": [{
+                    "sys_id": "0000000000000000000000000000e101",
+                    "number": "INC0000101",
+                    "short_description": "Example incident",
+                    "description": "Example operational issue",
+                    "state": {"value":"2","display_value":"In Progress"},
+                    "active": "true",
+                    "sys_updated_on": "2026-08-17 10:11:12",
+                    "sys_mod_count": "4"
+                }]
+            }),
+            json!({"result": []}),
+        ])
+        .await
+        .expect("http server");
+        let fixture = build_fixture_state_at_instance(&instance_url)
+            .await
+            .expect("fixture");
+        let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture.tempdir.path().join("incident-plan-update"),
+            enabled_change_update_mcp_config(),
+        ));
+
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "incident_plan_update".to_string(),
+                params: json!({
+                    "number": "INC0000101",
+                    "assigned_to": "unassigned",
+                    "work_notes": "Released for team reassignment."
+                }),
+                id: Some(json!(1)),
+            },
+            &state,
+        )
+        .await;
+
+        assert!(response.error.is_none(), "{response:?}");
+        let result = response.result.expect("incident plan");
+        assert_eq!(result["preview"]["assigned_to"], json!(""));
+        assert_eq!(
+            result["preview"]["work_notes"],
+            json!("Released for team reassignment.")
+        );
+        assert_eq!(
+            result["concurrency_token"],
+            json!({
+                "sys_updated_on": "2026-08-17 10:11:12",
+                "sys_mod_count": 4
+            })
+        );
+        assert!(result["confirmation_token"].as_str().is_some());
+        assert!(result["idempotency_key"].as_str().is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

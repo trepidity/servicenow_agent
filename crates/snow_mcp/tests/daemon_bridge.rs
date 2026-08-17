@@ -220,8 +220,14 @@ async fn bridge_forwards_generic_get_record_table_sys_id_lookup() {
     let result = response.result.expect("MCP tool result");
     assert_eq!(
         result["structuredContent"],
-        incident_group_page_payload(),
-        "the bridge must preserve the daemon's page contract"
+        json!({
+            "record": {
+                "number": "UNKNOWN",
+                "table": "change_request",
+                "sys_id": "0123456789abcdef0123456789abcdef"
+            }
+        }),
+        "the bridge must preserve the daemon's record contract"
     );
     assert_eq!(
         result["content"][0]["type"],
@@ -472,6 +478,37 @@ async fn bridge_forwards_incident_group_page_params_unchanged() {
     let calls = daemon.calls.lock().await;
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0, "incident_list_by_assignment_group");
+    assert_eq!(calls[1].1, arguments);
+}
+
+#[tokio::test]
+async fn bridge_forwards_operational_incident_queue_params_unchanged() {
+    let daemon = MockDaemon::new(contract(&[
+        "contract_info",
+        "incident_assignment_group_queue",
+    ]));
+    let server = bridge(daemon.clone());
+    let arguments = json!({
+        "group": "Example Operations",
+        "assigned_to": "unassigned",
+        "sla_risk": "at_risk",
+        "updated_since": "2026-08-17 10:00:00",
+        "known_sys_ids": ["0000000000000000000000000000ab01"]
+    });
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "incident_assignment_group_queue",
+                "arguments": arguments.clone()
+            }),
+        ))
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let calls = daemon.calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "incident_assignment_group_queue");
     assert_eq!(calls[1].1, arguments);
 }
 

@@ -1,10 +1,11 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
+use std::collections::BTreeMap;
 
 use crate::{
     CacheSource, FieldChoice, FieldValue, JournalEntry, RecordRef, Reference, ResourceType,
-    SnowRecord, normalize_record_lookup_sys_id,
+    SnowRecord, TaskSlaStatus, normalize_record_lookup_sys_id,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -17,6 +18,20 @@ impl IncidentResource {
         model.table = "incident".to_string();
         model.synced_at = Utc::now();
         model.source = CacheSource::Api;
+        for (field, reference) in [
+            ("caller_id", Self::caller_reference(record)),
+            ("assigned_to", Self::assigned_to_reference(record)),
+            ("assignment_group", Self::assignment_group_reference(record)),
+            ("cmdb_ci", Self::ci_reference(record)),
+            (
+                "business_service",
+                reference_from_record(record, "business_service", "cmdb_ci_service"),
+            ),
+        ] {
+            if let Some(reference) = reference {
+                model.references.insert(field.to_string(), reference);
+            }
+        }
         model
     }
 
@@ -123,6 +138,202 @@ pub const INCIDENT_GROUP_LIST_DEFAULT_LIMIT: usize = 50;
 ///
 /// Authority: `docs/spec-incident-list-by-assignment-group.md#decision-gaps-and-blockers`.
 pub const INCIDENT_GROUP_LIST_MAX_LIMIT: usize = 200;
+
+/// Default upper bound for the live Incident rows inspected by an operational
+/// assignment-group queue call.
+pub const INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT: usize = 2_000;
+
+/// Hard upper bound for one operational queue scan.
+pub const INCIDENT_QUEUE_MAX_SCAN_LIMIT: usize = 5_000;
+
+/// Largest caller baseline accepted for departure detection.
+pub const INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS: usize = 1_000;
+
+/// One active direct assignment-group membership for the authenticated user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAssignmentGroup {
+    pub sys_id: String,
+    pub name: String,
+}
+
+/// Sort field for the bounded operational queue.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentQueueSortBy {
+    #[default]
+    Priority,
+    OpenedAt,
+    UpdatedAt,
+    Assignee,
+    SlaRisk,
+}
+
+/// Sort direction for the bounded operational queue.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentQueueSortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// Optional SLA bucket filter.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentQueueSlaRisk {
+    #[default]
+    Any,
+    Healthy,
+    AtRisk,
+    Breached,
+    Unavailable,
+}
+
+/// Bounded, membership-scoped operational Incident queue input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentAssignmentGroupQueueInput {
+    /// Exact group sys_id or exact case-insensitive name from the caller's
+    /// active direct memberships.
+    pub group: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    /// `me`, `unassigned`, a sys_id, username, or email.
+    #[serde(default)]
+    pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub priorities: Vec<u8>,
+    #[serde(default)]
+    pub opened_after: Option<String>,
+    #[serde(default)]
+    pub opened_before: Option<String>,
+    #[serde(default)]
+    pub updated_since: Option<String>,
+    #[serde(default)]
+    pub updated_before: Option<String>,
+    /// Threshold used by the stale bucket. Defaults to 24 hours before the
+    /// queue call's watermark.
+    #[serde(default)]
+    pub stale_before: Option<String>,
+    #[serde(default)]
+    pub stale_only: bool,
+    #[serde(default)]
+    pub sla_risk: IncidentQueueSlaRisk,
+    #[serde(default = "default_sla_at_risk_percentage")]
+    pub sla_at_risk_percentage: f64,
+    #[serde(default)]
+    pub sort_by: IncidentQueueSortBy,
+    #[serde(default)]
+    pub sort_direction: IncidentQueueSortDirection,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub scan_limit: Option<usize>,
+    /// Caller baseline used to detect records that left the queue.
+    #[serde(default)]
+    pub known_sys_ids: Vec<String>,
+}
+
+fn default_sla_at_risk_percentage() -> f64 {
+    80.0
+}
+
+impl Default for IncidentAssignmentGroupQueueInput {
+    fn default() -> Self {
+        Self {
+            group: String::new(),
+            state: None,
+            assigned_to: None,
+            priorities: Vec::new(),
+            opened_after: None,
+            opened_before: None,
+            updated_since: None,
+            updated_before: None,
+            stale_before: None,
+            stale_only: false,
+            sla_risk: IncidentQueueSlaRisk::Any,
+            sla_at_risk_percentage: default_sla_at_risk_percentage(),
+            sort_by: IncidentQueueSortBy::Priority,
+            sort_direction: IncidentQueueSortDirection::Asc,
+            limit: None,
+            offset: None,
+            scan_limit: None,
+            known_sys_ids: Vec::new(),
+        }
+    }
+}
+
+/// One queue row with operational SLA and latest-activity context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IncidentAssignmentGroupQueueItem {
+    pub record: SnowRecord,
+    pub sla: TaskSlaStatus,
+    pub latest_activity: Option<JournalEntry>,
+}
+
+/// Handoff counts over the bounded filtered queue set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAssignmentGroupQueueAggregates {
+    pub by_state: BTreeMap<String, usize>,
+    pub by_priority: BTreeMap<String, usize>,
+    pub by_assignee: BTreeMap<String, usize>,
+    pub by_sla_risk: BTreeMap<String, usize>,
+    pub unassigned: usize,
+    pub stale: usize,
+    /// False when the configured scan limit was reached before ServiceNow's
+    /// result set was exhausted.
+    pub complete: bool,
+}
+
+/// Operational assignment-group queue response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IncidentAssignmentGroupQueuePage {
+    pub group: IncidentAssignmentGroup,
+    pub items: Vec<IncidentAssignmentGroupQueueItem>,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub complete: bool,
+    pub scan_complete: bool,
+    pub rows_scanned: usize,
+    pub watermark: String,
+    pub departed_sys_ids: Vec<String>,
+    pub aggregates: IncidentAssignmentGroupQueueAggregates,
+}
+
+/// Structured selector and input failures for assignment-group operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncidentAssignmentGroupOperationsError {
+    InvalidParams(String),
+    GroupNotFound {
+        requested: String,
+        available: Vec<IncidentAssignmentGroup>,
+    },
+    AmbiguousGroup {
+        requested: String,
+        matches: Vec<IncidentAssignmentGroup>,
+    },
+}
+
+impl std::fmt::Display for IncidentAssignmentGroupOperationsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParams(message) => formatter.write_str(message),
+            Self::GroupNotFound { requested, .. } => {
+                write!(
+                    formatter,
+                    "assignment group `{requested}` is not an active membership"
+                )
+            }
+            Self::AmbiguousGroup { requested, .. } => {
+                write!(formatter, "assignment group `{requested}` is ambiguous")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IncidentAssignmentGroupOperationsError {}
 
 /// Caller-supplied arguments for
 /// `SnowCore::incident_list_by_assignment_group`.

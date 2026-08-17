@@ -523,6 +523,17 @@ impl WriteService {
         .await
     }
 
+    /// Updates an Incident through the same refetch-and-concurrency contract
+    /// used by governed Change writes.
+    pub async fn update_incident(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.update_change_write_record("incident", sys_id, payload)
+            .await
+    }
+
     pub async fn create_resource_plan(
         &self,
         payload: serde_json::Value,

@@ -207,6 +207,10 @@ impl McpServer {
                 self.call_incident_list_by_assignment_group(id, params)
                     .await
             }
+            "incident_assignment_groups" => self.call_incident_assignment_groups(id).await,
+            "incident_assignment_group_queue" => {
+                self.call_incident_assignment_group_queue(id, params).await
+            }
             "story_get" => self.call_get_record_number(id, params).await,
             "story_tasks_list" => self.call_get_children(id, params).await,
             "timecard_list" => self.call_timecard_list(id, params).await,
@@ -968,6 +972,40 @@ impl McpServer {
                 ),
                 None => service_failure(id, err),
             },
+        }
+    }
+
+    async fn call_incident_assignment_groups(&self, id: Option<Value>) -> JsonRpcResponse {
+        match self.core.incident_assignment_groups().await {
+            Ok(groups) => JsonRpcResponse::ok(id, json!({"groups": groups})),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
+    async fn call_incident_assignment_group_queue(
+        &self,
+        id: Option<Value>,
+        params: &Value,
+    ) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let parsed: snow_core::IncidentAssignmentGroupQueueInput =
+            match serde_json::from_value(arguments) {
+                Ok(parsed) => parsed,
+                Err(err) => return invalid_params(id, err),
+            };
+        match self.core.incident_assignment_group_queue(parsed).await {
+            Ok(page) => JsonRpcResponse::ok(id, json!(page)),
+            Err(err)
+                if err
+                    .downcast_ref::<snow_core::IncidentAssignmentGroupOperationsError>()
+                    .is_some() =>
+            {
+                invalid_params(id, err)
+            }
+            Err(err) => service_failure(id, err),
         }
     }
 

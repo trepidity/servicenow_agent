@@ -33,6 +33,8 @@ pub const GOVERNED_CATALOG_TOOL_NAMES: &[&str] =
 pub const GOVERNED_APPROVAL_TOOL_NAMES: &[&str] = &["approval_approve", "approval_reject"];
 
 pub const GOVERNED_CHANGE_TOOL_NAMES: &[&str] = &[
+    "incident_plan_update",
+    "incident_apply_update",
     "change_request_plan_create",
     "change_request_apply_create",
     "change_request_plan_update",

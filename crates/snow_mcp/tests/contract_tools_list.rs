@@ -215,6 +215,71 @@ fn incident_list_by_assignment_group_is_a_bounded_read_tool() {
 }
 
 #[test]
+fn incident_assignment_group_operations_have_operational_and_governed_contracts() {
+    let registry = ToolRegistry::new();
+    let tools = registry.metadata();
+    let groups = tools
+        .iter()
+        .find(|tool| tool.name == "incident_assignment_groups")
+        .expect("group discovery registered");
+    assert!(groups.default_enabled);
+    assert!(!groups.requires_confirmation);
+
+    let queue = tools
+        .iter()
+        .find(|tool| tool.name == "incident_assignment_group_queue")
+        .expect("operational queue registered");
+    assert_eq!(queue.input_schema["required"], json!(["group"]));
+    assert_eq!(
+        queue.input_schema["properties"]["scan_limit"]["maximum"],
+        5000
+    );
+    assert_eq!(
+        queue.input_schema["properties"]["known_sys_ids"]["maxItems"],
+        1000
+    );
+
+    let plan = tools
+        .iter()
+        .find(|tool| tool.name == "incident_plan_update")
+        .expect("incident plan registered");
+    assert!(plan.default_enabled);
+    assert_eq!(
+        plan.input_schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "assigned_to",
+            "assignment_group",
+            "number",
+            "state",
+            "work_notes"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+
+    let apply = tools
+        .iter()
+        .find(|tool| tool.name == "incident_apply_update")
+        .expect("incident apply registered");
+    assert!(!apply.default_enabled);
+    assert!(apply.requires_confirmation);
+    assert!(
+        snow_mcp::domain::policy::PolicyConfig::read_only_default().tools["incident_apply_update"]
+            .field_allowlist
+            .iter()
+            .eq(["assigned_to", "assignment_group", "state", "work_notes"]
+                .iter()
+                .copied())
+    );
+}
+
+#[test]
 fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
     let registry = ToolRegistry::new();
     let tool = registry

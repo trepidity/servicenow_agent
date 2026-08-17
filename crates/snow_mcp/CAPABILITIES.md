@@ -40,6 +40,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Change request (`change_request`) | `change_request_apply_update` | **Update** | ❌ | yes | governed; daemon required; field allowlist |
 | Change task (`change_task`) | `change_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Change task (`change_task`) | `change_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; terminal records skipped by policy |
+| Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | governed; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`; concurrency checked |
 | Resource plan (`resource_plan`) | `resource_plan_apply_create` | **Create** | ❌ | yes | governed; daemon required; writes `task`,`group_resource` or `user_resource`,`resource_type`,`state`,`planned_hours`,`notes`,`start_date`,`end_date` |
 | Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `state`,`planned_hours`,`notes`,`start_date`,`end_date` only |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
@@ -47,6 +48,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_request_plan_create`, `change_request_plan_update`,
 `change_task_plan_create`, `change_task_plan_update`,
+`incident_plan_update`,
 `resource_plan_plan_create`, `resource_plan_plan_update`,
 `timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
@@ -124,7 +126,8 @@ work_record_ttl = "60m"
   `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`, `resource_plan_list`,
-  `incident_list_by_assignment_group`
+  `incident_list_by_assignment_group`, `incident_assignment_groups`,
+  `incident_assignment_group_queue`
 
 `list_my_approvals` is read-only and returns pending direct approvals plus
 pending approvals routed to direct `sys_user_group` memberships for the
@@ -193,6 +196,28 @@ one cursor page of *active* Incidents for a single assignment group.
 - **ACL:** authorization is ServiceNow's alone. The tool applies no
   assignment-group allowlist or other scope narrowing, so it returns exactly
   what the daemon credential is permitted to read.
+
+### Incident assignment-group operations
+
+- `incident_assignment_groups` discovers the authenticated user's active,
+  direct memberships and returns exact names plus sys_ids.
+- `incident_assignment_group_queue` requires one of those exact names or
+  sys_ids. It provides unassigned/assignee, priority, state, age/update,
+  staleness, and SLA filters; deterministic priority/opened/updated/assignee/SLA
+  sorting; caller, CI, service, impact, urgency, hold, latest-activity, and SLA
+  context; and state/priority/assignee/SLA, unassigned, and stale counts.
+- Queue scans are bounded (`scan_limit` defaults to 2,000 and is capped at
+  5,000). `scan_complete`, response `complete`, and aggregate `complete` remain
+  false when that bound prevents exhaustive results.
+- Delta polling passes the prior `watermark` as `updated_since` and the prior
+  row ids as `known_sys_ids`. Reassigned, inactive, terminal, deleted, or
+  unreadable baseline records appear in `departed_sys_ids`.
+- `incident_plan_update` previews claim (`assigned_to=me`), unassign,
+  membership-validated group transfer, exact state update, and work notes.
+  `incident_apply_update` requires its plan's confirmation, idempotency, and
+  concurrency tokens; it is disabled by default and requires the daemon.
+- `SNOW_INCIDENT_WRITE_KILL_SWITCH=1|true|yes` or the global
+  `SNOW_MCP_WRITE_KILL_SWITCH` denies Incident apply operations.
 
 - **Knowledge:** `search_knowledge`, `knowledge_search`, `kb_semantic_search`, `get_article`,
   `knowledge_fetch`, `knowledge_answer`, `knowledge_grounded_plan`, `list_knowledge_bases`,

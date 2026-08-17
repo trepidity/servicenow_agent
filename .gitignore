@@ -8,6 +8,7 @@ output/
 .superpowers/
 docs/**
 !docs/spec-incident-list-by-assignment-group.md
+!docs/spec-incident-assignment-group-operations.md
 .claude/**
 .claude/settings.local.json
 *.swp

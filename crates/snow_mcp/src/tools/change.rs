@@ -4,6 +4,24 @@ use serde_json::{Value, json};
 pub fn register(registry: &mut ToolRegistry) {
     add_tool(
         registry,
+        "incident_plan_update",
+        "Plan a governed Incident claim, unassign, group transfer, state update, or work note",
+        incident_plan_update_input_schema(),
+        plan_output_schema(true),
+        true,
+        false,
+    );
+    add_tool(
+        registry,
+        "incident_apply_update",
+        "Apply a confirmed, concurrency-safe Incident update plan",
+        apply_update_input_schema(),
+        receipt_output_schema(),
+        false,
+        true,
+    );
+    add_tool(
+        registry,
         "change_request_plan_create",
         "Plan creation of a governed Change Request",
         change_request_plan_create_input_schema(),
@@ -74,6 +92,21 @@ pub fn register(registry: &mut ToolRegistry) {
         false,
         true,
     );
+}
+
+fn incident_plan_update_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "number": {"type": "string", "pattern": "^INC\\d+$"},
+            "assigned_to": {"type": "string", "description": "Use me to claim, unassigned to clear, or an active user sys_id, username, or email."},
+            "assignment_group": {"type": "string", "description": "Exact active membership group name or sys_id."},
+            "state": {"type": "string", "description": "Exact state value or case-insensitive choice label."},
+            "work_notes": {"type": "string", "minLength": 1, "maxLength": 16000}
+        },
+        "required": ["number"]
+    })
 }
 
 fn add_tool(

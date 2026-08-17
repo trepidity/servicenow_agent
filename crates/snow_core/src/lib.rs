@@ -71,8 +71,13 @@ pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, Cat
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
 pub use resource::incident::{
     INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
-    IncidentAssignmentGroupListError, IncidentAssignmentGroupListInput,
-    IncidentAssignmentGroupPage, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
+    INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
+    INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup, IncidentAssignmentGroupListError,
+    IncidentAssignmentGroupListInput, IncidentAssignmentGroupOperationsError,
+    IncidentAssignmentGroupPage, IncidentAssignmentGroupQueueAggregates,
+    IncidentAssignmentGroupQueueInput, IncidentAssignmentGroupQueueItem,
+    IncidentAssignmentGroupQueuePage, IncidentQueueSlaRisk, IncidentQueueSortBy,
+    IncidentQueueSortDirection, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
     resolve_incident_state, validate_incident_assignment_group_input,
 };
 pub use resource::resource_plan::{

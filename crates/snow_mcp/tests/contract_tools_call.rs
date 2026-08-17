@@ -73,6 +73,8 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         "change_task_apply_create",
         "change_task_plan_update",
         "change_task_apply_update",
+        "incident_plan_update",
+        "incident_apply_update",
         "timecard_plan_set_hours",
         "timecard_apply_set_hours",
         "work_note_plan_add",
@@ -363,6 +365,26 @@ async fn foreground_incident_group_page_rejects_invalid_arguments() {
     ] {
         let response = raw_call(&server, "incident_list_by_assignment_group", arguments, id).await;
         assert_eq!(response.error.expect(why).code, -32602, "{why}");
+    }
+}
+
+#[tokio::test]
+async fn foreground_operational_incident_queue_rejects_invalid_arguments_before_io() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+
+    for (id, arguments) in [
+        (70, json!({})),
+        (71, json!({"group":""})),
+        (72, json!({"group":"Example Operations","priorities":[0]})),
+        (
+            73,
+            json!({"group":"Example Operations","updated_since":"yesterday"}),
+        ),
+        (74, json!({"group":"Example Operations","scan_limit":5001})),
+    ] {
+        let response = raw_call(&server, "incident_assignment_group_queue", arguments, id).await;
+        assert_eq!(response.error.expect("invalid queue input").code, -32602);
     }
 }
 

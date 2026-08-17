@@ -910,6 +910,11 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         ),
         ("approval_approve".to_string(), approval_action_policy()),
         ("approval_reject".to_string(), approval_action_policy()),
+        ("incident_plan_update".to_string(), change_plan_policy()),
+        (
+            "incident_apply_update".to_string(),
+            change_apply_policy(&["assigned_to", "assignment_group", "state", "work_notes"]),
+        ),
         (
             "change_request_plan_create".to_string(),
             change_plan_policy(),

@@ -388,6 +388,17 @@ impl SnowCore {
         self.records.incident_list_by_assignment_group(input).await
     }
 
+    pub async fn incident_assignment_groups(&self) -> Result<Vec<IncidentAssignmentGroup>> {
+        self.records.incident_assignment_groups().await
+    }
+
+    pub async fn incident_assignment_group_queue(
+        &self,
+        input: IncidentAssignmentGroupQueueInput,
+    ) -> Result<IncidentAssignmentGroupQueuePage> {
+        self.records.incident_assignment_group_queue(input).await
+    }
+
     pub async fn my_approvals_fresh(&self) -> Result<Vec<ApprovalRecord>> {
         self.approvals.my_approvals_fresh().await
     }
@@ -495,6 +506,14 @@ impl SnowCore {
         payload: serde_json::Value,
     ) -> Result<ChangeWriteResult> {
         self.writes.update_change_task(sys_id, payload).await
+    }
+
+    pub async fn update_incident(
+        &self,
+        sys_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<ChangeWriteResult> {
+        self.writes.update_incident(sys_id, payload).await
     }
 
     pub async fn create_resource_plan(

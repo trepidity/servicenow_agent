@@ -668,7 +668,7 @@ async fn build_plan_input(
                 concurrency_token: None,
             })
         }
-        "change_request_plan_update" | "change_task_plan_update" => {
+        "change_request_plan_update" | "change_task_plan_update" | "incident_plan_update" => {
             require_string(args, "number")?;
             let number = args
                 .get("number")
@@ -681,14 +681,16 @@ async fn build_plan_input(
                 .await
                 .map_err(PlanBuildError::Upstream)?
                 .ok_or_else(|| PlanBuildError::NotFound(format!("record {number} not found")))?;
-            require_table(
-                &record,
-                if tool == "change_request_plan_update" {
-                    "change_request"
-                } else {
-                    "change_task"
-                },
-            )?;
+            let expected_table = match tool {
+                "change_request_plan_update" => "change_request",
+                "change_task_plan_update" => "change_task",
+                "incident_plan_update" => "incident",
+                _ => unreachable!(),
+            };
+            require_table(&record, expected_table)?;
+            if tool == "incident_plan_update" {
+                normalize_incident_update_payload(&mut payload, state).await?;
+            }
             if state
                 .mcp_config
                 .policy
@@ -721,7 +723,7 @@ fn strip_non_writable_selector_fields(tool: &str, payload: &mut Value) {
         object.remove(*field);
     }
     match tool {
-        "change_request_plan_update" | "change_task_plan_update" => {
+        "change_request_plan_update" | "change_task_plan_update" | "incident_plan_update" => {
             object.remove("number");
         }
         "change_task_plan_create" => {
@@ -741,6 +743,118 @@ fn reject_cancel_state(payload: &Value) -> std::result::Result<(), PlanBuildErro
             "field": "state",
             "reason": "value_constrained",
         })]));
+    }
+    Ok(())
+}
+
+async fn normalize_incident_update_payload(
+    payload: &mut Value,
+    state: &DaemonState,
+) -> std::result::Result<(), PlanBuildError> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| PlanBuildError::Invalid("payload".to_string()))?;
+    let allowed = ["assigned_to", "assignment_group", "state", "work_notes"];
+    if !object.keys().any(|field| allowed.contains(&field.as_str())) {
+        return Err(PlanBuildError::FieldRejected(vec![json!({
+            "field": "changes",
+            "reason": "at_least_one_change_required",
+        })]));
+    }
+
+    if let Some(value) = object.get("assignment_group") {
+        let selector = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlanBuildError::Invalid("assignment_group".to_string()))?;
+        let groups = state
+            .core
+            .incident_assignment_groups()
+            .await
+            .map_err(PlanBuildError::Upstream)?;
+        let matches = groups
+            .iter()
+            .filter(|group| {
+                group.sys_id.eq_ignore_ascii_case(selector)
+                    || group.name.eq_ignore_ascii_case(selector)
+            })
+            .collect::<Vec<_>>();
+        let [group] = matches.as_slice() else {
+            return Err(PlanBuildError::FieldRejected(vec![json!({
+                "field": "assignment_group",
+                "reason": if matches.is_empty() { "not_an_active_membership" } else { "ambiguous_group" },
+            })]));
+        };
+        object.insert(
+            "assignment_group".to_string(),
+            Value::String(group.sys_id.clone()),
+        );
+    }
+
+    if let Some(value) = object.get("assigned_to") {
+        let selector = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlanBuildError::Invalid("assigned_to".to_string()))?;
+        let assignee = if selector.eq_ignore_ascii_case("unassigned") {
+            String::new()
+        } else if selector.eq_ignore_ascii_case("me") {
+            state
+                .core
+                .current_user_sys_id()
+                .await
+                .map_err(PlanBuildError::Upstream)?
+        } else {
+            let lookup = match snow_core::normalize_record_lookup_sys_id(selector) {
+                Ok(sys_id) => snow_core::UserLookup {
+                    sys_id: Some(sys_id),
+                    active: Some(true),
+                    ..Default::default()
+                },
+                Err(_) => snow_core::UserLookup {
+                    query: Some(selector.to_string()),
+                    active: Some(true),
+                    ..Default::default()
+                },
+            };
+            state
+                .core
+                .lookup_user(lookup)
+                .await
+                .map_err(PlanBuildError::Upstream)?
+                .map(|result| result.user.sys_id)
+                .ok_or_else(|| {
+                    PlanBuildError::FieldRejected(vec![json!({
+                        "field": "assigned_to",
+                        "reason": "active_user_not_found",
+                    })])
+                })?
+        };
+        object.insert("assigned_to".to_string(), Value::String(assignee));
+    }
+
+    if let Some(value) = object.get("state") {
+        let selector = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlanBuildError::Invalid("state".to_string()))?;
+        let choices = state
+            .core
+            .field_choices("incident", "state")
+            .await
+            .map_err(PlanBuildError::Upstream)?;
+        let state_choice = snow_core::resolve_incident_state(selector, &choices)
+            .map_err(|err| PlanBuildError::Upstream(err.into()))?;
+        object.insert("state".to_string(), Value::String(state_choice.value));
+    }
+
+    if let Some(value) = object.get("work_notes")
+        && value.as_str().is_none_or(|note| note.trim().is_empty())
+    {
+        return Err(PlanBuildError::Invalid("work_notes".to_string()));
     }
     Ok(())
 }
@@ -916,7 +1030,7 @@ fn blocked_fields_for_tool(tool: &str) -> BTreeSet<&'static str> {
     ]);
     if !matches!(
         tool,
-        "change_request_plan_update" | "change_task_plan_update"
+        "change_request_plan_update" | "change_task_plan_update" | "incident_plan_update"
     ) {
         blocked.insert("number");
     }
@@ -929,7 +1043,9 @@ fn metadata_fields() -> &'static [&'static str] {
 
 fn plan_selector_fields(tool: &str) -> &'static [&'static str] {
     match tool {
-        "change_request_plan_update" | "change_task_plan_update" => &["number"],
+        "change_request_plan_update" | "change_task_plan_update" | "incident_plan_update" => {
+            &["number"]
+        }
         "change_task_plan_create" => &["parent_change_number"],
         _ => &[],
     }
@@ -987,6 +1103,16 @@ async fn apply_plan(
             state
                 .core
                 .update_change_task(&target.sys_id, plan.planned_changes.clone())
+                .await
+        }
+        "incident_apply_update" => {
+            let target = plan
+                .target
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("incident update plan missing target"))?;
+            state
+                .core
+                .update_incident(&target.sys_id, plan.planned_changes.clone())
                 .await
         }
         _ => Err(anyhow::anyhow!("unsupported Change apply tool {tool}")),
@@ -1093,6 +1219,7 @@ fn apply_tool_for_plan_tool(tool: &str) -> &str {
         "change_request_plan_update" => "change_request_apply_update",
         "change_task_plan_create" => "change_task_apply_create",
         "change_task_plan_update" => "change_task_apply_update",
+        "incident_plan_update" => "incident_apply_update",
         other => other,
     }
 }
@@ -1100,14 +1227,22 @@ fn apply_tool_for_plan_tool(tool: &str) -> &str {
 fn is_update_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "change_request_apply_update" | "change_task_apply_update"
+        "change_request_apply_update" | "change_task_apply_update" | "incident_apply_update"
     )
 }
 
 fn is_kill_switched() -> bool {
-    std::env::var("SNOW_CHANGE_WRITE_KILL_SWITCH")
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    [
+        "SNOW_CHANGE_WRITE_KILL_SWITCH",
+        "SNOW_INCIDENT_WRITE_KILL_SWITCH",
+        "SNOW_MCP_WRITE_KILL_SWITCH",
+    ]
+    .into_iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
 }
 
 fn actor_from_params(params: &Value, state: &DaemonState) -> String {
@@ -1393,6 +1528,7 @@ fn service_now_table_for_apply_tool(tool: &str) -> &'static str {
     match tool {
         "change_request_apply_create" | "change_request_apply_update" => "change_request",
         "change_task_apply_create" | "change_task_apply_update" => "change_task",
+        "incident_apply_update" => "incident",
         _ => "unknown",
     }
 }
@@ -1400,7 +1536,9 @@ fn service_now_table_for_apply_tool(tool: &str) -> &'static str {
 fn service_now_operation_for_apply_tool(tool: &str) -> &'static str {
     match tool {
         "change_request_apply_create" | "change_task_apply_create" => "create",
-        "change_request_apply_update" | "change_task_apply_update" => "update",
+        "change_request_apply_update" | "change_task_apply_update" | "incident_apply_update" => {
+            "update"
+        }
         _ => "unknown",
     }
 }
@@ -1578,6 +1716,38 @@ mod tests {
 
     fn args(value: Value) -> Map<String, Value> {
         value.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn incident_update_is_governed_by_the_narrow_allowlist() {
+        let policy = snow_mcp::domain::policy::PolicyConfig::read_only_default();
+        let arguments = args(json!({
+            "number": "INC0000101",
+            "assigned_to": "me",
+            "assignment_group": "Example Operations",
+            "state": "In Progress",
+            "work_notes": "Claimed for investigation.",
+            "short_description": "must not be mutable here"
+        }));
+        let rejections = field_governance_rejections(
+            "incident_plan_update",
+            &arguments,
+            &policy,
+            FieldGovernanceMode::PlanInput,
+        );
+        assert_eq!(
+            rejections,
+            vec![json!({"field":"short_description","reason":"not_in_allowlist"})]
+        );
+        assert_eq!(
+            apply_tool_for_plan_tool("incident_plan_update"),
+            "incident_apply_update"
+        );
+        assert!(is_update_tool("incident_apply_update"));
+        assert_eq!(
+            service_now_table_for_apply_tool("incident_apply_update"),
+            "incident"
+        );
     }
 
     #[test]

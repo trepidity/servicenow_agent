@@ -76,6 +76,13 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
         "incident_list_by_assignment_group",
         "incident_list_by_assignment_group",
     ),
+    ("incident_assignment_groups", "incident_assignment_groups"),
+    (
+        "incident_assignment_group_queue",
+        "incident_assignment_group_queue",
+    ),
+    ("incident_plan_update", "incident_plan_update"),
+    ("incident_apply_update", "incident_apply_update"),
     ("resource_plan_plan_create", "resource_plan_plan_create"),
     ("resource_plan_apply_create", "resource_plan_apply_create"),
     ("resource_plan_plan_update", "resource_plan_plan_update"),
