@@ -283,7 +283,7 @@ are read tools) and are included in the `read_only_agent` role allow-list in
 Hydration behavior (search and the daemon `*_get_fresh` path): full-row fetch (no
 `sysparm_fields`, `sysparm_display_value=all`), persist to
 `business_applications/business_application_<sys_id>_<slug>.md`, project all
-fields into SQLite (current cache schema v11), and hydrate referenced sys_ids — owners, groups,
+fields into the current disposable SQLite cache format, and hydrate referenced sys_ids — owners, groups,
 portfolio — into local primitive objects (or unresolved/blocked/unknown stubs).
 Reference-resolution failures are **degraded reads**: the BA read still succeeds
 and surfaces diagnostics rather than failing.

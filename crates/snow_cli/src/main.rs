@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::{
     BasicAuth, DisplayValue, JournalEntry, Order, PrefixRegistry, Record, ServiceNowClient,
 };
-use snow_core::cache::store::Store;
+use snow_core::cache::store::{CacheFormat, Store};
 use snow_core::display as core_display;
 use snow_core::enrich::{VtbContext, VtbSchema, enrich_vtb_context};
 use snow_core::{
@@ -110,6 +110,9 @@ fn run_entry(cli: Cli) -> Result<(), SnowError> {
 
     if matches!(cli.command, Command::CacheInfo) {
         return cmd_cache_info();
+    }
+    if matches!(cli.command, Command::RebuildCache) {
+        return cmd_rebuild_cache_offline();
     }
 
     let auth_context = if command_uses_local_credentials(&cli.command) {
@@ -461,15 +464,13 @@ fn cmd_cache_info() -> Result<(), SnowError> {
     let paths = runtime_paths();
     let database_exists = paths.database.exists();
     let vault_exists = paths.vault.exists();
-    let schema_version = if database_exists {
-        match Store::open(&paths.database).and_then(|store| store.schema_version()) {
-            Ok(version) => version
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "n/a".to_string()),
-            Err(err) => format!("unavailable ({err})"),
+    let cache_format = match Store::inspect_format(&paths.database) {
+        Ok(CacheFormat::Absent) => "absent".to_string(),
+        Ok(CacheFormat::Current) => "current".to_string(),
+        Ok(CacheFormat::Incompatible { found }) => {
+            format!("incompatible ({found}); run `snow rebuild-cache`")
         }
-    } else {
-        "n/a".to_string()
+        Err(err) => format!("unreadable ({err})"),
     };
 
     println!("Runtime Root: {}", paths.root.display());
@@ -479,7 +480,15 @@ fn cmd_cache_info() -> Result<(), SnowError> {
     println!("Legacy Socket Path: {}", paths.socket.display());
     println!("Vault Exists: {}", if vault_exists { "yes" } else { "no" });
     println!("DB Exists: {}", if database_exists { "yes" } else { "no" });
-    println!("Schema Version: {schema_version}");
+    println!("Cache Format: {cache_format}");
+    Ok(())
+}
+
+fn cmd_rebuild_cache_offline() -> Result<(), SnowError> {
+    let paths = runtime_paths();
+    let report = snow_core::rebuild_cache_from_vault(&paths.vault, &paths.database)
+        .map_err(|error| SnowError::Api(error.to_string()))?;
+    print_rebuild_report(&report);
     Ok(())
 }
 

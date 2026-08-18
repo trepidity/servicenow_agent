@@ -9,6 +9,7 @@ output/
 docs/**
 !docs/spec-incident-list-by-assignment-group.md
 !docs/spec-incident-assignment-group-operations.md
+!docs/MCP_CAPABILITIES.md
 !docs/superpowers/
 !docs/superpowers/plans/
 !docs/superpowers/plans/2026-08-17-hotspot-remediation.md

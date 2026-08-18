@@ -9,17 +9,133 @@
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::BTreeMap;
+use std::path::Path;
 
+use crate::cache::store::{AliasRow, KeywordRow, Store, TagRow};
 use crate::context::CoreContext;
+use crate::convert::enrichment_origin_label;
+use crate::enrich::derive_for_record;
+use crate::helpers::project_runtime_document;
 use crate::vault::{scan_documents, scan_documents_detailed};
 use crate::{
     OrphanPruneReport, OrphanRecordRow, RebuildReport, RepairReport, UnindexedVaultDocument,
     VaultVerificationReport,
 };
 use crate::{
-    document_assigned_to, document_content, document_tag_tokens, document_work_notes,
+    ResourceType, document_assigned_to, document_content, document_tag_tokens, document_work_notes,
     record_row_from_runtime_record, serialize_vault_document,
 };
+
+/// Builds a fresh current-format projection beside `database_path` and replaces
+/// the local cache only after the vault reconstruction completes.
+pub fn rebuild_cache_from_vault(vault_path: &Path, database_path: &Path) -> Result<RebuildReport> {
+    let entries = scan_documents(vault_path)?;
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snow.db");
+    let temporary = parent.join(format!(".{file_name}.rebuild-{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| -> Result<RebuildReport> {
+        let store = Store::open(&temporary)?;
+        let scanned_documents = entries.len();
+        let mut rebuilt_records = 0;
+        for entry in entries {
+            rebuild_document_into_store(&store, entry.document, entry.relative_path)?;
+            rebuilt_records += 1;
+        }
+        drop(store);
+        if Store::inspect_format(&temporary)? != crate::cache::store::CacheFormat::Current {
+            anyhow::bail!("rebuilt cache did not validate as the current format");
+        }
+        Ok(RebuildReport {
+            scanned_documents,
+            rebuilt_records,
+        })
+    })();
+
+    match result {
+        Ok(report) => {
+            std::fs::rename(&temporary, database_path)?;
+            Ok(report)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn rebuild_document_into_store(
+    store: &Store,
+    document: crate::vault::VaultDocument,
+    relative_path: std::path::PathBuf,
+) -> Result<()> {
+    let record = document.record();
+    let row = record_row_from_runtime_record(
+        record,
+        Some(relative_path),
+        serialize_vault_document(&document).to_string(),
+    );
+    store.upsert_record_with_tags(
+        &row,
+        &document_work_notes(record),
+        &document_content(&document),
+        &document_tag_tokens(&document),
+    )?;
+    let projection = project_runtime_document(&document);
+    store.replace_relationships(record.sys_id.as_str(), &projection.relationships)?;
+    store.replace_references(&projection.references.into_values().collect::<Vec<_>>())?;
+    if let Some(article) = projection.knowledge_article {
+        store.upsert_knowledge_article(&article)?;
+    }
+    if record.resource_type == ResourceType::BusinessApplication {
+        store.upsert_business_application_projection(record, None)?;
+    }
+    persist_enrichment(store, record)?;
+    Ok(())
+}
+
+fn persist_enrichment(store: &Store, record: &crate::SnowRecord) -> Result<()> {
+    let bundle = derive_for_record(record);
+    let record_sys_id = record.sys_id.as_str();
+    let tags = bundle
+        .tags
+        .into_iter()
+        .map(|candidate| TagRow {
+            record_sys_id: record_sys_id.to_string(),
+            tag: candidate.value,
+            source: enrichment_origin_label(candidate.origin).to_string(),
+            weight: candidate.weight,
+        })
+        .collect::<Vec<_>>();
+    let keywords = bundle
+        .keywords
+        .into_iter()
+        .map(|candidate| KeywordRow {
+            record_sys_id: record_sys_id.to_string(),
+            keyword: candidate.value,
+            source: enrichment_origin_label(candidate.origin).to_string(),
+            weight: candidate.weight,
+        })
+        .collect::<Vec<_>>();
+    let aliases = bundle
+        .aliases
+        .into_iter()
+        .map(|candidate| AliasRow {
+            record_sys_id: record_sys_id.to_string(),
+            alias: candidate.value,
+            kind: enrichment_origin_label(candidate.origin).to_string(),
+            source: enrichment_origin_label(candidate.origin).to_string(),
+        })
+        .collect::<Vec<_>>();
+    store.replace_tags(record_sys_id, &tags)?;
+    store.replace_keywords(record_sys_id, &keywords)?;
+    store.replace_aliases(record_sys_id, &aliases)?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(crate) struct VaultService {

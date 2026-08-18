@@ -1956,8 +1956,10 @@ fn cache_info(core: &SnowCore) -> Result<CacheInfo> {
         .parent()
         .map(|parent| parent.join("snow.db"))
         .unwrap_or_else(|| PathBuf::from("snow.db"));
-    let store = Store::open(&sqlite_path)?;
-    let schema_version = store.schema_version()?.unwrap_or(0);
+    let _store = Store::open(&sqlite_path)?;
+    // Keep the established wire field stable while the cache itself is now
+    // identified by an exact format marker rather than an upgrade sequence.
+    let schema_version = 11;
     let total_rows = count_cache_records(&sqlite_path)?;
     let db_size_mb = std::fs::metadata(&sqlite_path)
         .map(|meta| meta.len() / (1024 * 1024))

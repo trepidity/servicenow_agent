@@ -104,6 +104,7 @@ pub use service::approval::{
 pub use service::business_application::BusinessApplicationSearchParams;
 pub use service::server::ServerGetError;
 pub use service::user::{UserLookup, UserLookupResult, UserRecord, UserSearch};
+pub use service::vault::rebuild_cache_from_vault;
 pub use servicenow_rs::model::reference::{
     Reference, choose_reference_display_name, is_opaque_sys_id,
 };

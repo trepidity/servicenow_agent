@@ -1,14 +1,14 @@
 use super::policy::stable_reference_ttl;
 use crate::{FieldValue, KnowledgeEmbeddingCoverage, ResourceType, SnowRecord};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const CACHE_FORMAT_ID: &str = "snow-cache-v1";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -20,6 +20,10 @@ pub enum StoreError {
     InvalidResourceType(String),
     #[error("invalid schema version: {0}")]
     InvalidSchemaVersion(String),
+    #[error(
+        "incompatible cache format: found {found}; expected {expected}. Run `snow rebuild-cache` to replace the disposable cache"
+    )]
+    IncompatibleCacheFormat { found: String, expected: String },
     #[error("invalid query: {0}")]
     InvalidQuery(String),
     #[error("invalid timestamp: {0}")]
@@ -33,6 +37,13 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheFormat {
+    Absent,
+    Current,
+    Incompatible { found: String },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordLifecycle {
@@ -411,11 +422,29 @@ impl fmt::Debug for Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
+        let in_memory = path == Path::new(":memory:");
+        let existed = !in_memory && path.exists();
+        if !in_memory
+            && !existed
+            && let Some(parent) = path.parent()
+        {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = if path == Path::new(":memory:") {
+        if existed {
+            match Self::inspect_format(path)? {
+                CacheFormat::Current => {}
+                CacheFormat::Absent => unreachable!("an existing cache cannot be absent"),
+                CacheFormat::Incompatible { found } => {
+                    return Err(StoreError::IncompatibleCacheFormat {
+                        found,
+                        expected: CACHE_FORMAT_ID.to_string(),
+                    });
+                }
+            }
+        }
+
+        let conn = if in_memory {
             Connection::open_in_memory()?
         } else {
             Connection::open(path)?
@@ -425,7 +454,11 @@ impl Store {
             path: path.to_path_buf(),
             conn,
         };
-        store.bootstrap()?;
+        if existed {
+            store.configure_connection()?;
+        } else {
+            store.bootstrap_new()?;
+        }
         Ok(store)
     }
 
@@ -433,10 +466,47 @@ impl Store {
         Self::open(":memory:")
     }
 
-    pub fn bootstrap(&self) -> Result<()> {
+    pub fn inspect_format(path: impl AsRef<Path>) -> Result<CacheFormat> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(CacheFormat::Absent);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let marker = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'cache_format'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional();
+        match marker {
+            Ok(Some(marker)) if marker == CACHE_FORMAT_ID => Ok(CacheFormat::Current),
+            Ok(Some(marker)) => Ok(CacheFormat::Incompatible {
+                found: format!("cache format marker {marker:?}"),
+            }),
+            Ok(None) => Ok(CacheFormat::Incompatible {
+                found: "missing cache format marker".to_string(),
+            }),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                Ok(CacheFormat::Incompatible {
+                    found: "missing schema metadata".to_string(),
+                })
+            }
+            Err(error) => Err(StoreError::Sqlite(error)),
+        }
+    }
+
+    fn configure_connection(&self) -> Result<()> {
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
-        self.conn.pragma_update(None, "journal_mode", "WAL")?;
         self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
+    fn bootstrap_new(&self) -> Result<()> {
+        self.configure_connection()?;
+        self.conn.pragma_update(None, "journal_mode", "WAL")?;
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_meta (
@@ -445,34 +515,11 @@ impl Store {
             );
             "#,
         )?;
-        let schema_version = self.schema_version()?.unwrap_or(0);
         self.create_schema_objects()?;
-        if self.needs_v3_migration(schema_version)? {
-            self.migrate_to_v3()?;
-        }
-        if self.needs_v5_migration(schema_version)? {
-            self.migrate_to_v5()?;
-        }
-        if self.needs_v6_migration(schema_version)? {
-            self.migrate_to_v6()?;
-        }
-        if self.needs_v7_migration(schema_version)? {
-            self.migrate_to_v7()?;
-        }
-        if self.needs_v8_migration(schema_version)? {
-            self.migrate_to_v8()?;
-        }
-        if self.needs_v9_migration(schema_version)? {
-            self.migrate_to_v9()?;
-        }
-        if self.needs_v10_migration(schema_version)? {
-            self.migrate_to_v10()?;
-        }
-        if self.needs_v11_migration(schema_version)? {
-            self.migrate_to_v11()?;
-        }
-        self.create_post_migration_indexes()?;
-        self.set_schema_version(SCHEMA_VERSION)?;
+        self.conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('cache_format', ?1)",
+            [CACHE_FORMAT_ID],
+        )?;
         Ok(())
     }
 
@@ -844,6 +891,11 @@ impl Store {
                 ON business_application_servers(ba_sys_id, tombstoned_at, min_depth, server_sys_id);
             CREATE INDEX IF NOT EXISTS idx_ba_servers_server
                 ON business_application_servers(server_sys_id, tombstoned_at, min_depth, ba_sys_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ba_servers_one_live_pair
+                ON business_application_servers(ba_sys_id, server_sys_id)
+                WHERE tombstoned_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_kb_articles_updated
+                ON knowledge_articles(sys_updated_on, record_sys_id);
             CREATE INDEX IF NOT EXISTS idx_primitive_objects_table
                 ON primitive_objects(table_name, display_name);
             CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_text
@@ -875,807 +927,6 @@ impl Store {
         Ok(())
     }
 
-    fn create_post_migration_indexes(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_kb_articles_updated
-                ON knowledge_articles(sys_updated_on, record_sys_id);
-            CREATE INDEX IF NOT EXISTS idx_kb_local_file_state_path
-                ON kb_local_file_state(file_path);
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn migrate_to_v3(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            PRAGMA foreign_keys=OFF;
-            PRAGMA legacy_alter_table=ON;
-            BEGIN IMMEDIATE;
-
-            ALTER TABLE records RENAME TO records_v2;
-
-            CREATE TABLE records (
-                sys_id TEXT PRIMARY KEY,
-                number TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                resource_type TEXT NOT NULL,
-                state TEXT,
-                short_desc TEXT,
-                description TEXT,
-                assigned_to TEXT,
-                parent_id TEXT,
-                file_path TEXT,
-                synced_at INTEGER NOT NULL,
-                sys_updated_on INTEGER NOT NULL,
-                etag TEXT,
-                in_scope INTEGER NOT NULL DEFAULT 1 CHECK (in_scope IN (0, 1)),
-                last_seen_at INTEGER NOT NULL,
-                tombstoned_at INTEGER,
-                pruned_at INTEGER,
-                raw_json TEXT NOT NULL DEFAULT '{}'
-            );
-
-            INSERT INTO records (
-                rowid, sys_id, number, table_name, resource_type, state, short_desc, description,
-                assigned_to, parent_id, file_path, synced_at, sys_updated_on, etag,
-                in_scope, last_seen_at, tombstoned_at, pruned_at, raw_json
-            )
-            SELECT
-                rowid, sys_id, number, table_name, resource_type, state, short_desc, description,
-                assigned_to, parent_id, file_path, synced_at, sys_updated_on, etag,
-                in_scope, last_seen_at, tombstoned_at, pruned_at, raw_json
-            FROM records_v2;
-
-            DROP TABLE records_v2;
-
-            COMMIT;
-            PRAGMA legacy_alter_table=OFF;
-            PRAGMA foreign_keys=ON;
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn migrate_to_v5(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.add_column_if_missing("knowledge_articles", "sys_updated_on", "TEXT")?;
-            self.add_column_if_missing(
-                "knowledge_articles",
-                "sn_tags",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )?;
-            self.add_column_if_missing(
-                "knowledge_articles",
-                "auto_tags",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )?;
-            self.add_column_if_missing(
-                "knowledge_articles",
-                "user_tags",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )?;
-            self.add_column_if_missing(
-                "knowledge_articles",
-                "body_cached",
-                "INTEGER NOT NULL DEFAULT 0 CHECK (body_cached IN (0, 1))",
-            )?;
-
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS kb_sync_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    last_full_at INTEGER,
-                    last_incr_at INTEGER,
-                    watermark_updated_at TEXT,
-                    watermark_sys_id TEXT,
-                    kb_sync_lock INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_kb_articles_updated
-                    ON knowledge_articles(sys_updated_on, record_sys_id);
-                "#,
-            )?;
-            self.conn
-                .execute("INSERT OR IGNORE INTO kb_sync_state (id) VALUES (1)", [])?;
-
-            if !self.table_has_column("fts_records", "tag_tokens")? {
-                self.conn.execute_batch(
-                    r#"
-                    ALTER TABLE fts_records RENAME TO fts_records_v4;
-                    CREATE VIRTUAL TABLE fts_records USING fts5(
-                        number,
-                        short_desc,
-                        description,
-                        work_notes,
-                        content,
-                        tag_tokens
-                    );
-                    INSERT INTO fts_records(
-                        rowid, number, short_desc, description, work_notes, content, tag_tokens
-                    )
-                    SELECT rowid, number, short_desc, description, work_notes, content, ''
-                    FROM fts_records_v4;
-                    DROP TABLE fts_records_v4;
-                    "#,
-                )?;
-            }
-
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn migrate_to_v6(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS kb_term_stats (
-                    term TEXT PRIMARY KEY,
-                    doc_freq INTEGER NOT NULL CHECK (doc_freq >= 0)
-                );
-                CREATE TABLE IF NOT EXISTS kb_article_terms (
-                    record_sys_id TEXT PRIMARY KEY,
-                    terms_json TEXT NOT NULL DEFAULT '[]'
-                );
-                CREATE TABLE IF NOT EXISTS kb_local_file_state (
-                    record_sys_id TEXT PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    modified_at_ms INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_kb_local_file_state_path
-                    ON kb_local_file_state(file_path);
-                "#,
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v3_migration(&self, schema_version: i64) -> Result<bool> {
-        Ok(schema_version > 0 && schema_version < 3)
-    }
-
-    fn needs_v5_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 5 {
-            return Ok(true);
-        }
-        if !self.table_exists("knowledge_articles")? || !self.table_exists("fts_records")? {
-            return Ok(false);
-        }
-        Ok(
-            !self.table_has_column("knowledge_articles", "sys_updated_on")?
-                || !self.table_has_column("knowledge_articles", "sn_tags")?
-                || !self.table_has_column("knowledge_articles", "auto_tags")?
-                || !self.table_has_column("knowledge_articles", "user_tags")?
-                || !self.table_has_column("knowledge_articles", "body_cached")?
-                || !self.table_exists("kb_sync_state")?
-                || !self.table_has_column("fts_records", "tag_tokens")?,
-        )
-    }
-
-    fn needs_v6_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 6 {
-            return Ok(true);
-        }
-        Ok(!self.table_exists("kb_term_stats")?
-            || !self.table_exists("kb_article_terms")?
-            || !self.table_exists("kb_local_file_state")?)
-    }
-
-    fn migrate_to_v7(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.conn.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS knowledge_article_embeddings (
-                    record_sys_id TEXT PRIMARY KEY
-                        REFERENCES knowledge_articles(record_sys_id)
-                        ON DELETE CASCADE,
-                    model TEXT NOT NULL,
-                    provider TEXT NOT NULL,
-                    dimensions INTEGER NOT NULL,
-                    coverage TEXT NOT NULL
-                        CHECK (coverage IN ('metadata', 'full_text')),
-                    content_hash TEXT NOT NULL,
-                    vector_blob BLOB NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_kb_embeddings_model
-                    ON knowledge_article_embeddings(model, coverage);
-                "#,
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v7_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 7 {
-            return Ok(true);
-        }
-        Ok(!self.table_exists("knowledge_article_embeddings")?)
-    }
-
-    fn migrate_to_v8(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.create_v8_schema_objects()?;
-            self.conn.execute(
-                r#"
-                UPDATE records
-                SET resource_type = 'business_application'
-                WHERE resource_type = 'cmdb_ci_business_app'
-                   OR table_name = 'cmdb_ci_business_app'
-                "#,
-                [],
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v8_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 8 {
-            return Ok(true);
-        }
-        Ok(!self.table_exists("business_applications")?
-            || !self.table_exists("business_application_fields")?
-            || !self.table_exists("business_application_field_dictionary")?
-            || !self.table_exists("primitive_objects")?
-            || !self.table_exists("primitive_object_fields")?
-            || !self.index_exists("idx_ba_fields_ref")?
-            || !self.index_exists("idx_primitive_fields_ref")?)
-    }
-
-    fn migrate_to_v9(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.create_v9_schema_objects();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v9_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 9 {
-            return Ok(true);
-        }
-        Ok(!self.table_exists("cached_users")?
-            || !self.table_exists("cached_user_queries")?
-            || !self.index_exists("idx_cached_users_user_name")?
-            || !self.index_exists("idx_cached_users_email")?
-            || !self.index_exists("idx_cached_users_employee_number")?
-            || !self.index_exists("idx_cached_users_name")?
-            || !self.index_exists("idx_cached_users_first_last")?
-            || !self.index_exists("idx_cached_user_queries_expires")?)
-    }
-
-    fn migrate_to_v10(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = self.create_v10_schema_objects();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v10_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 10 {
-            return Ok(true);
-        }
-        Ok(!self.table_exists("business_application_servers")?
-            || !self.index_exists("idx_ba_servers_ba")?
-            || !self.index_exists("idx_ba_servers_server")?)
-    }
-
-    fn migrate_to_v11(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.create_v11_schema_objects()?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
-    fn needs_v11_migration(&self, schema_version: i64) -> Result<bool> {
-        if schema_version > 0 && schema_version < 11 {
-            return Ok(true);
-        }
-        Ok(
-            !self.table_exists("business_application_server_inventory_health")?
-                || !self.index_exists("idx_ba_servers_one_live_pair")?,
-        )
-    }
-
-    fn create_v8_schema_objects(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS business_applications (
-                record_sys_id TEXT PRIMARY KEY
-                    REFERENCES records(sys_id)
-                    ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                number TEXT,
-                business_owner_sys_id TEXT,
-                business_owner_name TEXT,
-                is_owner_sys_id TEXT,
-                is_owner_name TEXT,
-                ci_owner_group_sys_id TEXT,
-                ci_owner_group_name TEXT,
-                primary_support_group_sys_id TEXT,
-                primary_support_group_name TEXT,
-                operational_status_value TEXT,
-                operational_status_display TEXT,
-                primary_portfolio_sys_id TEXT,
-                primary_portfolio_name TEXT,
-                primary_portfolio_table TEXT,
-                attested_date TEXT,
-                sys_updated_on TEXT,
-                field_count INTEGER NOT NULL DEFAULT 0,
-                reference_count INTEGER NOT NULL DEFAULT 0,
-                unresolved_reference_count INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS business_application_fields (
-                record_sys_id TEXT NOT NULL
-                    REFERENCES records(sys_id)
-                    ON DELETE CASCADE,
-                field_name TEXT NOT NULL,
-                field_label TEXT,
-                field_type TEXT,
-                value_text TEXT,
-                display_value TEXT,
-                value_number REAL,
-                value_date TEXT,
-                value_bool INTEGER CHECK (value_bool IN (0, 1)),
-                reference_sys_id TEXT,
-                reference_table TEXT,
-                raw_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(record_sys_id, field_name)
-            );
-
-            CREATE TABLE IF NOT EXISTS business_application_field_dictionary (
-                table_name TEXT NOT NULL,
-                field_name TEXT NOT NULL,
-                field_label TEXT,
-                field_type TEXT,
-                reference_table TEXT,
-                choice INTEGER NOT NULL DEFAULT 0 CHECK (choice IN (0, 1)),
-                mandatory INTEGER NOT NULL DEFAULT 0 CHECK (mandatory IN (0, 1)),
-                read_only INTEGER NOT NULL DEFAULT 0 CHECK (read_only IN (0, 1)),
-                max_length INTEGER,
-                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-                synced_at INTEGER NOT NULL,
-                raw_json TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY(table_name, field_name)
-            );
-
-            CREATE TABLE IF NOT EXISTS primitive_objects (
-                sys_id TEXT PRIMARY KEY,
-                table_name TEXT NOT NULL,
-                resource_type TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                number TEXT,
-                file_path TEXT,
-                raw_json TEXT NOT NULL DEFAULT '{}',
-                synced_at INTEGER NOT NULL,
-                sys_updated_on TEXT,
-                resolution_status TEXT NOT NULL
-                    CHECK (resolution_status IN ('resolved','unresolved','unknown_table','not_found','acl_restricted','error')),
-                last_error TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS primitive_object_fields (
-                primitive_sys_id TEXT NOT NULL
-                    REFERENCES primitive_objects(sys_id)
-                    ON DELETE CASCADE,
-                field_name TEXT NOT NULL,
-                field_label TEXT,
-                field_type TEXT,
-                value_text TEXT,
-                display_value TEXT,
-                value_number REAL,
-                value_date TEXT,
-                value_bool INTEGER CHECK (value_bool IN (0, 1)),
-                reference_sys_id TEXT,
-                reference_table TEXT,
-                raw_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY(primitive_sys_id, field_name)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_ba_name ON business_applications(name);
-            CREATE INDEX IF NOT EXISTS idx_ba_business_owner
-                ON business_applications(business_owner_sys_id, business_owner_name);
-            CREATE INDEX IF NOT EXISTS idx_ba_is_owner
-                ON business_applications(is_owner_sys_id, is_owner_name);
-            CREATE INDEX IF NOT EXISTS idx_ba_ci_owner_group
-                ON business_applications(ci_owner_group_sys_id, ci_owner_group_name);
-            CREATE INDEX IF NOT EXISTS idx_ba_support_group
-                ON business_applications(primary_support_group_sys_id, primary_support_group_name);
-            CREATE INDEX IF NOT EXISTS idx_ba_operational_status
-                ON business_applications(operational_status_value, operational_status_display);
-            CREATE INDEX IF NOT EXISTS idx_ba_portfolio
-                ON business_applications(primary_portfolio_table, primary_portfolio_sys_id, primary_portfolio_name);
-            CREATE INDEX IF NOT EXISTS idx_ba_attested_date ON business_applications(attested_date);
-            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_text
-                ON business_application_fields(field_name, value_text);
-            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_display
-                ON business_application_fields(field_name, display_value);
-            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_date
-                ON business_application_fields(field_name, value_date);
-            CREATE INDEX IF NOT EXISTS idx_ba_fields_name_number
-                ON business_application_fields(field_name, value_number);
-            CREATE INDEX IF NOT EXISTS idx_ba_fields_ref
-                ON business_application_fields(field_name, reference_table, reference_sys_id);
-            CREATE INDEX IF NOT EXISTS idx_primitive_objects_table
-                ON primitive_objects(table_name, display_name);
-            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_text
-                ON primitive_object_fields(field_name, value_text);
-            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_display
-                ON primitive_object_fields(field_name, display_value);
-            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_date
-                ON primitive_object_fields(field_name, value_date);
-            CREATE INDEX IF NOT EXISTS idx_primitive_fields_name_number
-                ON primitive_object_fields(field_name, value_number);
-            CREATE INDEX IF NOT EXISTS idx_primitive_fields_ref
-                ON primitive_object_fields(field_name, reference_table, reference_sys_id);
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn create_v9_schema_objects(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS cached_users (
-                sys_id TEXT PRIMARY KEY,
-                user_name TEXT,
-                name TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                email TEXT,
-                employee_number TEXT,
-                active INTEGER CHECK (active IN (0, 1)),
-                department TEXT,
-                location TEXT,
-                title TEXT,
-                raw_json TEXT NOT NULL DEFAULT '{}',
-                synced_at INTEGER NOT NULL,
-                sys_updated_on TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS cached_user_queries (
-                query_key TEXT PRIMARY KEY,
-                result_sys_ids_json TEXT NOT NULL DEFAULT '[]',
-                synced_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_cached_users_user_name
-                ON cached_users(user_name);
-            CREATE INDEX IF NOT EXISTS idx_cached_users_email
-                ON cached_users(email);
-            CREATE INDEX IF NOT EXISTS idx_cached_users_employee_number
-                ON cached_users(employee_number);
-            CREATE INDEX IF NOT EXISTS idx_cached_users_name
-                ON cached_users(name);
-            CREATE INDEX IF NOT EXISTS idx_cached_users_first_last
-                ON cached_users(first_name, last_name);
-            CREATE INDEX IF NOT EXISTS idx_cached_user_queries_expires
-                ON cached_user_queries(expires_at);
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn create_v10_schema_objects(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS business_application_servers (
-                ba_sys_id TEXT NOT NULL
-                    REFERENCES records(sys_id)
-                    ON DELETE CASCADE,
-                server_sys_id TEXT NOT NULL
-                    REFERENCES records(sys_id)
-                    ON DELETE CASCADE,
-                server_table TEXT NOT NULL,
-                provenance TEXT NOT NULL,
-                min_depth INTEGER NOT NULL CHECK (min_depth >= 0),
-                paths_json TEXT NOT NULL DEFAULT '[]',
-                discovered_at INTEGER NOT NULL,
-                last_seen_at INTEGER NOT NULL,
-                tombstoned_at INTEGER,
-                PRIMARY KEY(ba_sys_id, server_sys_id, provenance)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_ba_servers_ba
-                ON business_application_servers(ba_sys_id, tombstoned_at, min_depth, server_sys_id);
-            CREATE INDEX IF NOT EXISTS idx_ba_servers_server
-                ON business_application_servers(server_sys_id, tombstoned_at, min_depth, ba_sys_id);
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn create_v11_schema_objects(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS business_application_server_inventory_health (
-                ba_sys_id TEXT PRIMARY KEY
-                    REFERENCES records(sys_id)
-                    ON DELETE CASCADE,
-                run_started_at INTEGER NOT NULL,
-                run_completed_at INTEGER NOT NULL,
-                service_membership_status TEXT NOT NULL
-                    CHECK (service_membership_status IN (
-                        'ok',
-                        'not_attempted',
-                        'acl_restricted',
-                        'association_budget_exhausted',
-                        'page_budget_exhausted'
-                    )),
-                relationship_status TEXT NOT NULL
-                    CHECK (relationship_status IN (
-                        'ok',
-                        'depth_limited',
-                        'edge_budget_exhausted',
-                        'ci_budget_exhausted',
-                        'acl_restricted',
-                        'truncated'
-                    )),
-                inventory_status TEXT NOT NULL
-                    CHECK (inventory_status IN (
-                        'complete',
-                        'service_membership_degraded',
-                        'relationship_degraded',
-                        'truncated',
-                        'failed'
-                    )),
-                summary_json TEXT NOT NULL DEFAULT '{}'
-            );
-            "#,
-        )?;
-        self.collapse_duplicate_live_business_application_server_memberships()?;
-        self.conn.execute(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_ba_servers_one_live_pair
-                ON business_application_servers(ba_sys_id, server_sys_id)
-                WHERE tombstoned_at IS NULL
-            "#,
-            [],
-        )?;
-        Ok(())
-    }
-
-    fn collapse_duplicate_live_business_application_server_memberships(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            DROP TABLE IF EXISTS temp.ba_server_live_pair_cleanup;
-            CREATE TEMP TABLE ba_server_live_pair_cleanup AS
-            SELECT
-                ba_sys_id,
-                server_sys_id,
-                MIN(discovered_at) AS earliest_discovered_at,
-                MAX(last_seen_at) AS latest_last_seen_at,
-                MIN(min_depth) AS min_depth,
-                COALESCE(
-                    MAX(CASE WHEN provenance = 'both' THEN server_table END),
-                    MAX(CASE WHEN provenance = 'relationship' THEN server_table END),
-                    MAX(CASE WHEN provenance = 'service_membership' THEN server_table END),
-                    MAX(server_table)
-                ) AS server_table,
-                COALESCE(
-                    MAX(CASE WHEN provenance = 'both' THEN paths_json END),
-                    MAX(CASE WHEN provenance = 'relationship' THEN paths_json END),
-                    MAX(paths_json),
-                    '[]'
-                ) AS paths_json,
-                CASE
-                    WHEN SUM(CASE WHEN provenance = 'both' THEN 1 ELSE 0 END) > 0 THEN 'both'
-                    WHEN SUM(CASE WHEN provenance = 'relationship' THEN 1 ELSE 0 END) > 0
-                     AND SUM(CASE WHEN provenance = 'service_membership' THEN 1 ELSE 0 END) > 0 THEN 'both'
-                    WHEN SUM(CASE WHEN provenance = 'relationship' THEN 1 ELSE 0 END) > 0 THEN 'relationship'
-                    WHEN SUM(CASE WHEN provenance = 'service_membership' THEN 1 ELSE 0 END) > 0 THEN 'service_membership'
-                    ELSE MIN(provenance)
-                END AS desired_provenance
-            FROM business_application_servers
-            WHERE tombstoned_at IS NULL
-            GROUP BY ba_sys_id, server_sys_id
-            HAVING COUNT(*) > 1;
-
-            INSERT INTO business_application_servers (
-                ba_sys_id, server_sys_id, server_table, provenance, min_depth,
-                paths_json, discovered_at, last_seen_at, tombstoned_at
-            )
-            SELECT
-                ba_sys_id, server_sys_id, server_table, desired_provenance, min_depth,
-                paths_json, earliest_discovered_at, latest_last_seen_at, NULL
-            FROM ba_server_live_pair_cleanup
-            WHERE desired_provenance = 'both'
-            ON CONFLICT(ba_sys_id, server_sys_id, provenance) DO UPDATE SET
-                server_table = excluded.server_table,
-                min_depth = excluded.min_depth,
-                paths_json = excluded.paths_json,
-                discovered_at = MIN(business_application_servers.discovered_at, excluded.discovered_at),
-                last_seen_at = MAX(business_application_servers.last_seen_at, excluded.last_seen_at),
-                tombstoned_at = NULL;
-
-            UPDATE business_application_servers
-            SET
-                discovered_at = (
-                    SELECT earliest_discovered_at
-                    FROM ba_server_live_pair_cleanup cleanup
-                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
-                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
-                ),
-                last_seen_at = MAX(
-                    last_seen_at,
-                    (
-                        SELECT latest_last_seen_at
-                        FROM ba_server_live_pair_cleanup cleanup
-                        WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
-                          AND cleanup.server_sys_id = business_application_servers.server_sys_id
-                    )
-                ),
-                tombstoned_at = NULL
-            WHERE tombstoned_at IS NULL
-              AND EXISTS (
-                    SELECT 1
-                    FROM ba_server_live_pair_cleanup cleanup
-                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
-                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
-                      AND cleanup.desired_provenance = business_application_servers.provenance
-              );
-
-            UPDATE business_application_servers
-            SET tombstoned_at = (
-                SELECT latest_last_seen_at
-                FROM ba_server_live_pair_cleanup cleanup
-                WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
-                  AND cleanup.server_sys_id = business_application_servers.server_sys_id
-            )
-            WHERE tombstoned_at IS NULL
-              AND EXISTS (
-                    SELECT 1
-                    FROM ba_server_live_pair_cleanup cleanup
-                    WHERE cleanup.ba_sys_id = business_application_servers.ba_sys_id
-                      AND cleanup.server_sys_id = business_application_servers.server_sys_id
-                      AND cleanup.desired_provenance <> business_application_servers.provenance
-              );
-
-            DROP TABLE IF EXISTS temp.ba_server_live_pair_cleanup;
-            "#,
-        )?;
-        Ok(())
-    }
-
-    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
-        if self.table_has_column(table, column)? {
-            return Ok(());
-        }
-        self.conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )?;
-        Ok(())
-    }
-
-    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for name in rows {
-            if name? == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn table_exists(&self, table: &str) -> Result<bool> {
-        let exists = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
-            [table],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(exists > 0)
-    }
-
-    fn index_exists(&self, index: &str) -> Result<bool> {
-        let exists = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
-            [index],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(exists > 0)
-    }
-
-    pub fn schema_version(&self) -> Result<Option<i64>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| {
-                value
-                    .parse()
-                    .map_err(|_| StoreError::InvalidSchemaVersion(value))
-            })
-            .transpose()
-    }
-
-    pub fn set_schema_version(&self, version: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![version.to_string()],
-        )?;
-        Ok(())
-    }
-
     pub fn get_meta_value(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -1685,6 +936,26 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        let exists = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists > 0)
+    }
+
+    #[cfg(test)]
+    fn index_exists(&self, index: &str) -> Result<bool> {
+        let exists = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists > 0)
     }
 
     pub fn set_meta_value(&self, key: &str, value: Option<&str>) -> Result<()> {
@@ -5207,7 +4478,6 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::Value;
     use std::collections::HashMap;
-    use tempfile::tempdir;
 
     #[test]
     fn initializes_schema_and_persists_records() {
@@ -5365,11 +4635,13 @@ mod tests {
     }
 
     #[test]
-    fn initializes_schema_v11_business_application_projection_user_cache_ba_server_and_health_tables()
-     {
+    fn initializes_current_cache_projection_user_cache_ba_server_and_health_tables() {
         let store = Store::open_in_memory().expect("store");
 
-        assert_eq!(store.schema_version().expect("version"), Some(11));
+        assert_eq!(
+            store.get_meta_value("cache_format").expect("cache format"),
+            Some(CACHE_FORMAT_ID.to_string())
+        );
         for table in [
             "business_applications",
             "business_application_fields",
@@ -5940,182 +5212,6 @@ mod tests {
         assert_eq!(primary.sys_id, "chg-sys");
         assert_eq!(approval_row.sys_id, "apr-sys");
         assert_eq!(store.count_active_records().expect("count"), 2);
-    }
-
-    #[test]
-    fn migrates_legacy_schema_with_unique_number_constraint() {
-        let tempdir = tempdir().expect("tempdir");
-        let path = tempdir.path().join("snow.db");
-        let conn = Connection::open(&path).expect("open legacy db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE schema_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2');
-
-            CREATE TABLE records (
-                sys_id TEXT PRIMARY KEY,
-                number TEXT NOT NULL UNIQUE,
-                table_name TEXT NOT NULL,
-                resource_type TEXT NOT NULL,
-                state TEXT,
-                short_desc TEXT,
-                description TEXT,
-                assigned_to TEXT,
-                parent_id TEXT,
-                file_path TEXT,
-                synced_at INTEGER NOT NULL,
-                sys_updated_on INTEGER NOT NULL,
-                etag TEXT,
-                in_scope INTEGER NOT NULL DEFAULT 1 CHECK (in_scope IN (0, 1)),
-                last_seen_at INTEGER NOT NULL,
-                tombstoned_at INTEGER,
-                pruned_at INTEGER,
-                raw_json TEXT NOT NULL DEFAULT '{}'
-            );
-
-            CREATE VIRTUAL TABLE fts_records USING fts5(
-                number,
-                short_desc,
-                description,
-                work_notes,
-                content
-            );
-            "#,
-        )
-        .expect("seed legacy schema");
-        drop(conn);
-
-        let store = Store::open(&path).expect("migrate store");
-        assert_eq!(store.schema_version().expect("version"), Some(11));
-        assert!(
-            store
-                .table_has_column("fts_records", "tag_tokens")
-                .expect("fts tag_tokens column")
-        );
-        assert!(
-            store
-                .table_has_column("knowledge_articles", "sn_tags")
-                .expect("knowledge sn_tags column")
-        );
-        assert!(
-            store
-                .table_has_column("knowledge_articles", "body_cached")
-                .expect("knowledge body_cached column")
-        );
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM kb_sync_state WHERE id = 1",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .expect("kb sync seed row"),
-            1
-        );
-        assert!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kb_term_stats'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .expect("kb term stats table exists")
-                > 0
-        );
-
-        let change = RecordRow::active(
-            "chg-sys",
-            "CHG0012345",
-            "change_request",
-            ResourceType::Change,
-            Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
-        );
-        let approval = RecordRow::active(
-            "apr-sys",
-            "CHG0012345",
-            "sysapproval_approver",
-            ResourceType::Approval,
-            Utc.timestamp_opt(1_712_649_601, 0).unwrap(),
-        );
-        store.upsert_record(&change, "", "").expect("insert change");
-        store
-            .upsert_record(&approval, "", "")
-            .expect("insert approval after migration");
-    }
-
-    #[test]
-    fn migrates_unversioned_legacy_knowledge_schema_before_creating_updated_index() {
-        let tempdir = tempdir().expect("tempdir");
-        let path = tempdir.path().join("legacy-kb.db");
-        let conn = Connection::open(&path).expect("open legacy kb db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE knowledge_articles (
-                record_sys_id TEXT PRIMARY KEY,
-                number TEXT NOT NULL,
-                title TEXT NOT NULL,
-                workflow_state TEXT NOT NULL,
-                knowledge_base_sys_id TEXT NOT NULL,
-                knowledge_base_name TEXT NOT NULL,
-                category_sys_id TEXT NOT NULL,
-                category_name TEXT NOT NULL,
-                author_sys_id TEXT,
-                author_name TEXT,
-                published_at TEXT,
-                valid_to TEXT,
-                article_type TEXT NOT NULL
-            );
-
-            CREATE VIRTUAL TABLE fts_records USING fts5(
-                number,
-                short_desc,
-                description,
-                work_notes,
-                content
-            );
-            "#,
-        )
-        .expect("seed unversioned legacy kb schema");
-        drop(conn);
-
-        let store = Store::open(&path).expect("migrate unversioned legacy kb store");
-        assert_eq!(store.schema_version().expect("version"), Some(11));
-        assert!(
-            store
-                .table_has_column("knowledge_articles", "sys_updated_on")
-                .expect("knowledge sys_updated_on column")
-        );
-        assert!(
-            store
-                .table_has_column("knowledge_articles", "sn_tags")
-                .expect("knowledge sn_tags column")
-        );
-        assert!(
-            store
-                .table_has_column("knowledge_articles", "body_cached")
-                .expect("knowledge body_cached column")
-        );
-        assert!(
-            store
-                .table_has_column("fts_records", "tag_tokens")
-                .expect("fts tag_tokens column")
-        );
-        assert!(
-            store
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_kb_articles_updated'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .expect("kb updated index exists")
-                > 0
-        );
     }
 
     #[test]
