@@ -80,6 +80,12 @@ pub use resource::incident::{
     IncidentQueueSortDirection, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
     resolve_incident_state, validate_incident_assignment_group_input,
 };
+pub use resource::record_query::{
+    CHANGE_REQUEST_QUERY_FIELDS, ChangeRequestQueryFilters, RECORD_QUERY_DEFAULT_LIMIT,
+    RECORD_QUERY_MAX_LIMIT, RecordQueryError, RecordQueryInput, RecordQueryPage, RecordQuerySource,
+    STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, StoryQueryFilters, ValidatedRecordQuery,
+    resolve_record_query_state, validate_record_query,
+};
 pub use resource::resource_plan::{
     ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanListWarning, ResourcePlanParentRef, ResourcePlanParentType,

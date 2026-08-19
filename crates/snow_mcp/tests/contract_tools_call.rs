@@ -369,6 +369,28 @@ async fn foreground_incident_group_page_rejects_invalid_arguments() {
 }
 
 #[tokio::test]
+async fn foreground_record_query_and_legacy_list_fail_closed_on_unknown_arguments() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+    for (id, tool, arguments) in [
+        (
+            80,
+            "record_query",
+            json!({"resource_type":"story","filters":{"arbitrary":"x"}}),
+        ),
+        (
+            81,
+            "record_query",
+            json!({"resource_type":"change_request","include_description":true}),
+        ),
+        (82, "list_records", json!({"filter":"state=1"})),
+    ] {
+        let response = raw_call(&server, tool, arguments, id).await;
+        assert_eq!(response.error.expect("must reject").code, -32602);
+    }
+}
+
+#[tokio::test]
 async fn foreground_operational_incident_queue_rejects_invalid_arguments_before_io() {
     let fixture = support::build_fixture_state().await.expect("fixture");
     let server = McpServer::new(fixture.core);

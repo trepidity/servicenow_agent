@@ -123,7 +123,7 @@ work_record_ttl = "60m"
   `business_application_search`, `business_application_query`, `business_application_servers`,
   `business_application_servers_cached`, `business_applications_for_server`,
   `business_application_fields`,
-  `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`,
+  `server_get`, `server_search`, `server_query`, `server_fields`, `list_records`, `record_query`,
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`, `resource_plan_list`,
   `incident_list_by_assignment_group`, `incident_assignment_groups`,
@@ -135,6 +135,30 @@ daemon-authenticated ServiceNow user. It reads `sys_user_grmember` to resolve
 those memberships, accepts no caller-supplied user or approver override, keeps
 the approval collection under `records`, and includes a top-level
 `query_summary` on successful responses.
+
+### `record_query`
+
+`record_query` is the strict live query primitive for Change Requests and
+Stories. It accepts only `resource_type: change_request|story`, typed
+resource-specific filters, an optional 32-hex exclusive cursor, and a page
+limit from 1 through 200 (default 50). Unknown fields, raw encoded queries,
+cross-resource filters, malformed ranges, and unsupported Story description
+searches fail with `-32602` before record I/O.
+
+- Change filters: assignment group, assignee, exact live-resolved state, and
+  strict start-date bounds.
+- Story filters: assignment group, assignee, story owner, lead developer,
+  exact live-resolved states, sprint, project, CI, blocked flag, strict due or
+  update bounds, Story numbers, and `short_description` text only.
+- Pages are ordered by `sys_id` ascending and return
+  `{ records, next_cursor, complete, source: "live", limit, rows_inspected }`.
+  A full page is incomplete; an exact-multiple scan requires a final empty page.
+- The direct and daemon-backed MCP transports expose the same schema/payload.
+  The bridge advertises the tool only when `contract_info.supported_methods`
+  contains `record_query`.
+- The operation is ephemeral and never writes the cache or vault. Legacy
+  `list_records` rejects unknown properties, including the obsolete `filter`
+  argument, instead of silently returning an unfiltered list.
 
 ### `resource_plan_list`
 

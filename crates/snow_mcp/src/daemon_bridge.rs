@@ -63,6 +63,7 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("server_query", "server_query"),
     ("server_fields", "server_fields"),
     ("list_records", "list_records"),
+    ("record_query", "record_query"),
     ("list_my_tasks", "list_my_tasks"),
     ("list_my_approvals", "list_my_approvals"),
     ("list_my_projects", "list_my_projects"),

@@ -97,7 +97,12 @@ pub fn register(registry: &mut ToolRegistry) {
         (
             "list_records",
             "List records with optional daemon-side filters",
-            json!({"type":"object","properties":{"resource_type":{"type":"string"},"parent_number":{"type":"string"},"assigned_to":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
+            json!({"type":"object","additionalProperties":false,"properties":{"resource_type":{"type":"string"},"parent_number":{"type":"string"},"assigned_to":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
+        ),
+        (
+            "record_query",
+            "Query one bounded live page of Change Requests or Stories with typed allowlisted filters and stable cursor paging.",
+            record_query_arg_schema(),
         ),
         (
             "list_my_tasks",
@@ -166,6 +171,61 @@ pub fn register(registry: &mut ToolRegistry) {
         default_enabled: false,
         requires_confirmation: true,
     });
+}
+
+pub fn record_query_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "resource_type": {
+                "type": "string",
+                "enum": ["change_request", "story"]
+            },
+            "filters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "assignment_group": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "assigned_to": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "state": { "type": "string", "minLength": 1, "maxLength": 80 },
+                    "start_date_after": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+                    "start_date_before": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+                    "story_owner": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "lead_developer": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "states": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "uniqueItems": true,
+                        "items": { "type": "string", "minLength": 1, "maxLength": 80 }
+                    },
+                    "sprint": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "project": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "cmdb_ci": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "blocked": { "type": "boolean" },
+                    "due_date_after": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+                    "due_date_before": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+                    "updated_after": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$" },
+                    "numbers": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "uniqueItems": true,
+                        "items": { "type": "string", "pattern": "^[sS][tT][rR][yY][0-9]+$" }
+                    },
+                    "text": { "type": "string", "minLength": 1, "maxLength": 200 }
+                }
+            },
+            "include_description": { "type": "boolean", "default": false },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+            "cursor": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9a-fA-F]{32}$"
+            }
+        },
+        "required": ["resource_type"]
+    })
 }
 
 pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {

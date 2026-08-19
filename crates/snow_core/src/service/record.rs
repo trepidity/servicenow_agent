@@ -25,20 +25,22 @@ use crate::query;
 use crate::query::filter::ListQuery;
 use crate::resource;
 use crate::{
-    BUSINESS_APPLICATION_TABLE, DegradedReadDiagnostic, FieldChoice,
+    BUSINESS_APPLICATION_TABLE, CHANGE_REQUEST_QUERY_FIELDS, DegradedReadDiagnostic, FieldChoice,
     INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
     INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
     INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup, IncidentAssignmentGroupListInput,
     IncidentAssignmentGroupOperationsError, IncidentAssignmentGroupPage,
     IncidentAssignmentGroupQueueAggregates, IncidentAssignmentGroupQueueInput,
     IncidentAssignmentGroupQueueItem, IncidentAssignmentGroupQueuePage, IncidentQueueSlaRisk,
-    IncidentQueueSortBy, IncidentQueueSortDirection, JournalEntry, RecordLookup,
-    ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
+    IncidentQueueSortBy, IncidentQueueSortDirection, JournalEntry, RecordLookup, RecordQueryError,
+    RecordQueryInput, RecordQueryPage, RecordQuerySource, ResolvedResourceFilter,
+    ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanQuerySummary, ResourcePlanResourceType, ResourceType, SERVER_RESOURCE_TYPE,
-    SERVER_TABLE, SearchResult, SearchScope, SnowRecord, TaskSelector, TaskSlaParentRef,
-    TaskSlaReadability, TaskSlaStatus, TaskSlaSummaryView, is_terminal_state,
-    resolve_incident_state, resource_plan_record_from_row, sort_records_by_number,
-    validate_incident_assignment_group_input, validate_list_input,
+    SERVER_TABLE, STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, SearchResult, SearchScope,
+    SnowRecord, TaskSelector, TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus,
+    TaskSlaSummaryView, ValidatedRecordQuery, is_terminal_state, resolve_incident_state,
+    resolve_record_query_state, resource_plan_record_from_row, sort_records_by_number,
+    validate_incident_assignment_group_input, validate_list_input, validate_record_query,
 };
 
 const USER_RECORD_HYDRATE_LIMIT: u32 = 200;
@@ -782,6 +784,179 @@ impl RecordService {
         self.ctx.query.list_records(query).await
     }
 
+    /// Executes one bounded, deterministic, live page for the two explicitly
+    /// supported Mullet record kinds. The returned rows are ephemeral: this
+    /// method never writes the cache, vault, or search index.
+    pub async fn record_query(&self, input: RecordQueryInput) -> Result<RecordQueryPage> {
+        let validated = validate_record_query(input)?;
+        let (table, limit, cursor, mut query) = match validated {
+            ValidatedRecordQuery::ChangeRequest {
+                filters,
+                limit,
+                cursor,
+            } => {
+                let resolved_state = match filters.state.as_deref() {
+                    Some(selector) => {
+                        let choices = self.field_choices("change_request", "state").await?;
+                        Some(resolve_record_query_state(
+                            selector,
+                            "change_request",
+                            &choices,
+                        )?)
+                    }
+                    None => None,
+                };
+                let mut query = self
+                    .ctx
+                    .client
+                    .table("change_request")
+                    .fields(CHANGE_REQUEST_QUERY_FIELDS)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .limit(limit as u32);
+                if let Some(value) = filters.assignment_group.as_deref() {
+                    query = query.equals("assignment_group", value);
+                }
+                if let Some(value) = filters.assigned_to.as_deref() {
+                    query = query.equals("assigned_to", value);
+                }
+                if let Some(value) = resolved_state.as_deref() {
+                    query = query.equals("state", value);
+                }
+                if let Some(value) = filters.start_date_after.as_deref() {
+                    query = query.greater_than("start_date", value);
+                }
+                if let Some(value) = filters.start_date_before.as_deref() {
+                    query = query.less_than("start_date", value);
+                }
+                ("change_request", limit, cursor, query)
+            }
+            ValidatedRecordQuery::Story {
+                filters,
+                include_description,
+                limit,
+                cursor,
+            } => {
+                let filters = *filters;
+                let resolved_states = match filters.states.as_deref() {
+                    Some(selectors) => {
+                        let choices = self.field_choices("rm_story", "state").await?;
+                        let mut seen = HashSet::new();
+                        let mut resolved = Vec::with_capacity(selectors.len());
+                        for selector in selectors {
+                            let value = resolve_record_query_state(selector, "rm_story", &choices)?;
+                            if !seen.insert(value.clone()) {
+                                return Err(RecordQueryError::UnresolvedState {
+                                    requested: selector.clone(),
+                                    table: "rm_story".to_string(),
+                                    field: "state".to_string(),
+                                    ambiguous: true,
+                                    choices,
+                                }
+                                .into());
+                            }
+                            resolved.push(value);
+                        }
+                        Some(resolved)
+                    }
+                    None => None,
+                };
+                let mut fields = STORY_QUERY_FIELDS.to_vec();
+                if include_description {
+                    fields.extend_from_slice(STORY_QUERY_DESCRIPTION_FIELDS);
+                }
+                let mut query = self
+                    .ctx
+                    .client
+                    .table("rm_story")
+                    .fields(&fields)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .limit(limit as u32);
+                if let Some(value) = filters.assignment_group.as_deref() {
+                    query = query.equals("assignment_group", value);
+                }
+                if let Some(value) = filters.assigned_to.as_deref() {
+                    query = query.equals("assigned_to", value);
+                }
+                if let Some(value) = filters.story_owner.as_deref() {
+                    query = query.equals("u_story_owner", value);
+                }
+                if let Some(value) = filters.lead_developer.as_deref() {
+                    query = query.equals("u_lead_dev", value);
+                }
+                if let Some(values) = resolved_states.as_deref() {
+                    if let [value] = values {
+                        query = query.equals("state", value);
+                    } else {
+                        let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+                        query = query.in_list("state", &values);
+                    }
+                }
+                if let Some(value) = filters.sprint.as_deref() {
+                    query = query.equals("sprint", value);
+                }
+                if let Some(value) = filters.project.as_deref() {
+                    query = query.equals("project", value);
+                }
+                if let Some(value) = filters.cmdb_ci.as_deref() {
+                    query = query.equals("cmdb_ci", value);
+                }
+                if let Some(value) = filters.blocked {
+                    query = query.equals("blocked", if value { "true" } else { "false" });
+                }
+                if let Some(value) = filters.due_date_after.as_deref() {
+                    query = query.greater_than("due_date", value);
+                }
+                if let Some(value) = filters.due_date_before.as_deref() {
+                    query = query.less_than("due_date", value);
+                }
+                if let Some(value) = filters.updated_after.as_deref() {
+                    query = query.greater_than("sys_updated_on", value);
+                }
+                if let Some(values) = filters.numbers.as_deref() {
+                    if let [value] = values {
+                        query = query.equals("number", value);
+                    } else {
+                        let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+                        query = query.in_list("number", &values);
+                    }
+                }
+                if let Some(value) = filters.text.as_deref() {
+                    query = query.contains("short_description", value);
+                }
+                ("rm_story", limit, cursor, query)
+            }
+        };
+
+        if let Some(cursor) = cursor.as_deref() {
+            query = query.greater_than("sys_id", cursor);
+        }
+        query = query.order_by("sys_id", Order::Asc);
+        let rows = query.execute().await?.records;
+        let rows_inspected = rows.len();
+        let complete = rows_inspected < limit;
+        let next_cursor = if complete {
+            None
+        } else {
+            rows.last().map(|row| row.sys_id.clone())
+        };
+        let records = rows
+            .iter()
+            .map(SnowRecord::from_servicenow)
+            .collect::<Vec<_>>();
+        debug_assert!(records.iter().all(|record| record.table == table));
+
+        Ok(RecordQueryPage {
+            records,
+            next_cursor,
+            complete,
+            source: RecordQuerySource::Live,
+            limit,
+            rows_inspected,
+        })
+    }
+
     pub async fn my_tasks(&self) -> Result<Vec<SnowRecord>> {
         self.ctx.query.my_tasks().await
     }
@@ -1494,6 +1669,12 @@ impl RecordService {
 
     pub async fn field_choices(&self, table: &str, field: &str) -> Result<Vec<FieldChoice>> {
         let mut choices = self.ctx.field_choices_for_table(table, field).await?;
+        if choices.is_empty()
+            && let Some(ui_metadata) = self.ctx.ui_metadata.as_ref()
+            && let Ok(metadata_choices) = ui_metadata.field_choices(table, field).await
+        {
+            choices = metadata_choices;
+        }
         if choices.is_empty() {
             for ancestor in self.ctx.table_ancestors(table).await? {
                 choices = self.ctx.field_choices_for_table(&ancestor, field).await?;
@@ -1661,10 +1842,12 @@ mod tests {
     use crate::tests::*;
     use crate::vault::VaultDocument;
     use crate::{
-        FieldValue, MatchField, ResourcePlanStateFilter, SnowCore, WORK_RECORD_CACHE_TTL_MINUTES,
-        collect_journal_entries, document_content, document_tag_tokens,
-        record_row_from_runtime_record, record_row_from_servicenow, render_journal_entries,
-        serialize_vault_document, work_record_ttl,
+        CHANGE_REQUEST_QUERY_FIELDS, ChangeRequestQueryFilters, FieldValue, MatchField,
+        RecordQueryInput, RecordQuerySource, ResourcePlanStateFilter,
+        STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, SnowCore, StoryQueryFilters,
+        WORK_RECORD_CACHE_TTL_MINUTES, collect_journal_entries, document_content,
+        document_tag_tokens, record_row_from_runtime_record, record_row_from_servicenow,
+        render_journal_entries, serialize_vault_document, work_record_ttl,
     };
     use crate::{
         INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
@@ -2867,6 +3050,544 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn field_choices_falls_back_to_authenticated_ui_metadata_when_sys_choice_is_hidden() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/ui/meta/change_request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "columns": {
+                        "state": {
+                            "choices": [
+                                { "value": "1", "label": "New" },
+                                { "value": "2", "label": "In Progress" },
+                                { "value": "2", "label": "Duplicate" },
+                                { "value": "", "label": "None" }
+                            ]
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ServiceNowClient::builder()
+            .instance(server.uri())
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let choices = SnowCore::builder()
+            .client(client)
+            .ui_metadata_basic_auth(
+                "test_user",
+                crate::credential::SecretString::new("test_pass".to_string()),
+            )
+            .vault_path(tempdir.path().join("vault"))
+            .build()
+            .await
+            .expect("core")
+            .field_choices("change_request", "state")
+            .await
+            .expect("field choices");
+
+        assert_eq!(
+            choices,
+            vec![
+                FieldChoice {
+                    value: "1".to_string(),
+                    label: "New".to_string(),
+                    terminal: false,
+                },
+                FieldChoice {
+                    value: "2".to_string(),
+                    label: "In Progress".to_string(),
+                    terminal: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn record_query_enforces_change_and_story_filters_and_exact_projections() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "sys_id": "choice-one", "value": "1", "label": "New", "inactive": "false" },
+                    { "sys_id": "choice-two", "value": "2", "label": "In Progress", "inactive": "false" }
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let change_query = concat!(
+            "assignment_group=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "^assigned_to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "^state=2",
+            "^start_date>2026-08-01",
+            "^start_date<2026-08-31",
+            "^sys_id>11111111111111111111111111111111",
+            "^ORDERBYsys_id"
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/change_request"))
+            .and(query_param("sysparm_query", change_query))
+            .and(query_param(
+                "sysparm_fields",
+                CHANGE_REQUEST_QUERY_FIELDS.join(","),
+            ))
+            .and(query_param("sysparm_display_value", "all"))
+            .and(query_param("sysparm_limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "22222222222222222222222222222222",
+                    "number": "CHG0000001",
+                    "short_description": "Bounded change",
+                    "state": { "value": "2", "display_value": "In Progress" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let story_fields = STORY_QUERY_FIELDS
+            .iter()
+            .chain(STORY_QUERY_DESCRIPTION_FIELDS.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        let story_query = concat!(
+            "assignment_group=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "^assigned_to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "^u_story_owner=cccccccccccccccccccccccccccccccc",
+            "^u_lead_dev=dddddddddddddddddddddddddddddddd",
+            "^stateIN1,2",
+            "^sprint=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "^project=ffffffffffffffffffffffffffffffff",
+            "^cmdb_ci=99999999999999999999999999999999",
+            "^blocked=true",
+            "^due_date>2026-08-01",
+            "^due_date<2026-08-31",
+            "^sys_updated_on>2026-08-01 12:00:00",
+            "^numberINSTRY1,STRY2",
+            "^short_descriptionLIKEidentity",
+            "^sys_id>22222222222222222222222222222222",
+            "^ORDERBYsys_id"
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/rm_story"))
+            .and(query_param("sysparm_query", story_query))
+            .and(query_param("sysparm_fields", story_fields))
+            .and(query_param("sysparm_display_value", "all"))
+            .and(query_param("sysparm_limit", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "33333333333333333333333333333333",
+                    "number": "STRY1",
+                    "short_description": "Identity story",
+                    "description": "Details",
+                    "acceptance_criteria": "Accepted",
+                    "state": { "value": "1", "display_value": "New" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ServiceNowClient::builder()
+            .instance(server.uri())
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+        let tempdir = TempDir::new().expect("tempdir");
+        let vault_path = tempdir.path().join("vault");
+        let core = SnowCore::builder()
+            .client(client)
+            .vault_path(&vault_path)
+            .build()
+            .await
+            .expect("core");
+
+        let change_page = core
+            .record_query(RecordQueryInput::ChangeRequest {
+                filters: ChangeRequestQueryFilters {
+                    assignment_group: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+                    assigned_to: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                    state: Some("in progress".to_string()),
+                    start_date_after: Some("2026-08-01".to_string()),
+                    start_date_before: Some("2026-08-31".to_string()),
+                },
+                limit: Some(1),
+                cursor: Some("11111111111111111111111111111111".to_string()),
+            })
+            .await
+            .expect("change page");
+        assert_eq!(change_page.rows_inspected, 1);
+        assert!(!change_page.complete);
+        assert_eq!(
+            change_page.next_cursor.as_deref(),
+            Some("22222222222222222222222222222222")
+        );
+        assert_eq!(change_page.source, RecordQuerySource::Live);
+
+        let story_page = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters {
+                    assignment_group: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                    assigned_to: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                    story_owner: Some("cccccccccccccccccccccccccccccccc".to_string()),
+                    lead_developer: Some("dddddddddddddddddddddddddddddddd".to_string()),
+                    states: Some(vec!["New".to_string(), "2".to_string()]),
+                    sprint: Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()),
+                    project: Some("ffffffffffffffffffffffffffffffff".to_string()),
+                    cmdb_ci: Some("99999999999999999999999999999999".to_string()),
+                    blocked: Some(true),
+                    due_date_after: Some("2026-08-01".to_string()),
+                    due_date_before: Some("2026-08-31".to_string()),
+                    updated_after: Some("2026-08-01 12:00:00".to_string()),
+                    numbers: Some(vec!["stry1".to_string(), "STRY2".to_string()]),
+                    text: Some(" identity ".to_string()),
+                }),
+                include_description: true,
+                limit: Some(2),
+                cursor: Some("22222222222222222222222222222222".to_string()),
+            })
+            .await
+            .expect("story page");
+        assert_eq!(story_page.rows_inspected, 1);
+        assert!(story_page.complete);
+        assert_eq!(story_page.next_cursor, None);
+        assert_eq!(story_page.records[0].number, "STRY1");
+
+        assert_eq!(
+            core.ctx
+                .query
+                .list_records(ListQuery::new())
+                .await
+                .expect("cache query")
+                .len(),
+            0
+        );
+        assert!(
+            !vault_path.exists()
+                || std::fs::read_dir(&vault_path)
+                    .expect("vault directory")
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn record_query_exact_multiple_requires_terminal_empty_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/rm_story"))
+            .and(query_param("sysparm_query", "^ORDERBYsys_id"))
+            .and(query_param("sysparm_fields", STORY_QUERY_FIELDS.join(",")))
+            .and(query_param("sysparm_display_value", "all"))
+            .and(query_param("sysparm_limit", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "sys_id": "11111111111111111111111111111111", "number": "STRY1" },
+                    { "sys_id": "22222222222222222222222222222222", "number": "STRY2" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/rm_story"))
+            .and(query_param(
+                "sysparm_query",
+                "sys_id>22222222222222222222222222222222^ORDERBYsys_id",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ServiceNowClient::builder()
+            .instance(server.uri())
+            .auth(BasicAuth::new("test_user", "test_pass"))
+            .allow_http()
+            .build()
+            .await
+            .expect("client");
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = SnowCore::builder()
+            .client(client)
+            .vault_path(tempdir.path().join("vault"))
+            .build()
+            .await
+            .expect("core");
+
+        let first = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: Some(2),
+                cursor: None,
+            })
+            .await
+            .expect("first page");
+        assert!(!first.complete);
+        assert_eq!(
+            first.next_cursor.as_deref(),
+            Some("22222222222222222222222222222222")
+        );
+
+        let terminal = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: Some(2),
+                cursor: first.next_cursor,
+            })
+            .await
+            .expect("terminal page");
+        assert!(terminal.complete);
+        assert_eq!(terminal.rows_inspected, 0);
+        assert_eq!(terminal.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn record_query_rejects_invalid_arguments_before_record_io() {
+        let server = MockServer::start().await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let invalid = [
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: Some(0),
+                cursor: None,
+            },
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: Some(201),
+                cursor: None,
+            },
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters {
+                    due_date_after: Some("2026-08-31".to_string()),
+                    due_date_before: Some("2026-08-01".to_string()),
+                    ..Default::default()
+                }),
+                include_description: false,
+                limit: None,
+                cursor: None,
+            },
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters {
+                    states: Some(vec!["New".to_string(), " new ".to_string()]),
+                    ..Default::default()
+                }),
+                include_description: false,
+                limit: None,
+                cursor: None,
+            },
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters {
+                    numbers: Some(vec!["INC1".to_string()]),
+                    ..Default::default()
+                }),
+                include_description: false,
+                limit: None,
+                cursor: None,
+            },
+            RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: None,
+                cursor: Some("not-a-sys-id".to_string()),
+            },
+        ];
+
+        for input in invalid {
+            let error = core
+                .record_query(input)
+                .await
+                .expect_err("invalid record query must fail");
+            assert!(matches!(
+                error.downcast_ref::<RecordQueryError>(),
+                Some(RecordQueryError::InvalidParams(_))
+            ));
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "invalid arguments must fail before any ServiceNow request"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_query_state_correction_fails_before_record_io() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    { "value": "1", "label": "New", "inactive": "false" },
+                    { "value": "2", "label": "Pending", "inactive": "false" },
+                    { "value": "3", "label": "pending", "inactive": "false" }
+                ]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+
+        for (selectors, expected_ambiguous) in [
+            (vec!["Missing".to_string()], false),
+            (vec!["Pending".to_string()], true),
+            (vec!["1".to_string(), "New".to_string()], true),
+        ] {
+            let error = core
+                .record_query(RecordQueryInput::Story {
+                    filters: Box::new(StoryQueryFilters {
+                        states: Some(selectors),
+                        ..Default::default()
+                    }),
+                    include_description: false,
+                    limit: None,
+                    cursor: None,
+                })
+                .await
+                .expect_err("unresolved state must fail");
+            assert!(matches!(
+                error.downcast_ref::<RecordQueryError>(),
+                Some(RecordQueryError::UnresolvedState {
+                    ambiguous,
+                    choices,
+                    ..
+                }) if *ambiguous == expected_ambiguous && choices.len() == 3
+            ));
+        }
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() == "/api/now/table/sys_choice"),
+            "state correction must not issue a Story record request"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_query_empty_state_choices_fail_closed_before_record_io() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_choice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_db_object"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+
+        let error = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters {
+                    states: Some(vec!["1".to_string()]),
+                    ..Default::default()
+                }),
+                include_description: false,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .expect_err("empty live choices must fail closed");
+        assert!(matches!(
+            error.downcast_ref::<RecordQueryError>(),
+            Some(RecordQueryError::UnresolvedState {
+                ambiguous: false,
+                choices,
+                ..
+            }) if choices.is_empty()
+        ));
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/now/table/rm_story"),
+            "empty choices must not issue a Story record request"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_query_uses_default_and_maximum_page_limits() {
+        let server = MockServer::start().await;
+        for limit in [50, 200] {
+            Mock::given(method("GET"))
+                .and(path("/api/now/table/rm_story"))
+                .and(query_param("sysparm_query", "^ORDERBYsys_id"))
+                .and(query_param("sysparm_limit", limit.to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "result": []
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+
+        let default_page = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .expect("default page");
+        assert_eq!(default_page.limit, 50);
+
+        let maximum_page = core
+            .record_query(RecordQueryInput::Story {
+                filters: Box::new(StoryQueryFilters::default()),
+                include_description: false,
+                limit: Some(200),
+                cursor: None,
+            })
+            .await
+            .expect("maximum page");
+        assert_eq!(maximum_page.limit, 200);
     }
 
     #[tokio::test]

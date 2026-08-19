@@ -1,6 +1,7 @@
 # Lint and static-analysis checks for every push and pull request.
 #
-# Runs formatting verification and Clippy across the whole workspace.
+# Rejects orphaned production Rust sources, then runs formatting verification
+# and Clippy across the whole workspace.
 # Clippy warnings are treated as errors (-D warnings) so regressions fail CI.
 name: ci
 
@@ -14,7 +15,7 @@ env:
 
 jobs:
   lint:
-    name: fmt + clippy
+    name: source graph + fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,6 +28,9 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust source graph
+        run: python3 scripts/check_rust_source_graph.py
 
       - name: Check formatting
         run: cargo fmt --all --check

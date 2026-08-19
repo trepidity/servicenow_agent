@@ -1,3 +1,4 @@
+use super::handlers::*;
 use super::*;
 use crate::test_support::{
     build_fixture_state, build_fixture_state_at_instance,
@@ -4082,5 +4083,110 @@ async fn incident_list_by_assignment_group_is_routable_and_advertised() {
             .iter()
             .any(|method| method.as_str() == Some("incident_list_by_assignment_group")),
         "contract_info must advertise the method"
+    );
+}
+
+// ---------------------------------------------------------------------
+// record_query
+//
+// Authority: docs/spec-mullet-record-query-parity.md
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_query_returns_the_core_live_page_contract() {
+    let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![json!({
+        "result": [{
+            "sys_id": { "value": "00000000000000000000000000000001" },
+            "number": { "value": "STRY1" },
+            "short_description": { "value": "Typed story" },
+            "state": { "value": "1", "display_value": "New" }
+        }]
+    })])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "record_query".to_string(),
+            params: json!({
+                "resource_type": "story",
+                "filters": {},
+                "limit": 2
+            }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("result");
+    assert_eq!(result["records"].as_array().expect("records").len(), 1);
+    assert_eq!(result["records"][0]["number"], json!("STRY1"));
+    assert_eq!(result["next_cursor"], json!(null));
+    assert_eq!(result["complete"], json!(true));
+    assert_eq!(result["source"], json!("live"));
+    assert_eq!(result["limit"], json!(2));
+    assert_eq!(result["rows_inspected"], json!(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_query_and_legacy_list_reject_unknown_inputs_before_io() {
+    let fixture = build_fixture_state().await.expect("fixture");
+    for (method, params) in [
+        (
+            "record_query",
+            json!({"resource_type":"story","filters":{"arbitrary":"x"}}),
+        ),
+        (
+            "record_query",
+            json!({"resource_type":"change_request","include_description":true}),
+        ),
+        ("list_records", json!({"filter":"state=1"})),
+    ] {
+        let response = dispatch(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: method.to_string(),
+                params: params.clone(),
+                id: Some(json!(1)),
+            },
+            &fixture.state,
+        )
+        .await;
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("{method} accepted {params}"));
+        assert_eq!(error.code, -32602, "{method} {params}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_query_is_routable_and_advertised() {
+    assert_eq!(
+        RpcMethod::from_method("record_query"),
+        RpcMethod::RecordQuery
+    );
+    let fixture = build_fixture_state().await.expect("fixture");
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "contract_info".to_string(),
+            params: json!({}),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+    assert!(
+        response.result.expect("contract")["supported_methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .any(|method| method == "record_query")
     );
 }

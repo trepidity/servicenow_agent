@@ -184,6 +184,7 @@ impl McpServer {
             "knowledge_answer" => self.call_knowledge_answer(id, params).await,
             "knowledge_grounded_plan" => self.call_knowledge_grounded_plan(id, params).await,
             "list_records" => self.call_list_records(id, params).await,
+            "record_query" => self.call_record_query(id, params).await,
             "list_knowledge_bases" => self.call_list_knowledge_bases(id),
             "list_categories" => self.call_list_categories(id, params),
             "list_knowledge_articles" => self.call_list_knowledge_articles(id, params).await,
@@ -1384,6 +1385,24 @@ impl McpServer {
         }
     }
 
+    async fn call_record_query(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let input: snow_core::RecordQueryInput = match serde_json::from_value(arguments) {
+            Ok(input) => input,
+            Err(err) => return invalid_params(id, err),
+        };
+        if let Err(err) = snow_core::validate_record_query(input.clone()) {
+            return invalid_params(id, err);
+        }
+        match self.core.record_query(input).await {
+            Ok(page) => JsonRpcResponse::ok(id, json!(page)),
+            Err(err) => record_query_error_response(id, err),
+        }
+    }
+
     fn call_list_knowledge_bases(&self, id: Option<Value>) -> JsonRpcResponse {
         match self.core.list_knowledge_bases() {
             Ok(bases) => JsonRpcResponse::ok(id, json!({ "bases": bases })),
@@ -1927,6 +1946,7 @@ impl McpServerBuilder {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ListRecordsArguments {
     #[serde(default)]
     resource_type: Option<String>,
@@ -2254,6 +2274,35 @@ fn invalid_params(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         "invalid params",
         Some(json!({ "details": err.to_string() })),
     )
+}
+
+fn record_query_error_response(id: Option<Value>, err: anyhow::Error) -> JsonRpcResponse {
+    match err.downcast_ref::<snow_core::RecordQueryError>() {
+        Some(snow_core::RecordQueryError::InvalidParams(_)) => invalid_params(id, err),
+        Some(snow_core::RecordQueryError::UnresolvedState {
+            requested,
+            table,
+            field,
+            ambiguous,
+            choices,
+        }) => JsonRpcResponse::error(
+            id,
+            -32602,
+            "invalid params",
+            Some(json!({
+                "details": err.to_string(),
+                "requested": requested,
+                "table": table,
+                "field": field,
+                "ambiguous": ambiguous,
+                "choices": choices
+                    .iter()
+                    .map(|choice| json!({ "value": choice.value, "label": choice.label }))
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+        None => service_failure(id, err),
+    }
 }
 
 fn daemon_required_for_write(id: Option<Value>, tool: &str, details: &str) -> JsonRpcResponse {

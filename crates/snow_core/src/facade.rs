@@ -29,6 +29,20 @@ impl SnowCore {
         &self.ctx.vault_path
     }
 
+    pub fn cache_status(&self) -> Result<crate::cache::CacheStatus> {
+        let store = self.ctx.query.store();
+        let sqlite_path = store.path().to_path_buf();
+        let db_size_bytes = std::fs::metadata(&sqlite_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(crate::cache::CacheStatus {
+            vault_path: self.ctx.vault_path.clone(),
+            sqlite_path,
+            db_size_bytes,
+            total_rows: store.count_records()?,
+        })
+    }
+
     pub async fn lookup_user(&self, lookup: UserLookup) -> Result<Option<UserLookupResult>> {
         self.users.lookup_user(lookup).await
     }
@@ -334,6 +348,10 @@ impl SnowCore {
 
     pub async fn list_records_query(&self, query: ListQuery) -> Result<Vec<SnowRecord>> {
         self.records.list_records_query(query).await
+    }
+
+    pub async fn record_query(&self, input: RecordQueryInput) -> Result<RecordQueryPage> {
+        self.records.record_query(input).await
     }
 
     pub async fn my_tasks(&self) -> Result<Vec<SnowRecord>> {
@@ -651,6 +669,7 @@ impl SnowCore {
 pub struct SnowCoreBuilder {
     config: Option<config::SnowConfig>,
     client: Option<ServiceNowClient>,
+    ui_metadata_auth: Option<(String, credential::SecretString)>,
     vault_path: Option<PathBuf>,
 }
 
@@ -662,6 +681,17 @@ impl SnowCoreBuilder {
 
     pub fn client(mut self, client: ServiceNowClient) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Configure credentials for the read-only UI metadata fallback used when
+    /// `sys_choice` is hidden by ServiceNow ACLs.
+    pub fn ui_metadata_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: credential::SecretString,
+    ) -> Self {
+        self.ui_metadata_auth = Some((username.into(), password));
         self
     }
 
@@ -686,6 +716,13 @@ impl SnowCoreBuilder {
             self.client
                 .ok_or_else(|| anyhow::anyhow!("missing client"))?,
         );
+        let ui_metadata = self.ui_metadata_auth.map(|(username, password)| {
+            Arc::new(context::UiMetadataClient::new(
+                client.base_url(),
+                username,
+                password,
+            ))
+        });
         let db_path = vault_root_to_db_path(&vault_path);
         let vault = VaultManager::new(&vault_path);
         let query = Arc::new(query::QueryEngine::open_with_vault(&db_path, &vault_path)?);
@@ -698,6 +735,7 @@ impl SnowCoreBuilder {
 
         let ctx = context::CoreContext {
             client,
+            ui_metadata,
             store,
             query,
             cache,

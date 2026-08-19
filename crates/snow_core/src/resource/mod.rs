@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod change;
 pub mod incident;
 pub mod knowledge;
+pub mod record_query;
 pub mod request;
 pub mod resource_plan;
 pub mod server;

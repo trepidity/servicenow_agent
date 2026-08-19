@@ -362,6 +362,12 @@ crates/snow_daemon/src/story_write/
   audit.rs                  redacted audit identities, reasons, and warnings
 ```
 
+Implementation adjustment: the CLI ownership tree is nested under
+`crates/snow_cli/src/app/` (`bootstrap.rs`, `cache_command.rs`, `commands/`,
+and `output/`). These modules share the binary-private application context and
+therefore have the same reason to change; `main.rs` remains the composition
+entrypoint and `app/mod.rs` remains the execution-mode facade.
+
 Tests live with the owning behavior or in an integration-test target that
 drives a declared seam. Do not create a mirrored test file for every production
 module.
@@ -662,7 +668,7 @@ behavior uses red-first consumer tests that fail for the intended old behavior.
 
   ```bash
   rg -n 'rusqlite|cache::store::Store|Store::open|execute_batch|prepare\(' \
-    crates/snow_cli/src/main.rs crates/snow_cli/src/commands crates/snow_cli/src/output
+    crates/snow_cli/src/main.rs crates/snow_cli/src/app/commands crates/snow_cli/src/app/output
   ```
 
   Expected result: no matches. Concrete construction belongs in bootstrap or

@@ -334,6 +334,7 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let credential = CredentialProvider::from_runtime_env();
     let password = credential.resolve()?;
     let auth = BasicAuth::new(&username, password.as_str()).without_session();
+    let metadata_password = password.clone();
     drop(password);
 
     let client = ServiceNowClient::builder()
@@ -345,7 +346,7 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let mut config = SnowConfig {
         instance: core_config::InstanceConfig {
             url: instance,
-            user: username,
+            user: username.clone(),
             credential,
             portal: std::env::var("SNOW_PORTAL").unwrap_or_default(),
         },
@@ -371,6 +372,7 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     SnowCore::builder()
         .config(config.clone())
         .client(client)
+        .ui_metadata_basic_auth(username, metadata_password)
         .vault_path(config.vault.path)
         .build()
         .await

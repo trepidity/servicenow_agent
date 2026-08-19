@@ -25,6 +25,7 @@ use crate::convert::{
     enrichment_origin_label, record_row_from_runtime_record, record_row_from_snow_record,
     serialize_vault_document,
 };
+use crate::credential::SecretString;
 use crate::enrich::derive_for_record;
 use crate::helpers::{
     collect_journal_entries, document_content, document_tag_tokens, document_work_notes,
@@ -52,6 +53,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct CoreContext {
     pub client: Arc<ServiceNowClient>,
+    pub ui_metadata: Option<Arc<UiMetadataClient>>,
     // Read by the per-domain services extracted in Tasks 8-11; the primitives
     // moved here in this task reach the store via `self.query.store()`.
     #[allow(dead_code)]
@@ -62,6 +64,93 @@ pub(crate) struct CoreContext {
     pub vault: VaultManager,
     pub vault_path: PathBuf,
     pub config: Arc<SnowConfig>,
+}
+
+/// Authenticated reader for ServiceNow's UI metadata endpoint.
+///
+/// Some least-privilege integrations cannot read `sys_choice` even though the
+/// UI metadata API exposes the applicable, inherited choices for a table.
+/// Credentials are retained in zeroizing storage and used only on that
+/// read-only endpoint.
+pub(crate) struct UiMetadataClient {
+    client: reqwest::Client,
+    base_url: String,
+    username: String,
+    password: SecretString,
+}
+
+impl UiMetadataClient {
+    pub(crate) fn new(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: SecretString,
+    ) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            username: username.into(),
+            password,
+        }
+    }
+
+    pub(crate) async fn field_choices(&self, table: &str, field: &str) -> Result<Vec<FieldChoice>> {
+        if !is_metadata_identifier(table) || !is_metadata_identifier(field) {
+            return Err(anyhow::anyhow!(
+                "table and field names must contain only ASCII letters, digits, or underscores"
+            ));
+        }
+
+        let response = self
+            .client
+            .get(format!("{}/api/now/ui/meta/{table}", self.base_url))
+            .basic_auth(&self.username, Some(self.password.as_str()))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+        let raw_choices = body
+            .get("result")
+            .and_then(|result| result.get("columns"))
+            .and_then(|columns| columns.get(field))
+            .and_then(|column| column.get("choices"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("UI metadata did not contain a choice array for `{table}.{field}`")
+            })?;
+
+        let mut seen = HashSet::new();
+        let mut choices = Vec::new();
+        for choice in raw_choices {
+            let value = choice
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if value.is_empty() || !seen.insert(value.to_string()) {
+                continue;
+            }
+            let label = choice
+                .get("label")
+                .or_else(|| choice.get("rawLabel"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .unwrap_or(value);
+            choices.push(FieldChoice {
+                value: value.to_string(),
+                label: label.to_string(),
+                terminal: false,
+            });
+        }
+        Ok(choices)
+    }
+}
+
+fn is_metadata_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 impl CoreContext {

@@ -1,3 +1,6 @@
+#[path = "support/record_query.rs"]
+mod record_query_support;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -124,6 +127,12 @@ impl DaemonJsonRpcClient for MockDaemon {
                 })
             }
             "incident_list_by_assignment_group" => Ok(incident_group_page_payload()),
+            "record_query" => Ok(record_query_support::expected_page()),
+            "list_records" if params.get("filter").is_some() => Err(Error::DaemonJsonRpc {
+                code: -32602,
+                message: "invalid params".to_string(),
+                data: Some(json!({ "details": "unknown field `filter`" })),
+            }),
             "story_apply_create"
                 if params.get("plan_id").and_then(Value::as_str) == Some("error-plan") =>
             {
@@ -479,6 +488,61 @@ async fn bridge_forwards_incident_group_page_params_unchanged() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0, "incident_list_by_assignment_group");
     assert_eq!(calls[1].1, arguments);
+}
+
+#[tokio::test]
+async fn bridge_capability_gates_and_forwards_record_query_unchanged() {
+    let unavailable = bridge(MockDaemon::new(contract(&["contract_info"])));
+    let unavailable_response = unavailable
+        .dispatch(request(
+            "tools/call",
+            json!({"name":"record_query","arguments":{"resource_type":"story"}}),
+        ))
+        .await;
+    assert_eq!(
+        unavailable_response.error.expect("unavailable").code,
+        -32041
+    );
+
+    let daemon = MockDaemon::new(contract(&["contract_info", "record_query"]));
+    let server = bridge(daemon.clone());
+    let arguments = json!({
+        "resource_type": "story",
+        "filters": { "text": "identity" },
+        "include_description": true,
+        "limit": 2,
+        "cursor": "00000000000000000000000000000001"
+    });
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({"name":"record_query","arguments":arguments.clone()}),
+        ))
+        .await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.expect("result")["structuredContent"],
+        record_query_support::expected_page()
+    );
+    let calls = daemon.calls().await;
+    assert_eq!(calls[1], ("record_query".to_string(), arguments));
+}
+
+#[tokio::test]
+async fn bridge_preserves_legacy_list_filter_rejection() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "list_records"]));
+    let server = bridge(daemon.clone());
+    let response = server
+        .dispatch(request(
+            "tools/call",
+            json!({"name":"list_records","arguments":{"filter":"state=1"}}),
+        ))
+        .await;
+    assert_eq!(response.error.expect("must reject").code, -32602);
+    assert_eq!(
+        daemon.calls().await[1],
+        ("list_records".to_string(), json!({"filter":"state=1"}))
+    );
 }
 
 #[tokio::test]

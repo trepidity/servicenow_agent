@@ -11,6 +11,14 @@ use crate::SnowRecord;
 use memory::MemoryCache;
 use store::Store;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStatus {
+    pub vault_path: std::path::PathBuf,
+    pub sqlite_path: std::path::PathBuf,
+    pub db_size_bytes: u64,
+    pub total_rows: u64,
+}
+
 #[derive(Clone)]
 pub struct CacheManager {
     memory: Arc<Mutex<MemoryCache>>,

@@ -98,6 +98,7 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "get_article",
         "kb_semantic_search",
         "list_records",
+        "record_query",
         "list_knowledge_bases",
         "list_categories",
         "list_knowledge_articles",
@@ -212,6 +213,45 @@ fn incident_list_by_assignment_group_is_a_bounded_read_tool() {
         !snow_mcp::domain::policy::is_write_tool("incident_list_by_assignment_group"),
         "the group Incident page must never be classified as a write"
     );
+}
+
+#[test]
+fn record_query_schema_is_strict_bounded_and_composition_free() {
+    let registry = ToolRegistry::new();
+    let tool = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "record_query")
+        .expect("record_query registered");
+    assert!(tool.default_enabled);
+    assert!(!tool.requires_confirmation);
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert_no_top_level_schema_composition(&tool.input_schema);
+    assert_eq!(tool.input_schema["required"], json!(["resource_type"]));
+    assert_eq!(
+        tool.input_schema["properties"]["resource_type"]["enum"],
+        json!(["change_request", "story"])
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["filters"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["limit"]["maximum"],
+        json!(200)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["cursor"]["pattern"],
+        json!("^[0-9a-fA-F]{32}$")
+    );
+
+    let legacy = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "list_records")
+        .expect("list_records registered");
+    assert_eq!(legacy.input_schema["additionalProperties"], json!(false));
 }
 
 #[test]
