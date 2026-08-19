@@ -6,7 +6,7 @@
 //! in `lib.rs`; the only edits are `self.<helper>` → `self.ctx.<helper>` for the
 //! persistence/lifecycle primitives whose bodies live on [`CoreContext`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,6 +25,78 @@ use crate::{
     ResourceType, document_assigned_to, document_content, document_tag_tokens, document_work_notes,
     record_row_from_runtime_record, serialize_vault_document,
 };
+
+/// Replaces `database_path` with an empty current-format cache without reading
+/// or modifying the durable markdown vault.
+///
+/// The caller must ensure no process has the cache open while it is replaced.
+///
+/// # Errors
+///
+/// Returns an error when the replacement cache cannot be created, validated,
+/// cleaned of prior SQLite sidecars, or moved into place.
+pub fn reset_cache(database_path: &Path) -> Result<()> {
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snow.db");
+    let temporary = parent.join(format!(".{file_name}.reset-{}.tmp", uuid::Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let store = Store::open(&temporary).context("creating empty reset cache")?;
+        drop(store);
+        if Store::inspect_format(&temporary)? != crate::cache::store::CacheFormat::Current {
+            anyhow::bail!("reset cache did not validate as the current format");
+        }
+        remove_sqlite_sidecars(database_path)?;
+        std::fs::rename(&temporary, database_path)
+            .with_context(|| format!("replacing cache {}", database_path.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = remove_sqlite_sidecars(&temporary);
+    }
+    result
+}
+
+/// Validates and atomically promotes a completed ServiceNow rebuild cache.
+///
+/// The caller must drop every connection to both paths and ensure the daemon
+/// is stopped before calling this function.
+pub fn promote_rebuilt_cache(staging_path: &Path, database_path: &Path) -> Result<()> {
+    if Store::inspect_format(staging_path)? != crate::cache::store::CacheFormat::Current {
+        anyhow::bail!("ServiceNow rebuild cache did not validate as the current format");
+    }
+    let connection = rusqlite::Connection::open(staging_path)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(connection);
+    remove_sqlite_sidecars(staging_path)?;
+    remove_sqlite_sidecars(database_path)?;
+    std::fs::rename(staging_path, database_path)
+        .with_context(|| format!("promoting rebuilt cache to {}", database_path.display()))?;
+    Ok(())
+}
+
+fn remove_sqlite_sidecars(database_path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = database_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = std::path::PathBuf::from(sidecar);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing cache sidecar {}", sidecar.display()));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Builds a fresh current-format projection beside `database_path` and replaces
 /// the local cache only after the vault reconstruction completes.
@@ -198,10 +270,10 @@ impl VaultService {
     }
 
     pub fn rebuild_cache_from_vault(&self) -> Result<usize> {
-        Ok(self.rebuild_cache()?.rebuilt_records)
+        Ok(self.import_cache_from_vault()?.rebuilt_records)
     }
 
-    pub fn rebuild_cache(&self) -> Result<RebuildReport> {
+    pub fn import_cache_from_vault(&self) -> Result<RebuildReport> {
         let entries = scan_documents(&self.ctx.vault_path)?;
         let mut rebuilt = 0usize;
         let scanned = entries.len();
@@ -488,7 +560,7 @@ mod tests {
             .vault
             .persist_record(&record)
             .expect("persist vault record");
-        core.rebuild_cache().expect("rebuild cache");
+        core.import_cache_from_vault().expect("import cache");
 
         let verification = core.verify_vault().expect("verify vault");
         assert_eq!(verification.scanned_documents, 1);

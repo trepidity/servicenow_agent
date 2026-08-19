@@ -56,7 +56,7 @@ fn render_actions(f: &mut Frame, area: Rect, _app: &AdminApp) {
         Line::raw("  [S] full sync (DESTRUCTIVE)"),
         Line::raw("  [b] full sync with bodies (DESTRUCTIVE)"),
         Line::raw("  [R] rebuild semantic index (DESTRUCTIVE)"),
-        Line::raw("  [a] refresh KB/cache/vault pipeline"),
+        Line::raw("  cache rebuild is offline-only"),
     ];
     let block = Block::default().title("Actions").borders(Borders::ALL);
     f.render_widget(Paragraph::new(lines).block(block), area);

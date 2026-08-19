@@ -62,7 +62,6 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "get_degraded_reads",
     "cache_info",
     "repair_vault",
-    "rebuild_cache",
     "verify_vault",
     "prune_orphans",
     "refresh_all",

@@ -154,6 +154,75 @@ fn is_metadata_identifier(value: &str) -> bool {
 }
 
 impl CoreContext {
+    pub(crate) fn project_live_records_without_vault(&self, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut entries = Vec::with_capacity(records.len());
+        let mut documents = Vec::with_capacity(records.len());
+        for record in records {
+            let document = self.runtime_document_from_servicenow(record)?;
+            let row = record_row_from_snow_record(document.record(), record, None)?;
+            let work_notes = render_journal_entries(&collect_journal_entries(record, "work_notes"));
+            let content = document_content(&document);
+            let tag_tokens = document_tag_tokens(&document);
+            entries.push((row, work_notes, content, tag_tokens));
+            documents.push(document);
+        }
+
+        let batch = entries
+            .iter()
+            .map(|(row, work_notes, content, tag_tokens)| {
+                (
+                    row,
+                    work_notes.as_str(),
+                    content.as_str(),
+                    tag_tokens.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.query.store().upsert_records(&batch)?;
+        for document in &documents {
+            self.project_runtime_document(document)?;
+            self.persist_enrichment(document.record())?;
+            self.cache.put(document.record().clone());
+        }
+        Ok(())
+    }
+
+    fn runtime_document_from_servicenow(&self, record: &Record) -> Result<VaultDocument> {
+        match record.table.as_str() {
+            "kb_knowledge" => Ok(VaultDocument::Knowledge(
+                self.build_knowledge_article(record)?,
+            )),
+            "sysapproval_approver" => {
+                let approver = ApprovalResource::approver_reference(record)
+                    .unwrap_or_else(|| empty_reference("sys_user"));
+                Ok(VaultDocument::Approval(ApprovalResource::from_servicenow(
+                    record, approver,
+                )))
+            }
+            _ => {
+                let mut snow_record = SnowRecord::from_servicenow(record);
+                snow_record.parent = parent_record_ref(record);
+                snow_record.references =
+                    if resource::business_application::is_business_application_alias(&record.table)
+                    {
+                        resource::business_application::collect_business_application_references(
+                            record,
+                            &BusinessApplicationFieldAliases::baseline_degraded(),
+                        )
+                    } else if resource::server::is_server_table(&record.table) {
+                        resource::server::collect_server_references(record)
+                    } else {
+                        collect_record_references(record)
+                    };
+                Ok(VaultDocument::Record(snow_record))
+            }
+        }
+    }
+
     /// Fetch journal fields (`work_notes`, `comments`) with display values
     /// via [`ServiceNowClient::journal_inline`] and merge them into the record.
     ///
@@ -194,40 +263,22 @@ impl CoreContext {
     }
 
     pub(crate) fn persist_document(&self, record: &Record) -> Result<PersistedRuntimeDocument> {
-        match record.table.as_str() {
-            "kb_knowledge" => {
-                let article = self.build_knowledge_article(record)?;
+        match self.runtime_document_from_servicenow(record)? {
+            VaultDocument::Knowledge(article) => {
                 let persisted = self.vault.persist_knowledge_article(&article)?;
                 Ok(PersistedRuntimeDocument::Knowledge {
                     article,
                     relative_path: persisted.relative_path,
                 })
             }
-            "sysapproval_approver" => {
-                let approver = ApprovalResource::approver_reference(record)
-                    .unwrap_or_else(|| empty_reference("sys_user"));
-                let approval = ApprovalResource::from_servicenow(record, approver);
+            VaultDocument::Approval(approval) => {
                 let persisted = self.vault.persist_approval(&approval)?;
                 Ok(PersistedRuntimeDocument::Approval {
                     approval,
                     relative_path: persisted.relative_path,
                 })
             }
-            _ => {
-                let mut snow_record = SnowRecord::from_servicenow(record);
-                snow_record.parent = parent_record_ref(record);
-                snow_record.references =
-                    if resource::business_application::is_business_application_alias(&record.table)
-                    {
-                        resource::business_application::collect_business_application_references(
-                            record,
-                            &BusinessApplicationFieldAliases::baseline_degraded(),
-                        )
-                    } else if resource::server::is_server_table(&record.table) {
-                        resource::server::collect_server_references(record)
-                    } else {
-                        collect_record_references(record)
-                    };
+            VaultDocument::Record(snow_record) => {
                 let persisted = self.vault.persist_record(&snow_record)?;
                 Ok(PersistedRuntimeDocument::Record {
                     record: snow_record,

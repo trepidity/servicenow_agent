@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use servicenow_rs::prelude::Record;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::vault::VaultScanFailure;
 use crate::{
@@ -155,6 +156,69 @@ pub struct RebuildReport {
     pub scanned_documents: usize,
     pub rebuilt_records: usize,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceNowCacheRebuildTableReport {
+    pub resource: String,
+    pub table: String,
+    pub pages: usize,
+    pub records: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceNowCacheRebuildReport {
+    pub source: String,
+    pub scope: String,
+    pub tables: Vec<ServiceNowCacheRebuildTableReport>,
+    pub pages: usize,
+    pub records: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheRebuildProgressEvent {
+    Preparing,
+    Tables {
+        tables: usize,
+        page_size: u32,
+    },
+    ResolvingUserScope,
+    UserScopeResolved,
+    TableStarted {
+        index: usize,
+        tables: usize,
+        resource: String,
+        table: String,
+    },
+    RequestingPage {
+        index: usize,
+        tables: usize,
+        resource: String,
+        table: String,
+        page: usize,
+    },
+    PageProjected {
+        index: usize,
+        tables: usize,
+        resource: String,
+        table: String,
+        page: usize,
+        page_records: usize,
+        table_records: usize,
+        total_records: usize,
+    },
+    TableCompleted {
+        index: usize,
+        tables: usize,
+        resource: String,
+        table: String,
+        pages: usize,
+        records: usize,
+    },
+}
+
+pub type CacheRebuildProgressSink =
+    Arc<dyn Fn(CacheRebuildProgressEvent) -> anyhow::Result<()> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrphanRecordRow {

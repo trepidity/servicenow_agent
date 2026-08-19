@@ -1,4 +1,7 @@
 use super::*;
+use crate::daemon_cmd::{client::endpoint_alive, paths::DaemonPaths};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 pub(super) fn cmd_cache_info() -> Result<(), SnowError> {
     let paths = runtime_paths();
@@ -24,12 +27,329 @@ pub(super) fn cmd_cache_info() -> Result<(), SnowError> {
     Ok(())
 }
 
-pub(super) fn cmd_rebuild_cache_offline() -> Result<(), SnowError> {
+pub(super) fn ensure_cache_replacement_is_offline(action: &str) -> Result<(), SnowError> {
+    let daemon_paths = DaemonPaths::resolve().map_err(SnowError::from)?;
+    if endpoint_alive(&daemon_paths) {
+        return Err(SnowError::Api(format!(
+            "daemon is running; stop it before {action} the cache"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn cmd_import_cache_from_vault_offline() -> Result<(), SnowError> {
+    ensure_cache_replacement_is_offline("importing")?;
     let paths = runtime_paths();
     let report = snow_core::rebuild_cache_from_vault(&paths.vault, &paths.database)
         .map_err(|error| SnowError::Api(error.to_string()))?;
     print_rebuild_report(&report);
     Ok(())
+}
+
+pub(super) fn cmd_reset_cache_offline() -> Result<(), SnowError> {
+    ensure_cache_replacement_is_offline("resetting")?;
+    let paths = runtime_paths();
+    snow_core::reset_cache(&paths.database).map_err(|error| SnowError::Api(error.to_string()))?;
+    println!("reset-cache");
+    println!("cache format: {}", snow_core::cache::store::CACHE_FORMAT_ID);
+    println!("records: 0");
+    Ok(())
+}
+
+pub(super) async fn cmd_rebuild_cache_from_servicenow(
+    instance: &str,
+    username: &str,
+    credential: auth::CredentialProvider,
+    metadata_password: snow_core::credential::SecretString,
+    client: ServiceNowClient,
+) -> Result<(), SnowError> {
+    let paths = runtime_paths();
+    let file_name = paths
+        .database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snow.db");
+    let staging = paths.database.with_file_name(format!(
+        ".{file_name}.servicenow-rebuild-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let mut staging_guard = StagingCacheGuard::new(staging.clone());
+    let progress_renderer = CacheRebuildProgressRenderer::new();
+    progress_renderer
+        .write_line("rebuild-cache: preparing ServiceNow staging cache")
+        .map_err(render_progress_error)?;
+    let progress_sink = progress_renderer.sink();
+
+    let core = match build_core(
+        instance,
+        username,
+        credential,
+        metadata_password,
+        client,
+        Some(staging.clone()),
+    )
+    .await
+    {
+        Ok(core) => core,
+        Err(error) => {
+            render_pre_promotion_failure(&progress_renderer, &mut staging_guard)?;
+            return Err(error);
+        }
+    };
+    let report = core.rebuild_cache_from_servicenow(&progress_sink).await;
+    drop(core);
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            render_pre_promotion_failure(&progress_renderer, &mut staging_guard)?;
+            return Err(SnowError::Api(format!("{error:#}")));
+        }
+    };
+    progress_renderer
+        .write_line("rebuild-cache: finalizing validated staging cache")
+        .map_err(render_progress_error)?;
+    if let Err(error) = snow_core::promote_rebuilt_cache(&staging, &paths.database) {
+        render_promotion_failure(&progress_renderer, &mut staging_guard)?;
+        return Err(SnowError::Api(format!("{error:#}")));
+    }
+    staging_guard.mark_promoted();
+    progress_renderer
+        .write_line(&format!(
+            "rebuild-cache: complete tables={} pages={} records={}",
+            report.tables.len(),
+            report.pages,
+            report.records
+        ))
+        .map_err(render_progress_error)?;
+    print_servicenow_rebuild_report(&report);
+    Ok(())
+}
+
+fn render_pre_promotion_failure(
+    renderer: &CacheRebuildProgressRenderer,
+    staging_guard: &mut StagingCacheGuard,
+) -> Result<(), SnowError> {
+    let staging_removed = staging_guard.cleanup().is_ok();
+    renderer
+        .render_pre_promotion_failure(staging_removed)
+        .map_err(render_progress_error)
+}
+
+fn render_promotion_failure(
+    renderer: &CacheRebuildProgressRenderer,
+    staging_guard: &mut StagingCacheGuard,
+) -> Result<(), SnowError> {
+    let staging_removed = staging_guard.cleanup().is_ok();
+    renderer
+        .render_promotion_failure(staging_removed)
+        .map_err(render_progress_error)
+}
+
+fn render_progress_error(error: std::io::Error) -> SnowError {
+    SnowError::Api(format!("rendering rebuild progress: {error}"))
+}
+
+fn remove_cache_artifacts(database_path: &std::path::Path) -> std::io::Result<()> {
+    remove_file_if_present(database_path)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = database_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        remove_file_if_present(&std::path::PathBuf::from(sidecar))?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+struct StagingCacheGuard {
+    path: std::path::PathBuf,
+    cleaned: bool,
+    promoted: bool,
+}
+
+impl StagingCacheGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            cleaned: false,
+            promoted: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        if self.cleaned || self.promoted {
+            return Ok(());
+        }
+        remove_cache_artifacts(&self.path)?;
+        self.cleaned = true;
+        Ok(())
+    }
+
+    fn mark_promoted(&mut self) {
+        self.promoted = true;
+    }
+}
+
+impl Drop for StagingCacheGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[derive(Clone, Default)]
+struct CacheRebuildProgressRenderer {
+    state: Arc<Mutex<CacheRebuildProgressState>>,
+}
+
+#[derive(Default)]
+struct CacheRebuildProgressState {
+    last_table: Option<CacheRebuildProgressLocation>,
+}
+
+#[derive(Clone)]
+struct CacheRebuildProgressLocation {
+    resource: String,
+    table: String,
+    page: Option<usize>,
+}
+
+impl CacheRebuildProgressRenderer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn sink(&self) -> snow_core::CacheRebuildProgressSink {
+        let renderer = self.clone();
+        Arc::new(move |event| renderer.render_event(event).map_err(anyhow::Error::from))
+    }
+
+    fn render_event(&self, event: snow_core::CacheRebuildProgressEvent) -> std::io::Result<()> {
+        let line = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("rebuild progress state lock poisoned"))?;
+            match event {
+                snow_core::CacheRebuildProgressEvent::Preparing => {
+                    "rebuild-cache: preparing ServiceNow staging cache".to_string()
+                }
+                snow_core::CacheRebuildProgressEvent::Tables { tables, page_size } => {
+                    format!("rebuild-cache: tables={tables} page_size={page_size}")
+                }
+                snow_core::CacheRebuildProgressEvent::ResolvingUserScope => {
+                    "rebuild-cache: resolving configured user scope".to_string()
+                }
+                snow_core::CacheRebuildProgressEvent::UserScopeResolved => {
+                    "rebuild-cache: configured user scope resolved".to_string()
+                }
+                snow_core::CacheRebuildProgressEvent::TableStarted {
+                    index,
+                    tables,
+                    resource,
+                    table,
+                } => {
+                    state.last_table = Some(CacheRebuildProgressLocation {
+                        resource: resource.clone(),
+                        table: table.clone(),
+                        page: None,
+                    });
+                    format!("[{index}/{tables}] {resource} ({table}): start")
+                }
+                snow_core::CacheRebuildProgressEvent::RequestingPage {
+                    index,
+                    tables,
+                    resource,
+                    table,
+                    page,
+                } => {
+                    state.last_table = Some(CacheRebuildProgressLocation {
+                        resource: resource.clone(),
+                        table: table.clone(),
+                        page: Some(page),
+                    });
+                    format!("[{index}/{tables}] {resource} ({table}): requesting page={page}")
+                }
+                snow_core::CacheRebuildProgressEvent::PageProjected {
+                    index,
+                    tables,
+                    resource,
+                    table,
+                    page,
+                    page_records,
+                    table_records,
+                    total_records,
+                } => format!(
+                    "[{index}/{tables}] {resource} ({table}): page={page} page_records={page_records} table_records={table_records} total_records={total_records}"
+                ),
+                snow_core::CacheRebuildProgressEvent::TableCompleted {
+                    index,
+                    tables,
+                    resource,
+                    table,
+                    pages,
+                    records,
+                } => format!(
+                    "[{index}/{tables}] {resource} ({table}): complete pages={pages} records={records}"
+                ),
+            }
+        };
+        self.write_line(&line)
+    }
+
+    fn render_pre_promotion_failure(&self, staging_removed: bool) -> std::io::Result<()> {
+        let location = self.last_location()?;
+        if let Some(location) = location {
+            if let Some(page) = location.page {
+                self.write_line(&format!(
+                    "rebuild-cache: failed during {} ({}) page={page}",
+                    location.resource, location.table
+                ))?;
+            } else {
+                self.write_line(&format!(
+                    "rebuild-cache: failed during {} ({})",
+                    location.resource, location.table
+                ))?;
+            }
+        } else {
+            self.write_line("rebuild-cache: failed before ServiceNow table processing")?;
+        }
+        if staging_removed {
+            self.write_line("rebuild-cache: staging cache removed; current cache unchanged")
+        } else {
+            self.write_line("rebuild-cache: staging cache cleanup failed; current cache unchanged")
+        }
+    }
+
+    fn render_promotion_failure(&self, staging_removed: bool) -> std::io::Result<()> {
+        self.write_line("rebuild-cache: failed during staging cache promotion")?;
+        if staging_removed {
+            self.write_line("rebuild-cache: staging cache removed; current cache state not claimed")
+        } else {
+            self.write_line(
+                "rebuild-cache: staging cache cleanup failed; current cache state not claimed",
+            )
+        }
+    }
+
+    fn last_location(&self) -> std::io::Result<Option<CacheRebuildProgressLocation>> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("rebuild progress state lock poisoned"))
+            .map(|state| state.last_table.clone())
+    }
+
+    fn write_line(&self, line: &str) -> std::io::Result<()> {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        writeln!(stderr, "{line}")?;
+        stderr.flush()
+    }
 }
 
 pub(super) fn maybe_run_local_kb_command(command: &Command) -> Result<Option<()>, SnowError> {

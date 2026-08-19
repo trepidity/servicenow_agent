@@ -294,14 +294,6 @@ impl AdminApp {
                     },
                 });
             }
-            KeyCode::Char('a') => {
-                self.rpc
-                    .call(
-                        "start_job",
-                        serde_json::json!({"kind": JobKindWire::RefreshAll, "params": {}}),
-                    )
-                    .await?;
-            }
             _ => {}
         }
         Ok(())
@@ -325,14 +317,6 @@ impl AdminApp {
                         serde_json::json!({"kind": JobKindWire::VerifyVault, "params": {}}),
                     )
                     .await?;
-            }
-            KeyCode::Char('r') => {
-                self.pending_confirm = Some(confirm(
-                    "Confirm: rebuild cache",
-                    "Rebuild SQLite from vault markdown",
-                    "Drops and re-projects all cache rows. Read paths fall back to vault during rebuild.",
-                    JobKindWire::RebuildCache,
-                ));
             }
             KeyCode::Char('p') => {
                 self.pending_confirm = Some(confirm(

@@ -98,8 +98,12 @@ pub enum Command {
     },
     /// Repair missing vault files from cached runtime data
     RepairVault,
-    /// Rebuild SQLite cache projection from the markdown vault
+    /// Rebuild the SQLite cache from terminal live ServiceNow reads
     RebuildCache,
+    /// Import the SQLite cache projection from markdown vault documents
+    ImportCacheFromVault,
+    /// Replace the SQLite cache with an empty current-format database
+    ResetCache,
     /// Verify vault and cache parity
     VerifyVault,
     /// Prune orphaned cache rows discovered during verification

@@ -47,10 +47,6 @@ pub(in crate::rpc) async fn dispatch_cache_vault(
             Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
             Err(err) => internal_error(id, err),
         },
-        RpcMethod::RebuildCache => match state.core.rebuild_cache() {
-            Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
-            Err(err) => internal_error(id, err),
-        },
         RpcMethod::VerifyVault => match state.core.verify_vault() {
             Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
             Err(err) => internal_error(id, err),

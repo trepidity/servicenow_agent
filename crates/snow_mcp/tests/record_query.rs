@@ -5,9 +5,13 @@ mod record_query_support;
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde_json::{Value, json};
 use servicenow_rs::prelude::{BasicAuth, ServiceNowClient};
-use snow_core::SnowCore;
+use snow_core::{
+    ResourceType, SnowCore,
+    cache::store::{RecordRow, Store},
+};
 use snow_mcp::{JsonRpcRequest, McpServer};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,6 +67,42 @@ async fn server_at(instance_url: &str) -> (McpServer, TempDir) {
     (McpServer::new(core), tempdir)
 }
 
+async fn cached_server_with_work_note(work_note: &str) -> (McpServer, TempDir) {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let database = tempdir.path().join("snow.db");
+    let store = Store::open(&database).expect("current cache");
+    let mut row = RecordRow::active(
+        "00000000000000000000000000000001",
+        "INC0000001",
+        "incident",
+        ResourceType::Incident,
+        Utc::now(),
+    );
+    row.raw_json = json!({ "work_notes": work_note }).to_string();
+    store
+        .upsert_record(&row, work_note, "")
+        .expect("seed cached record");
+    drop(store);
+
+    let client = ServiceNowClient::builder()
+        .instance("http://127.0.0.1:9")
+        .allow_http()
+        .auth(BasicAuth::new("tester", "secret"))
+        .build()
+        .await
+        .expect("client");
+    let core = SnowCore::builder()
+        .client(client)
+        .vault_path(tempdir.path().join("vault"))
+        .database_path(database)
+        .build()
+        .await
+        .expect("core");
+    #[allow(clippy::arc_with_non_send_sync)]
+    let core = Arc::new(core);
+    (McpServer::new(core), tempdir)
+}
+
 #[tokio::test]
 async fn direct_mcp_record_query_returns_the_canonical_page_payload() {
     let instance_url = spawn_json_http_server(json!({
@@ -94,4 +134,28 @@ async fn direct_mcp_record_query_returns_the_canonical_page_payload() {
         .expect("record")
         .remove("synced_at");
     assert_eq!(actual, record_query_support::expected_page());
+}
+
+#[tokio::test]
+async fn direct_mcp_get_record_preserves_unicode_headerless_cached_work_notes() {
+    let work_note = "Escalation note x — vendor - update pending";
+    let (server, _tempdir) = cached_server_with_work_note(work_note).await;
+
+    let response = server
+        .dispatch(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "get_record",
+                "arguments": { "number": "INC0000001" }
+            }),
+            id: Some(json!(1)),
+        })
+        .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(
+        response.result.expect("record response")["record"]["work_notes"][0]["body"],
+        json!(work_note)
+    );
 }

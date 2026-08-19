@@ -118,12 +118,18 @@ pub(super) fn runtime_instance_url() -> Option<String> {
         .ok()
 }
 
+pub(super) fn allow_loopback_http_for_local_test(instance: &str) -> bool {
+    std::env::var("SNOW_ALLOW_LOOPBACK_HTTP").is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+        && (instance.starts_with("http://127.0.0.1:") || instance.starts_with("http://localhost:"))
+}
+
 pub(super) async fn build_core(
     instance: &str,
     username: &str,
     credential: auth::CredentialProvider,
     metadata_password: snow_core::credential::SecretString,
     client: ServiceNowClient,
+    database_path: Option<PathBuf>,
 ) -> Result<SnowCore, SnowError> {
     let paths = runtime_paths();
     let mut config = SnowConfig {
@@ -152,13 +158,15 @@ pub(super) async fn build_core(
     };
     config.apply_defaults();
 
-    Ok(SnowCore::builder()
+    let mut builder = SnowCore::builder()
         .config(config.clone())
         .client(client)
         .ui_metadata_basic_auth(username, metadata_password)
-        .vault_path(config.vault.path)
-        .build()
-        .await?)
+        .vault_path(config.vault.path);
+    if let Some(database_path) = database_path {
+        builder = builder.database_path(database_path);
+    }
+    Ok(builder.build().await?)
 }
 
 pub(super) fn config_path(filename: &str) -> PathBuf {

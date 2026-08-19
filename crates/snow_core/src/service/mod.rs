@@ -9,6 +9,7 @@
 
 pub(crate) mod approval;
 pub(crate) mod business_application;
+pub(crate) mod cache_rebuild;
 pub(crate) mod knowledge;
 pub(crate) mod record;
 pub(crate) mod server;
@@ -17,6 +18,7 @@ pub(crate) mod vault;
 pub(crate) mod write;
 pub(crate) use approval::ApprovalService;
 pub(crate) use business_application::BusinessApplicationService;
+pub(crate) use cache_rebuild::CacheRebuildService;
 pub(crate) use knowledge::KnowledgeService;
 pub(crate) use record::RecordService;
 pub(crate) use server::ServerService;

@@ -12,7 +12,6 @@ use uuid::Uuid;
 pub enum JobKind {
     KbSync,
     KbSyncFull,
-    RebuildCache,
     VerifyVault,
     PruneOrphans,
     RepairVault,

@@ -110,7 +110,7 @@ pub use service::approval::{
 pub use service::business_application::BusinessApplicationSearchParams;
 pub use service::server::ServerGetError;
 pub use service::user::{UserLookup, UserLookupResult, UserRecord, UserSearch};
-pub use service::vault::rebuild_cache_from_vault;
+pub use service::vault::{promote_rebuilt_cache, rebuild_cache_from_vault, reset_cache};
 pub use servicenow_rs::model::reference::{
     Reference, choose_reference_display_name, is_opaque_sys_id,
 };
@@ -143,6 +143,7 @@ pub struct SnowCore {
     users: service::UserService,
     approvals: service::ApprovalService,
     business_applications: service::BusinessApplicationService,
+    cache_rebuild: service::CacheRebuildService,
     servers: service::ServerService,
     records: service::RecordService,
     knowledge: service::KnowledgeService,

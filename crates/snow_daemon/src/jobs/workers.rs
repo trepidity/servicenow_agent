@@ -135,7 +135,6 @@ async fn run_kind(
         JobKind::VerifyVault => verify_vault_worker(params, ctx, runner).await,
         JobKind::KbSync => kb_sync_worker(params, ctx, runner, false).await,
         JobKind::KbSyncFull => kb_sync_worker(params, ctx, runner, true).await,
-        JobKind::RebuildCache => rebuild_cache_worker(params, ctx, runner).await,
         JobKind::PruneOrphans => prune_orphans_worker(params, ctx, runner).await,
         JobKind::RepairVault => repair_vault_worker(params, ctx, runner).await,
         JobKind::RefreshAll => refresh_all_worker(params, ctx, runner).await,
@@ -195,25 +194,6 @@ async fn kb_sync_worker(
     Ok(serde_json::json!({ "sync": outcome }))
 }
 
-/// Wraps `SnowCore::rebuild_cache` (synchronous). See `verify_vault_worker`
-/// for the rationale on calling sync core methods directly rather than via
-/// `spawn_blocking`.
-async fn rebuild_cache_worker(_params: Value, ctx: JobContext, runner: AppRunner) -> Result<Value> {
-    ctx.progress("starting", 0, None).await;
-    ctx.log("rebuild_cache: starting").await;
-
-    if ctx.is_cancelled() {
-        return Ok(serde_json::json!({"cancelled": true}));
-    }
-
-    // cooperative cancel granularity is whole-sync until core exposes batch boundary
-    let report = runner.state.core.rebuild_cache()?;
-
-    ctx.progress("complete", 1, Some(1)).await;
-    ctx.log("rebuild_cache: complete").await;
-    Ok(serde_json::json!({ "report": report }))
-}
-
 /// Wraps `SnowCore::prune_orphans`. Reads `dry_run: bool` from `params`
 /// (defaults to false to match the JSON-RPC behavior).
 async fn prune_orphans_worker(params: Value, ctx: JobContext, runner: AppRunner) -> Result<Value> {
@@ -253,43 +233,10 @@ async fn repair_vault_worker(_params: Value, ctx: JobContext, runner: AppRunner)
     Ok(serde_json::json!({ "report": report }))
 }
 
-/// Composite refresh pipeline: incremental `kb_sync`, then `rebuild_cache`,
-/// then `verify_vault`. Each phase reports its own progress stage so the
-/// TUI can show a meaningful "what's happening now" indicator. Cancellation
-/// is observed between phases.
-async fn refresh_all_worker(params: Value, ctx: JobContext, runner: AppRunner) -> Result<Value> {
-    let with_bodies = params
-        .get("with_bodies")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    ctx.progress("starting", 0, Some(3)).await;
-    ctx.log("refresh_all: starting").await;
-
-    if ctx.is_cancelled() {
-        return Ok(serde_json::json!({"cancelled": true}));
-    }
-    ctx.progress("kb_sync", 0, Some(3)).await;
-    let sync = runner.state.core.sync_knowledge(false, with_bodies).await?;
-
-    if ctx.is_cancelled() {
-        return Ok(serde_json::json!({"cancelled": true, "phase": "after_kb_sync"}));
-    }
-    ctx.progress("rebuild_cache", 1, Some(3)).await;
-    let rebuild = runner.state.core.rebuild_cache()?;
-
-    if ctx.is_cancelled() {
-        return Ok(serde_json::json!({"cancelled": true, "phase": "after_rebuild_cache"}));
-    }
-    ctx.progress("verify_vault", 2, Some(3)).await;
-    let verify = runner.state.core.verify_vault()?;
-
-    ctx.progress("complete", 3, Some(3)).await;
-    ctx.log("refresh_all: complete").await;
-    Ok(serde_json::json!({
-        "sync": sync,
-        "rebuild": rebuild,
-        "verify": verify,
-    }))
+/// The former online refresh pipeline replaced an open SQLite cache from the
+/// vault. Cache replacement is now an offline CLI-only lifecycle operation.
+async fn refresh_all_worker(_params: Value, _ctx: JobContext, _runner: AppRunner) -> Result<Value> {
+    anyhow::bail!("refresh_all is unavailable; stop the daemon and run `snow rebuild-cache`")
 }
 
 /// Wraps `SnowCore::rebuild_knowledge_semantic_index`. Reads `full: bool`

@@ -32,8 +32,8 @@ use snow_core::{
     ApprovalRecord, KnowledgeArticle, KnowledgeBaseSummary, KnowledgeCategorySummary,
     KnowledgeEmbeddingCoverage, KnowledgeSearchFilters, KnowledgeSearchHit, KnowledgeSearchMode,
     KnowledgeSemanticSearchFilters, KnowledgeSemanticStatus, OrphanPruneReport, RebuildReport,
-    RepairReport, SemanticIndexSummary, SnowCore, TaskSlaReadability, TaskSlaStatus,
-    TaskSlaSummaryView, TaskSlaView, VaultVerificationReport,
+    RepairReport, SemanticIndexSummary, ServiceNowCacheRebuildReport, SnowCore, TaskSlaReadability,
+    TaskSlaStatus, TaskSlaSummaryView, TaskSlaView, VaultVerificationReport,
     config::{
         CacheConfig as CoreCacheConfig, DaemonConfig as CoreDaemonConfig,
         InstanceConfig as CoreInstanceConfig, MemoryCacheConfig, SnowConfig,
@@ -93,8 +93,14 @@ pub(crate) fn run_entry(cli: Cli) -> Result<(), SnowError> {
     if matches!(cli.command, Command::CacheInfo) {
         return cmd_cache_info();
     }
+    if matches!(cli.command, Command::ImportCacheFromVault) {
+        return cmd_import_cache_from_vault_offline();
+    }
+    if matches!(cli.command, Command::ResetCache) {
+        return cmd_reset_cache_offline();
+    }
     if matches!(cli.command, Command::RebuildCache) {
-        return cmd_rebuild_cache_offline();
+        ensure_cache_replacement_is_offline("rebuilding")?;
     }
 
     let auth_context = if command_uses_local_credentials(&cli.command) {
@@ -203,16 +209,28 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
     drop(password);
 
     // Build client
-    let client = ServiceNowClient::builder()
+    let mut client_builder = ServiceNowClient::builder()
         .instance(&instance)
-        .auth(client_auth)
-        .build()
-        .await?;
-    let core_client = ServiceNowClient::builder()
+        .auth(client_auth);
+    let mut core_client_builder = ServiceNowClient::builder()
         .instance(&instance)
-        .auth(core_auth)
-        .build()
-        .await?;
+        .auth(core_auth);
+    if allow_loopback_http_for_local_test(&instance) {
+        client_builder = client_builder.allow_http();
+        core_client_builder = core_client_builder.allow_http();
+    }
+    let client = client_builder.build().await?;
+    let core_client = core_client_builder.build().await?;
+    if matches!(cli.command, Command::RebuildCache) {
+        return cmd_rebuild_cache_from_servicenow(
+            &instance,
+            &username,
+            credential,
+            metadata_password,
+            core_client,
+        )
+        .await;
+    }
     let core = Arc::new(
         build_core(
             &instance,
@@ -220,6 +238,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             credential,
             metadata_password,
             core_client,
+            None,
         )
         .await?,
     );
@@ -279,7 +298,10 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             cmd_timecard(Arc::clone(&core), &env_name, &instance, &username, action).await
         }
         Command::RepairVault => cmd_repair_vault(core.as_ref()).await,
-        Command::RebuildCache => cmd_rebuild_cache(core.as_ref()).await,
+        Command::RebuildCache | Command::ImportCacheFromVault => {
+            unreachable!("handled before normal core construction")
+        }
+        Command::ResetCache => unreachable!("handled before auth setup"),
         Command::VerifyVault => cmd_verify_vault(core.as_ref()).await,
         Command::PruneOrphans { dry_run } => cmd_prune_orphans(core.as_ref(), dry_run).await,
         Command::CacheInfo => unreachable!("handled before auth setup"),

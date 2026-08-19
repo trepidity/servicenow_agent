@@ -74,6 +74,10 @@ ID scheme for this architectural remediation.
 
 ### Scope
 
+> Cache recovery authority and command semantics in this historical plan are
+> superseded by
+> `docs/spec-servicenow-authoritative-cache-rebuild.md#approved-goal`.
+
 - Preserve the existing four Cargo crates and their public binary names.
 - Decompose each named hotspot by responsibility behind stable facades and
   deliberate re-exports.

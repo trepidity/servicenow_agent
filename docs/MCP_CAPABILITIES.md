@@ -197,9 +197,13 @@ Status / health fields:
 ## Local cache projection
 
 The local SQLite projection is a disposable, exact current-format cache. It is
-never upgraded in place: an incompatible cache must be replaced with `snow
-rebuild-cache`. The current format includes two tables backing the cached
-relationship tools:
+never upgraded in place. Cache replacement is deliberately absent from the MCP
+and daemon JSON-RPC surfaces because those processes hold the database open.
+With the daemon stopped, use `snow rebuild-cache` to reconstruct the configured
+ACL-readable projection from terminal live ServiceNow pages, `snow reset-cache`
+to create an empty projection, or `snow import-cache-from-vault` for an explicit
+markdown restore. Live rebuild and reset do not read or modify the vault. The
+current format includes two tables backing the cached relationship tools:
 
 - **`business_application_servers`** — durable BA↔Server membership rows.
 - **`business_application_server_inventory_health`** — per-BA inventory-health

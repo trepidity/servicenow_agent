@@ -1084,6 +1084,15 @@ async fn direct_rpc_contract_info_exposes_safe_contract_metadata() {
         );
     }
     assert!(
+        !result
+            .get("supported_methods")
+            .and_then(Value::as_array)
+            .expect("supported methods")
+            .iter()
+            .any(|method| method.as_str() == Some("rebuild_cache")),
+        "online cache replacement must not be advertised"
+    );
+    assert!(
         result
             .get("deprecated_aliases")
             .and_then(Value::as_array)
@@ -1184,6 +1193,25 @@ async fn record_lookup_methods_map_unknown_prefix_to_the_distinct_contract_error
         assert_eq!(error.code, UNKNOWN_PREFIX_CODE, "method={method}");
         assert_eq!(error.message, "unknown record prefix", "method={method}");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_rpc_rejects_online_cache_replacement() {
+    let fixture = build_fixture_state().await.expect("fixture");
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "rebuild_cache".to_string(),
+            params: json!({}),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let error = response.error.expect("method-not-found error");
+    assert_eq!(error.code, -32601);
+    assert_eq!(error.message, "method not found");
 }
 
 #[test]

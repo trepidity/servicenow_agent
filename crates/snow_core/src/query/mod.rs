@@ -1818,10 +1818,13 @@ fn parse_journal_header(line: &str) -> Option<(DateTime<Utc>, String)> {
     if line.len() < 22 || !line.contains(" - ") {
         return None;
     }
-    let timestamp = chrono::NaiveDateTime::parse_from_str(&line[..19], "%Y-%m-%d %H:%M:%S")
+    let timestamp = chrono::NaiveDateTime::parse_from_str(line.get(..19)?, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))?;
-    let remainder = &line[22..];
+    if line.get(19..22)? != " - " {
+        return None;
+    }
+    let remainder = line.get(22..)?;
     let author = remainder.split('(').next()?.trim().to_string();
     Some((timestamp, author))
 }

@@ -258,8 +258,12 @@ callers and map to the same daemon methods.
 - **Governance / audit:** `policy_describe`, `tool_capabilities`, `redaction_rules_describe`,
   `audit_event_get`, `audit_events_search`, `audit_chain_verify`
 
-> Local-cache writers (`kb_sync`, `kb_semantic_rebuild`, `rebuild_cache`, `repair_vault`)
+> Local-cache writers (`kb_sync`, `kb_semantic_rebuild`, `repair_vault`)
 > write only to the local KB vault/cache — **never** to ServiceNow.
+
+Cache replacement is offline-only and is not exposed as an MCP tool. Stop the
+daemon and use the CLI `rebuild-cache`, `reset-cache`, or explicit
+`import-cache-from-vault` operation.
 
 ---
 

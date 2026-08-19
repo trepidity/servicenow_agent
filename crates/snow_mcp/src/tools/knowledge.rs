@@ -147,14 +147,6 @@ pub fn register(registry: &mut ToolRegistry) {
             requires_confirmation: false,
         },
         ToolMetadata {
-            name: "rebuild_cache".to_string(),
-            description: "Rebuild the cache projection from vault markdown".to_string(),
-            input_schema: object_schema(),
-            output_schema: object_schema(),
-            default_enabled: true,
-            requires_confirmation: false,
-        },
-        ToolMetadata {
             name: "verify_vault".to_string(),
             description: "Verify vault and cache parity".to_string(),
             input_schema: object_schema(),

@@ -43,7 +43,7 @@ fn render_actions(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::raw("Actions:"),
         Line::raw("  [v] verify vault"),
-        Line::raw("  [r] rebuild cache (DESTRUCTIVE)"),
+        Line::raw("  cache replacement: stop daemon and use snow rebuild-cache"),
         Line::raw("  [p] prune orphans (DESTRUCTIVE)"),
         Line::raw("  [f] repair vault (DESTRUCTIVE)"),
     ];
@@ -85,6 +85,9 @@ mod tests {
             .join("\n");
         assert!(dump.contains("Cache / Vault"), "missing title:\n{dump}");
         assert!(dump.contains("verify vault"), "missing verify:\n{dump}");
-        assert!(dump.contains("rebuild cache"), "missing rebuild:\n{dump}");
+        assert!(
+            dump.contains("stop daemon"),
+            "missing offline lifecycle guidance:\n{dump}"
+        );
     }
 }

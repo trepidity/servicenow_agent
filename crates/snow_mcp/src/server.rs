@@ -195,7 +195,6 @@ impl McpServer {
             "kb_semantic_status" => self.call_kb_semantic_status(id).await,
             "kb_semantic_rebuild" => self.call_kb_semantic_rebuild(id, params).await,
             "repair_vault" => self.call_repair_vault(id).await,
-            "rebuild_cache" => self.call_rebuild_cache(id),
             "verify_vault" => self.call_verify_vault(id),
             "get_work_notes" => self.call_get_work_notes(id, params).await,
             "attachment_list" => self.call_attachment_list(id, params).await,
@@ -1518,13 +1517,6 @@ impl McpServer {
 
     async fn call_repair_vault(&self, id: Option<Value>) -> JsonRpcResponse {
         match self.core.repair_vault().await {
-            Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
-            Err(err) => service_failure(id, err),
-        }
-    }
-
-    fn call_rebuild_cache(&self, id: Option<Value>) -> JsonRpcResponse {
-        match self.core.rebuild_cache() {
             Ok(report) => JsonRpcResponse::ok(id, json!({ "report": report })),
             Err(err) => service_failure(id, err),
         }

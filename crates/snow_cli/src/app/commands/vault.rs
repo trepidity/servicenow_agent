@@ -6,12 +6,6 @@ pub(crate) async fn cmd_repair_vault(core: &SnowCore) -> Result<(), SnowError> {
     Ok(())
 }
 
-pub(crate) async fn cmd_rebuild_cache(core: &SnowCore) -> Result<(), SnowError> {
-    let report = core.rebuild_cache()?;
-    print_rebuild_report(&report);
-    Ok(())
-}
-
 pub(crate) async fn cmd_verify_vault(core: &SnowCore) -> Result<(), SnowError> {
     let report = core.verify_vault()?;
     print_verification_report(&report);

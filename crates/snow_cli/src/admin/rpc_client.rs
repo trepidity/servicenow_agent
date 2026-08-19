@@ -18,11 +18,9 @@ use crate::tui_client::DaemonRpcClient;
 pub enum JobKindWire {
     KbSync,
     KbSyncFull,
-    RebuildCache,
     VerifyVault,
     PruneOrphans,
     RepairVault,
-    RefreshAll,
     SemanticIndexRebuild,
 }
 

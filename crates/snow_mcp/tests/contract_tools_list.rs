@@ -75,6 +75,10 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
 
     let result = response.result.expect("result");
     let tools = result["tools"].as_array().expect("tools array");
+    assert!(
+        tools.iter().all(|tool| tool["name"] != "rebuild_cache"),
+        "cache replacement must remain offline-only"
+    );
     for expected in [
         "get_record",
         "get_approval",
@@ -145,7 +149,6 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
         "kb_semantic_status",
         "kb_semantic_rebuild",
         "repair_vault",
-        "rebuild_cache",
         "verify_vault",
         "tool_capabilities",
         "policy_describe",

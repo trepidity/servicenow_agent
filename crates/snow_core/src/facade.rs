@@ -319,8 +319,15 @@ impl SnowCore {
         self.vault_svc.rebuild_cache_from_vault()
     }
 
-    pub fn rebuild_cache(&self) -> Result<RebuildReport> {
-        self.vault_svc.rebuild_cache()
+    pub fn import_cache_from_vault(&self) -> Result<RebuildReport> {
+        self.vault_svc.import_cache_from_vault()
+    }
+
+    pub async fn rebuild_cache_from_servicenow(
+        &self,
+        progress: &CacheRebuildProgressSink,
+    ) -> Result<ServiceNowCacheRebuildReport> {
+        self.cache_rebuild.rebuild_from_servicenow(progress).await
     }
 
     pub fn verify_vault(&self) -> Result<VaultVerificationReport> {
@@ -671,6 +678,7 @@ pub struct SnowCoreBuilder {
     client: Option<ServiceNowClient>,
     ui_metadata_auth: Option<(String, credential::SecretString)>,
     vault_path: Option<PathBuf>,
+    database_path: Option<PathBuf>,
 }
 
 impl SnowCoreBuilder {
@@ -700,6 +708,11 @@ impl SnowCoreBuilder {
         self
     }
 
+    pub fn database_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.database_path = Some(path.into());
+        self
+    }
+
     pub async fn build(self) -> Result<SnowCore> {
         let config = self.config.unwrap_or_default();
         let vault_path = self
@@ -723,7 +736,9 @@ impl SnowCoreBuilder {
                 password,
             ))
         });
-        let db_path = vault_root_to_db_path(&vault_path);
+        let db_path = self
+            .database_path
+            .unwrap_or_else(|| vault_root_to_db_path(&vault_path));
         let vault = VaultManager::new(&vault_path);
         let query = Arc::new(query::QueryEngine::open_with_vault(&db_path, &vault_path)?);
         let cache = cache::CacheManager::open(&db_path, config.cache.memory.capacity)?;
@@ -747,6 +762,7 @@ impl SnowCoreBuilder {
         let users = service::UserService::new(ctx.clone());
         let approvals = service::ApprovalService::new(ctx.clone());
         let business_applications = service::BusinessApplicationService::new(ctx.clone());
+        let cache_rebuild = service::CacheRebuildService::new(ctx.clone());
         let servers = service::ServerService::new(ctx.clone());
         let records = service::RecordService::new(ctx.clone());
         let knowledge = service::KnowledgeService::new(ctx.clone());
@@ -757,6 +773,7 @@ impl SnowCoreBuilder {
             users,
             approvals,
             business_applications,
+            cache_rebuild,
             servers,
             records,
             knowledge,

@@ -108,6 +108,27 @@ snow reject CHG0327604            # prompts for reason interactively
 snow note CHG0327604 "Reviewed and looks good"
 ```
 
+### Cache recovery
+
+Run cache replacement commands only while the daemon is stopped:
+
+```bash
+snow daemon stop
+snow cache-info
+snow rebuild-cache             # terminal live ServiceNow rebuild of configured readable scope
+snow reset-cache               # create an empty current cache without remote reads
+snow import-cache-from-vault   # explicitly restore from markdown instead of ServiceNow
+snow daemon start
+```
+
+`rebuild-cache` requires credentials, drains every page for each enabled mapped
+resource plus Business Applications, stages a fresh database, and replaces
+`snow.db` only after the complete staging cache validates. Its scope is the
+configured ACL-readable projection, not an unrestricted instance export.
+`reset-cache` performs no ServiceNow or vault read. Neither command reads,
+rewrites, or deletes vault documents. A malformed vault document therefore
+affects only the explicit `import-cache-from-vault` operation.
+
 ### Knowledge articles
 
 ```bash

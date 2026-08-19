@@ -50,7 +50,6 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         | RpcMethod::GetDegradedReads
         | RpcMethod::CacheInfo
         | RpcMethod::RepairVault
-        | RpcMethod::RebuildCache
         | RpcMethod::VerifyVault
         | RpcMethod::PruneOrphans => {
             dispatch_cache_vault(method, id, &request, state, &transport).await
