@@ -283,6 +283,15 @@ fn rpc_method_parsing_covers_known_methods() {
 
 #[test]
 fn contract_info_method_lists_cover_canonical_and_deprecated_rpc_methods() {
+    assert!(
+        !SUPPORTED_RPC_METHODS.contains(&"catalog_cancel_request"),
+        "deferred catalog cancellation must not be advertised by the daemon"
+    );
+    assert_eq!(
+        RpcMethod::from_method("catalog_cancel_request"),
+        RpcMethod::Unknown
+    );
+
     for method in SUPPORTED_RPC_METHODS {
         assert_ne!(
             RpcMethod::from_method(method),
@@ -302,6 +311,28 @@ fn contract_info_method_lists_cover_canonical_and_deprecated_rpc_methods() {
             "{method} should point to canonical method {replacement}"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_rejects_deferred_catalog_cancellation_as_unknown() {
+    let fixture = build_fixture_state().await.expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "catalog_cancel_request".to_string(),
+            params: json!({}),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let error = response
+        .error
+        .expect("deferred cancellation must not have a callable route");
+    assert_eq!(error.code, -32601);
+    assert_eq!(error.message, "method not found");
 }
 
 #[tokio::test(flavor = "current_thread")]

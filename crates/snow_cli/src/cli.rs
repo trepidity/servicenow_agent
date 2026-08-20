@@ -137,6 +137,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ServerCommand,
     },
+    /// Incident typed-resource commands
+    Incident {
+        /// Incident subcommand.
+        #[command(subcommand)]
+        action: IncidentCommand,
+    },
     /// Show an approval through the typed runtime path
     Approval {
         /// Approval number
@@ -165,6 +171,8 @@ pub enum DaemonCommand {
     Restart,
     /// Show daemon status
     Status,
+    /// Print the bounded daemon JSON-RPC contract report
+    ContractInfo,
     /// Tail the daemon log
     Logs {
         /// Follow the log (default true)
@@ -691,6 +699,16 @@ fn parse_business_app_number(value: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum IncidentCommand {
+    /// Discover readable and writable Incident fields from ServiceNow
+    Fields {
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ServerCommand {
     /// Get one cached Server by sys_id, exact name, or IP address
     Get {
@@ -776,6 +794,35 @@ pub enum ServerCommand {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parses_incident_fields_command() {
+        let cli = Cli::parse_from(["snow", "incident", "fields"]);
+        assert!(matches!(
+            cli.command,
+            Command::Incident {
+                action: IncidentCommand::Fields { json: false }
+            }
+        ));
+
+        let cli = Cli::parse_from(["snow", "incident", "fields", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Incident {
+                action: IncidentCommand::Fields { json: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn incident_fields_rejects_a_caller_supplied_table() {
+        // Metadata discovery is bound to the `incident` table by the operation.
+        // Accepting a table argument would turn it into the generic table
+        // browser the capability contract forbids.
+        assert!(
+            Cli::try_parse_from(["snow", "incident", "fields", "--table", "sys_user"]).is_err()
+        );
+    }
 
     #[test]
     fn parses_runtime_maintenance_commands() {

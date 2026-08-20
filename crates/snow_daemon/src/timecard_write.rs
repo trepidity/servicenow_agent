@@ -82,7 +82,11 @@ pub async fn handle_timecard_plan_set_hours(
     params: &Value,
     state: &DaemonState,
 ) -> JsonRpcResponse {
-    if !state.mcp_config.policy.is_tool_enabled(TIMECARD_PLAN_TOOL) {
+    if !state
+        .mcp_config
+        .policy
+        .tool_enabled_in_environment(TIMECARD_PLAN_TOOL, &state.mcp_config.environment.label)
+    {
         return timecard_error(
             id,
             -32051,
@@ -315,7 +319,11 @@ pub async fn handle_timecard_apply_set_hours(
         )
         .await;
     }
-    if !state.mcp_config.policy.is_tool_enabled(TIMECARD_APPLY_TOOL) {
+    if !state
+        .mcp_config
+        .policy
+        .tool_enabled_in_environment(TIMECARD_APPLY_TOOL, &state.mcp_config.environment.label)
+    {
         return audited_timecard_error(
             state,
             id,

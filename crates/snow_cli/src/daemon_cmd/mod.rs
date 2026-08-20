@@ -4,6 +4,7 @@
 //! single entry point invoked from `main.rs`.
 
 pub mod client;
+pub mod contract_info;
 pub mod logs;
 pub mod paths;
 pub mod serve;
@@ -28,6 +29,7 @@ pub fn dispatch(action: DaemonCommand, env_name: &str) -> Result<()> {
             start::run(env_name, false)
         }
         DaemonCommand::Status => status::run(),
+        DaemonCommand::ContractInfo => contract_info::run(),
         DaemonCommand::Logs { follow, lines } => logs::run(follow, lines),
         DaemonCommand::Serve {
             no_idle_timeout, ..

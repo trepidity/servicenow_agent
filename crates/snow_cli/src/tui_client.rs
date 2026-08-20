@@ -832,6 +832,19 @@ impl DaemonRpcClient {
         self.call_wrapped("server_fields", None, "fields").await
     }
 
+    /// Fetch the Incident typed-resource descriptor envelope.
+    ///
+    /// Returns the daemon result verbatim rather than unwrapping a field. The
+    /// envelope's `operation`, `source`, and `completeness` are part of the
+    /// contract every transport must report identically, so unwrapping here
+    /// would make the CLI the one transport that reports something different.
+    pub async fn incident_fields(&self) -> Result<Value, SnowError> {
+        let response = self.send_request("incident_fields", None).await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
     /// Sync Business Applications into the local vault/cache with optional
     /// hydration. Returns the raw summary object; the CLI renders it generically.
     pub async fn business_application_sync(

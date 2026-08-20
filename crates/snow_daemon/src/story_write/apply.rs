@@ -170,7 +170,11 @@ pub(super) async fn handle_story_apply_impl(
             .await;
         }
     };
-    if !state.mcp_config.policy.is_tool_enabled(tool) {
+    if !state
+        .mcp_config
+        .policy
+        .tool_enabled_in_environment(tool, &state.mcp_config.environment.label)
+    {
         return audited_story_error(
             state,
             id,

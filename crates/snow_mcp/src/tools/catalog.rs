@@ -39,15 +39,6 @@ pub fn register(registry: &mut ToolRegistry) {
         false,
         true,
     );
-    add_catalog_tool(
-        registry,
-        "catalog_cancel_request",
-        "Cancel a cancellable catalog request",
-        object_schema(),
-        object_schema(),
-        false,
-        true,
-    );
 }
 
 fn add_catalog_tool(

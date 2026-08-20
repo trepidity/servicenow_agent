@@ -95,6 +95,11 @@ pub fn register(registry: &mut ToolRegistry) {
             server_fields_arg_schema(),
         ),
         (
+            "incident_fields",
+            "Discover readable and writable Incident fields, choices, references, and paging support from ServiceNow",
+            incident_fields_arg_schema(),
+        ),
+        (
             "list_records",
             "List records with optional daemon-side filters",
             json!({"type":"object","additionalProperties":false,"properties":{"resource_type":{"type":"string"},"parent_number":{"type":"string"},"assigned_to":{"type":"string"},"limit":{"type":"integer","minimum":1}}}),
@@ -785,6 +790,19 @@ pub fn server_query_arg_schema() -> Value {
             "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20 },
             "offset": { "type": "integer", "minimum": 0, "default": 0 }
         }
+    })
+}
+
+/// Argument schema for `incident_fields`.
+///
+/// Deliberately empty: the Incident table is fixed by the operation, and
+/// accepting a caller-supplied table would turn typed metadata discovery into
+/// the generic table browser this contract forbids.
+pub fn incident_fields_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
     })
 }
 

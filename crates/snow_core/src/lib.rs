@@ -69,6 +69,10 @@ pub use resource::business_application::{
 };
 pub use resource::catalog::{CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable};
 pub use resource::change::{ChangeWriteConcurrency, ChangeWriteResult};
+pub use resource::descriptor::{
+    Completeness, FieldDescriptor, FieldSupport, OperationEnvelope, PagingSupport, PartialReason,
+    ResourceDescriptor, Source, UnavailableReason,
+};
 pub use resource::incident::{
     INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
     INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
@@ -108,6 +112,9 @@ pub use service::approval::{
     ListMyApprovalsResponse,
 };
 pub use service::business_application::BusinessApplicationSearchParams;
+pub use service::descriptor::{
+    INCIDENT_DEFAULT_PAGE_LIMIT, INCIDENT_FIELDS_OPERATION, INCIDENT_MAX_PAGE_LIMIT, INCIDENT_TABLE,
+};
 pub use service::server::ServerGetError;
 pub use service::user::{UserLookup, UserLookupResult, UserRecord, UserSearch};
 pub use service::vault::{promote_rebuilt_cache, rebuild_cache_from_vault, reset_cache};
@@ -144,6 +151,7 @@ pub struct SnowCore {
     approvals: service::ApprovalService,
     business_applications: service::BusinessApplicationService,
     cache_rebuild: service::CacheRebuildService,
+    descriptors: service::DescriptorService,
     servers: service::ServerService,
     records: service::RecordService,
     knowledge: service::KnowledgeService,

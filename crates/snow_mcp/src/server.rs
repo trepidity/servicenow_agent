@@ -135,7 +135,12 @@ impl McpServer {
         if name == "plan_get" {
             return daemon_required_for_write(id, name, "daemon required for plan persistence");
         }
-        if is_write_tool(name) && !self.config.policy.is_tool_enabled(name) {
+        if is_write_tool(name)
+            && !self
+                .config
+                .policy
+                .tool_enabled_in_environment(name, &self.config.environment.label)
+        {
             return JsonRpcResponse::error(
                 id,
                 -32040,
@@ -178,6 +183,7 @@ impl McpServer {
             "server_search" => self.call_server_search(id, params).await,
             "server_query" => self.call_server_query(id, params).await,
             "server_fields" => self.call_server_fields(id, params).await,
+            "incident_fields" => self.call_incident_fields(id, params).await,
             "search_knowledge" | "knowledge_search" => self.call_search_knowledge(id, params).await,
             "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
             "get_article" | "knowledge_fetch" => self.call_get_article(id, params).await,
@@ -1157,6 +1163,25 @@ impl McpServer {
         JsonRpcResponse::ok(id, json!({ "servers": servers }))
     }
 
+    /// Discover the Incident typed-resource contract.
+    ///
+    /// Serializes the core envelope whole so direct MCP reports exactly what
+    /// CLI, daemon JSON-RPC, and the bridge report. Reassembling it here would
+    /// let the transports drift apart silently.
+    async fn call_incident_fields(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Err(err) = serde_json::from_value::<IncidentFieldsArguments>(arguments) {
+            return invalid_params(id, err);
+        }
+        match self.core.incident_fields().await {
+            Ok(envelope) => JsonRpcResponse::ok(id, json!(envelope)),
+            Err(err) => service_failure(id, err),
+        }
+    }
+
     async fn call_server_fields(&self, id: Option<Value>, _params: &Value) -> JsonRpcResponse {
         let records = match self
             .core
@@ -1914,6 +1939,11 @@ impl McpServer {
         )
     }
 }
+
+/// Closed argument object for the fixed-table `incident_fields` tool.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncidentFieldsArguments {}
 
 pub struct McpServerBuilder {
     core: Arc<SnowCore>,

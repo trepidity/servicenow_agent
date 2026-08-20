@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use snow_core::ipc::{IpcEndpoint, IpcStream, default_endpoint_from_env};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -62,6 +63,7 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("server_search", "server_search"),
     ("server_query", "server_query"),
     ("server_fields", "server_fields"),
+    ("incident_fields", "incident_fields"),
     ("list_records", "list_records"),
     ("record_query", "record_query"),
     ("list_my_tasks", "list_my_tasks"),
@@ -884,6 +886,11 @@ fn dashboard_key(method: &str) -> &'static str {
 }
 
 fn daemon_params_for_tool(tool: &str, method: &str, args: Value) -> Result<Value> {
+    if tool == "incident_fields" {
+        let _: IncidentFieldsArguments = serde_json::from_value(args)?;
+        return Ok(json!({}));
+    }
+
     let mut object = match args {
         Value::Object(map) => map,
         _ => return Ok(json!({})),
@@ -937,6 +944,11 @@ fn daemon_params_for_tool(tool: &str, method: &str, args: Value) -> Result<Value
 
     Ok(Value::Object(object))
 }
+
+/// Closed argument object for the fixed-table `incident_fields` bridge tool.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncidentFieldsArguments {}
 
 fn normalize_number_alias(object: &mut serde_json::Map<String, Value>) {
     if !object.contains_key("number")

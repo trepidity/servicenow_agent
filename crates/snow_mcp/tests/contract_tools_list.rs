@@ -76,6 +76,12 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
     let result = response.result.expect("result");
     let tools = result["tools"].as_array().expect("tools array");
     assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"] != "catalog_cancel_request"),
+        "deferred catalog cancellation must not be advertised"
+    );
+    assert!(
         tools.iter().all(|tool| tool["name"] != "rebuild_cache"),
         "cache replacement must remain offline-only"
     );

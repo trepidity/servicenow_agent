@@ -26,6 +26,7 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "resource_plan_list",
     "incident_list_by_assignment_group",
     "incident_assignment_groups",
+    "incident_fields",
     "incident_assignment_group_queue",
     "server_get",
     "server_get_fresh",

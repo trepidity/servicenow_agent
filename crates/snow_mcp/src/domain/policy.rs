@@ -162,8 +162,13 @@ impl PolicyConfig {
             .get(tool)
             .map(|policy| {
                 policy.enabled
-                    && (policy.environments.is_empty()
-                        || policy.environments.iter().any(|env| env == environment))
+                    && if is_write_tool(tool) {
+                        !policy.environments.is_empty()
+                            && policy.environments.iter().any(|env| env == environment)
+                    } else {
+                        policy.environments.is_empty()
+                            || policy.environments.iter().any(|env| env == environment)
+                    }
             })
             .unwrap_or_else(|| !is_write_tool(tool))
     }
@@ -587,7 +592,6 @@ pub fn is_write_tool(tool: &str) -> bool {
         || matches!(
             tool,
             "catalog_submit_request"
-                | "catalog_cancel_request"
                 | "work_note_apply_add"
                 | "attachment_upload"
                 | "approval_approve"
@@ -879,7 +883,7 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         (
             "catalog_submit_request".to_string(),
             ToolPolicy {
-                enabled: true,
+                enabled: false,
                 requires_confirmation: true,
                 requires_kb_evidence: true,
                 environments: vec!["test".to_string(), "training".to_string()],
@@ -1026,7 +1030,7 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         (
             "work_note_apply_add".to_string(),
             ToolPolicy {
-                enabled: true,
+                enabled: false,
                 requires_confirmation: true,
                 requires_kb_evidence: false,
                 field_allowlist: BTreeSet::from(["work_notes".to_string()]),

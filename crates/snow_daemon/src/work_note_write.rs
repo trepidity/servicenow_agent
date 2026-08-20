@@ -986,8 +986,40 @@ fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    /// Build an MCP config that explicitly enables the work-note apply tool for
+    /// the `test` environment.
+    ///
+    /// Governed mutation tools are disabled by default in every environment, so
+    /// a plan that must reach field validation has to name the tool and the
+    /// environment first. Without this the policy gate short-circuits ahead of
+    /// the behavior each test is written to prove.
+    fn enabled_work_note_mcp_config() -> snow_mcp::McpConfig {
+        let mut policy = snow_mcp::domain::policy::PolicyConfig::default();
+        policy
+            .tools
+            .get_mut(WORK_NOTE_APPLY_TOOL)
+            .expect("work-note apply policy")
+            .enabled = true;
+        snow_mcp::McpConfig {
+            environment: snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago"),
+            policy,
+            ..Default::default()
+        }
+    }
+
+    /// Rebuild the fixture daemon state with the work-note apply tool enabled.
+    fn enabled_work_note_state(fixture: &crate::test_support::FixtureState) -> Arc<DaemonState> {
+        Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture.tempdir.path().join("work-note-plan-add"),
+            enabled_work_note_mcp_config(),
+        ))
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn work_note_plan_add_accepts_explicit_work_notes_field() {
+    async fn work_note_plan_add_is_denied_when_policy_does_not_enable_the_apply_tool() {
         let fixture = crate::test_support::build_fixture_state()
             .await
             .expect("fixture");
@@ -999,6 +1031,34 @@ mod tests {
                 "work_notes": "Implementation is queued for validation."
             }),
             &fixture.state,
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("default policy must deny the work-note plan");
+        assert_eq!(error.code, -32040);
+        assert_eq!(error.message, "policy denied");
+        assert_eq!(
+            error.data.expect("data")["tool"],
+            json!(WORK_NOTE_APPLY_TOOL)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn work_note_plan_add_accepts_explicit_work_notes_field() {
+        let fixture = crate::test_support::build_fixture_state()
+            .await
+            .expect("fixture");
+        let state = enabled_work_note_state(&fixture);
+
+        let response = handle_work_note_plan_add(
+            Some(json!(1)),
+            &json!({
+                "number": "CHG001",
+                "work_notes": "Implementation is queued for validation."
+            }),
+            &state,
         )
         .await;
 
@@ -1018,6 +1078,7 @@ mod tests {
         let fixture = crate::test_support::build_fixture_state()
             .await
             .expect("fixture");
+        let state = enabled_work_note_state(&fixture);
 
         let response = handle_work_note_plan_add(
             Some(json!(1)),
@@ -1025,7 +1086,7 @@ mod tests {
                 "number": "CHG001",
                 "description": "This must not be treated as a journal note."
             }),
-            &fixture.state,
+            &state,
         )
         .await;
 

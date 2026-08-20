@@ -42,6 +42,13 @@ async fn representative_read_tool_calls_round_trip() {
         let name = tool["name"].as_str().expect("tool name");
         assert_eq!(tool["read_only"], json!(!is_write_tool(name)));
     }
+    for name in ["catalog_submit_request", "work_note_apply_add"] {
+        let capability = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing capability {name}"));
+        assert_eq!(capability["enabled"], json!(false), "{name}");
+    }
     let ba_servers = tools
         .iter()
         .find(|tool| tool["name"] == "business_application_servers")
@@ -49,6 +56,30 @@ async fn representative_read_tool_calls_round_trip() {
     assert_eq!(ba_servers["mode"], json!("read"));
     assert_eq!(ba_servers["read_only"], json!(true));
     assert_eq!(ba_servers["requires_confirmation"], json!(false));
+}
+
+#[tokio::test]
+async fn direct_mcp_rejects_deferred_catalog_cancellation_as_unknown() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+
+    let response = server
+        .dispatch(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "catalog_cancel_request",
+                "arguments": {"number": "RITM0010001"}
+            }),
+            id: Some(json!(99)),
+        })
+        .await;
+
+    let error = response
+        .error
+        .expect("deferred cancellation must not have a callable route");
+    assert_eq!(error.code, -32601);
+    assert_eq!(error.message, "tool not found");
 }
 
 #[tokio::test]

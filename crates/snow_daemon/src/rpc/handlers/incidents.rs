@@ -1,5 +1,10 @@
 use super::*;
 
+/// Closed parameter object for the fixed-table `incident_fields` operation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncidentFieldsParams {}
+
 /// Deserializes and pre-validates group-scoped Incident page arguments.
 ///
 /// Validation runs here as well as inside the core so a malformed group
@@ -81,6 +86,18 @@ pub(in crate::rpc) async fn dispatch_incidents(
             match state.core.incident_assignment_groups().await {
                 Ok(groups) => JsonRpcResponse::ok(id, json!({"groups": groups})),
                 Err(err) => internal_error(id, err),
+            }
+        }
+        // The envelope is serialized whole rather than reassembled field by
+        // field, so every transport emits the exact source/completeness
+        // contract and no path can quietly drop or rename part of it.
+        RpcMethod::IncidentFields => {
+            match serde_json::from_value::<IncidentFieldsParams>(request.params.clone()) {
+                Ok(_) => match state.core.incident_fields().await {
+                    Ok(envelope) => JsonRpcResponse::ok(id, json!(envelope)),
+                    Err(err) => internal_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
             }
         }
         RpcMethod::IncidentAssignmentGroupQueue => {

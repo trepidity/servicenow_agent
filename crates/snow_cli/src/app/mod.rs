@@ -192,6 +192,14 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
         return cmd_server(&client, action).await;
     }
+    if let Command::Incident { action } = cli.command {
+        let paths = runtime_paths();
+        let instance_url = runtime_instance_url();
+        let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root);
+        let client =
+            DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
+        return cmd_incident(&client, action).await;
+    }
 
     let AuthContext {
         instance,
@@ -316,6 +324,9 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         }
         Command::Server { .. } => {
             unreachable!("server is dispatched before local-credential setup")
+        }
+        Command::Incident { .. } => {
+            unreachable!("incident is dispatched before local-credential setup")
         }
         Command::Daemon { .. } | Command::Admin => {
             unreachable!("daemon and admin are dispatched before auth setup")

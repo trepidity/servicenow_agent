@@ -602,6 +602,20 @@ impl SnowCore {
         self.records.field_choices(table, field).await
     }
 
+    /// Discover the Incident typed-resource contract from ServiceNow.
+    ///
+    /// Live-only: Incidents are not a cache-eligible object, so this performs
+    /// no cache read or persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ServiceNow transport fails. ACL denial and an
+    /// empty dictionary are reported inside the descriptor as unavailable
+    /// categories rather than as errors.
+    pub async fn incident_fields(&self) -> Result<OperationEnvelope<ResourceDescriptor>> {
+        self.descriptors.incident_descriptor().await
+    }
+
     pub async fn reassign(&self, number: &str, user: &str) -> Result<Option<SnowRecord>> {
         self.records.reassign(number, user).await
     }
@@ -763,6 +777,7 @@ impl SnowCoreBuilder {
         let approvals = service::ApprovalService::new(ctx.clone());
         let business_applications = service::BusinessApplicationService::new(ctx.clone());
         let cache_rebuild = service::CacheRebuildService::new(ctx.clone());
+        let descriptors = service::DescriptorService::new(ctx.clone());
         let servers = service::ServerService::new(ctx.clone());
         let records = service::RecordService::new(ctx.clone());
         let knowledge = service::KnowledgeService::new(ctx.clone());
@@ -774,6 +789,7 @@ impl SnowCoreBuilder {
             approvals,
             business_applications,
             cache_rebuild,
+            descriptors,
             servers,
             records,
             knowledge,

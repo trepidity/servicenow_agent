@@ -115,7 +115,8 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         }
         RpcMethod::IncidentListByAssignmentGroup
         | RpcMethod::IncidentAssignmentGroups
-        | RpcMethod::IncidentAssignmentGroupQueue => {
+        | RpcMethod::IncidentAssignmentGroupQueue
+        | RpcMethod::IncidentFields => {
             dispatch_incidents(method, id, &request, state, &transport).await
         }
         RpcMethod::ServerGet
