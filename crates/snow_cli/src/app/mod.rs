@@ -99,9 +99,12 @@ pub(crate) fn run_entry(cli: Cli) -> Result<(), SnowError> {
     if matches!(cli.command, Command::ResetCache) {
         return cmd_reset_cache_offline();
     }
-    if matches!(cli.command, Command::RebuildCache) {
+    let _cache_maintenance_lock = if matches!(cli.command, Command::RebuildCache) {
         ensure_cache_replacement_is_offline("rebuilding")?;
-    }
+        Some(acquire_cache_maintenance_lock()?)
+    } else {
+        None
+    };
 
     let auth_context = if command_uses_local_credentials(&cli.command) {
         Some(load_auth_context(&cli)?)

@@ -1,6 +1,9 @@
 use super::*;
 use crate::daemon_cmd::{client::endpoint_alive, paths::DaemonPaths};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub(super) fn cmd_cache_info() -> Result<(), SnowError> {
@@ -37,8 +40,34 @@ pub(super) fn ensure_cache_replacement_is_offline(action: &str) -> Result<(), Sn
     Ok(())
 }
 
+pub(super) fn acquire_cache_maintenance_lock() -> Result<File, SnowError> {
+    let paths = runtime_paths();
+    let parent = paths.database.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(SnowError::from)?;
+    let lock_path = parent.join("cache.maintenance.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(SnowError::from)?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(SnowError::Api(
+            "another cache maintenance command is active; wait for it to finish before replacing the cache"
+                .to_string(),
+        )),
+        Err(error) => Err(SnowError::Api(format!(
+            "locking cache maintenance file {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
 pub(super) fn cmd_import_cache_from_vault_offline() -> Result<(), SnowError> {
     ensure_cache_replacement_is_offline("importing")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
     let paths = runtime_paths();
     let report = snow_core::rebuild_cache_from_vault(&paths.vault, &paths.database)
         .map_err(|error| SnowError::Api(error.to_string()))?;
@@ -48,6 +77,7 @@ pub(super) fn cmd_import_cache_from_vault_offline() -> Result<(), SnowError> {
 
 pub(super) fn cmd_reset_cache_offline() -> Result<(), SnowError> {
     ensure_cache_replacement_is_offline("resetting")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
     let paths = runtime_paths();
     snow_core::reset_cache(&paths.database).map_err(|error| SnowError::Api(error.to_string()))?;
     println!("reset-cache");

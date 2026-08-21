@@ -34,7 +34,7 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error when the replacement cache cannot be created, validated,
-/// cleaned of prior SQLite sidecars, or moved into place.
+/// moved into place, or cleaned of prior Snow-owned SQLite artifacts.
 pub fn reset_cache(database_path: &Path) -> Result<()> {
     let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -50,9 +50,12 @@ pub fn reset_cache(database_path: &Path) -> Result<()> {
         if Store::inspect_format(&temporary)? != crate::cache::store::CacheFormat::Current {
             anyhow::bail!("reset cache did not validate as the current format");
         }
+        checkpoint_sqlite(&temporary)?;
+        remove_sqlite_sidecars(&temporary)?;
         remove_sqlite_sidecars(database_path)?;
         std::fs::rename(&temporary, database_path)
             .with_context(|| format!("replacing cache {}", database_path.display()))?;
+        remove_stale_cache_artifacts(database_path)?;
         Ok(())
     })();
 
@@ -71,13 +74,18 @@ pub fn promote_rebuilt_cache(staging_path: &Path, database_path: &Path) -> Resul
     if Store::inspect_format(staging_path)? != crate::cache::store::CacheFormat::Current {
         anyhow::bail!("ServiceNow rebuild cache did not validate as the current format");
     }
-    let connection = rusqlite::Connection::open(staging_path)?;
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    drop(connection);
+    checkpoint_sqlite(staging_path)?;
     remove_sqlite_sidecars(staging_path)?;
     remove_sqlite_sidecars(database_path)?;
     std::fs::rename(staging_path, database_path)
         .with_context(|| format!("promoting rebuilt cache to {}", database_path.display()))?;
+    Ok(())
+}
+
+fn checkpoint_sqlite(database_path: &Path) -> Result<()> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(connection);
     Ok(())
 }
 
@@ -96,6 +104,53 @@ fn remove_sqlite_sidecars(database_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_stale_cache_artifacts(database_path: &Path) -> Result<()> {
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snow.db");
+
+    for entry in std::fs::read_dir(parent)
+        .with_context(|| format!("scanning cache directory {}", parent.display()))?
+    {
+        let entry = entry?;
+        if !is_snow_owned_cache_artifact(&entry.file_name(), file_name) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .with_context(|| format!("removing stale cache artifact {}", entry.path().display()))?;
+    }
+    Ok(())
+}
+
+fn is_snow_owned_cache_artifact(name: &std::ffi::OsStr, database_file_name: &str) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+
+    ["reset", "rebuild", "servicenow-rebuild"]
+        .into_iter()
+        .any(|operation| {
+            let prefix = format!(".{database_file_name}.{operation}-");
+            let Some(remainder) = name.strip_prefix(&prefix) else {
+                return false;
+            };
+            let without_sidecar = ["-wal", "-shm", "-journal"]
+                .into_iter()
+                .find_map(|suffix| remainder.strip_suffix(suffix))
+                .unwrap_or(remainder);
+            let Some(candidate_uuid) = without_sidecar.strip_suffix(".tmp") else {
+                return false;
+            };
+            uuid::Uuid::parse_str(candidate_uuid).is_ok()
+        })
 }
 
 /// Builds a fresh current-format projection beside `database_path` and replaces

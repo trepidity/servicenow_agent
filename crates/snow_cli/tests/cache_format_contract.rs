@@ -1,6 +1,6 @@
 //! L0 CLI cache-format contract.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -16,6 +16,7 @@ use std::os::unix::net::UnixListener;
 use std::time::Instant;
 
 use chrono::{TimeZone, Utc};
+use fs2::FileExt;
 use rusqlite::Connection;
 use snow_core::{
     ResourceType,
@@ -87,6 +88,31 @@ fn reset_cache_replaces_an_incompatible_cache_without_reading_the_vault() {
     fs::write(&shared_memory, b"stale shared memory").expect("stale shared memory");
     fs::write(&journal, b"stale rollback journal").expect("stale rollback journal");
 
+    let stale_cache_artifacts = [
+        config_dir.join(".snow.db.reset-11111111-1111-4111-8111-111111111111.tmp"),
+        config_dir.join(".snow.db.rebuild-33333333-3333-4333-8333-333333333333.tmp"),
+        config_dir.join(".snow.db.servicenow-rebuild-22222222-2222-4222-8222-222222222222.tmp"),
+    ]
+    .into_iter()
+    .flat_map(|database| {
+        let mut artifacts = vec![database.clone()];
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            artifacts.push(sidecar.into());
+        }
+        artifacts
+    })
+    .collect::<Vec<_>>();
+    for artifact in &stale_cache_artifacts {
+        fs::write(artifact, b"stale Snow-owned cache artifact")
+            .expect("stale Snow-owned cache artifact");
+    }
+    let unrelated_temporary = config_dir.join("operator-notes.tmp");
+    fs::write(&unrelated_temporary, b"unrelated temporary file").expect("unrelated temporary file");
+    let near_match = config_dir.join(".snow.db.servicenow-rebuild-not-a-uuid.tmp");
+    fs::write(&near_match, b"unrelated near-match").expect("unrelated near-match temporary file");
+
     let output = Command::new(env!("CARGO_BIN_EXE_snow"))
         .arg("reset-cache")
         .env("HOME", home.path())
@@ -115,8 +141,66 @@ fn reset_cache_replaces_an_incompatible_cache_without_reading_the_vault() {
         !journal.exists(),
         "reset must remove the prior cache journal"
     );
+    for artifact in stale_cache_artifacts {
+        assert!(
+            !artifact.exists(),
+            "reset left Snow-owned cache artifact {}",
+            artifact.display()
+        );
+    }
+    assert_eq!(
+        fs::read(&unrelated_temporary).expect("unrelated temporary file after reset"),
+        b"unrelated temporary file"
+    );
+    assert_eq!(
+        fs::read(&near_match).expect("unrelated near-match after reset"),
+        b"unrelated near-match"
+    );
     let store = Store::open(&database).expect("reset cache");
     assert_eq!(store.count_active_records().expect("record count"), 0);
+}
+
+#[test]
+fn reset_cache_refuses_while_another_cache_maintenance_command_is_active() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let config_dir = home.path().join(".config/snow");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    let database = config_dir.join("snow.db");
+    let connection = Connection::open(&database).expect("legacy database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n             INSERT INTO schema_meta(key, value) VALUES ('schema_version', '11');",
+        )
+        .expect("legacy schema marker");
+    drop(connection);
+    let before = fs::read(&database).expect("legacy database bytes");
+
+    let maintenance_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(config_dir.join("cache.maintenance.lock"))
+        .expect("cache maintenance lock file");
+    FileExt::lock_exclusive(&maintenance_lock).expect("hold cache maintenance lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_snow"))
+        .arg("reset-cache")
+        .env("HOME", home.path())
+        .output()
+        .expect("run snow reset-cache");
+
+    assert!(!output.status.success(), "overlapping reset succeeded");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("another cache maintenance command is active"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&database).expect("database after rejected reset"),
+        before
+    );
 }
 
 #[cfg(unix)]
