@@ -1,5 +1,9 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use servicenow_rs::prelude::Record;
+
+use crate::{OperationEnvelope, SnowCore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogItem {
@@ -34,6 +38,67 @@ pub struct CatalogVariable {
 pub struct CatalogChoice {
     pub value: String,
     pub label: String,
+}
+
+/// Native payload for the named `catalog_item_get` operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogItemGetData {
+    pub item: CatalogItem,
+}
+
+/// Native payload for the named `catalog_items_search` operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogItemsSearchData {
+    pub items: Vec<CatalogItem>,
+}
+
+pub(crate) fn catalog_item_from_record(
+    record: &Record,
+    variables: Vec<CatalogVariable>,
+) -> CatalogItem {
+    let name = record
+        .get_str("name")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&record.sys_id)
+        .to_string();
+    let short_description = record
+        .get_str("short_description")
+        .unwrap_or_default()
+        .to_string();
+    let table = record
+        .get_raw("sys_class_name")
+        .or_else(|| record.get_display("sys_class_name"))
+        .unwrap_or("sc_cat_item")
+        .to_string();
+    CatalogItem {
+        sys_id: record.sys_id.clone(),
+        name,
+        short_description,
+        table,
+        variables,
+    }
+}
+
+impl SnowCore {
+    /// Read one complete catalog product under the daemon-owned cache policy.
+    pub async fn catalog_item_get_envelope(
+        &self,
+        sys_id: &str,
+    ) -> Result<OperationEnvelope<CatalogItemGetData>> {
+        self.writes.catalog_item_get_envelope(sys_id).await
+    }
+
+    /// Search the intentionally narrowed catalog-product projection.
+    pub async fn catalog_items_search_envelope(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<OperationEnvelope<CatalogItemsSearchData>> {
+        self.writes
+            .catalog_items_search_envelope(query, limit)
+            .await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

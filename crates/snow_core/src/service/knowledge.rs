@@ -32,7 +32,10 @@ use std::time::Duration;
 
 use crate::context::CoreContext;
 use crate::convert::{record_row_from_runtime_record, serialize_vault_document};
-use crate::helpers::{document_content, document_tag_tokens, document_work_notes};
+use crate::helpers::{
+    apply_reference_name_or_sys_id_filter, document_content, document_tag_tokens,
+    document_work_notes,
+};
 use crate::resource::knowledge::KnowledgeResource;
 use crate::semantic::{
     EmbeddingProvider, OllamaEmbeddingProvider, content_hash, cosine_similarity,
@@ -980,17 +983,36 @@ impl KnowledgeService {
         &self,
         number: &str,
     ) -> Result<Option<KnowledgeArticle>> {
+        let rule = self
+            .ctx
+            .named_cache_policy
+            .active()
+            .rule_for("get_article", "knowledge");
+        if rule.mode == crate::cache::policy::CacheMode::Live {
+            return self
+                .get_knowledge_article_fresh_inner(number, false, false)
+                .await;
+        }
         let cached = self.get_knowledge_article(number).await?;
-        if cached.as_ref().is_some_and(|article| article.body_cached) {
+        let cache_is_usable = cached.as_ref().is_some_and(|article| {
+            article.body_cached
+                && (rule.mode == crate::cache::policy::CacheMode::CacheOnly
+                    || rule
+                        .ttl
+                        .is_some_and(|ttl| article.record.synced_at + ttl > Utc::now()))
+        });
+        if cache_is_usable {
             return Ok(cached);
         }
-
-        match self.get_knowledge_article_fresh_inner(number, false).await {
-            Ok(Some(fresh)) => Ok(Some(fresh)),
-            Ok(None) => Ok(cached),
-            Err(_) if cached.is_some() => Ok(cached),
-            Err(err) => Err(err),
+        if rule.mode == crate::cache::policy::CacheMode::CacheOnly {
+            return Err(crate::cache::policy::CacheMiss {
+                operation: "get_article",
+                object: "knowledge",
+            }
+            .into());
         }
+        self.get_knowledge_article_fresh_inner(number, false, true)
+            .await
     }
 
     pub async fn search_knowledge(
@@ -999,6 +1021,34 @@ impl KnowledgeService {
         filters: KnowledgeSearchFilters,
     ) -> Result<Vec<KnowledgeArticle>> {
         self.ctx.query.search_knowledge(query, filters).await
+    }
+
+    /// Run the fixed Knowledge search against ServiceNow and optionally
+    /// persist complete live article projections for read-through policy.
+    pub async fn search_knowledge_policy_live(
+        &self,
+        query: &str,
+        filters: KnowledgeSearchFilters,
+        persist: bool,
+    ) -> Result<Vec<KnowledgeArticle>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = filters.limit.unwrap_or(20).max(1);
+        let mut api = self
+            .base_knowledge_query(true)?
+            .limit(u32::try_from(limit).unwrap_or(u32::MAX))
+            .contains("short_description", query.trim());
+        api = apply_reference_name_or_sys_id_filter(
+            api,
+            "kb_knowledge_base",
+            filters.knowledge_base.as_deref(),
+        )?;
+        api =
+            apply_reference_name_or_sys_id_filter(api, "kb_category", filters.category.as_deref())?;
+        let records = api.execute().await?.records;
+        self.knowledge_articles_from_live_records(records, persist)
+            .await
     }
 
     pub async fn search_knowledge_semantic(
@@ -1216,6 +1266,60 @@ impl KnowledgeService {
             }
         }
 
+        Ok(articles)
+    }
+
+    /// Run the fixed Knowledge list against ServiceNow and optionally persist
+    /// complete live article projections for read-through policy.
+    pub async fn list_knowledge_articles_policy_live(
+        &self,
+        knowledge_base_sys_id: Option<&str>,
+        category_sys_id: Option<&str>,
+        limit: Option<usize>,
+        persist: bool,
+    ) -> Result<Vec<KnowledgeArticle>> {
+        let mut api = self.base_knowledge_query(true)?;
+        api =
+            apply_reference_name_or_sys_id_filter(api, "kb_knowledge_base", knowledge_base_sys_id)?;
+        api = apply_reference_name_or_sys_id_filter(api, "kb_category", category_sys_id)?;
+        let max_records = limit.map(|value| value.max(1) as u64);
+        if let Some(limit) = limit {
+            api = api.limit(u32::try_from(limit.max(1)).unwrap_or(u32::MAX));
+        }
+        let records = api.execute_all(max_records).await?.records;
+        self.knowledge_articles_from_live_records(records, persist)
+            .await
+    }
+
+    async fn knowledge_articles_from_live_records(
+        &self,
+        records: Vec<Record>,
+        persist: bool,
+    ) -> Result<Vec<KnowledgeArticle>> {
+        let mut articles = Vec::with_capacity(records.len());
+        for record in records {
+            if persist {
+                self.ctx.persist_record(&record)?;
+                let number = record.get_raw("number").unwrap_or_default();
+                let article = self
+                    .ctx
+                    .query
+                    .get_knowledge_article(number)
+                    .await?
+                    .ok_or_else(|| anyhow!("persisted knowledge record was not materialized"))?;
+                articles.push(article);
+            } else {
+                let document = self.ctx.runtime_document_from_servicenow(&record)?;
+                match document {
+                    crate::vault::VaultDocument::Knowledge(article) => articles.push(article),
+                    _ => {
+                        return Err(anyhow!(
+                            "knowledge record produced a non-knowledge projection"
+                        ));
+                    }
+                }
+            }
+        }
         Ok(articles)
     }
 
@@ -1614,13 +1718,15 @@ impl KnowledgeService {
         &self,
         number: &str,
     ) -> Result<Option<KnowledgeArticle>> {
-        self.get_knowledge_article_fresh_inner(number, true).await
+        self.get_knowledge_article_fresh_inner(number, true, false)
+            .await
     }
 
     pub(crate) async fn get_knowledge_article_fresh_inner(
         &self,
         number: &str,
         rebuild_semantic_index: bool,
+        persist: bool,
     ) -> Result<Option<KnowledgeArticle>> {
         let Some(record) = self
             .ctx
@@ -1635,8 +1741,20 @@ impl KnowledgeService {
             return Ok(None);
         };
 
-        self.ctx.persist_record(&record)?;
-        let article = self.ctx.query.get_knowledge_article(number).await?;
+        let article = if persist {
+            self.ctx.persist_record(&record)?;
+            self.ctx.query.get_knowledge_article(number).await?
+        } else {
+            let document = self.ctx.runtime_document_from_servicenow(&record)?;
+            match document {
+                crate::vault::VaultDocument::Knowledge(article) => Some(article),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "knowledge record produced a non-knowledge projection"
+                    ));
+                }
+            }
+        };
         if rebuild_semantic_index
             && article
                 .as_ref()
@@ -2609,7 +2727,7 @@ mod tests {
     }
 
     #[test]
-    fn default_config_keeps_knowledge_full_sync_interval_and_tag_defaults() {
+    fn default_config_does_not_reintroduce_legacy_refresh_resources() {
         let mut config = SnowConfig::default();
         config.apply_defaults();
         assert_eq!(
@@ -2618,7 +2736,7 @@ mod tests {
                 .resources
                 .get("knowledge")
                 .and_then(|resource| resource.full_sync_interval.as_deref()),
-            Some("7d")
+            None
         );
         assert_eq!(config.kb.max_auto_tags, 5);
         assert_eq!(config.kb.llm_tags.timeout_seconds, 10);
@@ -3403,7 +3521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_knowledge_article_cached_or_fresh_falls_back_on_live_error() {
+    async fn get_knowledge_article_read_through_does_not_fall_back_to_stale_on_live_miss() {
         let server = MockServer::start().await;
         let (core, _tempdir) = core_for_mock_server(&server).await;
         let metadata_only_record = Record::from_json(
@@ -3424,16 +3542,14 @@ mod tests {
             .persist_record(&metadata_only_record)
             .expect("persist metadata-only knowledge record");
 
-        let article = core
+        let result = core
             .get_knowledge_article_cached_or_fresh("KB0105015")
             .await
-            .expect("cached article despite live repair failure")
-            .expect("cached article present");
-
-        assert_eq!(article.record.number, "KB0105015");
-        assert!(!article.body_cached);
-        assert_eq!(article.record.description, "Cached summary only");
-        assert!(article.content.is_empty());
+            .expect("live miss result");
+        assert!(
+            result.is_none(),
+            "stale metadata-only article must not be returned"
+        );
     }
 
     #[tokio::test]

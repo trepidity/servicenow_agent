@@ -114,6 +114,84 @@ pub(in crate::rpc) async fn get_server_cached(
     }))
 }
 
+pub(in crate::rpc) async fn server_cache_snapshot(
+    core: &SnowCore,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let records = core
+        .list_records_query(
+            ListQuery::new()
+                .resource_type(ResourceType::Server)
+                .include_tombstoned(false),
+        )
+        .await?;
+    Ok(records.iter().map(|record| record.synced_at).min())
+}
+
+pub(in crate::rpc) fn server_cache_miss(
+    id: Option<Value>,
+    operation: &'static str,
+) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32072,
+        "cache miss",
+        Some(json!({
+            "code": "CACHE_MISS", "operation": operation, "object": "server"
+        })),
+    )
+}
+
+pub(in crate::rpc) fn server_get_result(
+    transport: &DaemonTransport<'_>,
+    record: &SnowRecord,
+    source: snow_core::Source,
+    live_without_local_io: bool,
+) -> Result<Value> {
+    let server = if live_without_local_io {
+        transport.live_server(record)?
+    } else {
+        transport.server(record)?
+    };
+    let record_dto = server.record.clone();
+    operation_envelope_result(
+        "server_get",
+        source,
+        snow_core::Completeness::Complete,
+        json!({
+            "server": server,
+            "record": record_dto,
+            "markdown": render_snow_record(record),
+        }),
+    )
+}
+
+pub(in crate::rpc) fn server_list_result(
+    operation: &'static str,
+    transport: &DaemonTransport<'_>,
+    records: Vec<SnowRecord>,
+    source: snow_core::Source,
+    completeness: snow_core::Completeness,
+    live_without_local_io: bool,
+) -> Result<Value> {
+    let mut servers = Vec::with_capacity(records.len());
+    let mut record_dtos = Vec::with_capacity(records.len());
+    for record in records {
+        let server = if live_without_local_io {
+            transport.live_server(&record)?
+        } else {
+            transport.server(&record)?
+        };
+        record_dtos.push(server.record.clone());
+        servers.push(server);
+    }
+    let data = if operation == "server_search" {
+        json!({"servers": servers, "records": record_dtos})
+    } else {
+        json!({"servers": servers})
+    };
+    operation_envelope_result(operation, source, completeness, data)
+}
+
 pub(in crate::rpc) async fn server_fields(
     core: &SnowCore,
     _params: ServerFieldsParams,
@@ -206,59 +284,73 @@ pub(in crate::rpc) async fn dispatch_servers(
 ) -> JsonRpcResponse {
     match method {
         RpcMethod::ServerGet => match extract_server_get_params(&request.params) {
-            Ok(params) => match get_server_cached(state.core.as_ref(), &params.lookup).await {
-                // Cache hit: return the cached record without a live query.
-                Ok(Some(record)) => match transport.server(&record) {
-                    Ok(server) => {
-                        let record_dto = server.record.clone();
-                        JsonRpcResponse::ok(
-                            id,
-                            json!({
-                                "server": server,
-                                "record": record_dto,
-                                "markdown": render_snow_record(&record),
-                            }),
-                        )
+            Ok(params) => {
+                let rule = state.cache_policy.active().rule_for("server_get", "server");
+                let cached = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                    Ok(None)
+                } else {
+                    get_server_cached(state.core.as_ref(), &params.lookup)
+                        .await
+                        .map(|record| {
+                            record.filter(|record| {
+                                rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                                    || rule.ttl.is_some_and(|ttl| {
+                                        record.synced_at + ttl > chrono::Utc::now()
+                                    })
+                            })
+                        })
+                };
+                match cached {
+                    // Cache hit: return the cached record without a live query.
+                    Ok(Some(record)) => match server_get_result(
+                        transport,
+                        &record,
+                        snow_core::Source::Cache {
+                            last_refreshed_at: record.synced_at,
+                        },
+                        false,
+                    ) {
+                        Ok(result) => JsonRpcResponse::ok(id, result),
+                        Err(err) => internal_error(id, err),
+                    },
+                    // Cache miss: fall through to the live exact fetch. On the
+                    // CLI/daemon path we persist the hit (read primitive contract);
+                    // a confirmed 404 is the only -32004, transient/ACL failures map
+                    // to distinct codes.
+                    Ok(None) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                        server_cache_miss(id, "server_get")
                     }
-                    Err(err) => internal_error(id, err),
-                },
-                // Cache miss: fall through to the live exact fetch. On the
-                // CLI/daemon path we persist the hit (read primitive contract);
-                // a confirmed 404 is the only -32004, transient/ACL failures map
-                // to distinct codes.
-                Ok(None) => match core_server_lookup(params.lookup) {
-                    Ok(core_lookup) => {
-                        match state
-                            .core
-                            .get_server_live(core_lookup, params.persist)
-                            .await
-                        {
-                            Ok(Some(server)) => match transport.server(&server.record) {
-                                Ok(server_dto) => {
-                                    let record_dto = server_dto.record.clone();
-                                    JsonRpcResponse::ok(
-                                        id,
-                                        json!({
-                                            "server": server_dto,
-                                            "record": record_dto,
-                                            "markdown": render_snow_record(&server.record),
-                                        }),
-                                    )
+                    Ok(None) => match core_server_lookup(params.lookup) {
+                        Ok(core_lookup) => {
+                            let live_without_local_io =
+                                rule.mode == snow_core::cache::policy::CacheMode::Live;
+                            match state
+                                .core
+                                .get_server_live(core_lookup, !live_without_local_io)
+                                .await
+                            {
+                                Ok(Some(server)) => match server_get_result(
+                                    transport,
+                                    &server.record,
+                                    snow_core::Source::Live,
+                                    live_without_local_io,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                },
+                                // get_server_live never returns Ok(None); NotFound is
+                                // an Err variant. Treat the impossible case as 404.
+                                Ok(None) => {
+                                    JsonRpcResponse::error(id, -32004, "server not found", None)
                                 }
-                                Err(err) => internal_error(id, err),
-                            },
-                            // get_server_live never returns Ok(None); NotFound is
-                            // an Err variant. Treat the impossible case as 404.
-                            Ok(None) => {
-                                JsonRpcResponse::error(id, -32004, "server not found", None)
+                                Err(err) => server_get_error_response(id, err),
                             }
-                            Err(err) => server_get_error_response(id, err),
                         }
-                    }
-                    Err(err) => invalid_params(id, err),
-                },
-                Err(err) => internal_error(id, err),
-            },
+                        Err(err) => invalid_params(id, err),
+                    },
+                    Err(err) => internal_error(id, err),
+                }
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::ServerGetFresh => match extract_server_lookup_params(&request.params) {
@@ -286,45 +378,168 @@ pub(in crate::rpc) async fn dispatch_servers(
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::ServerSearch => match extract_server_search_params(&request.params) {
-            Ok(params) => match state.core.search_servers_live(params).await {
-                Ok(servers) => {
-                    let mut server_dtos = Vec::with_capacity(servers.len());
-                    let mut record_dtos = Vec::with_capacity(servers.len());
-                    for server in servers {
-                        match transport.server(&server.record) {
-                            Ok(server_dto) => {
-                                record_dtos.push(server_dto.record.clone());
-                                server_dtos.push(server_dto);
-                            }
-                            Err(err) => return internal_error(id, err),
+            Ok(params) => {
+                let rule = state
+                    .cache_policy
+                    .active()
+                    .rule_for("server_search", "server");
+                let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                    Ok(None)
+                } else {
+                    server_cache_snapshot(state.core.as_ref()).await
+                };
+                match snapshot {
+                    Ok(Some(last_refreshed_at))
+                        if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                            || rule.ttl.is_some_and(|ttl| {
+                                last_refreshed_at + ttl > chrono::Utc::now()
+                            }) =>
+                    {
+                        match state
+                            .core
+                            .query_servers(snow_core::ServerQuery {
+                                name: params.name,
+                                ip_address: params.ip_address,
+                                ci_owner_group: params.ci_owner_group,
+                                class: params.class,
+                                limit: params.limit,
+                                ..Default::default()
+                            })
+                            .await
+                        {
+                            Ok(records) => match server_list_result(
+                                "server_search",
+                                transport,
+                                records,
+                                snow_core::Source::Cache { last_refreshed_at },
+                                snow_core::Completeness::Partial {
+                                    reason: snow_core::PartialReason::NarrowedProjection,
+                                },
+                                false,
+                            ) {
+                                Ok(result) => JsonRpcResponse::ok(id, result),
+                                Err(err) => internal_error(id, err),
+                            },
+                            Err(err) => internal_error(id, err),
                         }
                     }
-                    JsonRpcResponse::ok(
-                        id,
-                        json!({
-                            "servers": server_dtos,
-                            "records": record_dtos,
-                        }),
-                    )
+                    Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                        server_cache_miss(id, "server_search")
+                    }
+                    Ok(_) => {
+                        let limit = params
+                            .limit
+                            .unwrap_or(snow_core::resource::server::SERVER_DEFAULT_LIMIT);
+                        let live_without_local_io =
+                            rule.mode == snow_core::cache::policy::CacheMode::Live;
+                        match state
+                            .core
+                            .search_servers_policy_live(params, !live_without_local_io)
+                            .await
+                        {
+                            Ok(servers) => {
+                                let completeness = if servers.len() == limit {
+                                    snow_core::Completeness::Partial {
+                                        reason: snow_core::PartialReason::PageLimitReached,
+                                    }
+                                } else {
+                                    snow_core::Completeness::Complete
+                                };
+                                match server_list_result(
+                                    "server_search",
+                                    transport,
+                                    servers.into_iter().map(|server| server.record).collect(),
+                                    snow_core::Source::Live,
+                                    completeness,
+                                    live_without_local_io,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                }
+                            }
+                            Err(err) => internal_error(id, err),
+                        }
+                    }
+                    Err(err) => internal_error(id, err),
                 }
-                Err(err) => internal_error(id, err),
-            },
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::ServerQuery => match extract_server_query_params(&request.params) {
-            Ok(params) => match state.core.query_servers(params).await {
-                Ok(records) => {
-                    let mut servers = Vec::with_capacity(records.len());
-                    for record in records {
-                        match transport.server(&record) {
-                            Ok(server) => servers.push(server),
-                            Err(err) => return internal_error(id, err),
+            Ok(params) => {
+                let rule = state
+                    .cache_policy
+                    .active()
+                    .rule_for("server_query", "server");
+                let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                    Ok(None)
+                } else {
+                    server_cache_snapshot(state.core.as_ref()).await
+                };
+                match snapshot {
+                    Ok(Some(last_refreshed_at))
+                        if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                            || rule.ttl.is_some_and(|ttl| {
+                                last_refreshed_at + ttl > chrono::Utc::now()
+                            }) =>
+                    {
+                        match state.core.query_servers(params).await {
+                            Ok(records) => match server_list_result(
+                                "server_query",
+                                transport,
+                                records,
+                                snow_core::Source::Cache { last_refreshed_at },
+                                snow_core::Completeness::Partial {
+                                    reason: snow_core::PartialReason::NarrowedProjection,
+                                },
+                                false,
+                            ) {
+                                Ok(result) => JsonRpcResponse::ok(id, result),
+                                Err(err) => internal_error(id, err),
+                            },
+                            Err(err) => internal_error(id, err),
                         }
                     }
-                    JsonRpcResponse::ok(id, json!({ "servers": servers }))
+                    Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                        server_cache_miss(id, "server_query")
+                    }
+                    Ok(_) => {
+                        let limit = params
+                            .limit
+                            .unwrap_or(snow_core::resource::server::SERVER_DEFAULT_LIMIT);
+                        let live_without_local_io =
+                            rule.mode == snow_core::cache::policy::CacheMode::Live;
+                        match state
+                            .core
+                            .query_servers_policy_live(params, !live_without_local_io)
+                            .await
+                        {
+                            Ok(servers) => {
+                                let completeness = if servers.len() == limit {
+                                    snow_core::Completeness::Partial {
+                                        reason: snow_core::PartialReason::PageLimitReached,
+                                    }
+                                } else {
+                                    snow_core::Completeness::Complete
+                                };
+                                match server_list_result(
+                                    "server_query",
+                                    transport,
+                                    servers.into_iter().map(|server| server.record).collect(),
+                                    snow_core::Source::Live,
+                                    completeness,
+                                    live_without_local_io,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                }
+                            }
+                            Err(err) => internal_error(id, err),
+                        }
+                    }
+                    Err(err) => internal_error(id, err),
                 }
-                Err(err) => internal_error(id, err),
-            },
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::ServerFields => match extract_server_fields_params(&request.params) {

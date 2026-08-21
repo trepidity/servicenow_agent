@@ -22,6 +22,24 @@ pub fn register(registry: &mut ToolRegistry) {
     );
     add_tool(
         registry,
+        "incident_bulk_plan_update",
+        "Plan a governed 3..=25 target Incident bulk update",
+        incident_bulk_plan_input_schema(),
+        incident_bulk_plan_output_schema(),
+        false,
+        false,
+    );
+    add_tool(
+        registry,
+        "incident_bulk_apply_update",
+        "Apply a confirmed, concurrency-safe Incident bulk update plan",
+        incident_bulk_apply_input_schema(),
+        incident_bulk_receipt_output_schema(),
+        false,
+        true,
+    );
+    add_tool(
+        registry,
         "change_request_plan_create",
         "Plan creation of a governed Change Request",
         change_request_plan_create_input_schema(),
@@ -104,8 +122,114 @@ fn incident_plan_update_input_schema() -> Value {
             "assignment_group": {"type": "string", "description": "Exact active membership group name or sys_id."},
             "state": {"type": "string", "description": "Exact state value or case-insensitive choice label."},
             "work_notes": {"type": "string", "minLength": 1, "maxLength": 16000}
+            ,"comments": {"type": "string", "minLength": 1, "maxLength": 16000}
         },
         "required": ["number"]
+    })
+}
+
+fn incident_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "assigned_to": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
+            "assignment_group": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
+            "state": {"type": "string", "minLength": 1},
+            "work_notes": {"type": "string", "minLength": 1, "maxLength": 16000},
+            "comments": {"type": "string", "minLength": 1, "maxLength": 16000}
+        }
+    })
+}
+
+fn incident_bulk_plan_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "shared_patch": incident_patch_schema(),
+            "targets": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "number": {"type": "string", "pattern": "^INC[0-9]+$"},
+                        "sys_id": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
+                        "patch": incident_patch_schema()
+                    }
+                }
+            }
+        },
+        "required": ["targets"]
+    })
+}
+
+fn incident_bulk_apply_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "plan_id": {"type": "string", "minLength": 1},
+            "confirmation_token": {"type": "string", "minLength": 1},
+            "idempotency_key": {"type": "string", "minLength": 1},
+            "concurrency_tokens": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "sys_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                        "sys_updated_on": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["sys_id", "sys_updated_on"]
+                }
+            }
+        },
+        "required": ["plan_id", "confirmation_token", "idempotency_key", "concurrency_tokens"]
+    })
+}
+
+fn incident_bulk_plan_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "op_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "apply_tool": {"type": "string", "const": "incident_bulk_apply_update"},
+            "preview": {"type": "object"},
+            "expires_at": {"type": "string", "format": "date-time"},
+            "confirmation_token": {"type": "string"},
+            "idempotency_key": {"type": "string"}
+        },
+        "required": ["plan_id", "op_hash", "apply_tool", "preview", "expires_at", "confirmation_token", "idempotency_key"]
+    })
+}
+
+fn incident_bulk_receipt_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "audit_id": {"type": "string"},
+            "parent_audit_id": {"type": "string"},
+            "tool": {"type": "string"},
+            "status": {"type": "string", "enum": ["success", "partial"]},
+            "op_hash": {"type": "string"},
+            "idempotency_replay": {"type": "boolean"},
+            "target_results": {"type": "array", "items": {"type": "object"}},
+            "applied_count": {"type": "integer"},
+            "failed_count": {"type": "integer"},
+            "not_attempted_count": {"type": "integer"},
+            "cache_coherent": {"type": "boolean"},
+            "apply_started_at": {"type": "string", "format": "date-time"},
+            "completed_at": {"type": "string", "format": "date-time"}
+        },
+        "required": ["plan_id", "audit_id", "parent_audit_id", "tool", "status", "op_hash", "idempotency_replay", "target_results", "applied_count", "failed_count", "not_attempted_count", "cache_coherent", "apply_started_at", "completed_at"]
     })
 }
 

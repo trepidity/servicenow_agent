@@ -1,4 +1,4 @@
-use crate::{KnowledgeEmbeddingCoverage, ResourceType};
+use crate::{CatalogItem, KnowledgeEmbeddingCoverage, ResourceType};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +6,12 @@ pub enum CacheFormat {
     Absent,
     Current,
     Incompatible { found: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogProductProjectionRow {
+    pub item: CatalogItem,
+    pub last_refreshed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

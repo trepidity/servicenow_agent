@@ -33,6 +33,17 @@ pub(in crate::rpc) fn daemon_record_response(
     }
 }
 
+pub(in crate::rpc) fn daemon_live_record_response(
+    id: Option<Value>,
+    transport: &DaemonTransport<'_>,
+    record: &SnowRecord,
+) -> JsonRpcResponse {
+    match transport.live_record(record) {
+        Ok(record) => JsonRpcResponse::ok(id, json!({ "record": record })),
+        Err(err) => internal_error(id, err),
+    }
+}
+
 pub(in crate::rpc) async fn daemon_record_response_with_private_task_context(
     id: Option<Value>,
     transport: &DaemonTransport<'_>,
@@ -316,23 +327,22 @@ pub(in crate::rpc) async fn dispatch_records(
     match method {
         RpcMethod::GetRecord => match extract_record_lookup(&request.params) {
             Ok(RecordLookup::Number(number)) => {
-                match get_record_cached_or_fresh(state.core.as_ref(), &number).await {
-                    Ok(Some(record)) => {
-                        daemon_record_response_with_private_task_context(id, transport, &record)
-                            .await
-                    }
+                match state
+                    .core
+                    .get_record_live_without_persistence(&number)
+                    .await
+                {
+                    Ok(Some(record)) => daemon_live_record_response(id, transport, &record),
                     Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
                     Err(err) => map_record_lookup_error(id, err),
                 }
             }
             Ok(RecordLookup::TableSysId { table, sys_id }) => match state
                 .core
-                .get_record_by_table_sys_id_fresh(&table, &sys_id)
+                .get_record_by_table_sys_id_live_without_persistence(&table, &sys_id)
                 .await
             {
-                Ok(Some(record)) => {
-                    daemon_record_response_with_private_task_context(id, transport, &record).await
-                }
+                Ok(Some(record)) => daemon_live_record_response(id, transport, &record),
                 Ok(None) => JsonRpcResponse::error(id, -32004, "record not found", None),
                 Err(err) => map_record_lookup_error(id, err),
             },
@@ -374,23 +384,30 @@ pub(in crate::rpc) async fn dispatch_records(
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::SearchRecords => match extract_search_records_params(&request.params) {
-            Ok(params) => match state
-                .core
-                .search_enriched(&params.query, parse_search_scope(params.scope.as_deref()))
-                .await
-            {
-                Ok(results) => {
-                    let mut search_results = Vec::new();
-                    for result in results.into_iter().take(params.limit.unwrap_or(20)) {
-                        match transport.search_result(&result).await {
-                            Ok(result) => search_results.push(result),
-                            Err(err) => return internal_error(id, err),
+            Ok(params) => {
+                let exact_live = snow_core::query::is_exact_record_number(&params.query);
+                match state
+                    .core
+                    .search_enriched(&params.query, parse_search_scope(params.scope.as_deref()))
+                    .await
+                {
+                    Ok(results) => {
+                        let mut search_results = Vec::new();
+                        for result in results.into_iter().take(params.limit.unwrap_or(20)) {
+                            if exact_live {
+                                search_results.push(transport.live_search_result(&result));
+                            } else {
+                                match transport.search_result(&result).await {
+                                    Ok(result) => search_results.push(result),
+                                    Err(err) => return internal_error(id, err),
+                                }
+                            }
                         }
+                        JsonRpcResponse::ok(id, json!({ "results": search_results }))
                     }
-                    JsonRpcResponse::ok(id, json!({ "results": search_results }))
+                    Err(err) => internal_error(id, err),
                 }
-                Err(err) => internal_error(id, err),
-            },
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::UserLookup => match extract_user_lookup_params(&request.params) {

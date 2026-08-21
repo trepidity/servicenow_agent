@@ -16,6 +16,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Validate or atomically reload the daemon-owned cache policy
+    CachePolicy {
+        #[command(subcommand)]
+        action: CachePolicyCommand,
+    },
     /// Launch the interactive terminal UI
     Tui {
         /// Enable auto-refresh. If no value is provided, defaults to 60 seconds.
@@ -155,6 +160,22 @@ pub enum Command {
     },
     /// Launch the operator admin TUI
     Admin,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CachePolicyCommand {
+    /// Validate the fixed cache-policy.toml without changing daemon state
+    Validate {
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and atomically replace the active cache-policy snapshot
+    Reload {
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -699,7 +720,86 @@ fn parse_business_app_number(value: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap owns this short-lived parsed command value.
 pub enum IncidentCommand {
+    /// Plan or apply one governed Incident update
+    Update {
+        /// Strict update request JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "plan")]
+        request: Option<PathBuf>,
+        /// Saved plan bundle JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "request")]
+        plan: Option<PathBuf>,
+        /// Apply the saved plan bundle after confirmation
+        #[arg(long, requires = "plan")]
+        apply: bool,
+        /// Bypass only the interactive confirmation prompt
+        #[arg(long, requires = "apply")]
+        yes: bool,
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan or apply a separately governed 3..=25 target Incident bulk update
+    BulkUpdate {
+        /// Strict bulk-plan request JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "plan")]
+        request: Option<PathBuf>,
+        /// Saved plan bundle JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "request")]
+        plan: Option<PathBuf>,
+        /// Apply the saved plan bundle after confirmation
+        #[arg(long, requires = "plan")]
+        apply: bool,
+        /// Bypass only the interactive confirmation prompt
+        #[arg(long, requires = "apply")]
+        yes: bool,
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get one Incident live by exact number or sys_id
+    Get {
+        #[arg(long)]
+        number: Option<String>,
+        #[arg(long = "sys-id")]
+        sys_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query one bounded live page of ACL-visible Incidents
+    Query {
+        #[arg(long = "number")]
+        numbers: Vec<String>,
+        #[arg(long = "assignment-group")]
+        assignment_group: Option<String>,
+        #[arg(long = "assigned-to")]
+        assigned_to: Option<String>,
+        #[arg(long = "caller-id")]
+        caller_id: Option<String>,
+        #[arg(long = "cmdb-ci")]
+        cmdb_ci: Option<String>,
+        #[arg(long = "state")]
+        states: Vec<String>,
+        #[arg(long = "priority")]
+        priorities: Vec<u8>,
+        #[arg(long)]
+        active: Option<bool>,
+        #[arg(long = "opened-after")]
+        opened_after: Option<String>,
+        #[arg(long = "opened-before")]
+        opened_before: Option<String>,
+        #[arg(long = "updated-after")]
+        updated_after: Option<String>,
+        #[arg(long = "updated-before")]
+        updated_before: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Discover readable and writable Incident fields from ServiceNow
     Fields {
         /// Emit the raw daemon JSON payload

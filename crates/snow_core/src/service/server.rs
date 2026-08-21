@@ -14,7 +14,7 @@
 //! privatized here.
 
 use anyhow::Result;
-use servicenow_rs::prelude::{DisplayValue, Error as SnowApiError, Order, Record};
+use servicenow_rs::prelude::{DisplayValue, Error as SnowApiError, Operator, Order, Record};
 use servicenow_rs::query::TableApi;
 
 use crate::context::CoreContext;
@@ -26,8 +26,8 @@ use crate::resource::business_application::{
     BusinessApplicationsForServerParams, BusinessApplicationsForServerResult,
 };
 use crate::resource::server::{
-    SERVER_LEAF_TABLES, SERVER_TABLE, Server, ServerLookup, ServerQuery, ServerSearchParams,
-    canonical_server_class,
+    SERVER_DEFAULT_LIMIT, SERVER_LEAF_TABLES, SERVER_TABLE, Server, ServerLookup, ServerQuery,
+    ServerSearchParams, canonical_server_class,
 };
 use crate::{SnowRecord, normalize_record_lookup_sys_id};
 
@@ -245,12 +245,24 @@ impl ServerService {
     }
 
     pub async fn search_servers_live(&self, params: ServerSearchParams) -> Result<Vec<Server>> {
+        self.search_servers_policy_live(params, true).await
+    }
+
+    /// Execute the fixed typed Server search against ServiceNow, optionally
+    /// persisting the complete live records for read-through policy.
+    pub async fn search_servers_policy_live(
+        &self,
+        params: ServerSearchParams,
+        persist: bool,
+    ) -> Result<Vec<Server>> {
         params.validate()?;
         let records = self.server_base_query(params)?.execute().await?.records;
         let mut servers = Vec::with_capacity(records.len());
         for record in records {
             let server = Server::from_servicenow(&record)?;
-            self.ctx.persist_record(&record)?;
+            if persist {
+                self.ctx.persist_record(&record)?;
+            }
             servers.push(server);
         }
         Ok(servers)
@@ -258,6 +270,40 @@ impl ServerService {
 
     pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
         self.ctx.query.query_servers(query).await
+    }
+
+    /// Execute the fixed typed Server query against ServiceNow. This is the
+    /// live counterpart to the narrowed local projection used by cache modes.
+    pub async fn query_servers_policy_live(
+        &self,
+        query: ServerQuery,
+        persist: bool,
+    ) -> Result<Vec<Server>> {
+        query.validate()?;
+        let limit = query.limit.unwrap_or(SERVER_DEFAULT_LIMIT);
+        let offset = query.offset.unwrap_or(0);
+        let mut api = self
+            .server_query_base_query(&query)?
+            .limit(u32::try_from(limit).unwrap_or(u32::MAX))
+            .offset(u32::try_from(offset).unwrap_or(u32::MAX));
+
+        if let Some(text) = non_empty_owned(query.text.as_deref()) {
+            api = api
+                .contains("name", &text)
+                .or_filter("short_description", Operator::Contains, &text)
+                .or_filter("ip_address", Operator::Contains, &text);
+        }
+
+        let records = api.execute().await?.records;
+        let mut servers = Vec::with_capacity(records.len());
+        for record in records {
+            let server = Server::from_servicenow(&record)?;
+            if persist {
+                self.ctx.persist_record(&record)?;
+            }
+            servers.push(server);
+        }
+        Ok(servers)
     }
 
     pub async fn business_application_servers_cached(
@@ -281,13 +327,26 @@ impl ServerService {
     }
 
     fn server_base_query(&self, params: ServerSearchParams) -> Result<TableApi> {
+        let limit = params.validated_limit()?;
+        let query_params = ServerQuery {
+            name: params.name,
+            ip_address: params.ip_address,
+            ci_owner_group: params.ci_owner_group,
+            class: params.class,
+            ..Default::default()
+        };
+        Ok(self
+            .server_query_base_query(&query_params)?
+            .limit(u32::try_from(limit).unwrap_or(u32::MAX)))
+    }
+
+    fn server_query_base_query(&self, params: &ServerQuery) -> Result<TableApi> {
         let mut query = self
             .ctx
             .client
             .table(SERVER_TABLE)
             .display_value(DisplayValue::Both)
             .exclude_reference_link(true)
-            .limit(params.validated_limit()? as u32)
             .order_by("name", Order::Asc);
 
         if let Some(class) = non_empty_owned(params.class.as_deref()) {

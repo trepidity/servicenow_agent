@@ -95,6 +95,16 @@ pub fn register(registry: &mut ToolRegistry) {
             server_fields_arg_schema(),
         ),
         (
+            "incident_get",
+            "Get one Incident live by exact number or sys_id, preserving native ServiceNow fields and display values.",
+            incident_get_arg_schema(),
+        ),
+        (
+            "incident_query",
+            "Query one bounded live page of ACL-visible Incidents with typed filters and exclusive sys_id cursor paging.",
+            incident_query_arg_schema(),
+        ),
+        (
             "incident_fields",
             "Discover readable and writable Incident fields, choices, references, and paging support from ServiceNow",
             incident_fields_arg_schema(),
@@ -803,6 +813,46 @@ pub fn incident_fields_arg_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {}
+    })
+}
+
+pub fn incident_get_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "number": { "type": "string", "pattern": "^[Ii][Nn][Cc][0-9]+$" },
+            "sys_id": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" }
+        }
+    })
+}
+
+pub fn incident_query_arg_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "filters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "numbers": { "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": { "type": "string", "pattern": "^[Ii][Nn][Cc][0-9]+$" } },
+                    "assignment_group": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "assigned_to": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "caller_id": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "cmdb_ci": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
+                    "states": { "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": { "type": "string" } },
+                    "priorities": { "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 5 } },
+                    "active": { "type": "boolean" },
+                    "opened_after": { "type": "string" },
+                    "opened_before": { "type": "string" },
+                    "updated_after": { "type": "string" },
+                    "updated_before": { "type": "string" }
+                }
+            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+            "cursor": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" }
+        }
     })
 }
 

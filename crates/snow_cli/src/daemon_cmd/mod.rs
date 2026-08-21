@@ -3,6 +3,7 @@
 //! Each lifecycle action lives in its own module; [`dispatch`] is the
 //! single entry point invoked from `main.rs`.
 
+pub mod cache_policy;
 pub mod client;
 pub mod contract_info;
 pub mod logs;

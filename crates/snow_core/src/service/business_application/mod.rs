@@ -199,6 +199,64 @@ impl BusinessApplicationService {
         Ok(Some(business_application))
     }
 
+    /// Fetch one Business Application without consulting local cache, vault,
+    /// derived indexes, or cached dictionary metadata.
+    ///
+    /// Cache policy owns persistence for this entry point. The baseline typed
+    /// aliases are used deliberately: resolving instance aliases would itself
+    /// consult the local dictionary projection, violating `live` mode.
+    pub async fn get_business_application_policy_live(
+        &self,
+        lookup: BusinessApplicationLookup,
+        persist: bool,
+    ) -> Result<Option<BusinessApplication>> {
+        let aliases = BusinessApplicationFieldAliases::baseline_degraded();
+        let record = match lookup {
+            BusinessApplicationLookup::SysId(sys_id) => match self
+                .ctx
+                .client
+                .table(BUSINESS_APPLICATION_TABLE)
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(&normalize_record_lookup_sys_id(&sys_id)?)
+                .await
+            {
+                Ok(record) => Some(record),
+                Err(SnowApiError::Api { status: 404, .. }) => None,
+                Err(err) => return Err(err.into()),
+            },
+            BusinessApplicationLookup::ExactName(name) => {
+                let name = non_empty_owned(Some(&name))
+                    .ok_or_else(|| anyhow::anyhow!("Business Application name cannot be empty"))?;
+                let records = self
+                    .ctx
+                    .client
+                    .table(BUSINESS_APPLICATION_TABLE)
+                    .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+                    .equals("name", &name)
+                    .display_value(DisplayValue::Both)
+                    .exclude_reference_link(true)
+                    .limit(2)
+                    .execute()
+                    .await?
+                    .records;
+                if records.len() > 1 {
+                    anyhow::bail!("multiple Business Applications matched name={name}");
+                }
+                records.into_iter().next()
+            }
+        };
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let business_application = BusinessApplication::from_servicenow(&record, &aliases)?;
+        if persist {
+            self.ctx.persist_record(&record)?;
+        }
+        Ok(Some(business_application))
+    }
+
     pub async fn search_business_applications_live(
         &self,
         params: BusinessApplicationSearchParams,
@@ -209,6 +267,37 @@ impl BusinessApplicationService {
             .resolve_business_application_aliases(options.refresh_dictionary)
             .await;
 
+        self.search_business_applications_with_aliases(params, options, &aliases)
+            .await
+    }
+
+    /// Run a policy-owned live search without consulting local cache, vault,
+    /// indexes, or cached dictionary metadata before the ServiceNow request.
+    pub async fn search_business_applications_policy_live(
+        &self,
+        params: BusinessApplicationSearchParams,
+        persist: bool,
+    ) -> Result<Vec<BusinessApplication>> {
+        params.validate()?;
+        self.search_business_applications_with_aliases(
+            params,
+            BusinessApplicationHydrationOptions {
+                persist,
+                resolve_references: false,
+                reference_depth: 0,
+                refresh_dictionary: false,
+            },
+            &BusinessApplicationFieldAliases::baseline_degraded(),
+        )
+        .await
+    }
+
+    async fn search_business_applications_with_aliases(
+        &self,
+        params: BusinessApplicationSearchParams,
+        options: BusinessApplicationHydrationOptions,
+        aliases: &BusinessApplicationFieldAliases,
+    ) -> Result<Vec<BusinessApplication>> {
         let mut query = self
             .ctx
             .client
@@ -270,8 +359,72 @@ impl BusinessApplicationService {
         }
 
         let records = query.execute().await?.records;
-        self.hydrate_business_application_page(records, &aliases, &options)
+        self.hydrate_business_application_page(records, aliases, &options)
             .await
+    }
+
+    /// Execute the typed Business Application query against ServiceNow rather
+    /// than the narrowed local projection. Cache policy owns persistence.
+    pub async fn query_business_applications_policy_live(
+        &self,
+        query: BusinessApplicationQuery,
+        persist: bool,
+    ) -> Result<Vec<BusinessApplication>> {
+        let limit = query.limit.unwrap_or(BUSINESS_APPLICATION_DEFAULT_LIMIT);
+        if limit == 0 || limit > 500 {
+            anyhow::bail!("Business Application query limit must be between 1 and 500");
+        }
+        let offset = query.offset.unwrap_or(0);
+        let mut live = self
+            .ctx
+            .client
+            .table(BUSINESS_APPLICATION_TABLE)
+            .equals("sys_class_name", BUSINESS_APPLICATION_TABLE)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .limit(u32::try_from(limit)?)
+            .offset(u32::try_from(offset)?);
+
+        if let Some(text) = non_empty_owned(query.text.as_deref()) {
+            live = live.contains("name", &text);
+        }
+        for filter in query.filters {
+            let operator = match filter.op {
+                crate::query::filter::FieldOperator::Eq => Operator::Equals,
+                crate::query::filter::FieldOperator::Ne => Operator::NotEquals,
+                crate::query::filter::FieldOperator::Contains => Operator::Contains,
+                crate::query::filter::FieldOperator::StartsWith => Operator::StartsWith,
+                crate::query::filter::FieldOperator::In => Operator::In,
+                crate::query::filter::FieldOperator::IsEmpty => Operator::IsEmpty,
+                crate::query::filter::FieldOperator::IsNotEmpty => Operator::IsNotEmpty,
+                crate::query::filter::FieldOperator::Gt => Operator::GreaterThan,
+                crate::query::filter::FieldOperator::Gte => Operator::GreaterThanOrEqual,
+                crate::query::filter::FieldOperator::Lt => Operator::LessThan,
+                crate::query::filter::FieldOperator::Lte => Operator::LessThanOrEqual,
+            };
+            let value = business_application_filter_value(&filter.value);
+            live = live.filter(&filter.field, operator, &value);
+        }
+        for sort in query.sort {
+            let order = match sort.direction {
+                crate::query::filter::SortDirection::Asc => Order::Asc,
+                crate::query::filter::SortDirection::Desc => Order::Desc,
+            };
+            live = live.order_by(&sort.field, order);
+        }
+
+        let records = live.execute().await?.records;
+        self.hydrate_business_application_page(
+            records,
+            &BusinessApplicationFieldAliases::baseline_degraded(),
+            &BusinessApplicationHydrationOptions {
+                persist,
+                resolve_references: false,
+                reference_depth: 0,
+                refresh_dictionary: false,
+            },
+        )
+        .await
     }
 
     pub async fn query_business_applications(
@@ -279,6 +432,19 @@ impl BusinessApplicationService {
         query: BusinessApplicationQuery,
     ) -> Result<Vec<SnowRecord>> {
         self.ctx.query.query_business_applications(query).await
+    }
+}
+
+fn business_application_filter_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(business_application_filter_value)
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 

@@ -224,6 +224,48 @@ fn incident_list_by_assignment_group_is_a_bounded_read_tool() {
     );
 }
 
+/// L1 MCP registration seam for the approved B-OPS-07 request boundary.
+#[test]
+fn incident_get_and_query_advertise_only_the_typed_live_contract() {
+    let registry = ToolRegistry::new();
+    let get = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "incident_get")
+        .expect("incident_get registered");
+    let query = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "incident_query")
+        .expect("incident_query registered");
+
+    for tool in [get, query] {
+        assert!(tool.default_enabled);
+        assert!(!tool.requires_confirmation);
+        assert_eq!(tool.input_schema["type"], "object");
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_no_top_level_schema_composition(&tool.input_schema);
+    }
+    assert_eq!(
+        get.input_schema["properties"]
+            .as_object()
+            .map(|properties| {
+                let mut keys = properties.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            }),
+        Some(vec!["number".to_string(), "sys_id".to_string()])
+    );
+    assert_eq!(query.input_schema["properties"]["limit"]["maximum"], 200);
+    assert_eq!(
+        query.input_schema["properties"]["filters"]["additionalProperties"],
+        false
+    );
+    assert!(query.input_schema["properties"].get("table").is_none());
+    assert!(query.input_schema["properties"].get("sort").is_none());
+    assert!(query.input_schema["properties"].get("source").is_none());
+}
+
 #[test]
 fn record_query_schema_is_strict_bounded_and_composition_free() {
     let registry = ToolRegistry::new();
@@ -305,7 +347,8 @@ fn incident_assignment_group_operations_have_operational_and_governed_contracts(
             "assignment_group",
             "number",
             "state",
-            "work_notes"
+            "work_notes",
+            "comments"
         ]
         .into_iter()
         .map(str::to_string)
@@ -322,9 +365,47 @@ fn incident_assignment_group_operations_have_operational_and_governed_contracts(
         snow_mcp::domain::policy::PolicyConfig::read_only_default().tools["incident_apply_update"]
             .field_allowlist
             .iter()
-            .eq(["assigned_to", "assignment_group", "state", "work_notes"]
-                .iter()
-                .copied())
+            .eq([
+                "assigned_to",
+                "assignment_group",
+                "comments",
+                "state",
+                "work_notes"
+            ]
+            .iter()
+            .copied())
+    );
+
+    let bulk_plan = tools
+        .iter()
+        .find(|tool| tool.name == "incident_bulk_plan_update")
+        .expect("Incident bulk plan registered");
+    assert!(!bulk_plan.default_enabled);
+    assert_eq!(bulk_plan.input_schema["additionalProperties"], json!(false));
+    assert_eq!(
+        bulk_plan.input_schema["properties"]["targets"]["minItems"],
+        3
+    );
+    assert_eq!(
+        bulk_plan.input_schema["properties"]["targets"]["maxItems"],
+        25
+    );
+    assert_no_top_level_schema_composition(&bulk_plan.input_schema);
+
+    let bulk_apply = tools
+        .iter()
+        .find(|tool| tool.name == "incident_bulk_apply_update")
+        .expect("Incident bulk apply registered");
+    assert!(!bulk_apply.default_enabled);
+    assert!(bulk_apply.requires_confirmation);
+    assert_eq!(
+        bulk_apply.input_schema["required"],
+        json!([
+            "plan_id",
+            "confirmation_token",
+            "idempotency_key",
+            "concurrency_tokens"
+        ])
     );
 }
 

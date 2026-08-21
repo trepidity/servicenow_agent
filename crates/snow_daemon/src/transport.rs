@@ -30,6 +30,19 @@ impl<'a> DaemonTransport<'a> {
     }
 
     pub fn record(&self, record: &SnowRecord) -> Result<DaemonSnowRecord> {
+        self.record_with_local_projection(record, true)
+    }
+
+    /// Serialize a live-only record without consulting vault/cache metadata.
+    pub fn live_record(&self, record: &SnowRecord) -> Result<DaemonSnowRecord> {
+        self.record_with_local_projection(record, false)
+    }
+
+    fn record_with_local_projection(
+        &self,
+        record: &SnowRecord,
+        include_vault_path: bool,
+    ) -> Result<DaemonSnowRecord> {
         Ok(DaemonSnowRecord {
             sys_id: record.sys_id.clone(),
             number: record.number.clone(),
@@ -59,7 +72,11 @@ impl<'a> DaemonTransport<'a> {
             synced_at: record.synced_at,
             source: record.source.clone().into(),
             browser_url: self.browser_url(&record.table, &record.sys_id),
-            vault_relative_path: self.vault_relative_path(&record.sys_id)?,
+            vault_relative_path: if include_vault_path {
+                self.vault_relative_path(&record.sys_id)?
+            } else {
+                None
+            },
             vtb_context: None,
         })
     }
@@ -84,7 +101,25 @@ impl<'a> DaemonTransport<'a> {
 
     pub fn knowledge_article(&self, article: &KnowledgeArticle) -> Result<DaemonKnowledgeArticle> {
         let record = self.record(&article.record)?;
-        Ok(DaemonKnowledgeArticle {
+        Ok(self.knowledge_article_from_record(article, record))
+    }
+
+    /// Serialize a live-only Knowledge article without consulting local vault
+    /// metadata.
+    pub fn live_knowledge_article(
+        &self,
+        article: &KnowledgeArticle,
+    ) -> Result<DaemonKnowledgeArticle> {
+        let record = self.live_record(&article.record)?;
+        Ok(self.knowledge_article_from_record(article, record))
+    }
+
+    fn knowledge_article_from_record(
+        &self,
+        article: &KnowledgeArticle,
+        record: DaemonSnowRecord,
+    ) -> DaemonKnowledgeArticle {
+        DaemonKnowledgeArticle {
             browser_url: record.browser_url.clone(),
             vault_relative_path: record.vault_relative_path.clone(),
             record,
@@ -99,7 +134,7 @@ impl<'a> DaemonTransport<'a> {
             published_at: article.published_at,
             author: article.author.clone().map(Into::into),
             valid_to: article.valid_to,
-        })
+        }
     }
 
     pub fn approval(&self, approval: &ApprovalRecord) -> Result<DaemonApprovalRecord> {
@@ -119,7 +154,25 @@ impl<'a> DaemonTransport<'a> {
 
     pub fn business_application(&self, record: &SnowRecord) -> Result<DaemonBusinessApplication> {
         let record_dto = self.record(record)?;
-        Ok(DaemonBusinessApplication {
+        Ok(self.business_application_from_record(record, record_dto))
+    }
+
+    /// Serialize a live-only Business Application without consulting local
+    /// vault metadata.
+    pub fn live_business_application(
+        &self,
+        record: &SnowRecord,
+    ) -> Result<DaemonBusinessApplication> {
+        let record_dto = self.live_record(record)?;
+        Ok(self.business_application_from_record(record, record_dto))
+    }
+
+    fn business_application_from_record(
+        &self,
+        record: &SnowRecord,
+        record_dto: DaemonSnowRecord,
+    ) -> DaemonBusinessApplication {
+        DaemonBusinessApplication {
             browser_url: record_dto.browser_url.clone(),
             vault_relative_path: record_dto.vault_relative_path.clone(),
             name: business_application_name(record),
@@ -149,12 +202,26 @@ impl<'a> DaemonTransport<'a> {
             fields: record_dto.fields.clone(),
             unresolved_references: Vec::new(),
             record: record_dto,
-        })
+        }
     }
 
     pub fn server(&self, record: &SnowRecord) -> Result<DaemonServer> {
         let record_dto = self.record(record)?;
-        Ok(DaemonServer {
+        Ok(self.server_from_record(record, record_dto))
+    }
+
+    /// Serialize a live-only Server without consulting local vault metadata.
+    pub fn live_server(&self, record: &SnowRecord) -> Result<DaemonServer> {
+        let record_dto = self.live_record(record)?;
+        Ok(self.server_from_record(record, record_dto))
+    }
+
+    fn server_from_record(
+        &self,
+        record: &SnowRecord,
+        record_dto: DaemonSnowRecord,
+    ) -> DaemonServer {
+        DaemonServer {
             browser_url: record_dto.browser_url.clone(),
             vault_relative_path: record_dto.vault_relative_path.clone(),
             record: record_dto.clone(),
@@ -169,7 +236,7 @@ impl<'a> DaemonTransport<'a> {
                 .cloned()
                 .map(Into::into),
             fields: record_dto.fields.clone(),
-        })
+        }
     }
 
     pub fn knowledge_search_hit(
@@ -220,6 +287,28 @@ impl<'a> DaemonTransport<'a> {
             matched_value: result.matched_value.clone(),
             reasons: result.reasons.iter().cloned().map(Into::into).collect(),
         })
+    }
+
+    /// Serialize an exact-number live fallback without consulting the local
+    /// record or vault projections.
+    pub fn live_search_result(&self, result: &SearchResult) -> DaemonSearchResult {
+        DaemonSearchResult {
+            record: DaemonSearchRecord {
+                sys_id: result.record.sys_id.clone(),
+                number: result.record.number.clone(),
+                table: result.record.table.clone(),
+                resource_type: ResourceType::from_table(&result.record.table).into(),
+                state: String::new(),
+                short_description: result.snippet.clone(),
+                browser_url: self.browser_url(&result.record.table, &result.record.sys_id),
+                vault_relative_path: None,
+            },
+            snippet: result.snippet.clone(),
+            score: result.score,
+            match_in: result.match_in.into(),
+            matched_value: result.matched_value.clone(),
+            reasons: result.reasons.iter().cloned().map(Into::into).collect(),
+        }
     }
 
     pub fn knowledge_base_summary(

@@ -845,6 +845,20 @@ impl DaemonRpcClient {
             .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
     }
 
+    pub async fn incident_get(&self, params: Value) -> Result<Value, SnowError> {
+        let response = self.send_request("incident_get", Some(params)).await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
+    pub async fn incident_query(&self, params: Value) -> Result<Value, SnowError> {
+        let response = self.send_request("incident_query", Some(params)).await?;
+        response
+            .result
+            .ok_or_else(|| SnowError::Api("daemon response missing result".to_string()))
+    }
+
     /// Sync Business Applications into the local vault/cache with optional
     /// hydration. Returns the raw summary object; the CLI renders it generically.
     pub async fn business_application_sync(

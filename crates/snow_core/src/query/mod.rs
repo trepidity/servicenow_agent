@@ -1941,7 +1941,7 @@ fn degraded_reason_from_error(err: &anyhow::Error) -> DegradedReadReason {
 /// Matches patterns like `INC4992697`, `CHG0325640`, `CTASK0657426` —
 /// one or more ASCII letters followed by one or more digits, nothing else.
 /// Case-insensitive.
-pub(crate) fn is_exact_record_number(query: &str) -> bool {
+pub fn is_exact_record_number(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed.contains(' ') {
         return false;

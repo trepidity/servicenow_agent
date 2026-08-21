@@ -7,6 +7,8 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
     let method = RpcMethod::from_method(&request.method);
     match method {
         RpcMethod::ContractInfo
+        | RpcMethod::CachePolicyValidate
+        | RpcMethod::CachePolicyReload
         | RpcMethod::Ping
         | RpcMethod::Shutdown
         | RpcMethod::CatalogItemsSearch
@@ -24,11 +26,13 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         | RpcMethod::ChangeTaskPlanCreate
         | RpcMethod::ChangeTaskPlanUpdate
         | RpcMethod::IncidentPlanUpdate
+        | RpcMethod::IncidentBulkPlanUpdate
         | RpcMethod::ChangeRequestApplyCreate
         | RpcMethod::ChangeRequestApplyUpdate
         | RpcMethod::ChangeTaskApplyCreate
         | RpcMethod::ChangeTaskApplyUpdate
         | RpcMethod::IncidentApplyUpdate
+        | RpcMethod::IncidentBulkApplyUpdate
         | RpcMethod::ResourcePlanPlanCreate
         | RpcMethod::ResourcePlanPlanUpdate
         | RpcMethod::ResourcePlanApplyCreate
@@ -114,6 +118,8 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
             dispatch_business_applications(method, id, &request, state, &transport).await
         }
         RpcMethod::IncidentListByAssignmentGroup
+        | RpcMethod::IncidentGet
+        | RpcMethod::IncidentQuery
         | RpcMethod::IncidentAssignmentGroups
         | RpcMethod::IncidentAssignmentGroupQueue
         | RpcMethod::IncidentFields => {

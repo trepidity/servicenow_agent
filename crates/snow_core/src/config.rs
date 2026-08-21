@@ -159,7 +159,6 @@ impl SnowConfig {
         if self.kb.semantic_search.min_score_millis == 0 {
             self.kb.semantic_search.min_score_millis = 200;
         }
-        ensure_resource_defaults(&mut self.refresh.resources);
     }
 }
 
@@ -172,6 +171,12 @@ pub enum TransportPreference {
     Rest,
 }
 
+/// Background refresh scheduling.
+///
+/// `resources` carries operator-supplied per-resource overrides only. The
+/// built-in per-resource defaults were retired when the cache rebuild moved to
+/// the fixed cache policy (`cache-policy.toml`), so an absent entry now means
+/// "use the operation's own default", not "use a seeded default".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RefreshConfig {
     pub schedule: String,
@@ -180,6 +185,10 @@ pub struct RefreshConfig {
     pub resources: BTreeMap<String, ResourceRefreshConfig>,
 }
 
+/// Operator override for one refresh resource. Only `filter` and
+/// `full_sync_interval` are read today, both by the Knowledge sync path; the
+/// remaining fields are still parsed so configs written against earlier
+/// releases keep loading.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ResourceRefreshConfig {
     pub enabled: bool,
@@ -188,145 +197,6 @@ pub struct ResourceRefreshConfig {
     pub incremental: bool,
     pub fetch_children: bool,
     pub full_sync_interval: Option<String>,
-}
-
-fn ensure_resource_defaults(resources: &mut BTreeMap<String, ResourceRefreshConfig>) {
-    for (name, defaults) in [
-        (
-            "incident",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec!["New".into(), "In Progress".into(), "On Hold".into()],
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "change",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec![
-                    "New".into(),
-                    "Assess".into(),
-                    "Authorize".into(),
-                    "Scheduled".into(),
-                    "Implement".into(),
-                ],
-                incremental: true,
-                fetch_children: true,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "change_task",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec!["Open".into(), "Work in Progress".into(), "Pending".into()],
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "request",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec!["Open".into(), "Work in Progress".into()],
-                incremental: true,
-                fetch_children: true,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "request_task",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec!["Open".into(), "Work in Progress".into(), "Pending".into()],
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "story",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec![
-                    "Draft".into(),
-                    "Ready".into(),
-                    "In Progress".into(),
-                    "In Review".into(),
-                ],
-                incremental: true,
-                fetch_children: true,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "scrum_task",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "assigned_to={{user}}".to_string(),
-                states: vec!["Open".into(), "In Progress".into(), "Blocked".into()],
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "knowledge",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "workflow_state=published".to_string(),
-                states: Vec::new(),
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: Some("7d".to_string()),
-            },
-        ),
-        (
-            "approval",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "approver={{user}}^state=requested".to_string(),
-                states: Vec::new(),
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "project",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "project_manager={{user}}".to_string(),
-                states: Vec::new(),
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-        (
-            "demand",
-            ResourceRefreshConfig {
-                enabled: true,
-                filter: "demand_manager={{user}}".to_string(),
-                states: Vec::new(),
-                incremental: true,
-                fetch_children: false,
-                full_sync_interval: None,
-            },
-        ),
-    ] {
-        resources.entry(name.to_string()).or_insert(defaults);
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

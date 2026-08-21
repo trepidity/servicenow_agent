@@ -45,6 +45,18 @@ pub use server::{DEFAULT_IDLE_TIMEOUT, JsonRpcServer};
 pub(crate) mod handlers;
 
 #[cfg(test)]
+mod business_application_cache_policy_tests;
+#[cfg(test)]
+mod cache_policy_tests;
+#[cfg(test)]
+mod catalog_cache_policy_tests;
+#[cfg(test)]
+mod incident_bulk_write_tests;
+#[cfg(test)]
 mod incident_fields_parity_tests;
+#[cfg(test)]
+mod incident_read_parity_tests;
+#[cfg(test)]
+mod resource_cache_policy_tests;
 #[cfg(test)]
 mod tests;

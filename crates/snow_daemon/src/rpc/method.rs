@@ -1,6 +1,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcMethod {
     ContractInfo,
+    CachePolicyValidate,
+    CachePolicyReload,
     GetRecord,
     GetRecordFresh,
     GetKnowledgeArticle,
@@ -25,6 +27,8 @@ pub enum RpcMethod {
     BusinessApplicationFields,
     ResourcePlanList,
     IncidentListByAssignmentGroup,
+    IncidentGet,
+    IncidentQuery,
     IncidentAssignmentGroups,
     IncidentFields,
     IncidentAssignmentGroupQueue,
@@ -98,6 +102,8 @@ pub enum RpcMethod {
     ChangeTaskApplyUpdate,
     IncidentPlanUpdate,
     IncidentApplyUpdate,
+    IncidentBulkPlanUpdate,
+    IncidentBulkApplyUpdate,
     ResourcePlanPlanCreate,
     ResourcePlanApplyCreate,
     ResourcePlanPlanUpdate,
@@ -123,6 +129,8 @@ impl RpcMethod {
     pub fn from_method(method: &str) -> Self {
         match method {
             "contract_info" => Self::ContractInfo,
+            "cache_policy_validate" => Self::CachePolicyValidate,
+            "cache_policy_reload" => Self::CachePolicyReload,
             "get_record" => Self::GetRecord,
             "get_record_fresh" => Self::GetRecordFresh,
             "get_knowledge_article" => Self::GetKnowledgeArticle,
@@ -147,6 +155,8 @@ impl RpcMethod {
             "business_application_fields" => Self::BusinessApplicationFields,
             "resource_plan_list" => Self::ResourcePlanList,
             "incident_list_by_assignment_group" => Self::IncidentListByAssignmentGroup,
+            "incident_get" => Self::IncidentGet,
+            "incident_query" => Self::IncidentQuery,
             "incident_assignment_groups" => Self::IncidentAssignmentGroups,
             "incident_fields" => Self::IncidentFields,
             "incident_assignment_group_queue" => Self::IncidentAssignmentGroupQueue,
@@ -220,6 +230,8 @@ impl RpcMethod {
             "change_task_apply_update" => Self::ChangeTaskApplyUpdate,
             "incident_plan_update" => Self::IncidentPlanUpdate,
             "incident_apply_update" => Self::IncidentApplyUpdate,
+            "incident_bulk_plan_update" => Self::IncidentBulkPlanUpdate,
+            "incident_bulk_apply_update" => Self::IncidentBulkApplyUpdate,
             "resource_plan_plan_create" => Self::ResourcePlanPlanCreate,
             "resource_plan_apply_create" => Self::ResourcePlanApplyCreate,
             "resource_plan_plan_update" => Self::ResourcePlanPlanUpdate,

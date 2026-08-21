@@ -438,10 +438,27 @@ pub struct ToolPolicy {
     pub confirmation_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub max_records: Option<u64>,
+    /// Explicit finite target ceiling for a separately named bulk mutation.
+    /// This is intentionally distinct from read/result `max_records`.
+    #[serde(default, deserialize_with = "deserialize_max_targets")]
+    pub max_targets: Option<u64>,
     #[serde(default)]
     pub skip_terminal_records: bool,
     #[serde(default)]
     pub story_board_id: Option<String>,
+}
+
+fn deserialize_max_targets<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| !(3..=25).contains(&value)) {
+        return Err(serde::de::Error::custom(
+            "max_targets must be between 3 and 25",
+        ));
+    }
+    Ok(value)
 }
 
 impl Default for ToolPolicy {
@@ -454,6 +471,7 @@ impl Default for ToolPolicy {
             environments: vec!["test".to_string(), "training".to_string()],
             confirmation_ttl_seconds: None,
             max_records: None,
+            max_targets: None,
             skip_terminal_records: false,
             story_board_id: None,
         }
@@ -917,7 +935,21 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         ("incident_plan_update".to_string(), change_plan_policy()),
         (
             "incident_apply_update".to_string(),
-            change_apply_policy(&["assigned_to", "assignment_group", "state", "work_notes"]),
+            change_apply_policy(&[
+                "assigned_to",
+                "assignment_group",
+                "state",
+                "work_notes",
+                "comments",
+            ]),
+        ),
+        (
+            "incident_bulk_plan_update".to_string(),
+            incident_bulk_policy(),
+        ),
+        (
+            "incident_bulk_apply_update".to_string(),
+            incident_bulk_policy(),
         ),
         (
             "change_request_plan_create".to_string(),
@@ -1112,6 +1144,28 @@ fn change_apply_policy(field_allowlist: &[&str]) -> ToolPolicy {
         environments: default_story_environments(),
         confirmation_ttl_seconds: Some(default_confirmation_ttl_seconds()),
         skip_terminal_records: true,
+        ..ToolPolicy::default()
+    }
+}
+
+fn incident_bulk_policy() -> ToolPolicy {
+    ToolPolicy {
+        enabled: false,
+        requires_confirmation: true,
+        requires_kb_evidence: false,
+        field_allowlist: [
+            "assigned_to",
+            "assignment_group",
+            "state",
+            "work_notes",
+            "comments",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect(),
+        environments: Vec::new(),
+        confirmation_ttl_seconds: Some(600),
+        max_targets: None,
         ..ToolPolicy::default()
     }
 }

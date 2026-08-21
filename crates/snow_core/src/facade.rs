@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use servicenow_rs::prelude::ServiceNowClient;
+use serde_json::Value;
+use servicenow_rs::prelude::{Record, ServiceNowClient};
 
 use crate::cache::store::BusinessApplicationFieldDictionaryRow;
 use crate::enrich::{VtbContext, VtbSchema, enrich_vtb_context};
@@ -13,6 +14,60 @@ use crate::query::filter::{BusinessApplicationQuery, ListQuery};
 use crate::vault::manager::VaultManager;
 
 impl SnowCore {
+    pub fn cache_policy_manager(&self) -> Arc<cache::policy::CachePolicyManager> {
+        Arc::clone(&self.ctx.named_cache_policy)
+    }
+
+    pub async fn invalidate_cache_target(&self, object: &str, sys_id: &str) -> Result<()> {
+        self.records.invalidate_cache_target(object, sys_id).await
+    }
+
+    pub async fn invalidate_cache_segment(&self, object: &str) -> Result<usize> {
+        self.records.invalidate_cache_segment(object).await
+    }
+
+    pub async fn get_record_live_without_persistence(
+        &self,
+        number: &str,
+    ) -> Result<Option<SnowRecord>> {
+        self.ctx.get_record_live_without_persistence(number).await
+    }
+
+    pub async fn get_record_by_table_sys_id_live_without_persistence(
+        &self,
+        table: &str,
+        sys_id: &str,
+    ) -> Result<Option<SnowRecord>> {
+        self.ctx
+            .get_record_by_table_sys_id_live_without_persistence(table, sys_id)
+            .await
+    }
+
+    /// Replace every local projection for one Incident after a governed PATCH.
+    ///
+    /// This row-specific coherence seam is deliberately not added to the
+    /// generic record-lookup allowlist used by consumer reads.
+    pub async fn replace_incident_projection_after_write(&self, sys_id: &str) -> Result<()> {
+        // Incident reads are live-only. The strict coherent post-write state
+        // is therefore absence of any legacy local projection, not a
+        // best-effort persisted copy of a live row.
+        self.prune_record(sys_id, Utc::now()).await
+    }
+
+    /// Issue exactly one governed Incident PATCH through the dedicated
+    /// no-retry mutation client.
+    pub async fn update_incident_without_retry(
+        &self,
+        sys_id: &str,
+        patch: Value,
+    ) -> Result<Record> {
+        let client =
+            self.ctx.write_client.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("governed Incident write client is not configured")
+            })?;
+        Ok(client.table("incident").update(sys_id, patch).await?)
+    }
+
     pub fn builder() -> SnowCoreBuilder {
         SnowCoreBuilder::default()
     }
@@ -70,6 +125,16 @@ impl SnowCore {
             .await
     }
 
+    pub async fn get_business_application_policy_live(
+        &self,
+        lookup: BusinessApplicationLookup,
+        persist: bool,
+    ) -> Result<Option<BusinessApplication>> {
+        self.business_applications
+            .get_business_application_policy_live(lookup, persist)
+            .await
+    }
+
     pub async fn search_business_applications_live(
         &self,
         params: BusinessApplicationSearchParams,
@@ -77,6 +142,26 @@ impl SnowCore {
     ) -> Result<Vec<BusinessApplication>> {
         self.business_applications
             .search_business_applications_live(params, options)
+            .await
+    }
+
+    pub async fn search_business_applications_policy_live(
+        &self,
+        params: BusinessApplicationSearchParams,
+        persist: bool,
+    ) -> Result<Vec<BusinessApplication>> {
+        self.business_applications
+            .search_business_applications_policy_live(params, persist)
+            .await
+    }
+
+    pub async fn query_business_applications_policy_live(
+        &self,
+        query: BusinessApplicationQuery,
+        persist: bool,
+    ) -> Result<Vec<BusinessApplication>> {
+        self.business_applications
+            .query_business_applications_policy_live(query, persist)
             .await
     }
 
@@ -166,8 +251,26 @@ impl SnowCore {
         self.servers.search_servers_live(params).await
     }
 
+    pub async fn search_servers_policy_live(
+        &self,
+        params: ServerSearchParams,
+        persist: bool,
+    ) -> Result<Vec<Server>> {
+        self.servers
+            .search_servers_policy_live(params, persist)
+            .await
+    }
+
     pub async fn query_servers(&self, query: ServerQuery) -> Result<Vec<SnowRecord>> {
         self.servers.query_servers(query).await
+    }
+
+    pub async fn query_servers_policy_live(
+        &self,
+        query: ServerQuery,
+        persist: bool,
+    ) -> Result<Vec<Server>> {
+        self.servers.query_servers_policy_live(query, persist).await
     }
 
     pub async fn business_application_servers_cached(
@@ -256,6 +359,17 @@ impl SnowCore {
         self.knowledge.search_knowledge(query, filters).await
     }
 
+    pub async fn search_knowledge_policy_live(
+        &self,
+        query: &str,
+        filters: KnowledgeSearchFilters,
+        persist: bool,
+    ) -> Result<Vec<KnowledgeArticle>> {
+        self.knowledge
+            .search_knowledge_policy_live(query, filters, persist)
+            .await
+    }
+
     pub async fn search_knowledge_semantic(
         &self,
         query: &str,
@@ -296,6 +410,23 @@ impl SnowCore {
     ) -> Result<Vec<KnowledgeArticle>> {
         self.knowledge
             .list_knowledge_articles(knowledge_base_sys_id, category_sys_id, limit)
+            .await
+    }
+
+    pub async fn list_knowledge_articles_policy_live(
+        &self,
+        knowledge_base_sys_id: Option<&str>,
+        category_sys_id: Option<&str>,
+        limit: Option<usize>,
+        persist: bool,
+    ) -> Result<Vec<KnowledgeArticle>> {
+        self.knowledge
+            .list_knowledge_articles_policy_live(
+                knowledge_base_sys_id,
+                category_sys_id,
+                limit,
+                persist,
+            )
             .await
     }
 
@@ -411,6 +542,20 @@ impl SnowCore {
         input: IncidentAssignmentGroupListInput,
     ) -> Result<IncidentAssignmentGroupPage> {
         self.records.incident_list_by_assignment_group(input).await
+    }
+
+    pub async fn incident_get(
+        &self,
+        input: IncidentGetInput,
+    ) -> std::result::Result<OperationEnvelope<IncidentGetData>, IncidentReadError> {
+        self.records.incident_get(input).await
+    }
+
+    pub async fn incident_query(
+        &self,
+        input: IncidentQueryInput,
+    ) -> std::result::Result<OperationEnvelope<IncidentQueryData>, IncidentReadError> {
+        self.records.incident_query(input).await
     }
 
     pub async fn incident_assignment_groups(&self) -> Result<Vec<IncidentAssignmentGroup>> {
@@ -537,7 +682,7 @@ impl SnowCore {
         &self,
         sys_id: &str,
         payload: serde_json::Value,
-    ) -> Result<ChangeWriteResult> {
+    ) -> std::result::Result<ChangeWriteResult, crate::IncidentWriteError> {
         self.writes.update_incident(sys_id, payload).await
     }
 
@@ -690,6 +835,7 @@ impl SnowCore {
 pub struct SnowCoreBuilder {
     config: Option<config::SnowConfig>,
     client: Option<ServiceNowClient>,
+    write_client: Option<ServiceNowClient>,
     ui_metadata_auth: Option<(String, credential::SecretString)>,
     vault_path: Option<PathBuf>,
     database_path: Option<PathBuf>,
@@ -703,6 +849,15 @@ impl SnowCoreBuilder {
 
     pub fn client(mut self, client: ServiceNowClient) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Configure the dedicated no-retry client used by governed mutations.
+    ///
+    /// This is deliberately separate from the read client because reads may
+    /// retain their bounded retry policy while writes must never be retried.
+    pub fn write_client(mut self, client: ServiceNowClient) -> Self {
+        self.write_client = Some(client);
         self
     }
 
@@ -761,14 +916,23 @@ impl SnowCoreBuilder {
             &config.cache.policy.stable_reference_ttl,
             &config.cache.policy.work_record_ttl,
         )?;
+        let config_dir = config
+            .daemon
+            .socket_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let named_cache_policy = Arc::new(cache::policy::CachePolicyManager::open(config_dir)?);
 
         let ctx = context::CoreContext {
             client,
+            write_client: self.write_client.map(Arc::new),
             ui_metadata,
             store,
             query,
             cache,
             cache_policy,
+            named_cache_policy,
             vault,
             vault_path,
             config: Arc::new(config),

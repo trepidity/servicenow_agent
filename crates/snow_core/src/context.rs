@@ -19,7 +19,10 @@ use servicenow_rs::prelude::{
 };
 
 use crate::cache::store::{AliasRow, KeywordRow, RecordRow, Store, TagRow};
-use crate::cache::{CacheManager, policy::CacheTtlPolicy};
+use crate::cache::{
+    CacheManager,
+    policy::{CachePolicyManager, CacheTtlPolicy},
+};
 use crate::config::SnowConfig;
 use crate::convert::{
     enrichment_origin_label, record_row_from_runtime_record, record_row_from_snow_record,
@@ -53,6 +56,9 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct CoreContext {
     pub client: Arc<ServiceNowClient>,
+    /// Dedicated mutation transport. Callers must construct this client with
+    /// automatic retries disabled so a governed PATCH is issued at most once.
+    pub write_client: Option<Arc<ServiceNowClient>>,
     pub ui_metadata: Option<Arc<UiMetadataClient>>,
     // Read by the per-domain services extracted in Tasks 8-11; the primitives
     // moved here in this task reach the store via `self.query.store()`.
@@ -61,6 +67,7 @@ pub(crate) struct CoreContext {
     pub query: Arc<QueryEngine>,
     pub cache: CacheManager,
     pub cache_policy: CacheTtlPolicy,
+    pub named_cache_policy: Arc<CachePolicyManager>,
     pub vault: VaultManager,
     pub vault_path: PathBuf,
     pub config: Arc<SnowConfig>,
@@ -191,7 +198,10 @@ impl CoreContext {
         Ok(())
     }
 
-    fn runtime_document_from_servicenow(&self, record: &Record) -> Result<VaultDocument> {
+    pub(crate) fn runtime_document_from_servicenow(
+        &self,
+        record: &Record,
+    ) -> Result<VaultDocument> {
         match record.table.as_str() {
             "kb_knowledge" => Ok(VaultDocument::Knowledge(
                 self.build_knowledge_article(record)?,
@@ -702,11 +712,88 @@ impl CoreContext {
         }
     }
 
+    /// Read one allowlisted table/sys_id record live without consulting or
+    /// mutating any local projection.
+    pub(crate) async fn get_record_by_table_sys_id_live_without_persistence(
+        &self,
+        table: &str,
+        sys_id: &str,
+    ) -> Result<Option<SnowRecord>> {
+        let table = normalize_record_lookup_table(table)?;
+        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
+        let result = async {
+            let mut record = self
+                .client
+                .table(&table)
+                .display_value(DisplayValue::Both)
+                .get(&sys_id)
+                .await?;
+            if record.sys_id.eq_ignore_ascii_case(&sys_id) {
+                record.sys_id = sys_id;
+            }
+            let number = record
+                .get_raw("number")
+                .or_else(|| record.get_str("number"))
+                .unwrap_or("")
+                .to_string();
+            if let Err(err) = self.enrich_record_journals(&mut record).await {
+                eprintln!("snow_core: journal enrichment failed for {number}: {err}");
+            }
+            Ok::<_, anyhow::Error>(Some(
+                self.runtime_document_from_servicenow(&record)?
+                    .record()
+                    .clone(),
+            ))
+        }
+        .await;
+        match result {
+            Err(err)
+                if err
+                    .downcast_ref::<SnowApiError>()
+                    .is_some_and(|err| matches!(err, SnowApiError::Api { status: 404, .. })) =>
+            {
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
     pub(crate) async fn get_record_fresh(&self, number: &str) -> Result<Option<SnowRecord>> {
         Ok(self
             .get_record_fresh_with_source(number)
             .await?
             .map(|(_, record)| record))
+    }
+
+    /// Read one work record live without touching memory, SQLite, vault, or
+    /// derived indexes. This is the omission behavior for compatibility reads.
+    pub(crate) async fn get_record_live_without_persistence(
+        &self,
+        number: &str,
+    ) -> Result<Option<SnowRecord>> {
+        let table = self.table_for_number(number).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
+            )
+        })?;
+        let Some(mut record) = self
+            .client
+            .table(&table)
+            .equals("number", number)
+            .display_value(DisplayValue::Both)
+            .first()
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Err(err) = self.enrich_record_journals(&mut record).await {
+            eprintln!("snow_core: journal enrichment failed for {number}: {err}");
+        }
+        Ok(Some(
+            self.runtime_document_from_servicenow(&record)?
+                .record()
+                .clone(),
+        ))
     }
 
     // Private helper — not pub(crate); only called by the methods above.

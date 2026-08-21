@@ -39,7 +39,8 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Change request (`change_request`) | `change_request_apply_update` | **Update** | ❌ | yes | governed; daemon required; field allowlist |
 | Change task (`change_task`) | `change_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Change task (`change_task`) | `change_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; terminal records skipped by policy |
-| Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | governed; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`; concurrency checked |
+| Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | compatible single-target operation; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`,`comments`; concurrency checked |
+| Incident (`incident`) | `incident_bulk_apply_update` | **Update 3..=25** | ❌ | yes | separately governed daemon operation; explicit `max_targets`; ordered, stop-first, no rollback/retry |
 | Resource plan (`resource_plan`) | `resource_plan_apply_create` | **Create** | ❌ | yes | governed; daemon required; writes `task`,`group_resource` or `user_resource`,`resource_type`,`state`,`planned_hours`,`notes`,`start_date`,`end_date` |
 | Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `state`,`planned_hours`,`notes`,`start_date`,`end_date` only |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
@@ -47,7 +48,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_request_plan_create`, `change_request_plan_update`,
 `change_task_plan_create`, `change_task_plan_update`,
-`incident_plan_update`,
+`incident_plan_update`, `incident_bulk_plan_update`,
 `resource_plan_plan_create`, `resource_plan_plan_update`,
 `timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
@@ -126,7 +127,7 @@ work_record_ttl = "60m"
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`, `resource_plan_list`,
   `incident_list_by_assignment_group`, `incident_assignment_groups`,
-  `incident_assignment_group_queue`, `incident_fields`
+  `incident_assignment_group_queue`, `incident_get`, `incident_query`, `incident_fields`
 
 `list_my_approvals` is read-only and returns pending direct approvals plus
 pending approvals routed to direct `sys_user_group` memberships for the
@@ -235,10 +236,21 @@ one cursor page of *active* Incidents for a single assignment group.
 - Delta polling passes the prior `watermark` as `updated_since` and the prior
   row ids as `known_sys_ids`. Reassigned, inactive, terminal, deleted, or
   unreadable baseline records appear in `departed_sys_ids`.
-- `incident_plan_update` previews claim (`assigned_to=me`), unassign,
-  membership-validated group transfer, exact state update, and work notes.
+- `incident_plan_update` previews one exact Incident update for `assigned_to`,
+  `assignment_group`, `state`, `work_notes`, or `comments`.
   `incident_apply_update` requires its plan's confirmation, idempotency, and
-  concurrency tokens; it is disabled by default and requires the daemon.
+  concurrency token; it is disabled by default and requires the daemon.
+- `incident_bulk_plan_update` accepts 3 through the narrower configured
+  `max_targets` (never above 25), resolves exact `number` or `sys_id` selectors
+  live, and returns canonical `sys_id` order with one concurrency token per
+  target. `incident_bulk_apply_update` requires the saved plan's exact
+  confirmation, idempotency key, and canonical token array. It preflights every
+  target before the first PATCH, applies in order without mutation retries,
+  stops on the first failure, and returns or durably replays the exact public-safe
+  receipt/error. A partial failure is not rolled back or automatically retried.
+- Successful Incident PATCHes strictly remove any legacy local projection;
+  Incident reads remain live-only. ServiceNow ACLs remain the record/field
+  authority; Snow adds no membership or target-scope allowlist.
 - `SNOW_INCIDENT_WRITE_KILL_SWITCH=1|true|yes` or the global
   `SNOW_MCP_WRITE_KILL_SWITCH` denies Incident apply operations.
 
@@ -728,6 +740,19 @@ native `kind` (the dictionary `internal_type`), optional `reference_table`, and
 the dictionary flags as choice fields; every other field reports
 `not_supported_by_operation`.
 
+### `incident_get` / `incident_query`
+
+`incident_get` performs a live-only exact lookup by one `number` or `sys_id`
+selector. It returns a complete `OperationEnvelope` containing every native
+field ServiceNow exposed, with raw and optional display values preserved.
+
+`incident_query` performs a live-only bounded query with typed Incident
+filters, a fixed non-journal projection, ascending `sys_id` order, and an
+exclusive `sys_id` cursor. The page limit defaults to 50 and is capped at 200.
+Exactly a full page reports `page_limit_reached`; callers page until a shorter,
+possibly empty, complete page. Neither operation reads or writes Snow's cache,
+vault, or index.
+
 `paging` reports native support only:
 `{ "mode": "cursor", "default_limit": 50, "max_limit": 200 }` for Incidents.
 Snow never fabricates pagination an operation does not have.
@@ -759,7 +784,8 @@ document is namespaced under `[mcp]`. Key rules:
   callable only when `SNOW_ENV` is in this list (empty = all environments).
 - Per-tool knobs: `requires_confirmation`, `requires_kb_evidence`,
   `field_allowlist`, `confirmation_ttl_seconds`, `max_records`,
-  `skip_terminal_records`, `story_board_id`.
+  `skip_terminal_records`, `story_board_id`, and (for Incident bulk plan/apply)
+  `max_targets` in the inclusive range 3 through 25.
 - Optional `[mcp.roles.<role>]` allow-lists further restrict a caller, intersected
   with the per-tool policy.
 

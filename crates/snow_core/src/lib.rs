@@ -74,14 +74,16 @@ pub use resource::descriptor::{
     ResourceDescriptor, Source, UnavailableReason,
 };
 pub use resource::incident::{
-    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
-    INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
-    INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup, IncidentAssignmentGroupListError,
-    IncidentAssignmentGroupListInput, IncidentAssignmentGroupOperationsError,
-    IncidentAssignmentGroupPage, IncidentAssignmentGroupQueueAggregates,
-    IncidentAssignmentGroupQueueInput, IncidentAssignmentGroupQueueItem,
-    IncidentAssignmentGroupQueuePage, IncidentQueueSlaRisk, IncidentQueueSortBy,
-    IncidentQueueSortDirection, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
+    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT, INCIDENT_QUERY_DEFAULT_LIMIT,
+    INCIDENT_QUERY_FIELDS, INCIDENT_QUERY_MAX_LIMIT, INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT,
+    INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS, INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup,
+    IncidentAssignmentGroupListError, IncidentAssignmentGroupListInput,
+    IncidentAssignmentGroupOperationsError, IncidentAssignmentGroupPage,
+    IncidentAssignmentGroupQueueAggregates, IncidentAssignmentGroupQueueInput,
+    IncidentAssignmentGroupQueueItem, IncidentAssignmentGroupQueuePage, IncidentGetData,
+    IncidentGetInput, IncidentQueryData, IncidentQueryFilters, IncidentQueryInput,
+    IncidentQueueSlaRisk, IncidentQueueSortBy, IncidentQueueSortDirection, IncidentReadError,
+    IncidentRecord, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
     resolve_incident_state, validate_incident_assignment_group_input,
 };
 pub use resource::record_query::{
@@ -118,6 +120,7 @@ pub use service::descriptor::{
 pub use service::server::ServerGetError;
 pub use service::user::{UserLookup, UserLookupResult, UserRecord, UserSearch};
 pub use service::vault::{promote_rebuilt_cache, rebuild_cache_from_vault, reset_cache};
+pub use service::write::IncidentWriteError;
 pub use servicenow_rs::model::reference::{
     Reference, choose_reference_display_name, is_opaque_sys_id,
 };

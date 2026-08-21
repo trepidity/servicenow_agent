@@ -15,10 +15,12 @@
 //! `lib.rs` so external callers keep reaching them at `snow_core::*`.
 
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use servicenow_rs::prelude::{DisplayValue, Order, Record, child_relation_for_table};
+use servicenow_rs::prelude::{
+    DisplayValue, Error as SnowApiError, Order, Record, child_relation_for_table,
+};
 
 use crate::context::CoreContext;
 use crate::query;
@@ -26,18 +28,20 @@ use crate::query::filter::ListQuery;
 use crate::resource;
 use crate::{
     BUSINESS_APPLICATION_TABLE, CHANGE_REQUEST_QUERY_FIELDS, DegradedReadDiagnostic, FieldChoice,
-    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
-    INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT, INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS,
-    INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup, IncidentAssignmentGroupListInput,
-    IncidentAssignmentGroupOperationsError, IncidentAssignmentGroupPage,
-    IncidentAssignmentGroupQueueAggregates, IncidentAssignmentGroupQueueInput,
-    IncidentAssignmentGroupQueueItem, IncidentAssignmentGroupQueuePage, IncidentQueueSlaRisk,
-    IncidentQueueSortBy, IncidentQueueSortDirection, JournalEntry, RecordLookup, RecordQueryError,
-    RecordQueryInput, RecordQueryPage, RecordQuerySource, ResolvedResourceFilter,
-    ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
-    ResourcePlanQuerySummary, ResourcePlanResourceType, ResourceType, SERVER_RESOURCE_TYPE,
-    SERVER_TABLE, STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, SearchResult, SearchScope,
-    SnowRecord, TaskSelector, TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus,
+    INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT, INCIDENT_QUERY_DEFAULT_LIMIT,
+    INCIDENT_QUERY_FIELDS, INCIDENT_QUERY_MAX_LIMIT, INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT,
+    INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS, INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup,
+    IncidentAssignmentGroupListInput, IncidentAssignmentGroupOperationsError,
+    IncidentAssignmentGroupPage, IncidentAssignmentGroupQueueAggregates,
+    IncidentAssignmentGroupQueueInput, IncidentAssignmentGroupQueueItem,
+    IncidentAssignmentGroupQueuePage, IncidentGetData, IncidentGetInput, IncidentQueryData,
+    IncidentQueryInput, IncidentQueueSlaRisk, IncidentQueueSortBy, IncidentQueueSortDirection,
+    IncidentReadError, JournalEntry, MatchField, RecordLookup, RecordQueryError, RecordQueryInput,
+    RecordQueryPage, RecordQuerySource, RecordRef, ResolvedResourceFilter, ResourcePlanListError,
+    ResourcePlanListInput, ResourcePlanListResponse, ResourcePlanQuerySummary,
+    ResourcePlanResourceType, ResourceType, SERVER_RESOURCE_TYPE, SERVER_TABLE,
+    STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, SearchMatchReason, SearchResult,
+    SearchScope, SnowRecord, TaskSelector, TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus,
     TaskSlaSummaryView, ValidatedRecordQuery, is_terminal_state, resolve_incident_state,
     resolve_record_query_state, resource_plan_record_from_row, sort_records_by_number,
     validate_incident_assignment_group_input, validate_list_input, validate_record_query,
@@ -87,6 +91,289 @@ const INCIDENT_QUEUE_FIELDS: &[&str] = &[
     "comments",
 ];
 
+#[derive(Debug)]
+struct ValidatedIncidentQuery {
+    numbers: Vec<String>,
+    assignment_group: Option<String>,
+    assigned_to: Option<String>,
+    caller_id: Option<String>,
+    cmdb_ci: Option<String>,
+    states: Vec<String>,
+    priorities: Vec<String>,
+    active: Option<bool>,
+    opened_after: Option<String>,
+    opened_before: Option<String>,
+    updated_after: Option<String>,
+    updated_before: Option<String>,
+    limit: usize,
+    cursor: Option<String>,
+}
+
+fn validate_incident_get_input(
+    input: IncidentGetInput,
+) -> std::result::Result<(Option<String>, Option<String>), IncidentReadError> {
+    match (input.number, input.sys_id) {
+        (Some(number), None) => {
+            let number = number.trim().to_ascii_uppercase();
+            if number.len() <= 3
+                || !number.starts_with("INC")
+                || !number[3..].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(IncidentReadError::InvalidParams(
+                    "number must match ^INC[0-9]+$".to_string(),
+                ));
+            }
+            Ok((Some(number), None))
+        }
+        (None, Some(sys_id)) => normalize_record_lookup_sys_id(&sys_id)
+            .map(|sys_id| (None, Some(sys_id)))
+            .map_err(|error| IncidentReadError::InvalidParams(error.to_string())),
+        _ => Err(IncidentReadError::InvalidParams(
+            "exactly one of number or sys_id is required".to_string(),
+        )),
+    }
+}
+
+fn validate_incident_query_input(
+    input: IncidentQueryInput,
+) -> std::result::Result<ValidatedIncidentQuery, IncidentReadError> {
+    let filters = input.filters;
+    let numbers = match filters.numbers {
+        Some(values) if values.is_empty() => {
+            return Err(IncidentReadError::InvalidParams(
+                "numbers must contain at least one value".to_string(),
+            ));
+        }
+        Some(values) => normalize_incident_numbers(values)?,
+        None => Vec::new(),
+    };
+    let states = match filters.states {
+        Some(values) if values.is_empty() => {
+            return Err(IncidentReadError::InvalidParams(
+                "states must contain at least one value".to_string(),
+            ));
+        }
+        Some(values) => normalize_unique_non_empty(values, "states", 20)?,
+        None => Vec::new(),
+    };
+    let priorities = match filters.priorities {
+        Some(values) if values.is_empty() => {
+            return Err(IncidentReadError::InvalidParams(
+                "priorities must contain at least one value".to_string(),
+            ));
+        }
+        Some(values) => normalize_priorities(values)?,
+        None => Vec::new(),
+    };
+    let assignment_group = normalize_optional_sys_id(filters.assignment_group, "assignment_group")?;
+    let assigned_to = normalize_optional_sys_id(filters.assigned_to, "assigned_to")?;
+    let caller_id = normalize_optional_sys_id(filters.caller_id, "caller_id")?;
+    let cmdb_ci = normalize_optional_sys_id(filters.cmdb_ci, "cmdb_ci")?;
+    let opened_after = validate_incident_timestamp(filters.opened_after, "opened_after")?;
+    let opened_before = validate_incident_timestamp(filters.opened_before, "opened_before")?;
+    let updated_after = validate_incident_timestamp(filters.updated_after, "updated_after")?;
+    let updated_before = validate_incident_timestamp(filters.updated_before, "updated_before")?;
+    validate_time_range(opened_after.as_deref(), opened_before.as_deref(), "opened")?;
+    validate_time_range(
+        updated_after.as_deref(),
+        updated_before.as_deref(),
+        "updated",
+    )?;
+    let limit = input.limit.unwrap_or(INCIDENT_QUERY_DEFAULT_LIMIT);
+    if !(1..=INCIDENT_QUERY_MAX_LIMIT).contains(&limit) {
+        return Err(IncidentReadError::InvalidParams(format!(
+            "limit must be between 1 and {INCIDENT_QUERY_MAX_LIMIT}"
+        )));
+    }
+    let cursor = input
+        .cursor
+        .map(|value| normalize_record_lookup_sys_id(&value))
+        .transpose()
+        .map_err(|error| IncidentReadError::InvalidParams(error.to_string()))?;
+    Ok(ValidatedIncidentQuery {
+        numbers,
+        assignment_group,
+        assigned_to,
+        caller_id,
+        cmdb_ci,
+        states,
+        priorities,
+        active: filters.active,
+        opened_after,
+        opened_before,
+        updated_after,
+        updated_before,
+        limit,
+        cursor,
+    })
+}
+
+fn normalize_incident_numbers(
+    values: Vec<String>,
+) -> std::result::Result<Vec<String>, IncidentReadError> {
+    if values.len() > 20 {
+        return Err(IncidentReadError::InvalidParams(
+            "numbers accepts at most 20 values".to_string(),
+        ));
+    }
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let (number, _) = validate_incident_get_input(IncidentGetInput {
+            number: Some(value),
+            sys_id: None,
+        })?;
+        let number = number.expect("number selector");
+        if !seen.insert(number.clone()) {
+            return Err(IncidentReadError::InvalidParams(
+                "numbers must be unique after normalization".to_string(),
+            ));
+        }
+        normalized.push(number);
+    }
+    Ok(normalized)
+}
+
+fn normalize_unique_non_empty(
+    values: Vec<String>,
+    field: &str,
+    max: usize,
+) -> std::result::Result<Vec<String>, IncidentReadError> {
+    if values.len() > max {
+        return Err(IncidentReadError::InvalidParams(format!(
+            "{field} accepts at most {max} values"
+        )));
+    }
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let value = value.trim().to_string();
+        if value.is_empty() || !seen.insert(value.clone()) {
+            return Err(IncidentReadError::InvalidParams(format!(
+                "{field} values must be non-empty and unique"
+            )));
+        }
+        normalized.push(value);
+    }
+    Ok(normalized)
+}
+
+fn normalize_priorities(values: Vec<u8>) -> std::result::Result<Vec<String>, IncidentReadError> {
+    if values.len() > 5 {
+        return Err(IncidentReadError::InvalidParams(
+            "priorities accepts at most 5 values".to_string(),
+        ));
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        if !(1..=5).contains(&value) || !seen.insert(value) {
+            return Err(IncidentReadError::InvalidParams(
+                "priorities must contain unique integers from 1 through 5".to_string(),
+            ));
+        }
+        normalized.push(value.to_string());
+    }
+    Ok(normalized)
+}
+
+fn normalize_optional_sys_id(
+    value: Option<String>,
+    field: &str,
+) -> std::result::Result<Option<String>, IncidentReadError> {
+    value
+        .map(|value| normalize_record_lookup_sys_id(&value))
+        .transpose()
+        .map_err(|_| IncidentReadError::InvalidParams(format!("{field} must be a 32-hex sys_id")))
+}
+
+fn validate_incident_timestamp(
+    value: Option<String>,
+    field: &str,
+) -> std::result::Result<Option<String>, IncidentReadError> {
+    value
+        .map(|value| {
+            NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                .map(|_| value)
+                .map_err(|_| {
+                    IncidentReadError::InvalidParams(format!(
+                        "{field} must use YYYY-MM-DD HH:MM:SS"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+fn validate_time_range(
+    after: Option<&str>,
+    before: Option<&str>,
+    field: &str,
+) -> std::result::Result<(), IncidentReadError> {
+    if let (Some(after), Some(before)) = (after, before)
+        && after >= before
+    {
+        return Err(IncidentReadError::InvalidParams(format!(
+            "{field}_after must be earlier than {field}_before"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_incident_states(
+    requested: &[String],
+    choices: &[FieldChoice],
+) -> std::result::Result<Vec<String>, IncidentReadError> {
+    let mut resolved = Vec::with_capacity(requested.len());
+    let mut seen = HashSet::with_capacity(requested.len());
+    for selector in requested {
+        let raw_matches = choices
+            .iter()
+            .filter(|choice| choice.value == *selector)
+            .collect::<Vec<_>>();
+        let matches = if raw_matches.is_empty() {
+            choices
+                .iter()
+                .filter(|choice| choice.label.eq_ignore_ascii_case(selector))
+                .collect::<Vec<_>>()
+        } else {
+            raw_matches
+        };
+        if matches.len() != 1 {
+            return Err(IncidentReadError::StateUnresolved {
+                requested: selector.clone(),
+                ambiguous: matches.len() > 1,
+                unavailable: false,
+                choices: choices.to_vec(),
+            });
+        }
+        let value = matches[0].value.clone();
+        if !seen.insert(value.clone()) {
+            return Err(IncidentReadError::StateUnresolved {
+                requested: selector.clone(),
+                ambiguous: true,
+                unavailable: false,
+                choices: choices.to_vec(),
+            });
+        }
+        resolved.push(value);
+    }
+    Ok(resolved)
+}
+
+fn classify_incident_api_error(error: &SnowApiError) -> IncidentReadError {
+    match error {
+        SnowApiError::Api {
+            status: 401 | 403, ..
+        }
+        | SnowApiError::Auth {
+            status: Some(401 | 403),
+            ..
+        } => IncidentReadError::AclDenied,
+        SnowApiError::Http(_) => IncidentReadError::ServiceNowUnavailable,
+        _ => IncidentReadError::ServiceNowError,
+    }
+}
+
 const RESOURCE_PLAN_CHILD_FIELDS: &[&str] = &[
     "sys_id",
     "number",
@@ -129,14 +416,6 @@ fn child_relation_for_parent_table(table_name: &str) -> Option<(&'static str, &'
         "pm_project" | "dmn_demand" => Some(("resource_plan", "task")),
         _ => child_relation_for_table(table_name),
     }
-}
-
-fn work_record_cache_is_fresh(
-    record: &SnowRecord,
-    now: DateTime<Utc>,
-    ttl: chrono::Duration,
-) -> bool {
-    now.signed_duration_since(record.synced_at) <= ttl
 }
 
 pub(crate) fn canonical_record_table(table: &str) -> String {
@@ -583,17 +862,47 @@ impl RecordService {
         Self { ctx }
     }
 
-    /// Look up a record by number, checking the in-memory L1 cache first
-    /// and falling through to the SQLite-backed query engine on a miss.
-    ///
-    /// Cached work records are only served when their projection was synced
-    /// within the local TTL. Stale cached rows are refreshed through the same
-    /// live path as [`get_record_fresh`], which also persists the refreshed
-    /// projection back into the cache.
+    pub async fn invalidate_cache_target(&self, object: &str, sys_id: &str) -> Result<()> {
+        let (resource_type, table) = cache_object_resource_type(object)?;
+        let Some(row) = self.ctx.query.store().get_record_by_sys_id(sys_id)? else {
+            return Ok(());
+        };
+        if row.resource_type != resource_type || table.is_some_and(|table| row.table_name != table)
+        {
+            anyhow::bail!("cached target does not belong to object `{object}`");
+        }
+        self.ctx.prune_record(sys_id, Utc::now()).await
+    }
+
+    pub async fn invalidate_cache_segment(&self, object: &str) -> Result<usize> {
+        let (resource_type, table) = cache_object_resource_type(object)?;
+        let records = self
+            .ctx
+            .query
+            .list_records(
+                ListQuery::new()
+                    .resource_type(resource_type)
+                    .include_tombstoned(true),
+            )
+            .await?;
+        let records = records
+            .into_iter()
+            .filter(|record| table.is_none_or(|table| record.table == table))
+            .collect::<Vec<_>>();
+        let count = records.len();
+        for record in records {
+            self.ctx.prune_record(&record.sys_id, Utc::now()).await?;
+        }
+        Ok(count)
+    }
+
+    /// Look up a compatibility work record live without local cache I/O.
     pub async fn get_record(&self, number: &str) -> Result<Option<SnowRecord>> {
         let now = Utc::now();
         if let Some(record) = self.ctx.cache.get(number) {
-            if work_record_cache_is_fresh(&record, now, self.ctx.cache_policy.work_record_ttl()) {
+            if now.signed_duration_since(record.synced_at)
+                <= self.ctx.cache_policy.work_record_ttl()
+            {
                 return Ok(Some(record));
             }
             self.ctx.cache.invalidate(number);
@@ -601,7 +910,8 @@ impl RecordService {
         }
         let record = self.ctx.query.get_record(number).await?;
         if let Some(ref record) = record {
-            if !work_record_cache_is_fresh(record, now, self.ctx.cache_policy.work_record_ttl()) {
+            if now.signed_duration_since(record.synced_at) > self.ctx.cache_policy.work_record_ttl()
+            {
                 return self.get_record_fresh(number).await;
             }
             self.ctx.cache.put(record.clone());
@@ -609,18 +919,11 @@ impl RecordService {
         Ok(record)
     }
 
-    /// Fetch a record from the live ServiceNow API with raw and display
-    /// values, enrich it with journal content, and persist it into the cache,
-    /// vault, and search index.
+    /// Fetch a record from the live ServiceNow API with raw and display values
+    /// without persisting it into cache, vault, or search index.
     ///
-    /// Unlike [`get_record`], which reads from the local cache only, this
-    /// method always hits the ServiceNow REST API. After fetching, it calls
-    /// [`enrich_record_journals`] to backfill `work_notes` and `comments`
-    /// (which come back empty under the default `DisplayValue::Raw` mode),
-    /// then persists the enriched record through the full pipeline.
-    ///
-    /// Journal enrichment is best-effort — if the inline journal fetch fails
-    /// (ACL, timeout, etc.), the base record is still persisted.
+    /// Journal enrichment is best-effort; the base live result is still
+    /// returned when journals are unavailable.
     pub async fn get_record_fresh(&self, number: &str) -> Result<Option<SnowRecord>> {
         self.ctx.get_record_fresh(number).await
     }
@@ -1217,6 +1520,182 @@ impl RecordService {
         })
     }
 
+    /// Fetch one Incident live without consulting or updating local state.
+    pub async fn incident_get(
+        &self,
+        input: IncidentGetInput,
+    ) -> std::result::Result<crate::OperationEnvelope<IncidentGetData>, IncidentReadError> {
+        let (number, sys_id) = validate_incident_get_input(input)?;
+        let row = if let Some(sys_id) = sys_id {
+            match self
+                .ctx
+                .client
+                .table("incident")
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .get(&sys_id)
+                .await
+            {
+                Ok(row) => row,
+                Err(SnowApiError::Api { status: 404, .. }) => {
+                    return Err(IncidentReadError::NotFound);
+                }
+                Err(error) => return Err(classify_incident_api_error(&error)),
+            }
+        } else {
+            let number = number.expect("validated selector");
+            let result = self
+                .ctx
+                .client
+                .table("incident")
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .equals("number", &number)
+                .limit(2)
+                .execute()
+                .await
+                .map_err(|error| classify_incident_api_error(&error))?;
+            match result.records.as_slice() {
+                [] => return Err(IncidentReadError::LookupUnavailable),
+                [row] => row.clone(),
+                _ => return Err(IncidentReadError::NumberAmbiguous),
+            }
+        };
+
+        Ok(crate::OperationEnvelope::live_complete(
+            "incident_get",
+            IncidentGetData {
+                record: resource::incident::IncidentResource::native_fields(&row),
+            },
+        ))
+    }
+
+    /// Query one deterministic page of ACL-visible Incidents, live-only.
+    pub async fn incident_query(
+        &self,
+        input: IncidentQueryInput,
+    ) -> std::result::Result<crate::OperationEnvelope<IncidentQueryData>, IncidentReadError> {
+        let validated = validate_incident_query_input(input)?;
+        let resolved_states = if validated.states.is_empty() {
+            Vec::new()
+        } else {
+            let choices = self.field_choices("incident", "state").await.map_err(|_| {
+                IncidentReadError::StateUnresolved {
+                    requested: validated.states[0].clone(),
+                    ambiguous: false,
+                    unavailable: true,
+                    choices: Vec::new(),
+                }
+            })?;
+            if choices.is_empty() {
+                return Err(IncidentReadError::StateUnresolved {
+                    requested: validated.states[0].clone(),
+                    ambiguous: false,
+                    unavailable: true,
+                    choices,
+                });
+            }
+            resolve_incident_states(&validated.states, &choices)?
+        };
+
+        let mut query = self
+            .ctx
+            .client
+            .table("incident")
+            .fields(INCIDENT_QUERY_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .order_by("sys_id", Order::Asc)
+            .limit(validated.limit as u32);
+
+        if !validated.numbers.is_empty() {
+            let values = validated
+                .numbers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            query = query.in_list("number", &values);
+        }
+        for (field, value) in [
+            ("assignment_group", validated.assignment_group.as_deref()),
+            ("assigned_to", validated.assigned_to.as_deref()),
+            ("caller_id", validated.caller_id.as_deref()),
+            ("cmdb_ci", validated.cmdb_ci.as_deref()),
+        ] {
+            if let Some(value) = value {
+                query = query.equals(field, value);
+            }
+        }
+        if !resolved_states.is_empty() {
+            let values = resolved_states
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            query = query.in_list("state", &values);
+        }
+        if !validated.priorities.is_empty() {
+            let values = validated
+                .priorities
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            query = query.in_list("priority", &values);
+        }
+        if let Some(active) = validated.active {
+            query = query.equals("active", if active { "true" } else { "false" });
+        }
+        for (field, value) in [
+            ("opened_at", validated.opened_after.as_deref()),
+            ("sys_updated_on", validated.updated_after.as_deref()),
+        ] {
+            if let Some(value) = value {
+                query = query.greater_than(field, value);
+            }
+        }
+        for (field, value) in [
+            ("opened_at", validated.opened_before.as_deref()),
+            ("sys_updated_on", validated.updated_before.as_deref()),
+        ] {
+            if let Some(value) = value {
+                query = query.less_than(field, value);
+            }
+        }
+        if let Some(cursor) = validated.cursor.as_deref() {
+            query = query.greater_than("sys_id", cursor);
+        }
+
+        let rows = query
+            .execute()
+            .await
+            .map_err(|error| classify_incident_api_error(&error))?
+            .records;
+        let rows_inspected = rows.len();
+        let complete = rows_inspected < validated.limit;
+        let next_cursor = if complete {
+            None
+        } else {
+            rows.last().map(|row| row.sys_id.clone())
+        };
+        let data = IncidentQueryData {
+            records: rows
+                .iter()
+                .map(resource::incident::IncidentResource::native_fields)
+                .collect(),
+            next_cursor,
+            limit: validated.limit,
+            rows_inspected,
+        };
+        Ok(if complete {
+            crate::OperationEnvelope::live_complete("incident_query", data)
+        } else {
+            crate::OperationEnvelope::live_partial(
+                "incident_query",
+                crate::PartialReason::PageLimitReached,
+                data,
+            )
+        })
+    }
+
     /// Lists the authenticated user's active direct assignment-group memberships.
     pub async fn incident_assignment_groups(&self) -> Result<Vec<IncidentAssignmentGroup>> {
         const PAGE_SIZE: usize = 500;
@@ -1610,15 +2089,13 @@ impl RecordService {
         self.ctx.query.search_by_alias(alias, scope).await
     }
 
-    /// Full-text search across cached records with automatic live-fetch
-    /// fallback for exact record numbers.
+    /// Full-text search across cached records, with live-only exact work-record
+    /// lookup before any local projection access.
     ///
-    /// First runs the cache-only enriched search. If no results are found and
-    /// the query matches an exact ServiceNow record number pattern (e.g.
-    /// `INC4992697`, `chg0325640`), normalizes the query to uppercase and
-    /// attempts a live API fetch via [`get_record_fresh`]. If the live fetch
-    /// succeeds, the record is promoted into cache/vault/index and the search
-    /// is re-run against the now-populated index.
+    /// If the query matches an exact ServiceNow record number pattern (e.g.
+    /// `INC4992697`, `chg0325640`), the compatibility operation is omitted from
+    /// cache policy and therefore reads ServiceNow without a cache lookup or
+    /// persistence. Other queries retain the local full-text behavior.
     ///
     /// Free-text queries never trigger the live-fetch fallback.
     pub async fn search_enriched(
@@ -1626,25 +2103,38 @@ impl RecordService {
         query: &str,
         scope: SearchScope,
     ) -> Result<Vec<SearchResult>> {
-        let results = self.ctx.query.search_enriched(query, scope.clone()).await?;
-        if !results.is_empty() {
-            return Ok(results);
-        }
-        // Exact record-number fallback: if the query looks like "INC4992697"
-        // and the cache has no hits, try a live API fetch to hydrate the cache,
-        // then re-run the search. This ensures exact-number lookups work even
-        // when the index is cold.
+        // Exact work-record numbers are policy omissions and therefore live
+        // only. Resolve them before any local search so a seeded or stale
+        // projection cannot intercept the request.
         if query::is_exact_record_number(query) {
             let normalized = query.trim().to_uppercase();
             // Gate on table_for_number: we can only fetch if the prefix maps
             // to a known table (INC→incident, CHG→change_request, etc.)
             if self.ctx.table_for_number(&normalized).is_some()
-                && let Ok(Some(_)) = self.get_record_fresh(&normalized).await
+                && let Ok(Some(record)) = self
+                    .ctx
+                    .get_record_live_without_persistence(&normalized)
+                    .await
             {
-                return self.ctx.query.search_enriched(&normalized, scope).await;
+                return Ok(vec![SearchResult {
+                    record: RecordRef {
+                        sys_id: record.sys_id,
+                        number: record.number.clone(),
+                        table: record.table,
+                    },
+                    snippet: record.short_description,
+                    score: 30,
+                    match_in: MatchField::Number,
+                    matched_value: Some(record.number.clone()),
+                    reasons: vec![SearchMatchReason {
+                        field: MatchField::Number,
+                        value: record.number,
+                    }],
+                }]);
             }
+            return Ok(Vec::new());
         }
-        Ok(results)
+        self.ctx.query.search_enriched(query, scope).await
     }
 
     pub async fn add_work_note(&self, number: &str, text: &str) -> Result<Option<SnowRecord>> {
@@ -1834,6 +2324,16 @@ impl RecordService {
     }
 }
 
+fn cache_object_resource_type(object: &str) -> Result<(ResourceType, Option<&'static str>)> {
+    match object {
+        "knowledge" => Ok((ResourceType::Knowledge, None)),
+        "business_application" => Ok((ResourceType::BusinessApplication, None)),
+        "server" => Ok((ResourceType::Server, None)),
+        "service_catalog_product" => Ok((ResourceType::Unknown, Some("sc_cat_item"))),
+        _ => anyhow::bail!("unknown cache object `{object}`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,7 +2347,7 @@ mod tests {
         STORY_QUERY_DESCRIPTION_FIELDS, STORY_QUERY_FIELDS, SnowCore, StoryQueryFilters,
         WORK_RECORD_CACHE_TTL_MINUTES, collect_journal_entries, document_content,
         document_tag_tokens, record_row_from_runtime_record, record_row_from_servicenow,
-        render_journal_entries, serialize_vault_document, work_record_ttl,
+        render_journal_entries, serialize_vault_document,
     };
     use crate::{
         INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT,
@@ -2054,7 +2554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_record_refreshes_stale_cached_work_record() {
+    async fn public_record_read_ignores_stale_projection_and_does_not_persist_live_result() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -2088,19 +2588,13 @@ mod tests {
         seed_projected_record(&core, &cached);
 
         let record = core
-            .get_record("INC002")
+            .get_record_live_without_persistence("INC002")
             .await
             .expect("record lookup")
             .expect("record");
 
         assert_eq!(record.short_description, "Live incident title");
         assert_eq!(record.description, "Live incident body");
-        assert!(work_record_cache_is_fresh(
-            &record,
-            Utc::now(),
-            work_record_ttl()
-        ));
-
         let persisted = core
             .ctx
             .query
@@ -2108,7 +2602,7 @@ mod tests {
             .get_record_by_number("INC002")
             .expect("persisted row")
             .expect("persisted row");
-        assert_eq!(persisted.short_desc.as_deref(), Some("Live incident title"));
+        assert_eq!(persisted.short_desc.as_deref(), Some("Stale cached title"));
 
         let requests = server.received_requests().await.expect("requests");
         assert!(
@@ -2162,8 +2656,10 @@ mod tests {
         assert_eq!(record.resource_type, ResourceType::Demand);
 
         let cached = core
-            .get_record("DMND0320098")
-            .await
+            .ctx
+            .query
+            .store()
+            .get_record_by_number("DMND0320098")
             .expect("cached record")
             .expect("persisted record");
         assert_eq!(cached.sys_id, sys_id);
@@ -2619,6 +3115,75 @@ mod tests {
                 .list_aliases(&record.sys_id)
                 .expect("aliases")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_invalidation_removes_exact_target_then_only_the_named_segment() {
+        let server = MockServer::start().await;
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let mut first = sample_projected_record();
+        first.sys_id = "0000000000000000000000000000a001".to_string();
+        first.number = "SRV0001".to_string();
+        first.table = "cmdb_ci_server".to_string();
+        first.resource_type = ResourceType::Server;
+        let mut second = first.clone();
+        second.sys_id = "0000000000000000000000000000a002".to_string();
+        second.number = "SRV0002".to_string();
+        let mut incident = sample_projected_record();
+        incident.sys_id = "0000000000000000000000000000b001".to_string();
+        incident.number = "INC9000001".to_string();
+        core.ctx
+            .persist_snow_records(&[first.clone(), second.clone(), incident.clone()])
+            .expect("seed projections");
+
+        let wrong_segment = core
+            .invalidate_cache_target("server", &incident.sys_id)
+            .await
+            .expect_err("exact invalidation must reject a different object segment");
+        assert!(wrong_segment.to_string().contains("does not belong"));
+
+        core.invalidate_cache_target("server", &first.sys_id)
+            .await
+            .expect("exact invalidation");
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_sys_id(&first.sys_id)
+                .expect("first lookup")
+                .is_none()
+        );
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_sys_id(&second.sys_id)
+                .expect("second lookup")
+                .is_some()
+        );
+
+        assert_eq!(
+            core.invalidate_cache_segment("server")
+                .await
+                .expect("segment invalidation"),
+            1
+        );
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_sys_id(&second.sys_id)
+                .expect("second lookup")
+                .is_none()
+        );
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_sys_id(&incident.sys_id)
+                .expect("incident lookup")
+                .is_some()
         );
     }
 
@@ -3744,7 +4309,7 @@ mod tests {
             .await
             .expect("core");
 
-        // First search — index is cold, triggers live fallback
+        // Exact work-record searches are live-only.
         let results = core
             .search_enriched("INC4992697", SearchScope::All)
             .await
@@ -3753,7 +4318,8 @@ mod tests {
         assert_eq!(results[0].record.number, "INC4992697");
         assert_eq!(results[0].match_in, MatchField::Number);
 
-        // Second search — now cached, no additional API call (mock expects exactly 1)
+        // A second search also returns the live result without relying on a
+        // projection created by the first request.
         let results2 = core
             .search_enriched("INC4992697", SearchScope::All)
             .await
@@ -3821,13 +4387,15 @@ mod tests {
         assert_eq!(results[0].record.number, "DMNTSK0001122");
         assert_eq!(results[0].record.table, "dmn_demand_task");
 
-        let record = core
-            .get_record("DMNTSK0001122")
-            .await
-            .expect("cached record")
-            .expect("record");
-        assert_eq!(record.resource_type, ResourceType::DemandTask);
-        assert_eq!(record.table, "dmn_demand_task");
+        assert!(
+            core.ctx
+                .query
+                .get_record("DMNTSK0001122")
+                .await
+                .expect("inspect local projection")
+                .is_none(),
+            "exact work-record search must not persist"
+        );
     }
 
     #[tokio::test]

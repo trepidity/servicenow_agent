@@ -1,26 +1,31 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use servicenow_rs::prelude::{DisplayValue, Order};
 use servicenow_rs::query::builder::TableApi;
 
+use crate::cache::policy::CacheMode;
 use crate::context::CoreContext;
 use crate::{
     CacheRebuildProgressEvent, CacheRebuildProgressSink, ServiceNowCacheRebuildReport,
     ServiceNowCacheRebuildTableReport,
 };
 
-const PAGE_SIZE: u32 = 100;
-const REBUILD_SCOPE: &[(&str, &str)] = &[
-    ("incident", "incident"),
-    ("change", "change_request"),
-    ("change_task", "change_task"),
-    ("request", "sc_req_item"),
-    ("request_task", "sc_task"),
-    ("story", "rm_story"),
-    ("scrum_task", "rm_scrum_task"),
-    ("knowledge", "kb_knowledge"),
-    ("approval", "sysapproval_approver"),
-    ("project", "pm_project"),
-    ("demand", "dmn_demand"),
+const PAGE_SIZE: u32 = 1_000;
+const REBUILD_SCOPE: &[(&str, &str, &str)] = &[
+    ("incident", "incident", "incident"),
+    ("change", "change_request", "change_request"),
+    ("knowledge", "knowledge", "kb_knowledge"),
+    (
+        "business_application",
+        "business_application",
+        "cmdb_ci_business_app",
+    ),
+    (
+        "service_catalog_product",
+        "service_catalog_product",
+        "sc_cat_item",
+    ),
+    ("server", "server", "cmdb_ci_server"),
 ];
 
 #[derive(Clone)]
@@ -44,61 +49,36 @@ impl CacheRebuildService {
         &self,
         progress: &CacheRebuildProgressSink,
     ) -> Result<ServiceNowCacheRebuildReport> {
-        self.reject_unknown_enabled_resources()?;
+        let policy = self.ctx.named_cache_policy.active();
         let enabled_tables = REBUILD_SCOPE
             .iter()
-            .filter_map(|(resource, table)| {
-                self.ctx
-                    .config
-                    .refresh
-                    .resources
-                    .get(*resource)
-                    .filter(|config| config.enabled)
-                    .map(|_| (*resource, *table))
+            .filter(|(_, object, _)| {
+                policy.rule_for(rebuild_operation(object), object).mode != CacheMode::Live
+                    && (*object != "knowledge" || policy.knowledge_rebuild_base_sys_id().is_some())
             })
-            .chain(std::iter::once((
-                "business_application",
-                "cmdb_ci_business_app",
-            )))
+            .copied()
             .collect::<Vec<_>>();
         progress(CacheRebuildProgressEvent::Tables {
             tables: enabled_tables.len(),
             page_size: PAGE_SIZE,
         })?;
-        let needs_user = enabled_tables.iter().any(|(resource, _)| {
-            self.ctx
-                .config
-                .refresh
-                .resources
-                .get(*resource)
-                .is_some_and(|config| config.filter.contains("{{user}}"))
-        });
-        let user_sys_id = if needs_user {
-            progress(CacheRebuildProgressEvent::ResolvingUserScope)?;
-            let user_sys_id = self.ctx.current_user_sys_id().await?;
-            progress(CacheRebuildProgressEvent::UserScopeResolved)?;
-            Some(user_sys_id)
-        } else {
-            None
-        };
-
         let mut tables = Vec::new();
         let mut total_records = 0usize;
-        for (position, (resource, table)) in enabled_tables.iter().enumerate() {
+        for (position, (resource, _object, table)) in enabled_tables.iter().enumerate() {
             let index = position + 1;
-            let query = if *resource == "business_application" {
-                self.base_query(table)
-                    .equals("sys_class_name", "cmdb_ci_business_app")
-            } else {
-                let Some(config) = self.ctx.config.refresh.resources.get(*resource) else {
-                    anyhow::bail!("enabled rebuild table `{resource}` lost its configuration");
-                };
-                apply_configured_filter(
-                    self.base_query(table),
-                    &config.filter,
-                    user_sys_id.as_deref(),
-                )
-                .with_context(|| format!("validating rebuild filter for {resource}"))?
+            let query = match *resource {
+                "business_application" => self
+                    .base_query(table)
+                    .equals("sys_class_name", "cmdb_ci_business_app"),
+                "knowledge" => {
+                    let knowledge_base_sys_id =
+                        policy.knowledge_rebuild_base_sys_id().ok_or_else(|| {
+                            anyhow::anyhow!("knowledge rebuild scope was not captured")
+                        })?;
+                    self.base_query(table)
+                        .equals("kb_knowledge_base", knowledge_base_sys_id)
+                }
+                _ => self.base_query(table),
             };
             tables.push(
                 self.drain_table(
@@ -118,7 +98,7 @@ impl CacheRebuildService {
 
         Ok(ServiceNowCacheRebuildReport {
             source: "ServiceNow".to_string(),
-            scope: "configured ACL-readable projection".to_string(),
+            scope: "cache-policy-scoped ACL-readable projection".to_string(),
             pages: tables.iter().map(|table| table.pages).sum(),
             records: tables.iter().map(|table| table.records).sum(),
             tables,
@@ -180,6 +160,20 @@ impl CacheRebuildService {
             self.ctx
                 .project_live_records_without_vault(&page.records)
                 .with_context(|| format!("projecting ServiceNow rebuild page for {table}"))?;
+            if table == "sc_cat_item" {
+                let refreshed_at = Utc::now();
+                for record in &page.records {
+                    let item =
+                        crate::resource::catalog::catalog_item_from_record(record, Vec::new());
+                    self.ctx
+                        .query
+                        .store()
+                        .upsert_narrowed_catalog_product(&item, refreshed_at)
+                        .with_context(|| {
+                            format!("projecting narrowed catalog product {}", record.sys_id)
+                        })?;
+                }
+            }
             pages += 1;
             let page_records = page.records.len();
             records += page_records;
@@ -210,50 +204,16 @@ impl CacheRebuildService {
             records,
         })
     }
-
-    fn reject_unknown_enabled_resources(&self) -> Result<()> {
-        for (resource, config) in &self.ctx.config.refresh.resources {
-            if config.enabled
-                && !REBUILD_SCOPE
-                    .iter()
-                    .any(|(known_resource, _)| resource == known_resource)
-            {
-                anyhow::bail!(
-                    "enabled refresh resource `{resource}` has no ServiceNow cache rebuild mapping"
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
-fn apply_configured_filter(
-    mut query: TableApi,
-    filter: &str,
-    user_sys_id: Option<&str>,
-) -> Result<TableApi> {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return Ok(query);
+fn rebuild_operation(object: &str) -> &str {
+    match object {
+        "knowledge" => "get_article",
+        "business_application" => "business_application_get",
+        "service_catalog_product" => "catalog_item_get",
+        "server" => "server_get",
+        "incident" => "incident_get",
+        "change_request" => "change_request_get",
+        _ => "",
     }
-    for condition in filter.split('^') {
-        if condition.is_empty() || condition.starts_with("OR") || condition.starts_with("NQ") {
-            anyhow::bail!("only AND-joined equality conditions are supported");
-        }
-        let (field, value) = condition
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("unsupported condition `{condition}`"))?;
-        if field.trim().is_empty() || value.trim().is_empty() {
-            anyhow::bail!("filter condition `{condition}` has an empty field or value");
-        }
-        let value = if value.trim() == "{{user}}" {
-            user_sys_id.ok_or_else(|| {
-                anyhow::anyhow!("filter condition `{condition}` requires a resolved current user")
-            })?
-        } else {
-            value.trim()
-        };
-        query = query.equals(field.trim(), value);
-    }
-    Ok(query)
 }

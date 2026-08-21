@@ -319,6 +319,7 @@ impl Store {
     }
 
     pub fn prune_record(&self, sys_id: &str, when: DateTime<Utc>) -> Result<()> {
+        self.delete_catalog_product_projections(sys_id)?;
         self.conn.execute(
             r#"
             UPDATE records

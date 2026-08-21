@@ -22,10 +22,11 @@ ACL access, and installed-runtime proof remain separate claims.
 |---|---|---|
 | T-OPS-05 runtime inventory reconciliation | Closed: ghost advertisement removed and CLI/RPC/direct-MCP/bridge inventory probes pass | COMPLETE |
 | T-OPS-01 typed-operation foundation | Closed: shared descriptor/envelope shipped and `incident_fields` proves parity across all four transports | COMPLETE |
-| T-OPS-02 cache-policy foundation | Goal and defaults are approved, but the policy wire/lifecycle contract is absent | BLOCKED by B-OPS-06 |
-| T-OPS-03 resource reads | Incident family/table are approved, but get/query request contracts are absent | BLOCKED by B-OPS-07 |
-| T-OPS-04 governed writes | Single-target precedent exists, but the required bulk request/outcome contract is absent | BLOCKED by T-OPS-03 and B-OPS-08 |
-| FEAT-OPS-CONTRACT production closure | Not installed-runtime proven | BLOCKED until selected row gates and operator evidence pass |
+| T-OPS-02 cache-policy foundation | Closed after installed-scale amendment: Knowledge rebuild requires one explicit typed base scope and omission performs zero Knowledge I/O | COMPLETE |
+| T-OPS-03 resource reads | Closed: live-only Incident get/query, strict filters, native projection, cursor paging, exact errors, and four-transport parity pass source/fake gates | COMPLETE |
+| T-OPS-04 governed writes | Closed: compatible single and finite bulk governed Incident writes pass source/local-fake gates | COMPLETE |
+| FEAT-OPS-CONTRACT source implementation closure | Closed: approved rows, the Knowledge rebuild-scope amendment, and aggregate source/local-fake gates pass | COMPLETE |
+| OPS-ATTEST-01 installed/live attestation | Not claimed; operator-owned after installation and policy enablement | SEPARATE — not an implementation or Mullet gate |
 
 “Selected” never means implemented, enabled, authorized, or production-ready.
 No blocked task above is a coder handoff. They authorize no inferred API shape
@@ -152,7 +153,7 @@ and no live ServiceNow operation.
 | FND-OPS-002 | Foundation | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_core/src/config.rs#cacheconfig`; `docs/spec-cache-rebuild-progress.md#verification-and-closure` | Phase 1 | Wave 2 after dependency closure | Per-operation cache policy, source/completeness envelope, invalidation, validate-only, and atomic reload | Existing cache/vault/query stores, offline rebuild, daemon configuration | FND-OPS-000 closure; B-OPS-05 closure | L0 cache hit/miss/stale/mutation and reload tests prove no work-record cache I/O by default and prior-policy retention after invalid reload |
 | CAP-OPS-READ | Capability | `docs/spec-servicenow-operational-capabilities.md#scope`; `docs/spec-incident-list-by-assignment-group.md#scope` | Phase 2 | Row-specific wave | Separate typed live read/query operations and field metadata | FND-OPS-001; FND-OPS-002 for cache-eligible rows | Foundation closures plus approved B-OPS-01 row | Each selected row has independent transport L0 proof, native pagination where available, and truthful source/completeness |
 | CAP-OPS-WRITE | Capability | `docs/spec-servicenow-operational-capabilities.md#scope`; `AGENTS.md#behavioral-test-seams` | Phase 3 | Row-specific wave | Fail-closed governed writes, receipt/audit, two-target default, and finite named bulk | Foundations; target CAP-OPS-READ row | Foundation closures plus approved B-OPS-01 write row and target read closure | L0 plan/apply proves explicit enablement, confirmation, receipt/audit, target limits, replay/concurrency, and no-I/O denial |
-| FEAT-OPS-CONTRACT | Feature | `docs/spec-servicenow-operational-capabilities.md#approved-goal`; `AGENTS.md#public-safe-content` | Phase 4 | Final wave | Public-safe discoverable operational contract and bounded readiness statement | CAP-OPS-READ; CAP-OPS-WRITE; operator evidence | Selected capability closures and installed-runtime evidence | Source, policy, transport, ACL, and installed claims are separately evidenced; no selected row is overstated |
+| FEAT-OPS-CONTRACT | Feature | `docs/spec-servicenow-operational-capabilities.md#approved-goal`; `AGENTS.md#public-safe-content` | Phase 4 | Final source wave | Public-safe discoverable operational contract and bounded source-readiness statement | CAP-OPS-READ; CAP-OPS-WRITE | Approved selected-row closures and aggregate source gates | Every approved source row is behaviorally proven; installed and live claims remain explicitly separate |
 
 Hard `requires` edges override desired delivery order and parallelism. Direct
 MCP does not prove daemon-backed MCP, source does not prove installed runtime,
@@ -165,8 +166,8 @@ and registry presence does not prove a callable operation.
 | `docs/spec-servicenow-operational-capabilities.md#retained-compatibility-surfaces`; `AGENTS.md#behavioral-test-seams` | Reconcile shipped transports, retain bounded legacy attachment upload, select attachment list, and remove the unimplemented catalog-cancel advertisement | T-OPS-05 | CLI help/commands; daemon `contract_info` and dispatcher; MCP registries/dispatchers/bridge; capability docs | Red-first L0 inventory fails on current ghost/mismatch state, then proves exact classified inventory and no unknown-route result for any advertised operation | Rust coder + QA |
 | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_daemon/src/rpc/handlers/system.rs#contract_info` | Discover selected capability metadata without hardcoded field guesses | T-OPS-01 | `snow_core` resource descriptor; daemon metadata dispatch; CLI and MCP exposure | Independent CLI, JSON-RPC, direct MCP, and bridge fixtures assert discovered fields, choices, references, paging support, and raw/display representation | Rust coder + QA |
 | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_core/src/config.rs#cacheconfig` | Replace broad work-record population/read behavior with named cache policy and atomic policy lifecycle | T-OPS-02 | Config/policy, cache rebuild, live persistence, record reads/search, daemon policy holder and fixed CLI commands | Compiled CLI/daemon with local ServiceNow fake proves approved defaults, no work-record cache I/O, source/completeness, miss/stale behavior, invalidation, and failed reload retention | Rust coder + QA |
-| `docs/spec-servicenow-operational-capabilities.md#scope`; approved B-OPS-01 row | Deliver one typed read family without local access narrowing | T-OPS-03 | Row-named resource/core/daemon/CLI/MCP/bridge modules | L0 fake proves ACL-visible records, absent missing fields, native paging, truthful completeness, and no unapproved cache I/O | Rust coder + QA |
-| `docs/spec-servicenow-operational-capabilities.md#scope`; approved B-OPS-01 write row | Deliver one fail-closed governed write family with finite target limits | T-OPS-04 | Row-named planner/applier, daemon, CLI, MCP policy/bridge, receipt/audit modules | Red-first L0 fake proves default denial, explicit enablement, confirmation, finite target denial, replay/concurrency, receipt/audit, redaction, and zero I/O on every guard failure | Rust coder + QA |
+| `docs/spec-servicenow-operational-capabilities.md#scope`; approved B-OPS-01 row; approved B-OPS-07 contract | Deliver one typed read family without local access narrowing | T-OPS-03 | Row-named resource/core/daemon/CLI/MCP/bridge modules | L0 fake proves ACL-visible records, absent missing fields, native paging, truthful completeness, exact errors, state correction, and no cache I/O | Rust coder + QA |
+| `docs/spec-servicenow-operational-capabilities.md#scope`; approved B-OPS-01 write row; approved B-OPS-08 contract | Deliver one fail-closed governed write family with compatible single-target and finite bulk operations | T-OPS-04 | Row-named planner/applier, daemon, CLI, MCP policy/bridge, receipt/audit modules | Red-first governed-write L0 proves default denial, explicit enablement, confirmation, target bounds, replay/concurrency, durable partial receipts, invalidation failure, redaction, and zero write I/O on every preflight denial | Rust coder + QA |
 
 ## Implementation boundary
 
@@ -175,9 +176,10 @@ and registry presence does not prove a callable operation.
 | Field | Value |
 |---|---|
 | Immutable base | `622a9258d959afea035ce75e4c52ba888d7d8db0` |
-| Ready first | T-OPS-05 (closed) |
-| Source complete | T-OPS-05 and T-OPS-01 |
-| Decision-blocked | T-OPS-02 by B-OPS-06; T-OPS-03 by B-OPS-07; T-OPS-04 by T-OPS-03 and B-OPS-08 |
+| Ready for implementation | None |
+| Source complete | T-OPS-05, T-OPS-01, T-OPS-02, T-OPS-03, and T-OPS-04 |
+| Decision-blocked | None for the two approved Incident rows |
+| Dependency-blocked | None for the two approved Incident rows |
 | Row-gated | Every family beyond the two approved Incident rows remains row-gated. |
 | Operator-owned | Live/installed evidence and deployment policy enablement |
 | Scope rule | A changed production path outside the active task scope blocks handoff until this manifest is amended |
@@ -194,7 +196,11 @@ and registry presence does not prove a callable operation.
   `crates/snow_daemon/src/rpc/{method.rs,handlers/}`;
   `crates/snow_mcp/src/{tools/,server.rs,daemon_bridge.rs}`;
   `crates/snow_cli/src/{cli.rs,daemon_cmd/,app/}`; and focused L0 transport tests.
-- T-OPS-02: `crates/snow_core/src/{cache/,config.rs,context.rs,facade.rs,query/,service/cache_rebuild.rs,service/record.rs,service/knowledge.rs,service/business_application/,service/server.rs}`;
+- T-OPS-02: `crates/snow_core/src/{cache/,config.rs,context.rs,facade.rs,query/,resource/catalog.rs,service/cache_rebuild.rs,service/record.rs,service/knowledge.rs,service/business_application/,service/server.rs,service/write.rs}`;
+  the required typed catalog-product projection under
+  `crates/snow_core/src/cache/store/`; `crates/snow_daemon/src/catalog_write.rs`;
+  `crates/snow_mcp/src/server.rs` and focused direct/daemon-backed MCP process
+  parity tests for the two catalog read operations;
   daemon cache-policy state/handlers; fixed CLI validate/reload commands; public-safe
   config examples; and focused L0 cache/policy tests.
 - T-OPS-03: only the resource/core/daemon/CLI/MCP/bridge paths and L0 tests named
@@ -246,30 +252,551 @@ B-OPS-04 is resolved by the fixed-path daemon-owned cache-policy lifecycle in
 `#scope`; audit/receipt retention belongs to each T-OPS-04 write row, not cache
 policy. Neither resolution authorizes a live call.
 
-- **B-OPS-06 — cache-policy wire and lifecycle contract:** approval is still
-  required for the fixed source filename/location, serialized policy schema,
-  operation/object key namespace, live/read-through/cache-only modes, TTL
-  validation, validate/reload CLI and daemon method names, result/error shapes,
-  and object-segment invalidation rules. The approved defaults and atomicity
-  prose do not determine those public contracts. T-OPS-02 is not dispatchable
-  until this decision is recorded.
-- **B-OPS-07 — Incident get/query contract:** approval is still required for
-  `incident_get` selectors, `incident_query` filter and sort allowlists, exact
-  cursor/request/result shapes, field projection behavior, and transport error
-  mapping. Naming the table and operations does not determine those behaviors.
-  T-OPS-03 is not dispatchable until this decision is recorded.
-- **B-OPS-08 — Incident bulk-update contract:** approval is still required for
-  the `incident_bulk_apply_update` target and shared/per-target patch shape,
-  plan/apply relationship, atomic versus partial-failure semantics, concurrency
-  tokens, confirmation binding, and receipt/audit result. The approved limit of
-  25 does not determine those behaviors. T-OPS-04 is not dispatchable until
-  B-OPS-08 and its read prerequisite close.
+- **B-OPS-06 — cache-policy wire and lifecycle contract: CLOSED 2026-08-20.**
+  The approved contract is recorded in `#approved-b-ops-06-cache-policy-contract`.
+  T-OPS-02 source closure passed on 2026-08-20; installed/live attestation is
+  separately operator-owned.
+- **B-OPS-07 — Incident get/query contract: CLOSED 2026-08-20.** The approved
+  contract is recorded in `#approved-b-ops-07-incident-read-contract`.
+  T-OPS-03 source/fake closure passed on 2026-08-20; installed/live attestation
+  remains separately operator-owned.
+- **B-OPS-08 — Incident bulk-update contract: CLOSED 2026-08-20.** The approved
+  contract is recorded in `#approved-b-ops-08-incident-write-contract`.
+  T-OPS-04 has no remaining design or dependency blocker and is source-complete
+  against local ServiceNow and state-store fakes.
+
+### Approved B-OPS-06 cache-policy contract
+
+Approved 2026-08-20. This contract closes the cache-policy design gap; current
+source implementation status is recorded by the readiness decision below.
+
+Installed-scale amendment approved 2026-08-21: Knowledge cache rebuild is
+bounded by an explicit typed Knowledge-base scope in the same fixed policy.
+An absent Knowledge rebuild scope performs no `kb_knowledge` I/O; it never
+means "all ACL-visible articles." This amendment changes rebuild breadth only,
+not live/read-through lookup authorization or ServiceNow ACL behavior.
+
+#### Source and effective-policy construction
+
+- The source is the fixed file `<resolved Snow config directory>/cache-policy.toml`.
+  The daemon and offline cache commands resolve and capture that path at process
+  startup. No CLI or JSON-RPC request accepts a path.
+- An absent file activates the built-in defaults. An existing but unreadable or
+  invalid file fails daemon startup; a running daemon retains its prior active
+  snapshot when validation or reload fails.
+- Built-in object defaults are `knowledge = 7d`,
+  `business_application = 30d`, `service_catalog_product = 30d`, and
+  `server = 24h`, all in `read_through` mode.
+- File entries override the exact built-in object or operation entry. A
+  `live` override explicitly disables caching. After composing defaults and
+  overrides, an operation/object pair with no rule is live-only.
+- An object name is a canonical snake-case typed resource key registered by
+  Snow, never a table name supplied by a caller. An operation name is a
+  canonical daemon operation. An operation override must name the operation's
+  registered object; unknown objects, unknown operations, mismatched pairs,
+  duplicate entries, and wildcards are invalid. Policy may restrict an
+  operation but cannot register or widen one.
+
+The strict TOML schema is versioned and rejects unknown fields:
+
+```toml
+version = 1
+
+[objects.server]
+mode = "read_through"
+ttl = "24h"
+
+[operations.server_get]
+object = "server"
+mode = "cache_only"
+ttl = "24h"
+```
+
+`objects.<object>` supplies the default for registered operations bound to that
+object. `operations.<operation>` is an exact override and must repeat its
+registered object. New operations receive no implicit operation override; they
+may consume an approved object default only when their typed registration binds
+them to that object.
+
+#### Modes, freshness, and rebuild
+
+| Mode | Contract |
+|---|---|
+| `live` | Performs zero cache, vault, or derived-index reads and zero persistence. `ttl` is forbidden. |
+| `read_through` | Returns a fresh cache hit. A miss or stale entry reads ServiceNow; a successful complete live projection is persisted. A live failure remains an upstream error and never silently falls back to stale data. |
+| `cache_only` | Never contacts ServiceNow. Any existing projection, including one older than TTL, is returned with mandatory `last_refreshed_at`; absence returns `CACHE_MISS`. |
+
+Cached-mode TTLs are required positive integer durations using `s`, `m`, `h`,
+or `d`, with an inclusive range of `1m` through `365d`. Offline
+`snow rebuild-cache` projects only effective `read_through` or `cache_only`
+rules and uses the same fixed source and validation. SQLite remains disposable
+derived state; this contract adds no migration path. `refresh_all` remains
+unavailable.
+
+Knowledge rebuild uses this optional strict section:
+
+```toml
+[rebuild.knowledge]
+knowledge_base_sys_id = "0123456789abcdef0123456789abcdef"
+```
+
+- `knowledge_base_sys_id` is exactly one 32-hex ServiceNow reference,
+  normalized to lowercase. Empty, malformed, unknown, wildcard, display-name,
+  table-name, and raw encoded-query inputs are invalid or unavailable; this
+  contract creates no generic query surface.
+- When the section is absent, offline and daemon-triggered rebuilds omit
+  Knowledge and perform zero `kb_knowledge` I/O. Other cache-policy objects and
+  ordinary Knowledge reads are unchanged.
+- When it is present and Knowledge's effective mode is cached, rebuild applies
+  exact `kb_knowledge_base=<sys_id>` equality on the ServiceNow `kb_knowledge`
+  table before fixed `sys_id` ordering and pagination. Rows from every other
+  Knowledge base are outside the rebuilt projection.
+- The normalized rebuild scope participates in the policy fingerprint and
+  atomic validate/reload snapshot. Validation and public summaries never emit
+  the configured reference value.
+- Deployment-specific Knowledge-base references belong only in the ignored
+  local `cache-policy.toml`; committed examples and tests use generic values.
+
+#### Lifecycle wire contract
+
+- CLI commands are `snow cache-policy validate [--json]` and
+  `snow cache-policy reload [--json]`.
+- Daemon JSON-RPC methods are `cache_policy_validate` and
+  `cache_policy_reload`. Each accepts exactly `{}`; unknown arguments are
+  JSON-RPC `-32602`.
+- Validate parses and materializes the effective snapshot without changing
+  daemon state. Reload parses completely and atomically swaps only the
+  cache-policy snapshot.
+- Validate returns exactly `version`, `source`, `rule_count`, and `fingerprint`.
+  Reload returns exactly `version`, `source`, `rule_count`,
+  `previous_fingerprint`, `fingerprint`, and `changed`.
+- `source` is `built_in_defaults` or `built_in_plus_file`. `fingerprint` is the
+  lowercase SHA-256 of the canonical, key-sorted effective rules, so formatting
+  or TOML key order cannot manufacture a change.
+- JSON-RPC `-32070` carries
+  `{ "code": "CACHE_POLICY_INVALID", "field"?, "rule"?, "reason" }`.
+  JSON-RPC `-32071` carries
+  `{ "code": "CACHE_POLICY_IO", "kind", "reason" }` without the path or file
+  contents. A cache-only read miss uses JSON-RPC `-32072` with
+  `{ "code": "CACHE_MISS", "operation", "object" }`.
+
+#### Mutation invalidation
+
+- A successful mutation that returns the complete current record replaces that
+  exact cached projection and its successful live-refresh timestamp.
+- Otherwise, every known target is removed by canonical object key and
+  `sys_id` from memory cache, SQLite projection, vault projection, and derived
+  indexes before Snow reports local cache coherence.
+- If a successful bulk mutation cannot identify every affected target, Snow
+  invalidates only the exact object segment across those same local layers,
+  never the entire cache.
+- B-OPS-08 owns the externally visible write outcome when ServiceNow succeeds
+  but subsequent local invalidation fails. No automatic write retry is allowed.
+
+#### Approved T-OPS-02 catalog projection amendment
+
+Approved 2026-08-20. T-OPS-02 may modify
+`crates/snow_core/src/service/write.rs`,
+`crates/snow_core/src/resource/catalog.rs`, the required catalog-product
+projection files under `crates/snow_core/src/cache/store/`, and
+`crates/snow_daemon/src/catalog_write.rs`.
+
+- Catalog products use a typed current-format projection containing the complete
+  `CatalogItem`, including variables and choices.
+- A cache lacking that typed projection is incompatible with this source and
+  fails closed. Recovery is `reset-cache` or ServiceNow-authoritative
+  `rebuild-cache`; no migration, legacy backfill, or generic-row promotion is
+  added.
+- `catalog_item_get` may return a cached result only from that complete typed
+  projection. A generic `sc_cat_item` row is never represented as complete.
+- Narrowed rebuild or `catalog_items_search` projections report
+  `Partial/NarrowedProjection`, including the mandatory cached refresh time,
+  and never masquerade as complete catalog items.
+
+#### Approved T-OPS-02 direct-MCP parity amendment
+
+Approved 2026-08-20. T-OPS-02 may modify
+`crates/snow_mcp/src/server.rs` and focused direct/daemon-backed MCP process
+parity tests for `catalog_items_search` and `catalog_item_get`.
+
+- Direct MCP uses the same policy-aware catalog envelope entry points and exact
+  public error mapping as daemon JSON-RPC and daemon-backed MCP.
+- Independently authored process-level expectations prove byte-identical
+  structured payloads across direct and daemon-backed MCP for `live`,
+  `read_through`, and `cache_only`.
+- Parity proof includes complete typed `CatalogItem` results, narrowed search
+  with mandatory cached refresh time, generic-row rejection/`CACHE_MISS`, and a
+  stale live-refresh failure with no stale fallback.
+- This amendment changes no operation inventory, policy enablement, write
+  behavior, or Mullet consumer path.
+
+T-OPS-02 closure requires red-first L0 proof through compiled CLI and real
+daemon JSON-RPC seams for built-in defaults, strict schema rejection, each mode,
+fresh/miss/stale behavior, zero I/O for `live`, cache-only no-network behavior,
+offline rebuild scope, exact and segment invalidation, validate no-state-change,
+atomic reload, and prior-snapshot retention after every invalid reload.
+
+### Approved B-OPS-07 Incident read contract
+
+Approved 2026-08-20. This contract closes the Incident get/query design gap; it
+is implemented in current source as recorded by the readiness decision below.
+Installed-runtime and live ServiceNow behavior remain separate claims.
+
+#### `incident_get` request and lookup behavior
+
+`incident_get` accepts exactly one selector and rejects unknown properties:
+
+```json
+{ "number": "INC0012345" }
+```
+
+or:
+
+```json
+{ "sys_id": "0123456789abcdef0123456789abcdef" }
+```
+
+- `number` is normalized to uppercase and must match `^INC[0-9]+$`.
+- `sys_id` must contain exactly 32 hexadecimal characters and is normalized to
+  lowercase.
+- Supplying neither selector or both selectors is invalid before ServiceNow
+  record I/O.
+- A number lookup requests at most two rows. Two rows are
+  `INCIDENT_NUMBER_AMBIGUOUS`; Snow never picks one. An empty number result is
+  `INCIDENT_LOOKUP_UNAVAILABLE`, because an empty Table API query does not prove
+  whether the record is absent or hidden by a row ACL. A direct `sys_id` lookup
+  that ServiceNow explicitly reports absent is `INCIDENT_NOT_FOUND`.
+- The operation is always live and performs zero cache, vault, or index I/O.
+  It requests display values for every field ServiceNow exposes and applies no
+  caller field projection. Missing upstream fields remain absent.
+
+The successful data shape is exactly `{ "record": <IncidentRecord> }` inside
+`OperationEnvelope`, with operation `incident_get`, source `{ "kind": "live" }`,
+and completeness `{ "kind": "complete" }`. `IncidentRecord` is a map keyed by
+native ServiceNow field name. Each present field retains raw `value` and
+optional `display_value`; Snow does not synthesize absent fields or flatten
+references.
+
+#### `incident_query` request contract
+
+The request accepts only `filters`, `limit`, and `cursor`; every property is
+optional, so `{}` is the bounded query for all ACL-visible Incidents. `filters`
+defaults to `{}` and rejects unknown properties. There is no caller-selected
+table, raw encoded query, field list, cache/source mode, or sort.
+
+| Filter | Type and bound | ServiceNow predicate |
+|---|---|---|
+| `numbers` | 1..=20 unique values matching `^INC[0-9]+$`, normalized uppercase | exact `number` equality or `IN` |
+| `assignment_group` | 32-hex `sys_id` | exact reference equality |
+| `assigned_to` | 32-hex `sys_id` | exact reference equality |
+| `caller_id` | 32-hex `sys_id` | exact reference equality |
+| `cmdb_ci` | 32-hex `sys_id` | exact reference equality |
+| `states` | 1..=20 unique raw values or case-insensitive exact labels | live `incident.state` choice resolution, then exact equality or `IN` |
+| `priorities` | 1..=5 unique integers, each in `1..=5` | exact equality or `IN` |
+| `active` | boolean | exact boolean equality |
+| `opened_after` / `opened_before` | ServiceNow UTC timestamp `YYYY-MM-DD HH:MM:SS` | strict `opened_at >` / `<` bounds |
+| `updated_after` / `updated_before` | ServiceNow UTC timestamp `YYYY-MM-DD HH:MM:SS` | strict `sys_updated_on >` / `<` bounds |
+
+Array values must remain unique after normalization or state resolution. Empty
+strings, invalid calendar timestamps, inverted or equal time ranges, invalid
+references, and unknown properties are invalid before the Incident record
+request. Raw state values match case-sensitively; labels match
+case-insensitively and exactly. Unknown, ambiguous, duplicate-after-resolution,
+or unavailable choices return correction data containing the requested value,
+table, field, ambiguity status, and current choices. Snow never accepts an
+unverified raw state when the live choice set is unavailable or empty.
+
+`limit` defaults to 50 and accepts integers `1..=200`; values outside the range
+are rejected rather than clamped. `cursor` is omitted/null on the first page or
+is the previous page's `next_cursor`: exactly 32 hexadecimal characters,
+normalized to lowercase, and applied as exclusive `sys_id > cursor`.
+Every query is ordered only by ascending `sys_id`. Caller-selected sorting is
+forbidden because it would make the approved `sys_id`-only cursor untruthful.
+
+#### Query projection and result
+
+`incident_query` requests exactly these fields, with ServiceNow raw and display
+values preserved:
+
+```text
+sys_id, number, short_description, state, active, priority, impact, urgency,
+opened_at, resolved_at, closed_at, caller_id, assigned_to, assignment_group,
+cmdb_ci, business_service, category, subcategory, sys_created_on,
+sys_updated_on, sys_updated_by
+```
+
+Descriptions, work notes, comments, and arbitrary caller projection are not
+query fields; callers use `incident_get` for the complete record returned by
+their instance.
+
+The successful data shape is exactly:
+
+```json
+{
+  "records": [],
+  "next_cursor": null,
+  "limit": 50,
+  "rows_inspected": 0
+}
+```
+
+inside an `OperationEnvelope` whose operation is `incident_query` and source is
+`{ "kind": "live" }`. `rows_inspected` is the number of rows ServiceNow
+returned. Fewer rows than `limit` yields `{ "kind": "complete" }` and a null
+cursor. Exactly `limit` rows yields
+`{ "kind": "partial", "reason": "page_limit_reached" }`; `next_cursor` is
+the last ServiceNow row's `sys_id`. An exact-multiple scan therefore requires a
+terminal empty page to establish completeness. This is deterministic cursor
+progression, not a transactional snapshot guarantee.
+
+#### Errors and transport parity
+
+| JSON-RPC code | Public code | Meaning |
+|---|---|---|
+| `-32602` | `INVALID_PARAMS` or `INCIDENT_STATE_UNRESOLVED` | Unknown/invalid input or state correction; no Incident record I/O |
+| `-32001` | `SERVICENOW_UNAVAILABLE` | Network or timeout failure |
+| `-32003` | `ACL_DENIED` | ServiceNow explicitly denied access |
+| `-32004` | `INCIDENT_NOT_FOUND` | Direct `sys_id` lookup explicitly absent |
+| `-32005` | `INCIDENT_NUMBER_AMBIGUOUS` | More than one row matched an exact number |
+| `-32007` | `INCIDENT_LOOKUP_UNAVAILABLE` | Empty exact-number result cannot distinguish absence from row ACL filtering |
+| `-32000` | `SERVICENOW_ERROR` | Other redacted upstream/service failure |
+
+Upstream diagnostics pass through only after credential, token, URL, and other
+secret redaction. An empty `incident_query` page is a successful complete page,
+not a not-found error.
+
+CLI forms are `snow incident get --number <INC...> --json`,
+`snow incident get --sys-id <sys_id> --json`, and `snow incident query ...
+--json`. Query flags map one-to-one to the approved filters; array flags are
+repeatable. Daemon JSON-RPC, direct MCP, and daemon-backed MCP expose the same
+operation names and exact request properties. JSON surfaces return
+byte-identical envelope JSON for the same upstream fixture; CLI failures are
+non-zero and preserve the same public code/correction data without secrets.
+
+T-OPS-03 closure requires red-first L0 proof through the compiled CLI connected
+over a real local socket to the daemon and a local ServiceNow fake, plus direct
+and daemon-backed MCP parity. The proof covers both selectors, number
+ambiguity/ACL uncertainty, fixed projection, missing-field omission, empty and
+multi-page results including terminal exact-multiple paging, state correction,
+unknown-input rejection before record I/O, explicit ACL distinction, and zero
+cache/vault/index I/O. Independently authored wire expectations are L1
+supplemental evidence; DTO, derive, constructor, mock-call, or self-round-trip
+tests do not close the behavior.
+
+### Approved B-OPS-08 Incident write contract
+
+Approved 2026-08-20. This closes the Incident governed-write design gap. It
+did not by itself claim that T-OPS-04 source or runtime behavior was implemented, and it
+does not relax the hard dependency on T-OPS-03 closure.
+
+#### Operations, compatibility, and policy
+
+- The shipped `incident_plan_update` / `incident_apply_update` pair remains the
+  compatible single-target operation. Its existing flat request stays accepted;
+  T-OPS-04 adds `comments` to the exact permitted-field set but does not turn the
+  ordinary operation into a bulk request. One target is within the universal
+  ordinary-operation ceiling of two.
+- The new separately named bulk pair is `incident_bulk_plan_update` /
+  `incident_bulk_apply_update`. It accepts 3..=25 targets. Three targets sent to
+  the ordinary operation are rejected before ServiceNow write I/O; 26 targets
+  are rejected by bulk before target resolution or write I/O.
+- Both bulk operations are disabled by default in every environment. Planning
+  is refused unless the matching bulk apply tool is explicitly enabled for the
+  named environment.
+- `ToolPolicy` gains a distinct `max_targets`. A bulk request requires an
+  explicitly configured integer in `3..=25`; omission denies bulk, an operator
+  may lower the maximum, and a value above the row-approved ceiling is invalid.
+  `max_records` is not a target-count control and must not be reused.
+- Policy may narrow the five approved fields or lower the target count. It may
+  not add a field, increase the maximum, bypass confirmation, or authorize a
+  new operation.
+
+#### Bulk plan request
+
+`incident_bulk_plan_update` accepts exactly:
+
+```json
+{
+  "shared_patch": {
+    "assignment_group": "0123456789abcdef0123456789abcdef"
+  },
+  "targets": [
+    {
+      "number": "INC0012345",
+      "patch": { "state": "In Progress" }
+    },
+    {
+      "sys_id": "fedcba9876543210fedcba9876543210",
+      "patch": { "work_notes": "Generic operator note" }
+    },
+    {
+      "number": "INC0012347"
+    }
+  ]
+}
+```
+
+`shared_patch` is optional. Each target accepts exactly one normalized
+`number` or `sys_id` selector and an optional `patch`; unknown properties are
+rejected. Every target must have at least one effective field after combining
+the shared and target patch. A field may not appear in both patches for the
+same target, so there is no hidden override order. Targets must be unique after
+live resolution to canonical lowercase `sys_id`.
+
+The only patch fields are `assigned_to`, `assignment_group`, `state`,
+`work_notes`, and `comments`. Assignment references in the bulk form are exact
+32-hex `sys_id` values; Snow does not narrow them by configured identity
+membership or guess from a name. State accepts an exact raw value or an exact
+case-insensitive live choice label, but cancellation values remain forbidden.
+`work_notes` and `comments` are non-empty strings under the existing 16,000
+character bound and retain ServiceNow append semantics. Empty patches, unknown
+fields, malformed selectors, unavailable/ambiguous targets, unresolved states,
+duplicates, overlap, target-count failure, or policy denial fail the complete
+plan with no ServiceNow write I/O.
+
+Planning performs live target reads through the T-OPS-03 contract, normalizes
+the effective patches, captures each target's required `sys_updated_on`, sorts
+the normalized targets by `sys_id`, and creates no mutation. There is no partial
+plan.
+
+The successful plan result is exactly:
+
+```json
+{
+  "plan_id": "<opaque>",
+  "op_hash": "<lowercase-sha256>",
+  "apply_tool": "incident_bulk_apply_update",
+  "preview": {
+    "targets": [
+      {
+        "target": { "number": "INC0012345", "sys_id": "00000000000000000000000000000001" },
+        "patch": { "state": "2" },
+        "concurrency_token": { "sys_updated_on": "2026-08-20 12:00:00" }
+      },
+      {
+        "target": { "number": "INC0012346", "sys_id": "00000000000000000000000000000002" },
+        "patch": { "assignment_group": "0123456789abcdef0123456789abcdef", "work_notes": "Generic operator note" },
+        "concurrency_token": { "sys_updated_on": "2026-08-20 12:01:00" }
+      },
+      {
+        "target": { "number": "INC0012347", "sys_id": "00000000000000000000000000000003" },
+        "patch": { "assignment_group": "0123456789abcdef0123456789abcdef" },
+        "concurrency_token": { "sys_updated_on": "2026-08-20 12:02:00" }
+      }
+    ]
+  },
+  "expires_at": "<rfc3339>",
+  "confirmation_token": "<opaque>",
+  "idempotency_key": "<opaque>"
+}
+```
+
+The plan uses the existing ten-minute lifetime. `op_hash` covers the apply tool,
+actor/requester-independent canonical target order, each resolved target, each
+effective normalized patch, and every concurrency token.
+
+#### Apply, confirmation, and concurrency
+
+`incident_bulk_apply_update` accepts exactly:
+
+```json
+{
+  "plan_id": "<opaque>",
+  "confirmation_token": "<opaque>",
+  "idempotency_key": "<opaque>",
+  "concurrency_tokens": [
+    { "sys_id": "00000000000000000000000000000001", "sys_updated_on": "2026-08-20 12:00:00" },
+    { "sys_id": "00000000000000000000000000000002", "sys_updated_on": "2026-08-20 12:01:00" },
+    { "sys_id": "00000000000000000000000000000003", "sys_updated_on": "2026-08-20 12:02:00" }
+  ]
+}
+```
+
+The token array must contain every planned target exactly once and byte-match
+the plan after canonical ordering. Apply accepts no selectors or patches. The
+confirmation is bound to actor, requester, environment, apply tool, and
+`op_hash`; the hash in turn binds the complete normalized targets, patches, and
+concurrency tokens. A token or confirmation cannot be reused for a different
+target, patch, actor, requester, environment, or operation.
+
+Before the first PATCH, apply rechecks policy, kill switch, plan lifetime,
+confirmation, idempotency, target count, and every target's current
+`sys_updated_on`. Any preflight failure denies the whole apply and proves zero
+ServiceNow write I/O. A matching idempotency replay returns the prior receipt
+without another PATCH; a key bound to another hash is a conflict.
+
+ServiceNow Table API PATCH does not provide a cross-record transaction. After
+preflight, Snow processes targets in canonical ascending `sys_id` order,
+rechecks the target token immediately before its PATCH, and stops at the first
+write, concurrency, durable-receipt, or invalidation failure. It performs no
+compensating rollback and never automatically retries a ServiceNow write.
+
+#### Success, partial failure, and local coherence
+
+A complete success returns one durable receipt with `status: "success"`. If at
+least one target was applied and a later target fails, JSON-RPC returns
+`-32046` with public code `PARTIAL_FAILURE` and the durable receipt in error
+data. Each target result is exactly `applied`, `failed`, or `not_attempted`, so
+an empty or superficially successful response cannot conceal a partial write.
+
+After each successful PATCH, Snow applies the B-OPS-06 exact-target replacement
+or invalidation contract before continuing. If ServiceNow succeeded but local
+cache/vault/index coherence fails, Snow stops and returns the same `-32046`
+partial path with `failure_code: "LOCAL_COHERENCE_FAILED"` and
+`upstream_applied: true`. The receipt identifies the applied target; Snow does
+not retry the write. If no target was applied, existing typed policy, field,
+lookup, confirmation, idempotency, plan, concurrency, upstream, and pending-
+resolution errors remain in force rather than being mislabeled partial.
+
+The idempotency pending marker is durable before the first PATCH, and each
+per-target outcome is durably appended before Snow attempts the next target.
+Existing `PENDING_RESOLUTION_REQUIRED` semantics remain for a crash or local
+store failure where Snow cannot prove a final receipt; callers must inspect the
+target and create a fresh plan rather than blindly retry.
+
+The bulk receipt contains exactly `plan_id`, `audit_id`, `parent_audit_id`,
+`tool`, `status`, `op_hash`, `idempotency_replay`, `target_results`,
+`applied_count`, `failed_count`, `not_attempted_count`, `cache_coherent`,
+`apply_started_at`, and `completed_at`. Each target result contains its
+`number`, `sys_id`, outcome status, changed field names and before/after hashes,
+and observed `sys_updated_on`; a failed result also carries its typed redacted
+error code. Receipts and audit rows contain no record snapshot, instance URL,
+work-note/comment text, or other field body. Receipt replay follows the existing
+idempotency window; audit retention follows the existing configured
+`McpAuditConfig.retention_days`. This contract adds no second retention store.
+
+#### CLI, MCP, and proof
+
+- CLI planning is `snow incident bulk-update --request <path|-> [--json]`.
+  `-` reads JSON from stdin so journal text need not enter process arguments.
+- Applying a saved plan bundle is
+  `snow incident bulk-update --plan <path|-> --apply [--yes] [--json]`.
+  `--request` and `--plan` are mutually exclusive; `--yes` is valid only with
+  `--apply` and bypasses interaction only after printing the exact preview.
+- Daemon JSON-RPC, direct MCP, and daemon-backed MCP expose
+  `incident_bulk_plan_update` and `incident_bulk_apply_update` with the exact
+  request/result contracts above. Direct and bridged MCP return byte-identical
+  structured results for the same fixture.
+
+T-OPS-04 closure requires red-first governed-write L0 tests through the
+compiled CLI over a real daemon socket with local ServiceNow and state-store
+fakes, plus daemon JSON-RPC and direct/bridge MCP parity. Required mutations
+include removing default denial, accepting three ordinary or 26 bulk targets,
+ignoring a patch overlap, skipping all-target preflight, applying with a stale
+token, reusing confirmation/idempotency authority for another hash, continuing
+after a failed target, collapsing partial into success, retaining journal text
+in a receipt, skipping invalidation, or retrying after local-coherence failure.
+Every preflight denial asserts zero ServiceNow write I/O and unchanged prior
+state; partial paths assert the exact applied/failed/not-attempted state and
+durable replay without another write. DTO, schema, derive, constructor,
+mock-call, or self-round-trip assertions do not close the governed-write seam.
 
 ### Approved B-OPS-01 rows
 
 Approved 2026-08-20. These two rows, and only these two, select the T-OPS-03 and
-T-OPS-04 families. They do not unblock coding until B-OPS-07/B-OPS-08 define
-their missing public contracts. Every other selected family stays row-gated.
+T-OPS-04 families. B-OPS-07 and B-OPS-08 are closed; T-OPS-03 source/fake
+closure passes and T-OPS-04 source/local-fake closure now passes. Every other selected family stays
+row-gated.
 
 #### Read row — Incidents (T-OPS-03)
 
@@ -310,7 +837,7 @@ This row does not authorize expanding `RECORD_LOOKUP_ALLOWED_TABLES`, adding an
 | Default posture | Disabled in every environment including production |
 | Enablement | Explicit named tool plus named environment, through `tool_enabled_in_environment` |
 | Default target limit | 2 |
-| Named bulk | `incident_bulk_apply_update`, `max_targets: 25`, separately enabled. Omission denies bulk. |
+| Named bulk | `incident_bulk_plan_update` / `incident_bulk_apply_update`, 3..=25 targets, separately enabled with `max_targets: 25`. Omission denies bulk. |
 | Cancellation | Excluded; `reject_cancel_state` stands |
 | Concurrency | `sys_updated_on` token; a stale token denies the apply |
 
@@ -377,7 +904,9 @@ is live-only and therefore independent of FND-OPS-002.
 | SC-OPS-METADATA | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_core/src/resource/record_query.rs` | Typed resource descriptor | Returns only dictionary-visible field candidates, dictionary-declared non-read-only candidates, hierarchy-aware choices, references, and native paging support; never represents either list as record ACL authorization | Typed unavailable/blocked field category; never guessed success | Rust core coder | L0 CLI/RPC/MCP expectations against independent local metadata fixtures |
 | SC-OPS-ENVELOPE | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_daemon/src/rpc/handlers/records.rs` | Shared transport response adapter | Stable source/completeness/cache-age envelope preserving ServiceNow-native record values | Transport error or explicit partial/unavailable; never synthetic empty data | Rust daemon/MCP coder | Independent consumer-visible transport expectations |
 | SC-OPS-CACHE-POLICY | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_core/src/cache/policy.rs` | Named operation/object policy plus daemon atomic snapshot | `enabled`, TTL, and miss behavior; omitted means live-only/no cache I/O; fixed-source validate and reload | Validation error and prior active snapshot retained | Rust core/daemon coder | Compiled CLI/daemon L0 cache and invalid-reload tests |
+| SC-OPS-INCIDENT-READ | `docs/spec-servicenow-operational-capabilities.md#approved-b-ops-07-incident-read-contract` | Incident resource/core/daemon/CLI/MCP/bridge seams | Exclusive get selector; strict typed live query; fixed projection; exclusive `sys_id` paging; exact errors and envelope | Typed unavailable/error for invalid, unresolved, or ACL-uncertain lookup; never cache fallback or synthetic empty get | Rust read coder | Red-first compiled CLI/real-daemon L0 plus direct/bridge MCP parity and terminal paging |
 | SC-OPS-WRITE-GUARD | `docs/spec-servicenow-operational-capabilities.md#scope`; `crates/snow_mcp/src/domain/policy.rs#toolpolicy` | Shared governed-write enablement and target counter | Disabled by default; two targets maximum unless named bulk policy supplies row-approved finite maximum; CLI flags cannot bypass | Policy refusal before ServiceNow I/O and no synthetic receipt | Rust write/MCP coder | Red-first L0 fake asserts exact denial, no I/O, and receipt/audit outcomes |
+| SC-OPS-INCIDENT-BULK | `docs/spec-servicenow-operational-capabilities.md#approved-b-ops-08-incident-write-contract` | Incident bulk planner/applier, policy, durable receipt/audit, invalidation, CLI/RPC/MCP/bridge | Strict shared/per-target patch plan; canonical targets/tokens; stop-on-first non-atomic apply; durable success/partial receipt | Typed fail-closed denied, pending-resolution, or partial state; never synthetic success, rollback claim, or automatic write retry | Rust write coder | Red-first governed-write L0 with exact partial state, replay, local-coherence failure, zero-I/O denials, and transport parity |
 
 ## Task breakdown and coder handoffs
 
@@ -448,17 +977,21 @@ is live-only and therefore independent of FND-OPS-002.
 - System node: CAP-OPS-READ typed resource row.
 - Phase / Wave: Phase 2 / row-specific wave.
 - Hard prerequisites: FND-OPS-001 closure; FND-OPS-002 closure when cache-eligible;
-  approved B-OPS-01 row.
+  approved B-OPS-01 row; B-OPS-07 closure.
 - Provides / consumes: provides one named typed read/query family; consumes
   discovered metadata and the shared envelope/cache contracts.
 - Closure gate: the approved operation works through every selected transport,
   preserves native values, uses only native paging, and reports source and
   completeness truthfully.
 - Authority refs: `docs/spec-servicenow-operational-capabilities.md#scope`;
-  approved B-OPS-01 row amendment.
+  approved B-OPS-01 row amendment;
+  `docs/spec-servicenow-operational-capabilities.md#approved-b-ops-07-incident-read-contract`.
 - Allowed write scope: only row-named modules/tests; no wildcard table registry.
-- Acceptance evidence: red-first local-ServiceNow L0 expectations, negative
-  no-cache-I/O proof for live-only rows, and cache miss/stale proof where eligible.
+- Acceptance evidence: red-first compiled CLI through a real daemon socket and
+  local ServiceNow fake; both get selectors and ambiguity/ACL uncertainty;
+  fixed projection and missing fields; state correction; invalid input before
+  record I/O; terminal cursor paging; exact parity through direct and bridged
+  MCP; and negative no-cache/vault/index-I/O proof.
 - Coder rule: Implement only the cited behavior. Surface every uncited path or solution as a blocker requiring an approved authority update.
 
 ### T-OPS-04: Add one approved fail-closed governed write family
@@ -466,7 +999,7 @@ is live-only and therefore independent of FND-OPS-002.
 - System node: CAP-OPS-WRITE governed write row.
 - Phase / Wave: Phase 3 / row-specific wave.
 - Hard prerequisites: Foundation closures; target CAP-OPS-READ row closure;
-  approved B-OPS-01 write row including finite bulk maximum when applicable.
+  approved B-OPS-01 write row; B-OPS-08 closure.
 - Provides / consumes: provides one disabled-by-default plan/apply family and
   policy enablement; consumes resource metadata, envelopes, receipt/audit, and
   target-count guards.
@@ -474,11 +1007,15 @@ is live-only and therefore independent of FND-OPS-002.
   enablement, confirmation, redacted upstream failure, receipt/audit, two-target
   default, finite named bulk, replay/concurrency, and CLI flag non-bypass.
 - Authority refs: `docs/spec-servicenow-operational-capabilities.md#scope`;
-  approved B-OPS-01 write row.
+  approved B-OPS-01 write row;
+  `docs/spec-servicenow-operational-capabilities.md#approved-b-ops-08-incident-write-contract`.
 - Allowed write scope: only row-named modules/tests.
-- Acceptance evidence: red-first local ServiceNow/state-store fake; every
-  invalid policy, confirmation, idempotency, concurrency, and target-count path
-  proves zero ServiceNow write I/O and preserves prior valid state.
+- Acceptance evidence: red-first compiled CLI/real-daemon governed-write seam
+  with local ServiceNow/state-store fakes; exact single-target compatibility,
+  bulk plan/apply, policy/target bounds, confirmation/idempotency/concurrency,
+  durable success/partial replay, stop-on-first behavior, local-coherence
+  failure, redaction, direct/bridge MCP parity, and zero write I/O for every
+  preflight denial.
 - Coder rule: Implement only the cited behavior. Surface every uncited path or solution as a blocker requiring an approved authority update.
 
 ## Verification and closure
@@ -500,9 +1037,15 @@ is live-only and therefore independent of FND-OPS-002.
 - T-OPS-02 cache: assert source, completeness, refresh timestamp, four default
   TTLs, omission/no-I/O, miss/stale behavior, invalidation, offline rebuild
   scope, partial projection truth, and validate/reload atomicity.
+- T-OPS-03 Incident reads: assert exclusive selectors, number ambiguity versus
+  ACL uncertainty, fixed typed filters/projection, state correction, exact
+  errors, missing-field omission, exclusive terminal paging, transport parity,
+  and zero cache/vault/index I/O.
 - T-OPS-04 writes: assert explicit enablement, permitted fields, confirmation,
-  idempotency, replay, applicable concurrency, finite target bounds, audit and
-  receipts, upstream failure, and zero I/O for every denial.
+  idempotency, replay, applicable concurrency, finite target bounds, all-target
+  preflight, deterministic stop-on-first behavior, durable success/partial
+  audit and receipts, local-coherence failure, upstream failure, redaction, and
+  zero write I/O for every preflight denial.
 - Changed behavior begins with a red L0 test that fails for the intended old
   behavior. DTO, schema, derive, constructor, mock-call, or self-round-trip
   assertions do not count.
@@ -525,15 +1068,51 @@ is live-only and therefore independent of FND-OPS-002.
   hierarchy-aware `sys_choice` only; no bundled schema is consulted. Field
   candidates are explicitly structural metadata, never an ACL authorization
   claim, and every empty-schema transport rejects undeclared arguments.
-- **T-OPS-02: BLOCKED by B-OPS-06.** B-OPS-05 and its offline-rebuild baseline
-  are green, but the public cache-policy wire/lifecycle contract is not defined.
-- **T-OPS-03: BLOCKED by B-OPS-07.** The Incident row selects the family and
-  table but does not define implementable get/query request and result contracts.
-- **T-OPS-04: BLOCKED by T-OPS-03 and B-OPS-08.** The row approves fields and
-  target bounds but does not define the required named bulk operation's wire,
-  failure, concurrency, confirmation, or receipt semantics.
-- **Production feature closure: BLOCKED** until selected row evidence and
-  installed operator proof pass.
+- **T-OPS-02: COMPLETE** on 2026-08-20 for current source and local-fake
+  evidence. Fixed-source strict policy validate/reload, atomic prior-snapshot
+  retention, daemon startup failure, the four default TTLs, `live`,
+  `read_through`, and `cache_only`, truthful source/completeness/cache age,
+  Server/Knowledge/Business Application/Service Catalog reads, rebuild, and
+  exact/segment invalidation are proven through compiled CLI and daemon L0
+  seams. The current-format typed catalog projection preserves variables and
+  choices, rejects generic rows as `CACHE_MISS`, and direct/daemon-backed MCP
+  process tests prove byte-identical catalog envelopes and public errors,
+  including narrowed timestamps and no stale fallback. The post-T-OPS-04
+  aggregate workspace/Snow-owned E2E gates passed on 2026-08-21; installed/live
+  attestation remains separately operator-owned. Installed-scale evidence on
+  2026-08-21 exposed an unbounded Knowledge rebuild; the approved amendment now
+  requires one exact policy-selected Knowledge base, omits Knowledge with zero
+  I/O when unscoped, and fingerprints the redacted scope. Compiled CLI durable-
+  cache tests and daemon lifecycle tests pass, and mutations removing the
+  filter, the omission guard, or sys_id validation are killed.
+- **T-OPS-03: COMPLETE** on 2026-08-20 for current source and local-fake
+  evidence. `incident_get` and `incident_query` are live-only, reject unknown
+  or ambiguous input before Incident record I/O, preserve native raw/display
+  fields, use the fixed query projection and exclusive `sys_id` cursor, and
+  report exact errors and truthful completeness. Compiled CLI, daemon JSON-RPC,
+  direct MCP, and real-socket daemon-backed MCP pass parity evidence. Incident
+  cache-policy entries are rejected, so cached modes cannot widen the row.
+  Aggregate workspace/Snow E2E passed on 2026-08-21; installed/live attestation
+  remains separate.
+- **T-OPS-04: COMPLETE** on 2026-08-20 for current source and local-fake
+  evidence. The compatible single-target path and separately named 3..=25
+  target bulk family are fail-closed, use no-retry mutation transport, enforce
+  exact confirmation/idempotency/concurrency bindings, stop on first failure,
+  durably retain public-safe receipts/audits, and strictly invalidate legacy
+  Incident projections after successful PATCHes. Compiled CLI, daemon JSON-RPC,
+  direct MCP, and real-socket daemon-backed MCP behavior pass focused evidence.
+  Aggregate workspace/Snow-owned E2E passed on 2026-08-21 with 816 tests passed,
+  zero failed, and six intentionally ignored; strict Clippy, formatting, source
+  graph, spec, diff, public-safety, and the local 83-tool MCP schema smoke also
+  passed. Installed/live attestation remains separate and is not claimed by
+  this source closure.
+- **FEAT-OPS-CONTRACT source implementation: COMPLETE.** Every approved source
+  row and aggregate implementation gate is closed. Mullet is a downstream
+  consumer and is neither a dependency nor a closure gate.
+- **OPS-ATTEST-01 installed/live attestation: NOT CLAIMED.** Rebuilding and
+  restarting the installed daemon, enabling operator policy, and live
+  ServiceNow proof are deployment evidence owned separately by the operator;
+  their absence does not reopen source implementation.
 
-This is a bounded readiness decision. It authorizes no blocked source handoff,
-live ServiceNow access, or deployment policy change.
+This is a bounded readiness decision. It authorizes consumer handoff from the
+current source, but no live ServiceNow access or deployment policy change.

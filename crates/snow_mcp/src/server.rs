@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::signal;
 
 use crate::config::McpConfig;
+use crate::daemon_bridge::{DaemonJsonRpcClient, LocalSocketDaemonJsonRpcClient};
 use crate::domain::policy::is_write_tool;
 use crate::planner::is_governed_write_tool;
 use crate::planner::knowledge_grounding::{KbGroundedPlanner, content_hash};
@@ -129,6 +130,27 @@ impl McpServer {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return invalid_params(id, "missing tool name");
         };
+        if matches!(
+            name,
+            "incident_bulk_plan_update" | "incident_bulk_apply_update"
+        ) {
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let client = LocalSocketDaemonJsonRpcClient::from_socket_path(
+                self.core.config().daemon.socket_path.clone(),
+            );
+            return match client.request(name, arguments).await {
+                Ok(result) => JsonRpcResponse::ok(id, result),
+                Err(Error::DaemonJsonRpc {
+                    code,
+                    message,
+                    data,
+                }) => JsonRpcResponse::error(id, code, message, data),
+                Err(error) => service_failure(id, error),
+            };
+        }
         if is_governed_write_tool(name) {
             return daemon_required_for_write(id, name, "daemon required for governed write");
         }
@@ -184,6 +206,8 @@ impl McpServer {
             "server_query" => self.call_server_query(id, params).await,
             "server_fields" => self.call_server_fields(id, params).await,
             "incident_fields" => self.call_incident_fields(id, params).await,
+            "incident_get" => self.call_incident_get(id, params).await,
+            "incident_query" => self.call_incident_query(id, params).await,
             "search_knowledge" | "knowledge_search" => self.call_search_knowledge(id, params).await,
             "kb_semantic_search" => self.call_kb_semantic_search(id, params).await,
             "get_article" | "knowledge_fetch" => self.call_get_article(id, params).await,
@@ -1182,6 +1206,36 @@ impl McpServer {
         }
     }
 
+    async fn call_incident_get(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let input = match serde_json::from_value::<snow_core::IncidentGetInput>(arguments) {
+            Ok(input) => input,
+            Err(error) => return incident_invalid_params(id, error.to_string()),
+        };
+        match self.core.incident_get(input).await {
+            Ok(envelope) => JsonRpcResponse::ok(id, json!(envelope)),
+            Err(error) => incident_read_error_response(id, error),
+        }
+    }
+
+    async fn call_incident_query(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let input = match serde_json::from_value::<snow_core::IncidentQueryInput>(arguments) {
+            Ok(input) => input,
+            Err(error) => return incident_invalid_params(id, error.to_string()),
+        };
+        match self.core.incident_query(input).await {
+            Ok(envelope) => JsonRpcResponse::ok(id, json!(envelope)),
+            Err(error) => incident_read_error_response(id, error),
+        }
+    }
+
     async fn call_server_fields(&self, id: Option<Value>, _params: &Value) -> JsonRpcResponse {
         let records = match self
             .core
@@ -1621,9 +1675,12 @@ impl McpServer {
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .min(50) as u32;
-        match self.core.search_catalog_items(query, limit).await {
-            Ok(items) => JsonRpcResponse::ok(id, json!({ "items": items })),
-            Err(err) => service_failure(id, err),
+        match self.core.catalog_items_search_envelope(query, limit).await {
+            Ok(envelope) => match serde_json::to_value(envelope) {
+                Ok(value) => JsonRpcResponse::ok(id, value),
+                Err(err) => catalog_read_error_response(id, err.into()),
+            },
+            Err(err) => catalog_read_error_response(id, err),
         }
     }
 
@@ -1638,9 +1695,12 @@ impl McpServer {
         else {
             return invalid_params(id, "missing sys_id");
         };
-        match self.core.get_catalog_item(sys_id).await {
-            Ok(item) => JsonRpcResponse::ok(id, json!({ "item": item })),
-            Err(err) => service_failure(id, err),
+        match self.core.catalog_item_get_envelope(sys_id).await {
+            Ok(envelope) => match serde_json::to_value(envelope) {
+                Ok(value) => JsonRpcResponse::ok(id, value),
+                Err(err) => catalog_read_error_response(id, err.into()),
+            },
+            Err(err) => catalog_read_error_response(id, err),
         }
     }
 
@@ -2327,6 +2387,83 @@ fn record_query_error_response(id: Option<Value>, err: anyhow::Error) -> JsonRpc
     }
 }
 
+fn incident_invalid_params(id: Option<Value>, details: String) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32602,
+        "invalid params",
+        Some(json!({ "code": "INVALID_PARAMS", "details": details })),
+    )
+}
+
+fn incident_read_error_response(
+    id: Option<Value>,
+    error: snow_core::IncidentReadError,
+) -> JsonRpcResponse {
+    use snow_core::IncidentReadError;
+    match error {
+        IncidentReadError::InvalidParams(details) => incident_invalid_params(id, details),
+        IncidentReadError::StateUnresolved {
+            requested,
+            ambiguous,
+            unavailable,
+            choices,
+        } => JsonRpcResponse::error(
+            id,
+            -32602,
+            "incident state unresolved",
+            Some(json!({
+                "code": "INCIDENT_STATE_UNRESOLVED",
+                "requested": requested,
+                "table": "incident",
+                "field": "state",
+                "ambiguous": ambiguous,
+                "unavailable": unavailable,
+                "choices": choices.into_iter().map(|choice| json!({
+                    "value": choice.value,
+                    "label": choice.label
+                })).collect::<Vec<_>>()
+            })),
+        ),
+        IncidentReadError::NotFound => JsonRpcResponse::error(
+            id,
+            -32004,
+            "incident not found",
+            Some(json!({ "code": "INCIDENT_NOT_FOUND" })),
+        ),
+        IncidentReadError::NumberAmbiguous => JsonRpcResponse::error(
+            id,
+            -32005,
+            "incident number is ambiguous",
+            Some(json!({ "code": "INCIDENT_NUMBER_AMBIGUOUS" })),
+        ),
+        IncidentReadError::LookupUnavailable => JsonRpcResponse::error(
+            id,
+            -32007,
+            "incident lookup is unavailable",
+            Some(json!({ "code": "INCIDENT_LOOKUP_UNAVAILABLE" })),
+        ),
+        IncidentReadError::AclDenied => JsonRpcResponse::error(
+            id,
+            -32003,
+            "access denied",
+            Some(json!({ "code": "ACL_DENIED" })),
+        ),
+        IncidentReadError::ServiceNowUnavailable => JsonRpcResponse::error(
+            id,
+            -32001,
+            "ServiceNow unavailable",
+            Some(json!({ "code": "SERVICENOW_UNAVAILABLE" })),
+        ),
+        IncidentReadError::ServiceNowError => JsonRpcResponse::error(
+            id,
+            -32000,
+            "ServiceNow error",
+            Some(json!({ "code": "SERVICENOW_ERROR" })),
+        ),
+    }
+}
+
 fn daemon_required_for_write(id: Option<Value>, tool: &str, details: &str) -> JsonRpcResponse {
     JsonRpcResponse::error(
         id,
@@ -2345,6 +2482,27 @@ fn service_failure(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
         id,
         -32000,
         "service failure",
+        Some(json!({ "details": err.to_string() })),
+    )
+}
+
+fn catalog_read_error_response(id: Option<Value>, err: anyhow::Error) -> JsonRpcResponse {
+    if let Some(miss) = err.downcast_ref::<snow_core::cache::policy::CacheMiss>() {
+        return JsonRpcResponse::error(
+            id,
+            -32072,
+            "cache miss",
+            Some(json!({
+                "code": "CACHE_MISS",
+                "operation": miss.operation,
+                "object": miss.object,
+            })),
+        );
+    }
+    JsonRpcResponse::error(
+        id,
+        -32000,
+        "internal error",
         Some(json!({ "details": err.to_string() })),
     )
 }

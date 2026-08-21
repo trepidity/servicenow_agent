@@ -51,6 +51,13 @@ async fn build_fixture_state_with_config_instance(
         .auth(BasicAuth::new("tester", "secret"))
         .build()
         .await?;
+    let write_client = ServiceNowClient::builder()
+        .instance(client_instance_url)
+        .allow_http()
+        .auth(BasicAuth::new("tester", "secret"))
+        .max_retries(0)
+        .build()
+        .await?;
 
     let mut config = SnowConfig {
         instance: InstanceConfig {
@@ -73,6 +80,7 @@ async fn build_fixture_state_with_config_instance(
     let core = SnowCore::builder()
         .config(config.clone())
         .client(client)
+        .write_client(write_client)
         .vault_path(vault_path)
         .build()
         .await?;

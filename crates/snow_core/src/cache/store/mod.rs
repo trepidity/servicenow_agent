@@ -6,9 +6,10 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-pub const CACHE_FORMAT_ID: &str = "snow-cache-v1";
+pub const CACHE_FORMAT_ID: &str = "snow-cache-v2";
 
 mod business_applications;
+mod catalog_products;
 mod error;
 mod helpers;
 mod knowledge;
@@ -101,7 +102,25 @@ impl Store {
             )
             .optional();
         match marker {
-            Ok(Some(marker)) if marker == CACHE_FORMAT_ID => Ok(CacheFormat::Current),
+            Ok(Some(marker)) if marker == CACHE_FORMAT_ID => {
+                let projection_tables = conn.query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('catalog_products_complete', 'catalog_products_narrowed')
+                    "#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if projection_tables == 2 {
+                    Ok(CacheFormat::Current)
+                } else {
+                    Ok(CacheFormat::Incompatible {
+                        found: format!("{CACHE_FORMAT_ID} missing typed catalog projection"),
+                    })
+                }
+            }
             Ok(Some(marker)) => Ok(CacheFormat::Incompatible {
                 found: format!("cache format marker {marker:?}"),
             }),

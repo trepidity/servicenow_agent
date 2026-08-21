@@ -11,6 +11,139 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct IncidentResource;
 
+/// Default and maximum page sizes for the fixed `incident_query` operation.
+pub const INCIDENT_QUERY_DEFAULT_LIMIT: usize = 50;
+pub const INCIDENT_QUERY_MAX_LIMIT: usize = 200;
+
+/// Native ServiceNow fields returned by `incident_query`.
+pub const INCIDENT_QUERY_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "short_description",
+    "state",
+    "active",
+    "priority",
+    "impact",
+    "urgency",
+    "opened_at",
+    "resolved_at",
+    "closed_at",
+    "caller_id",
+    "assigned_to",
+    "assignment_group",
+    "cmdb_ci",
+    "business_service",
+    "category",
+    "subcategory",
+    "sys_created_on",
+    "sys_updated_on",
+    "sys_updated_by",
+];
+
+/// One Incident record preserving ServiceNow's native field names and values.
+pub type IncidentRecord = BTreeMap<String, FieldValue>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentGetInput {
+    #[serde(default)]
+    pub number: Option<String>,
+    #[serde(default)]
+    pub sys_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentQueryFilters {
+    #[serde(default)]
+    pub numbers: Option<Vec<String>>,
+    #[serde(default)]
+    pub assignment_group: Option<String>,
+    #[serde(default)]
+    pub assigned_to: Option<String>,
+    #[serde(default)]
+    pub caller_id: Option<String>,
+    #[serde(default)]
+    pub cmdb_ci: Option<String>,
+    #[serde(default)]
+    pub states: Option<Vec<String>>,
+    #[serde(default)]
+    pub priorities: Option<Vec<u8>>,
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub opened_after: Option<String>,
+    #[serde(default)]
+    pub opened_before: Option<String>,
+    #[serde(default)]
+    pub updated_after: Option<String>,
+    #[serde(default)]
+    pub updated_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentQueryInput {
+    #[serde(default)]
+    pub filters: IncidentQueryFilters,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentGetData {
+    pub record: IncidentRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentQueryData {
+    pub records: Vec<IncidentRecord>,
+    pub next_cursor: Option<String>,
+    pub limit: usize,
+    pub rows_inspected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncidentReadError {
+    InvalidParams(String),
+    StateUnresolved {
+        requested: String,
+        ambiguous: bool,
+        unavailable: bool,
+        choices: Vec<FieldChoice>,
+    },
+    NotFound,
+    NumberAmbiguous,
+    LookupUnavailable,
+    AclDenied,
+    ServiceNowUnavailable,
+    ServiceNowError,
+}
+
+impl std::fmt::Display for IncidentReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParams(message) => formatter.write_str(message),
+            Self::StateUnresolved { requested, .. } => {
+                write!(
+                    formatter,
+                    "incident state `{requested}` could not be resolved"
+                )
+            }
+            Self::NotFound => formatter.write_str("incident not found"),
+            Self::NumberAmbiguous => formatter.write_str("incident number is ambiguous"),
+            Self::LookupUnavailable => formatter.write_str("incident lookup is unavailable"),
+            Self::AclDenied => formatter.write_str("access to incident was denied"),
+            Self::ServiceNowUnavailable => formatter.write_str("ServiceNow is unavailable"),
+            Self::ServiceNowError => formatter.write_str("ServiceNow request failed"),
+        }
+    }
+}
+
+impl std::error::Error for IncidentReadError {}
+
 impl IncidentResource {
     pub fn from_servicenow(record: &Record) -> SnowRecord {
         let mut model = SnowRecord::from_servicenow(record);
@@ -88,6 +221,29 @@ impl IncidentResource {
                             .as_ref()
                             .map(|v| match v {
                                 serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default(),
+                        display_value: value.display_value.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub fn native_fields(record: &Record) -> IncidentRecord {
+        record
+            .fields()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    FieldValue {
+                        value: value
+                            .value
+                            .as_ref()
+                            .map(|raw| match raw {
+                                serde_json::Value::String(text) => text.clone(),
                                 other => other.to_string(),
                             })
                             .unwrap_or_default(),

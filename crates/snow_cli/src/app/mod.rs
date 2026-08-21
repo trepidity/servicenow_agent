@@ -72,6 +72,9 @@ pub(super) enum ShowTarget {
 }
 
 pub(crate) fn run_entry(cli: Cli) -> Result<(), SnowError> {
+    if let Command::CachePolicy { action } = cli.command {
+        return daemon_cmd::cache_policy::run(action).map_err(SnowError::from);
+    }
     // Daemon lifecycle commands launch or become the daemon process. Keep them
     // outside any Tokio runtime so the daemon child can build its own runtime.
     if let Command::Daemon { action } = cli.command {
@@ -316,6 +319,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         Command::VerifyVault => cmd_verify_vault(core.as_ref()).await,
         Command::PruneOrphans { dry_run } => cmd_prune_orphans(core.as_ref(), dry_run).await,
         Command::CacheInfo => unreachable!("handled before auth setup"),
+        Command::CachePolicy { .. } => unreachable!("handled before auth setup"),
         Command::Knowledge {
             number,
             fresh,

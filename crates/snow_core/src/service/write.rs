@@ -10,7 +10,7 @@
 //! [`CoreContext`] (Task 6).
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,13 +21,26 @@ use servicenow_rs::prelude::{
 
 use crate::context::CoreContext;
 use crate::resource;
+use crate::resource::catalog::{
+    CatalogItemGetData, CatalogItemsSearchData, catalog_item_from_record,
+};
 use crate::{
-    CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable, ChangeWriteResult,
-    ResourcePlanWriteResult, SetMode, SimpleRef, StoryWriteResult, TimeCard, TimeValue,
-    TimecardSheet, UserRef, WeekSelector, Weekday, canonical_record_table,
-    normalize_record_lookup_sys_id, parse_servicenow_date, record_bool,
+    CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable, ChangeWriteConcurrency,
+    ChangeWriteResult, Completeness, OperationEnvelope, PartialReason, ResourcePlanWriteResult,
+    SetMode, SimpleRef, SnowRecord, StoryWriteResult, TimeCard, TimeValue, TimecardSheet, UserRef,
+    WeekSelector, Weekday,
+    cache::policy::{CacheMiss, CacheMode},
+    canonical_record_table, normalize_record_lookup_sys_id, parse_servicenow_date, record_bool,
     record_field_display_or_raw, record_field_raw_or_display,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum IncidentWriteError {
+    #[error(transparent)]
+    Upstream(#[from] anyhow::Error),
+    #[error("local Incident coherence failed after ServiceNow accepted the PATCH: {0}")]
+    LocalCoherence(anyhow::Error),
+}
 
 const TIME_SHEET_FIELDS: &[&str] = &[
     "sys_id",
@@ -72,31 +85,6 @@ fn time_sheet_row_contains_date(row: &Record, date: NaiveDate) -> bool {
     )
     .map(|start| date >= start && date < start + chrono::Duration::days(7))
     .unwrap_or(false)
-}
-
-fn catalog_item_from_record(record: Record, variables: Vec<CatalogVariable>) -> CatalogItem {
-    let name = record
-        .get_str("name")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&record.sys_id)
-        .to_string();
-    let short_description = record
-        .get_str("short_description")
-        .unwrap_or_default()
-        .to_string();
-    let table = record
-        .get_raw("sys_class_name")
-        .or_else(|| record.get_display("sys_class_name"))
-        .unwrap_or("sc_cat_item")
-        .to_string();
-    CatalogItem {
-        sys_id: record.sys_id,
-        name,
-        short_description,
-        table,
-        variables,
-    }
 }
 
 fn catalog_variable_from_record(
@@ -523,15 +511,42 @@ impl WriteService {
         .await
     }
 
-    /// Updates an Incident through the same refetch-and-concurrency contract
-    /// used by governed Change writes.
+    /// Updates one Incident with no automatic PATCH retries and leaves the
+    /// live-only Incident family with no local projection.
     pub async fn update_incident(
         &self,
         sys_id: &str,
         payload: serde_json::Value,
-    ) -> Result<ChangeWriteResult> {
-        self.update_change_write_record("incident", sys_id, payload)
+    ) -> std::result::Result<ChangeWriteResult, IncidentWriteError> {
+        let write_client =
+            self.ctx.write_client.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("governed Incident write client is not configured")
+            })?;
+        write_client
+            .table("incident")
+            .update(sys_id, payload)
             .await
+            .map_err(anyhow::Error::from)?;
+        let fresh_row = self
+            .ctx
+            .client
+            .table("incident")
+            .display_value(DisplayValue::Both)
+            .get(sys_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(IncidentWriteError::LocalCoherence)?;
+        let concurrency = ChangeWriteConcurrency::from_fresh_row(&fresh_row)
+            .map_err(IncidentWriteError::LocalCoherence)?;
+        let record = SnowRecord::from_servicenow(&fresh_row);
+        self.ctx
+            .prune_record(sys_id, Utc::now())
+            .await
+            .map_err(IncidentWriteError::LocalCoherence)?;
+        Ok(ChangeWriteResult {
+            record,
+            concurrency,
+        })
     }
 
     pub async fn create_resource_plan(
@@ -690,6 +705,97 @@ impl WriteService {
     }
 
     pub async fn search_catalog_items(&self, query: &str, limit: u32) -> Result<Vec<CatalogItem>> {
+        Ok(self
+            .search_catalog_items_live(query, limit)
+            .await?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect())
+    }
+
+    pub async fn catalog_items_search_envelope(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<OperationEnvelope<CatalogItemsSearchData>> {
+        const OPERATION: &str = "catalog_items_search";
+        const OBJECT: &str = "service_catalog_product";
+        let rule = self
+            .ctx
+            .named_cache_policy
+            .active()
+            .rule_for(OPERATION, OBJECT);
+        let limit = limit.clamp(1, 50);
+
+        if rule.mode != CacheMode::Live {
+            let cached = self
+                .ctx
+                .query
+                .store()
+                .search_narrowed_catalog_products(query, limit as usize)?;
+            if !cached.is_empty() {
+                let last_refreshed_at = cached
+                    .iter()
+                    .map(|row| row.last_refreshed_at)
+                    .min()
+                    .expect("non-empty catalog cache has a refresh timestamp");
+                let fresh = rule.ttl.is_some_and(|ttl| {
+                    cached
+                        .iter()
+                        .all(|row| row.last_refreshed_at + ttl > Utc::now())
+                });
+                if rule.mode == CacheMode::CacheOnly || fresh {
+                    return Ok(OperationEnvelope::cached(
+                        OPERATION,
+                        last_refreshed_at,
+                        Completeness::Partial {
+                            reason: PartialReason::NarrowedProjection,
+                        },
+                        CatalogItemsSearchData {
+                            items: cached.into_iter().map(|row| row.item).collect(),
+                        },
+                    ));
+                }
+            } else if rule.mode == CacheMode::CacheOnly {
+                return Err(CacheMiss {
+                    operation: OPERATION,
+                    object: OBJECT,
+                }
+                .into());
+            }
+        }
+
+        let live = self.search_catalog_items_live(query, limit).await?;
+        let items = live
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        if rule.mode == CacheMode::ReadThrough && !live.is_empty() {
+            let refreshed_at = Utc::now();
+            let records = live
+                .iter()
+                .map(|(record, _)| record.clone())
+                .collect::<Vec<_>>();
+            self.ctx.project_live_records_without_vault(&records)?;
+            for item in &items {
+                self.ctx
+                    .query
+                    .store()
+                    .upsert_narrowed_catalog_product(item, refreshed_at)?;
+            }
+        }
+        Ok(OperationEnvelope::live_partial(
+            OPERATION,
+            PartialReason::NarrowedProjection,
+            CatalogItemsSearchData { items },
+        ))
+    }
+
+    async fn search_catalog_items_live(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<(Record, CatalogItem)>> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
@@ -717,11 +823,74 @@ impl WriteService {
 
         Ok(records
             .into_iter()
-            .map(|record| catalog_item_from_record(record, Vec::new()))
+            .map(|record| {
+                let item = catalog_item_from_record(&record, Vec::new());
+                (record, item)
+            })
             .collect())
     }
 
     pub async fn get_catalog_item(&self, sys_id: &str) -> Result<CatalogItem> {
+        Ok(self.get_catalog_item_live(sys_id).await?.1)
+    }
+
+    pub async fn catalog_item_get_envelope(
+        &self,
+        sys_id: &str,
+    ) -> Result<OperationEnvelope<CatalogItemGetData>> {
+        const OPERATION: &str = "catalog_item_get";
+        const OBJECT: &str = "service_catalog_product";
+        let sys_id = normalize_record_lookup_sys_id(sys_id)?;
+        let rule = self
+            .ctx
+            .named_cache_policy
+            .active()
+            .rule_for(OPERATION, OBJECT);
+
+        if rule.mode != CacheMode::Live {
+            let cached = self
+                .ctx
+                .query
+                .store()
+                .get_complete_catalog_product(&sys_id)?;
+            if let Some(cached) = cached {
+                let fresh = rule
+                    .ttl
+                    .is_some_and(|ttl| cached.last_refreshed_at + ttl > Utc::now());
+                if rule.mode == CacheMode::CacheOnly || fresh {
+                    return Ok(OperationEnvelope::cached(
+                        OPERATION,
+                        cached.last_refreshed_at,
+                        Completeness::Complete,
+                        CatalogItemGetData { item: cached.item },
+                    ));
+                }
+            } else if rule.mode == CacheMode::CacheOnly {
+                return Err(CacheMiss {
+                    operation: OPERATION,
+                    object: OBJECT,
+                }
+                .into());
+            }
+        }
+
+        let (record, item) = self.get_catalog_item_live(&sys_id).await?;
+        if rule.mode == CacheMode::ReadThrough {
+            let refreshed_at = Utc::now();
+            self.ctx
+                .project_live_records_without_vault(std::slice::from_ref(&record))?;
+            self.ctx
+                .query
+                .store()
+                .upsert_complete_catalog_product(&item, refreshed_at)?;
+        }
+        Ok(OperationEnvelope::live_complete(
+            OPERATION,
+            CatalogItemGetData { item },
+        ))
+    }
+
+    async fn get_catalog_item_live(&self, sys_id: &str) -> Result<(Record, CatalogItem)> {
         let sys_id = normalize_record_lookup_sys_id(sys_id)?;
         let item = self
             .ctx
@@ -738,7 +907,8 @@ impl WriteService {
             .get(&sys_id)
             .await?;
         let variables = self.catalog_item_variables(&sys_id).await?;
-        Ok(catalog_item_from_record(item, variables))
+        let catalog_item = catalog_item_from_record(&item, variables);
+        Ok((item, catalog_item))
     }
 
     async fn catalog_item_variables(&self, item_sys_id: &str) -> Result<Vec<CatalogVariable>> {
