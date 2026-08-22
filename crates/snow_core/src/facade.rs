@@ -761,6 +761,15 @@ impl SnowCore {
         self.descriptors.incident_descriptor().await
     }
 
+    /// Determine whether a record-derived table supports one field.
+    ///
+    /// This is an internal composition capability, not a transport operation:
+    /// callers must derive `table` from an already-resolved record and must not
+    /// pass a caller-selected table through any public interface.
+    pub async fn supports_field(&self, table: &str, field: &str) -> Result<FieldSupport<bool>> {
+        self.descriptors.supports_field(table, field).await
+    }
+
     pub async fn reassign(&self, number: &str, user: &str) -> Result<Option<SnowRecord>> {
         self.records.reassign(number, user).await
     }

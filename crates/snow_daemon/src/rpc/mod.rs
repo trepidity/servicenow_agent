@@ -60,3 +60,5 @@ mod incident_read_parity_tests;
 mod resource_cache_policy_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod work_note_support_tests;

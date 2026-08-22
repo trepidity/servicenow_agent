@@ -2013,7 +2013,7 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
     let cache_info = cache_info.result.expect("cache info");
     assert_eq!(
         cache_info.get("total_rows").and_then(Value::as_u64),
-        Some(4)
+        Some(5)
     );
     assert!(
         cache_info

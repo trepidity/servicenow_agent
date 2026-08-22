@@ -30,7 +30,9 @@ use crate::{FieldChoice, ResourceType};
 ///
 /// Bound as a constant rather than a parameter: a caller-supplied table would
 /// turn typed metadata discovery into the generic table browser this contract
-/// explicitly forbids.
+/// explicitly forbids. Internal callers may make a record-derived field-support
+/// probe only; that narrow capability does not expose table browsing on any
+/// public transport.
 pub const INCIDENT_TABLE: &str = "incident";
 
 /// Named operation for Incident metadata discovery.
@@ -87,6 +89,26 @@ impl DescriptorService {
             INCIDENT_FIELDS_OPERATION,
             descriptor,
         ))
+    }
+
+    /// Determine whether a record-derived table supports one field.
+    ///
+    /// This is deliberately narrower than exposing full descriptor discovery:
+    /// callers receive only the requested support fact, and must never accept
+    /// the table from an RPC or MCP request.
+    pub(crate) async fn supports_field(
+        &self,
+        table: &str,
+        field: &str,
+    ) -> Result<FieldSupport<bool>> {
+        match self.discover_fields(table).await? {
+            FieldSupport::Available { value } => Ok(FieldSupport::available_value(
+                value
+                    .iter()
+                    .any(|candidate| candidate.descriptor.name == field),
+            )),
+            FieldSupport::Unavailable { reason } => Ok(FieldSupport::Unavailable { reason }),
+        }
     }
 
     /// Build a descriptor for one typed family by reading its dictionary.
