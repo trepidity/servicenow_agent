@@ -461,6 +461,37 @@ pub(in crate::rpc) async fn dispatch_records(
             },
             Err(err) => invalid_params(id, err),
         },
+        // Narrow live CTASK child read for Change setup. Unlike get_children,
+        // this never reads the local vault and reports page completeness.
+        RpcMethod::ChangeRequestListTasks => {
+            match serde_json::from_value::<snow_core::ChangeRequestTaskListInput>(
+                request.params.clone(),
+            ) {
+                Ok(input) => match snow_core::validate_change_request_task_list(input.clone()) {
+                    Ok(_) => match state.core.change_request_list_tasks(input).await {
+                        Ok(page) => {
+                            let completeness = if page.complete {
+                                json!({ "kind": "complete" })
+                            } else {
+                                json!({ "kind": "partial", "reason": "page_limit_reached" })
+                            };
+                            JsonRpcResponse::ok(
+                                id,
+                                json!({
+                                    "operation": "change_request_list_tasks",
+                                    "source": { "kind": "live" },
+                                    "completeness": completeness,
+                                    "data": page,
+                                }),
+                            )
+                        }
+                        Err(err) => internal_error(id, err),
+                    },
+                    Err(err) => invalid_params(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
         RpcMethod::GetWorkNotes => match extract_record_lookup(&request.params) {
             Ok(lookup) => {
                 match get_record_by_lookup_cached_or_fresh(state.core.as_ref(), lookup).await {

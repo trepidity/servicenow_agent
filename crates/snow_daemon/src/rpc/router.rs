@@ -67,6 +67,7 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         | RpcMethod::UserSearch
         | RpcMethod::ResourcePlanList
         | RpcMethod::GetChildren
+        | RpcMethod::ChangeRequestListTasks
         | RpcMethod::GetWorkNotes
         | RpcMethod::ListRecords
         | RpcMethod::RecordQuery

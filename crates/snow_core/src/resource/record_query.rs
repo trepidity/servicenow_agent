@@ -18,6 +18,25 @@ pub const CHANGE_REQUEST_QUERY_FIELDS: &[&str] = &[
     "cmdb_ci",
 ];
 
+/// Fixed, live projection for the Change Request child-read contract.
+///
+/// This is intentionally separate from the general Change Request query: the
+/// only selector is a parent CHG number and the only rows are CTASK children.
+pub const CHANGE_REQUEST_TASK_QUERY_FIELDS: &[&str] = &[
+    "sys_id",
+    "number",
+    "short_description",
+    "state",
+    "due_date",
+    "planned_start_date",
+    "planned_end_date",
+    "assigned_to",
+    "assignment_group",
+    "change_task_type",
+    "cmdb_ci",
+    "change_request",
+];
+
 pub const STORY_QUERY_FIELDS: &[&str] = &[
     "sys_id",
     "number",
@@ -78,6 +97,23 @@ pub struct ChangeRequestQueryFilters {
     pub start_date_after: Option<String>,
     #[serde(default)]
     pub start_date_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeRequestTaskListInput {
+    pub change_request_number: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedChangeRequestTaskListInput {
+    pub change_request_number: String,
+    pub limit: usize,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,6 +283,22 @@ pub fn validate_record_query(
             })
         }
     }
+}
+
+pub fn validate_change_request_task_list(
+    input: ChangeRequestTaskListInput,
+) -> Result<ValidatedChangeRequestTaskListInput, RecordQueryError> {
+    let change_request_number = input.change_request_number.trim().to_ascii_uppercase();
+    if !change_request_number.starts_with("CHG") || change_request_number.len() <= 3 {
+        return Err(RecordQueryError::InvalidParams(
+            "`change_request_number` must be a non-empty CHG number".to_string(),
+        ));
+    }
+    Ok(ValidatedChangeRequestTaskListInput {
+        change_request_number,
+        limit: validate_limit(input.limit)?,
+        cursor: normalize_cursor(input.cursor)?,
+    })
 }
 
 pub fn resolve_record_query_state(

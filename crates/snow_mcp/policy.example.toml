@@ -144,7 +144,7 @@ enabled = false
 requires_confirmation = true
 environments = ["test", "training"]
 field_allowlist = [
-    "short_description", "description", "type", "category",
+    "short_description", "description", "type", "category", "contact_type",
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
     "implementation_plan", "change_plan", "backout_plan", "test_plan",
     "risk", "impact", "justification",
@@ -174,7 +174,8 @@ requires_confirmation = true
 environments = ["test", "training"]
 field_allowlist = [
     "change_request", "short_description", "description", "assignment_group",
-    "assigned_to", "start_date", "end_date", "state", "work_notes",
+    "assigned_to", "cmdb_ci", "change_task_type", "planned_start_date", "planned_end_date",
+    "due_date", "u_primary_tester", "start_date", "end_date", "state", "work_notes",
 ]
 
 [mcp.tools.change_task_apply_update]
@@ -184,7 +185,8 @@ environments = ["test", "training"]
 skip_terminal_records = true
 field_allowlist = [
     "short_description", "description", "assignment_group", "assigned_to",
-    "start_date", "end_date", "state", "work_notes",
+    "cmdb_ci", "change_task_type", "planned_start_date", "planned_end_date", "due_date",
+    "u_primary_tester", "start_date", "end_date", "state", "work_notes",
 ]
 
 [mcp.tools.resource_plan_plan_create]

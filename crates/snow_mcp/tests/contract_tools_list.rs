@@ -1407,4 +1407,54 @@ fn policy_defaults_allow_full_change_request_form_fields() {
         );
     }
     assert!(update.contains("state"));
+    assert!(create.contains("contact_type"));
+    assert!(!update.contains("contact_type"));
+}
+
+#[test]
+fn policy_defaults_allow_the_change_task_restore_and_tester_fields() {
+    let cfg = PolicyConfig::default();
+    let create = &cfg
+        .tools
+        .get("change_task_apply_create")
+        .expect("change task create policy")
+        .field_allowlist;
+    let update = &cfg
+        .tools
+        .get("change_task_apply_update")
+        .expect("change task update policy")
+        .field_allowlist;
+
+    for field in [
+        "change_request",
+        "short_description",
+        "description",
+        "assignment_group",
+        "start_date",
+        "end_date",
+        "cmdb_ci",
+        "change_task_type",
+        "planned_start_date",
+        "planned_end_date",
+        "due_date",
+        "u_primary_tester",
+    ] {
+        assert!(
+            create.contains(field),
+            "change_task_apply_create missing {field}"
+        );
+    }
+    for field in [
+        "cmdb_ci",
+        "change_task_type",
+        "planned_start_date",
+        "planned_end_date",
+        "due_date",
+        "u_primary_tester",
+    ] {
+        assert!(
+            update.contains(field),
+            "change_task_apply_update missing {field}"
+        );
+    }
 }

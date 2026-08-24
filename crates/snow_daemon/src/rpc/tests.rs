@@ -313,6 +313,14 @@ fn contract_info_method_lists_cover_canonical_and_deprecated_rpc_methods() {
     }
 }
 
+#[test]
+fn contract_info_advertises_the_named_live_change_task_child_read() {
+    assert!(
+        SUPPORTED_RPC_METHODS.contains(&"change_request_list_tasks"),
+        "the Mullet Change workflow must not fall back to cached get_children"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_rejects_deferred_catalog_cancellation_as_unknown() {
     let fixture = build_fixture_state().await.expect("fixture");
@@ -4308,4 +4316,55 @@ async fn record_query_is_routable_and_advertised() {
             .iter()
             .any(|method| method == "record_query")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn change_request_list_tasks_is_live_paged_and_never_uses_cached_children() {
+    let (instance_url, request_rx) = spawn_json_http_sequence_server(vec![json!({
+        "result": [{
+            "sys_id": "22222222222222222222222222222222",
+            "number": "CTASK0000001",
+            "short_description": "Plan the approved change",
+            "change_request": { "value": "change-sys", "display_value": "CHG0000001" },
+            "change_task_type": { "value": "planning", "display_value": "Planning" },
+            "state": { "value": "1", "display_value": "Open" }
+        }]
+    })])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "change_request_list_tasks".to_string(),
+            params: json!({ "change_request_number": "CHG0000001", "limit": 1 }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("live task page");
+    assert_eq!(result["operation"], json!("change_request_list_tasks"));
+    assert_eq!(result["source"]["kind"], json!("live"));
+    assert_eq!(result["completeness"]["kind"], json!("partial"));
+    assert_eq!(result["data"]["complete"], json!(false));
+    assert_eq!(
+        result["data"]["next_cursor"],
+        json!("22222222222222222222222222222222")
+    );
+    assert_eq!(
+        result["data"]["records"][0]["number"],
+        json!("CTASK0000001")
+    );
+
+    let requests = request_rx.await.expect("one live ServiceNow request");
+    let request = requests.first().expect("first request");
+    assert!(request.contains("/api/now/table/change_task"));
+    assert!(request.contains("change_request.number%3DCHG0000001"));
+    assert!(request.contains("sysparm_limit=1"));
 }

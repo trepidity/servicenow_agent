@@ -492,6 +492,13 @@ impl SnowCore {
         self.records.record_query(input).await
     }
 
+    pub async fn change_request_list_tasks(
+        &self,
+        input: ChangeRequestTaskListInput,
+    ) -> Result<RecordQueryPage> {
+        self.records.change_request_list_tasks(input).await
+    }
+
     pub async fn my_tasks(&self) -> Result<Vec<SnowRecord>> {
         self.records.my_tasks().await
     }

@@ -27,7 +27,8 @@ use crate::query;
 use crate::query::filter::ListQuery;
 use crate::resource;
 use crate::{
-    BUSINESS_APPLICATION_TABLE, CHANGE_REQUEST_QUERY_FIELDS, DegradedReadDiagnostic, FieldChoice,
+    BUSINESS_APPLICATION_TABLE, CHANGE_REQUEST_QUERY_FIELDS, CHANGE_REQUEST_TASK_QUERY_FIELDS,
+    ChangeRequestTaskListInput, DegradedReadDiagnostic, FieldChoice,
     INCIDENT_GROUP_LIST_DEFAULT_LIMIT, INCIDENT_GROUP_LIST_MAX_LIMIT, INCIDENT_QUERY_DEFAULT_LIMIT,
     INCIDENT_QUERY_FIELDS, INCIDENT_QUERY_MAX_LIMIT, INCIDENT_QUEUE_DEFAULT_SCAN_LIMIT,
     INCIDENT_QUEUE_MAX_KNOWN_SYS_IDS, INCIDENT_QUEUE_MAX_SCAN_LIMIT, IncidentAssignmentGroup,
@@ -44,7 +45,8 @@ use crate::{
     SearchScope, SnowRecord, TaskSelector, TaskSlaParentRef, TaskSlaReadability, TaskSlaStatus,
     TaskSlaSummaryView, ValidatedRecordQuery, is_terminal_state, resolve_incident_state,
     resolve_record_query_state, resource_plan_record_from_row, sort_records_by_number,
-    validate_incident_assignment_group_input, validate_list_input, validate_record_query,
+    validate_change_request_task_list, validate_incident_assignment_group_input,
+    validate_list_input, validate_record_query,
 };
 
 const USER_RECORD_HYDRATE_LIMIT: u32 = 200;
@@ -1256,6 +1258,45 @@ impl RecordService {
             complete,
             source: RecordQuerySource::Live,
             limit,
+            rows_inspected,
+        })
+    }
+
+    /// Returns one bounded, live page of CTASKs for exactly one Change Request.
+    /// The result is ephemeral and never falls back to a cache or vault.
+    pub async fn change_request_list_tasks(
+        &self,
+        input: ChangeRequestTaskListInput,
+    ) -> Result<RecordQueryPage> {
+        let validated = validate_change_request_task_list(input)?;
+        let mut query = self
+            .ctx
+            .client
+            .table("change_task")
+            .fields(CHANGE_REQUEST_TASK_QUERY_FIELDS)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .order_by("sys_id", Order::Asc)
+            .limit(validated.limit as u32)
+            .equals("change_request.number", &validated.change_request_number);
+        if let Some(cursor) = validated.cursor.as_deref() {
+            query = query.greater_than("sys_id", cursor);
+        }
+        let rows = query.execute().await?.records;
+        let rows_inspected = rows.len();
+        let complete = rows_inspected < validated.limit;
+        let next_cursor = if complete {
+            None
+        } else {
+            rows.last().map(|row| row.sys_id.clone())
+        };
+        let records = rows.iter().map(SnowRecord::from_servicenow).collect();
+        Ok(RecordQueryPage {
+            records,
+            next_cursor,
+            complete,
+            source: RecordQuerySource::Live,
+            limit: validated.limit,
             rows_inspected,
         })
     }

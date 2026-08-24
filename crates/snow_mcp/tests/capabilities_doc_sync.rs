@@ -137,6 +137,12 @@ fn example_policy_parses() {
             "example policy {tool} allowlist missing requested_by_date"
         );
     }
+    assert!(
+        cfg.tools["change_request_apply_create"]
+            .field_allowlist
+            .contains("contact_type"),
+        "example policy change_request_apply_create allowlist missing contact_type"
+    );
 
     let read_only_agent = cfg
         .roles

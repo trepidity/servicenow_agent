@@ -48,6 +48,7 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "catalog_plan_request",
     "catalog_submit_request",
     "get_children",
+    "change_request_list_tasks",
     "get_work_notes",
     "list_records",
     "record_query",
