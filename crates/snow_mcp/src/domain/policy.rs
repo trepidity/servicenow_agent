@@ -1040,6 +1040,7 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
         (
             "change_task_apply_update".to_string(),
             change_apply_policy(&[
+                "change_request",
                 "short_description",
                 "description",
                 "assignment_group",

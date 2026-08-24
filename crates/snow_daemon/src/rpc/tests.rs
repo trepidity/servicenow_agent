@@ -744,6 +744,45 @@ async fn change_task_completed_remains_terminal() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn change_task_update_plan_admits_the_parent_restore_field_through_rpc() {
+    let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+        change_update_response("CTASK001", "1", "Open"),
+        json!({ "result": [] }),
+    ])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+    let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+        Arc::clone(&fixture.state.core),
+        fixture.tempdir.path().join("change-task-parent-restore"),
+        enabled_change_update_mcp_config(),
+    ));
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "change_task_plan_update".to_string(),
+            params: json!({
+                "number": "CTASK001",
+                "change_request": "0123456789abcdef0123456789abcdef"
+            }),
+            id: Some(json!(1)),
+        },
+        &state,
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("update plan");
+    assert_eq!(
+        result["preview"]["change_request"],
+        json!("0123456789abcdef0123456789abcdef")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn timecard_apply_dispatch_returns_replay_receipt_through_rpc() {
     use chrono::Utc;
     use snow_mcp::domain::audit::ServiceNowMetadata;
@@ -2504,6 +2543,57 @@ async fn direct_rpc_get_record_refreshes_uncached_demand() {
             .is_none(),
         "a live-only compatibility read must not persist"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_rpc_get_record_ignores_cached_change_and_returns_live_record() {
+    let response = json!({
+        "result": [
+            {
+                "sys_id": "chg-sys",
+                "number": "CHG001",
+                "short_description": "Live emergency patch",
+                "description": "The live record is newer than the cached fixture",
+                "state": "Assess"
+            }
+        ]
+    });
+    let (instance_url, request_rx) =
+        spawn_json_http_sequence_server(vec![response, json!({ "result": [] })])
+            .await
+            .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "get_record".to_string(),
+            params: json!({ "number": "CHG001" }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let record = response
+        .result
+        .expect("record result")
+        .get("record")
+        .cloned()
+        .expect("wrapped record");
+    assert_eq!(
+        record.get("short_description").and_then(Value::as_str),
+        Some("Live emergency patch"),
+        "get_record must not return the cached 'Database patch' fixture"
+    );
+    assert_eq!(record.get("source").and_then(Value::as_str), Some("api"));
+
+    let requests = request_rx.await.expect("request lines");
+    let request_line = requests.first().expect("record request");
+    assert!(request_line.contains("/api/now/table/change_request"));
+    assert!(request_line.contains("CHG001"));
 }
 
 #[tokio::test(flavor = "current_thread")]

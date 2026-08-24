@@ -184,7 +184,7 @@ requires_confirmation = true
 environments = ["test", "training"]
 skip_terminal_records = true
 field_allowlist = [
-    "short_description", "description", "assignment_group", "assigned_to",
+    "change_request", "short_description", "description", "assignment_group", "assigned_to",
     "cmdb_ci", "change_task_type", "planned_start_date", "planned_end_date", "due_date",
     "u_primary_tester", "start_date", "end_date", "state", "work_notes",
 ]

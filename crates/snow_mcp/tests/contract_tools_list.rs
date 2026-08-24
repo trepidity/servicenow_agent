@@ -1183,6 +1183,10 @@ fn schemas_include_required_fields_for_create_update_apply() {
         change_task_update["properties"]["number"]["pattern"],
         "^CTASK\\d+$"
     );
+    assert_eq!(
+        change_task_update["properties"]["change_request"]["type"],
+        "string"
+    );
 
     let work_note_plan = &tool("work_note_plan_add").input_schema;
     assert_eq!(work_note_plan["type"], "object");
@@ -1445,6 +1449,7 @@ fn policy_defaults_allow_the_change_task_restore_and_tester_fields() {
         );
     }
     for field in [
+        "change_request",
         "cmdb_ci",
         "change_task_type",
         "planned_start_date",
