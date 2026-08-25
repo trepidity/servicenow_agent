@@ -44,9 +44,9 @@ use snow_core::{
 
 use crate::error::SnowError;
 use cli::{
-    AttachmentCommand, BusinessAppCommand, BusinessAppFilter, Cli, Command, KnowledgeCommand,
-    KnowledgeSearchModeArg, KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand,
-    TimecardCommand,
+    AttachmentCommand, BusinessAppCommand, BusinessAppFilter, Cli, Command,
+    DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS, KnowledgeCommand, KnowledgeSearchModeArg,
+    KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand, TimecardCommand,
 };
 use tui_client::{
     BusinessApplicationQueryArgs, BusinessApplicationQueryFilter, BusinessApplicationQueryPageArgs,
@@ -54,6 +54,9 @@ use tui_client::{
     BusinessApplicationSyncArgs, BusinessApplicationsForServerArgs, DaemonRpcClient,
     ServerQueryArgs, TuiClient,
 };
+
+const DEFAULT_SERVICENOW_REQUEST_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ShowTarget {
@@ -72,6 +75,9 @@ pub(super) enum ShowTarget {
 }
 
 pub(crate) fn run_entry(cli: Cli) -> Result<(), SnowError> {
+    if let Command::CachePolicy { action } = cli.command {
+        return daemon_cmd::cache_policy::run(action).map_err(SnowError::from);
+    }
     // Daemon lifecycle commands launch or become the daemon process. Keep them
     // outside any Tokio runtime so the daemon child can build its own runtime.
     if let Command::Daemon { action } = cli.command {
@@ -99,9 +105,15 @@ pub(crate) fn run_entry(cli: Cli) -> Result<(), SnowError> {
     if matches!(cli.command, Command::ResetCache) {
         return cmd_reset_cache_offline();
     }
-    if matches!(cli.command, Command::RebuildCache) {
-        ensure_cache_replacement_is_offline("rebuilding")?;
+    if let Command::AdoptCacheOnlyProjection { yes } = cli.command {
+        return cmd_adopt_cache_only_projection(yes);
     }
+    let _cache_maintenance_lock = if matches!(cli.command, Command::RebuildCache { .. }) {
+        ensure_cache_replacement_is_offline("rebuilding")?;
+        Some(acquire_cache_maintenance_lock()?)
+    } else {
+        None
+    };
 
     let auth_context = if command_uses_local_credentials(&cli.command) {
         Some(load_auth_context(&cli)?)
@@ -192,6 +204,14 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
         return cmd_server(&client, action).await;
     }
+    if let Command::Incident { action } = cli.command {
+        let paths = runtime_paths();
+        let instance_url = runtime_instance_url();
+        let endpoint = snow_core::ipc::IpcEndpoint::for_config_dir(&paths.root);
+        let client =
+            DaemonRpcClient::with_endpoint_auto_spawn(endpoint, instance_url, env_name.clone());
+        return cmd_incident(&client, action).await;
+    }
 
     let AuthContext {
         instance,
@@ -203,6 +223,13 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         SnowError::Api("credentials were not prepared for this command".to_string())
     })?;
 
+    let request_timeout = match &cli.command {
+        Command::RebuildCache {
+            timeout_seconds, ..
+        } => Duration::from_secs(*timeout_seconds),
+        _ => DEFAULT_SERVICENOW_REQUEST_TIMEOUT,
+    };
+
     let client_auth = BasicAuth::new(&username, password.as_str()).without_session();
     let core_auth = BasicAuth::new(&username, password.as_str()).without_session();
     let metadata_password = password.clone();
@@ -211,23 +238,36 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
     // Build client
     let mut client_builder = ServiceNowClient::builder()
         .instance(&instance)
-        .auth(client_auth);
+        .auth(client_auth)
+        .timeout(request_timeout);
     let mut core_client_builder = ServiceNowClient::builder()
         .instance(&instance)
-        .auth(core_auth);
+        .auth(core_auth)
+        .timeout(request_timeout);
     if allow_loopback_http_for_local_test(&instance) {
         client_builder = client_builder.allow_http();
         core_client_builder = core_client_builder.allow_http();
     }
     let client = client_builder.build().await?;
     let core_client = core_client_builder.build().await?;
-    if matches!(cli.command, Command::RebuildCache) {
+    if let Command::RebuildCache {
+        page_limit,
+        knowledge_base,
+        knowledge_category,
+        ..
+    } = &cli.command
+    {
         return cmd_rebuild_cache_from_servicenow(
             &instance,
             &username,
             credential,
             metadata_password,
             core_client,
+            *page_limit,
+            snow_core::CacheRebuildKnowledgeScope {
+                knowledge_base_sys_id: knowledge_base.clone(),
+                knowledge_category_sys_id: knowledge_category.clone(),
+            },
         )
         .await;
     }
@@ -298,13 +338,17 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             cmd_timecard(Arc::clone(&core), &env_name, &instance, &username, action).await
         }
         Command::RepairVault => cmd_repair_vault(core.as_ref()).await,
-        Command::RebuildCache | Command::ImportCacheFromVault => {
+        Command::RebuildCache { .. } | Command::ImportCacheFromVault => {
             unreachable!("handled before normal core construction")
+        }
+        Command::AdoptCacheOnlyProjection { .. } => {
+            unreachable!("handled before auth setup")
         }
         Command::ResetCache => unreachable!("handled before auth setup"),
         Command::VerifyVault => cmd_verify_vault(core.as_ref()).await,
         Command::PruneOrphans { dry_run } => cmd_prune_orphans(core.as_ref(), dry_run).await,
         Command::CacheInfo => unreachable!("handled before auth setup"),
+        Command::CachePolicy { .. } => unreachable!("handled before auth setup"),
         Command::Knowledge {
             number,
             fresh,
@@ -316,6 +360,9 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
         }
         Command::Server { .. } => {
             unreachable!("server is dispatched before local-credential setup")
+        }
+        Command::Incident { .. } => {
+            unreachable!("incident is dispatched before local-credential setup")
         }
         Command::Daemon { .. } | Command::Admin => {
             unreachable!("daemon and admin are dispatched before auth setup")

@@ -51,6 +51,13 @@ async fn build_fixture_state_with_config_instance(
         .auth(BasicAuth::new("tester", "secret"))
         .build()
         .await?;
+    let write_client = ServiceNowClient::builder()
+        .instance(client_instance_url)
+        .allow_http()
+        .auth(BasicAuth::new("tester", "secret"))
+        .max_retries(0)
+        .build()
+        .await?;
 
     let mut config = SnowConfig {
         instance: InstanceConfig {
@@ -73,6 +80,7 @@ async fn build_fixture_state_with_config_instance(
     let core = SnowCore::builder()
         .config(config.clone())
         .client(client)
+        .write_client(write_client)
         .vault_path(vault_path)
         .build()
         .await?;
@@ -114,6 +122,39 @@ async fn build_fixture_state_with_config_instance(
         &change,
         "2026-04-09 10:11:12 - Casey User\nPatched the primary node.",
         "Patch production database",
+    )?;
+
+    let resource_plan = RecordRow {
+        sys_id: "rpln-sys".to_string(),
+        number: "RPLN001".to_string(),
+        table_name: "resource_plan".to_string(),
+        resource_type: ResourceType::ResourcePlan,
+        state: Some("Allocated".to_string()),
+        short_desc: Some("Generic capacity allocation".to_string()),
+        description: Some("A resource plan without work-note support".to_string()),
+        assigned_to: None,
+        parent_id: None,
+        file_path: None,
+        synced_at: now,
+        sys_updated_on: now,
+        etag: Some("etag-rpln-1".to_string()),
+        in_scope: true,
+        last_seen_at: now,
+        tombstoned_at: None,
+        pruned_at: None,
+        raw_json: serde_json::json!({
+            "sys_id": "rpln-sys",
+            "number": "RPLN001",
+            "short_description": "Generic capacity allocation",
+            "description": "A resource plan without work-note support",
+            "state": { "value": "1", "display_value": "Allocated" }
+        })
+        .to_string(),
+    };
+    engine.store().upsert_record(
+        &resource_plan,
+        "",
+        "A resource plan without work-note support",
     )?;
 
     let change_task = RecordRow {

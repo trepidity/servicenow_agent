@@ -52,7 +52,7 @@ field_allowlist = [                        # only these fields may be written
 ]
 story_board_id = "0123456789abcdef0123456789abcdef"
 
-# Tighten a tool that is enabled by default (e.g. forbid it in prod, cap bulk):
+# Explicitly enable a governed write tool for named environments:
 [mcp.tools.work_note_apply_add]
 enabled = true
 requires_confirmation = true
@@ -77,7 +77,7 @@ enabled = false
 
 # --- Remaining write tools (all ship DISABLED by default) ---
 # The complete set of write tools you may toggle (is_write_tool):
-#   catalog_submit_request, catalog_cancel_request, work_note_apply_add,
+#   catalog_submit_request, work_note_apply_add,
 #   approval_approve, approval_reject,
 #   story_apply_create, story_apply_update,
 #   story_task_apply_create, story_task_apply_update,
@@ -130,11 +130,6 @@ field_allowlist = [
     "remaining_hours", "percent_complete",
 ]
 
-# Cancel a cancellable catalog request (sc_req_item).
-[mcp.tools.catalog_cancel_request]
-enabled = false
-requires_confirmation = true
-
 # Upload local files as ServiceNow attachments. Keep disabled unless the
 # deployment explicitly allows local-file writes in this environment.
 [mcp.tools.attachment_upload]
@@ -149,7 +144,7 @@ enabled = false
 requires_confirmation = true
 environments = ["test", "training"]
 field_allowlist = [
-    "short_description", "description", "type", "category",
+    "short_description", "description", "type", "category", "contact_type",
     "assignment_group", "assigned_to", "cmdb_ci", "start_date", "end_date",
     "implementation_plan", "change_plan", "backout_plan", "test_plan",
     "risk", "impact", "justification",
@@ -179,7 +174,8 @@ requires_confirmation = true
 environments = ["test", "training"]
 field_allowlist = [
     "change_request", "short_description", "description", "assignment_group",
-    "assigned_to", "start_date", "end_date", "state", "work_notes",
+    "assigned_to", "cmdb_ci", "change_task_type", "planned_start_date", "planned_end_date",
+    "due_date", "u_primary_tester", "start_date", "end_date", "state", "work_notes",
 ]
 
 [mcp.tools.change_task_apply_update]
@@ -188,8 +184,9 @@ requires_confirmation = true
 environments = ["test", "training"]
 skip_terminal_records = true
 field_allowlist = [
-    "short_description", "description", "assignment_group", "assigned_to",
-    "start_date", "end_date", "state", "work_notes",
+    "change_request", "short_description", "description", "assignment_group", "assigned_to",
+    "cmdb_ci", "change_task_type", "planned_start_date", "planned_end_date", "due_date",
+    "u_primary_tester", "start_date", "end_date", "state", "work_notes",
 ]
 
 [mcp.tools.resource_plan_plan_create]

@@ -25,11 +25,10 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 
 | ServiceNow entity | Tool | Action | Enabled by default | Confirm? | Field allowlist / limits |
 |---|---|---|---|---|---|
-| Catalog request (`sc_req_item`) | `catalog_submit_request` | **Create** | ✅ (test/training) | yes | requires KB evidence |
-| Catalog request (`sc_req_item`) | `catalog_cancel_request` | **Delete** (cancel) | ❌ | yes | |
+| Catalog request (`sc_req_item`) | `catalog_submit_request` | **Create** | ❌ | yes | requires KB evidence; explicit environment policy required |
 | Approval (`sysapproval_approver`) | `approval_approve` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals`; target record number still accepted; daemon required |
 | Approval (`sysapproval_approver`) | `approval_reject` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals` plus reason; target record number still accepted; daemon required |
-| Work note / journal | `work_note_apply_add` | **Create** | ✅ (test/training) | yes | `work_notes` only |
+| Work note / journal | `work_note_apply_add` | **Create** | ❌ | yes | `work_notes` only; explicit environment policy required |
 | Story (`rm_story`) | `story_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |
 | Story task (`rm_scrum_task`) | `story_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
@@ -40,7 +39,8 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Change request (`change_request`) | `change_request_apply_update` | **Update** | ❌ | yes | governed; daemon required; field allowlist |
 | Change task (`change_task`) | `change_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Change task (`change_task`) | `change_task_apply_update` | **Update** | ❌ | yes | governed; daemon required; terminal records skipped by policy |
-| Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | governed; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`; concurrency checked |
+| Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | compatible single-target operation; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`,`comments`; concurrency checked |
+| Incident (`incident`) | `incident_bulk_apply_update` | **Update 3..=25** | ❌ | yes | separately governed daemon operation; explicit `max_targets`; ordered, stop-first, no rollback/retry |
 | Resource plan (`resource_plan`) | `resource_plan_apply_create` | **Create** | ❌ | yes | governed; daemon required; writes `task`,`group_resource` or `user_resource`,`resource_type`,`state`,`planned_hours`,`notes`,`start_date`,`end_date` |
 | Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `state`,`planned_hours`,`notes`,`start_date`,`end_date` only |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
@@ -48,7 +48,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_request_plan_create`, `change_request_plan_update`,
 `change_task_plan_create`, `change_task_plan_update`,
-`incident_plan_update`,
+`incident_plan_update`, `incident_bulk_plan_update`,
 `resource_plan_plan_create`, `resource_plan_plan_update`,
 `timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
@@ -127,7 +127,7 @@ work_record_ttl = "60m"
   `list_my_tasks`, `list_my_approvals`, `list_my_projects`, `get_approval`, `get_children`,
   `get_work_notes`, `attachment_list`, `resource_plan_list`,
   `incident_list_by_assignment_group`, `incident_assignment_groups`,
-  `incident_assignment_group_queue`
+  `incident_assignment_group_queue`, `incident_get`, `incident_query`, `incident_fields`
 
 `list_my_approvals` is read-only and returns pending direct approvals plus
 pending approvals routed to direct `sys_user_group` memberships for the
@@ -236,10 +236,21 @@ one cursor page of *active* Incidents for a single assignment group.
 - Delta polling passes the prior `watermark` as `updated_since` and the prior
   row ids as `known_sys_ids`. Reassigned, inactive, terminal, deleted, or
   unreadable baseline records appear in `departed_sys_ids`.
-- `incident_plan_update` previews claim (`assigned_to=me`), unassign,
-  membership-validated group transfer, exact state update, and work notes.
+- `incident_plan_update` previews one exact Incident update for `assigned_to`,
+  `assignment_group`, `state`, `work_notes`, or `comments`.
   `incident_apply_update` requires its plan's confirmation, idempotency, and
-  concurrency tokens; it is disabled by default and requires the daemon.
+  concurrency token; it is disabled by default and requires the daemon.
+- `incident_bulk_plan_update` accepts 3 through the narrower configured
+  `max_targets` (never above 25), resolves exact `number` or `sys_id` selectors
+  live, and returns canonical `sys_id` order with one concurrency token per
+  target. `incident_bulk_apply_update` requires the saved plan's exact
+  confirmation, idempotency key, and canonical token array. It preflights every
+  target before the first PATCH, applies in order without mutation retries,
+  stops on the first failure, and returns or durably replays the exact public-safe
+  receipt/error. A partial failure is not rolled back or automatically retried.
+- Successful Incident PATCHes strictly remove any legacy local projection;
+  Incident reads remain live-only. ServiceNow ACLs remain the record/field
+  authority; Snow adds no membership or target-scope allowlist.
 - `SNOW_INCIDENT_WRITE_KILL_SWITCH=1|true|yes` or the global
   `SNOW_MCP_WRITE_KILL_SWITCH` denies Incident apply operations.
 
@@ -624,6 +635,7 @@ canonical local resource type is `server`; the dedicated server tools
 | `server_search` | Live query Linux/Windows servers by name, IP, CI owner group, and class | Yes | Yes |
 | `server_query` | Local SQLite query across projected Server records | No | n/a — reads local |
 | `server_fields` | List observed Server field metadata from the local projection | No | n/a — reads local |
+| `incident_fields` | Discover Incident field candidates, dictionary-declared writable candidates, choices, references, and paging from ServiceNow `sys_dictionary` / `sys_choice` | Yes | No — metadata is not cache-eligible |
 
 Hydration behavior (`server_search` and daemon `server_get_fresh`): full-row
 fetch from `cmdb_ci_server` with `sys_class_name` restricted to Linux/Windows
@@ -695,6 +707,59 @@ Each `server` object contains the underlying `record`, `name`, optional
 `operational_status`, every observed `fields` value, and `browser_url` /
 `vault_relative_path` when available.
 
+### `incident_fields`
+
+- **Params:** none. The `incident` table is fixed by the operation; there is no
+  caller-supplied table, because that would make this a generic table browser.
+- **Returns:** an `OperationEnvelope` —
+  `{ "operation": "incident_fields", "source": { "kind": "live" },
+  "completeness": { "kind": "complete" }, "data": <ResourceDescriptor> }`.
+
+`data` carries `resource_type`, `table`, `readable_fields`, `writable_fields`,
+and `paging`. Each field category is either
+`{ "status": "available", "value": [<FieldDescriptor>...] }` or
+`{ "status": "unavailable", "reason": "not_returned_by_instance" | "acl_denied"
+| "not_supported_by_operation" }`.
+
+`available` with an empty list and `unavailable` are **different facts** and are
+never interchangeable: the first means the instance reported no fields, the
+second means Snow could not find out. An ACL denial on `sys_dictionary` is
+reported as `acl_denied` rather than as an empty descriptor or an error.
+
+These lists are structural metadata, not an authorization oracle.
+`readable_fields` contains fields visible to live dictionary discovery and
+`writable_fields` is its subset not marked `read_only` by that dictionary.
+Record-level read/write ACLs and Snow's governed-write policy are separate
+runtime decisions; consumers must not infer authorization from either list.
+Choice discovery follows the table hierarchy so choices defined on an ancestor
+such as `task` are not lost when the child table has no local `sys_choice` row.
+
+Each `FieldDescriptor` carries the native ServiceNow `name`, optional `label`,
+native `kind` (the dictionary `internal_type`), optional `reference_table`, and
+`choices` in the same `FieldSupport` shape. Choices are fetched only for fields
+the dictionary flags as choice fields; every other field reports
+`not_supported_by_operation`.
+
+### `incident_get` / `incident_query`
+
+`incident_get` performs a live-only exact lookup by one `number` or `sys_id`
+selector. It returns a complete `OperationEnvelope` containing every native
+field ServiceNow exposed, with raw and optional display values preserved.
+
+`incident_query` performs a live-only bounded query with typed Incident
+filters, a fixed non-journal projection, ascending `sys_id` order, and an
+exclusive `sys_id` cursor. The page limit defaults to 50 and is capped at 200.
+Exactly a full page reports `page_limit_reached`; callers page until a shorter,
+possibly empty, complete page. Neither operation reads or writes Snow's cache,
+vault, or index.
+
+`paging` reports native support only:
+`{ "mode": "cursor", "default_limit": 50, "max_limit": 200 }` for Incidents.
+Snow never fabricates pagination an operation does not have.
+
+Nothing here is read from a bundled schema or inferred from a display name — a
+field the instance does not return is omitted rather than guessed.
+
 ---
 
 ## Deploy-time policy
@@ -719,7 +784,8 @@ document is namespaced under `[mcp]`. Key rules:
   callable only when `SNOW_ENV` is in this list (empty = all environments).
 - Per-tool knobs: `requires_confirmation`, `requires_kb_evidence`,
   `field_allowlist`, `confirmation_ttl_seconds`, `max_records`,
-  `skip_terminal_records`, `story_board_id`.
+  `skip_terminal_records`, `story_board_id`, and (for Incident bulk plan/apply)
+  `max_targets` in the inclusive range 3 through 25.
 - Optional `[mcp.roles.<role>]` allow-lists further restrict a caller, intersected
   with the per-tool policy.
 

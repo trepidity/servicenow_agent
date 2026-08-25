@@ -795,7 +795,7 @@ pub(super) fn decode_embedding_vector(raw: &[u8], dimensions: usize) -> Result<V
         });
     }
     let mut out = Vec::with_capacity(dimensions);
-    for chunk in raw.chunks_exact(4) {
+    for chunk in raw.as_chunks::<4>().0 {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     if !crate::semantic::is_unit_length(&out) {

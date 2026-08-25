@@ -23,11 +23,11 @@ impl Store {
             r#"
             INSERT INTO records (
                 sys_id, number, table_name, resource_type, state, short_desc, description,
-                assigned_to, parent_id, file_path, synced_at, sys_updated_on, etag,
+                assigned_to, parent_id, file_path, vault_provenance, synced_at, sys_updated_on, etag,
                 in_scope, last_seen_at, tombstoned_at, pruned_at, raw_json
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11, ?12, ?13,
+                ?8, ?9, ?10, CASE WHEN ?10 IS NOT NULL THEN 'vault_backed' ELSE 'legacy_unknown' END, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18
             )
             ON CONFLICT(sys_id) DO UPDATE SET
@@ -40,6 +40,10 @@ impl Store {
                 assigned_to = excluded.assigned_to,
                 parent_id = excluded.parent_id,
                 file_path = excluded.file_path,
+                vault_provenance = CASE
+                    WHEN excluded.file_path IS NOT NULL THEN 'vault_backed'
+                    ELSE records.vault_provenance
+                END,
                 synced_at = excluded.synced_at,
                 sys_updated_on = excluded.sys_updated_on,
                 etag = excluded.etag,
@@ -93,6 +97,68 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn mark_records_cache_only(&self, sys_ids: &[String]) -> Result<()> {
+        if sys_ids.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "UPDATE records
+                 SET vault_provenance = ?1
+                 WHERE sys_id = ?2 AND file_path IS NULL",
+            )?;
+            for sys_id in sys_ids {
+                statement.execute(params![
+                    VaultProjectionProvenance::CacheOnly.as_str(),
+                    sys_id
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn adopt_legacy_cache_only_records(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE records
+             SET vault_provenance = ?1
+             WHERE file_path IS NULL
+               AND vault_provenance = ?2
+               AND in_scope = 1
+               AND pruned_at IS NULL",
+            params![
+                VaultProjectionProvenance::CacheOnly.as_str(),
+                VaultProjectionProvenance::LegacyUnknown.as_str()
+            ],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn active_record_vault_provenance(
+        &self,
+    ) -> Result<HashMap<String, VaultProjectionProvenance>> {
+        let mut statement = self.conn.prepare(
+            "SELECT sys_id, vault_provenance
+             FROM records
+             WHERE in_scope = 1 AND pruned_at IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let sys_id = row.get::<_, String>(0)?;
+            let raw = row.get::<_, String>(1)?;
+            let provenance = VaultProjectionProvenance::parse(&raw).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    format!("unknown vault provenance {raw:?}").into(),
+                )
+            })?;
+            Ok((sys_id, provenance))
+        })?;
+        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
     }
 
     /// Batch-upsert multiple records in a single SQLite transaction.
@@ -319,6 +385,7 @@ impl Store {
     }
 
     pub fn prune_record(&self, sys_id: &str, when: DateTime<Utc>) -> Result<()> {
+        self.delete_catalog_product_projections(sys_id)?;
         self.conn.execute(
             r#"
             UPDATE records

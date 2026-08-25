@@ -351,12 +351,164 @@ pub(in crate::rpc) async fn get_business_application_cached(
     }))
 }
 
+pub(in crate::rpc) fn core_business_application_lookup(
+    lookup: BusinessApplicationLookup,
+) -> Result<snow_core::BusinessApplicationLookup> {
+    Ok(match lookup {
+        BusinessApplicationLookup::SysId(sys_id) => {
+            snow_core::BusinessApplicationLookup::sys_id(sys_id)?
+        }
+        BusinessApplicationLookup::Name(name) => {
+            snow_core::BusinessApplicationLookup::exact_name(name)
+        }
+    })
+}
+
+pub(in crate::rpc) fn business_application_get_result(
+    transport: &DaemonTransport<'_>,
+    record: &SnowRecord,
+    source: snow_core::Source,
+    completeness: snow_core::Completeness,
+    live_without_local_io: bool,
+) -> Result<Value> {
+    let business_application = if live_without_local_io {
+        transport.live_business_application(record)?
+    } else {
+        transport.business_application(record)?
+    };
+    let record_dto = business_application.record.clone();
+    operation_envelope_result(
+        "business_application_get",
+        source,
+        completeness,
+        json!({
+        "business_application": business_application,
+        "record": record_dto,
+        "markdown": render_snow_record(record),
+        }),
+    )
+}
+
+pub(in crate::rpc) fn operation_envelope_result(
+    operation: &str,
+    source: snow_core::Source,
+    completeness: snow_core::Completeness,
+    data: Value,
+) -> Result<Value> {
+    Ok(serde_json::to_value(snow_core::OperationEnvelope {
+        operation: operation.to_string(),
+        source,
+        completeness,
+        data,
+    })?)
+}
+
 pub(in crate::rpc) async fn query_business_applications_local(
     core: &SnowCore,
     params: &BusinessApplicationQueryParams,
 ) -> Result<Vec<SnowRecord>> {
     core.query_business_applications(core_business_application_query(params)?)
         .await
+}
+
+pub(in crate::rpc) async fn business_application_cache_snapshot(
+    core: &SnowCore,
+) -> Result<Option<(Vec<SnowRecord>, chrono::DateTime<chrono::Utc>)>> {
+    let records = core
+        .list_records_query(
+            ListQuery::new()
+                .resource_type(ResourceType::BusinessApplication)
+                .include_tombstoned(false),
+        )
+        .await?;
+    let Some(last_refreshed_at) = records.iter().map(|record| record.synced_at).min() else {
+        return Ok(None);
+    };
+    Ok(Some((records, last_refreshed_at)))
+}
+
+pub(in crate::rpc) fn cached_business_application_search_query(
+    params: &snow_core::BusinessApplicationSearchParams,
+) -> snow_core::query::filter::BusinessApplicationQuery {
+    use snow_core::query::filter::{BusinessApplicationQuery, FieldOperator};
+
+    let mut query = BusinessApplicationQuery::new()
+        .limit(params.limit.unwrap_or(20))
+        .allow_unknown_fields(true);
+    for (field, value, op) in [
+        ("name", params.name.as_ref(), FieldOperator::Contains),
+        (
+            "business_owner",
+            params.business_owner.as_ref(),
+            FieldOperator::Contains,
+        ),
+        (
+            "it_application_owner",
+            params.is_owner.as_ref(),
+            FieldOperator::Contains,
+        ),
+        (
+            "managed_by_group",
+            params.ci_owner_group.as_ref(),
+            FieldOperator::Contains,
+        ),
+        (
+            "support_group",
+            params.primary_support_group.as_ref(),
+            FieldOperator::Contains,
+        ),
+        (
+            "operational_status",
+            params.operational_state.as_ref(),
+            FieldOperator::Eq,
+        ),
+        (
+            "operational_status",
+            params.operational_state_not.as_ref(),
+            FieldOperator::Ne,
+        ),
+        (
+            "portfolio",
+            params.primary_portfolio.as_ref(),
+            FieldOperator::Contains,
+        ),
+        (
+            "attested_date",
+            params.attested_date.as_ref(),
+            FieldOperator::Eq,
+        ),
+        (
+            "attested_date",
+            params.attested_date_on_or_after.as_ref(),
+            FieldOperator::Gte,
+        ),
+        (
+            "attested_date",
+            params.attested_date_on_or_before.as_ref(),
+            FieldOperator::Lte,
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            query = query.filter(field, op, json!(value));
+        }
+    }
+    query
+}
+
+pub(in crate::rpc) fn business_application_cache_miss(
+    id: Option<Value>,
+    operation: &str,
+) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32072,
+        "cache miss",
+        Some(json!({
+            "code": "CACHE_MISS",
+            "operation": operation,
+            "object": "business_application"
+        })),
+    )
 }
 
 pub(in crate::rpc) fn core_business_application_query(
@@ -686,28 +838,88 @@ pub(in crate::rpc) async fn dispatch_business_applications(
     match method {
         RpcMethod::BusinessApplicationGet => {
             match extract_business_application_lookup_params(&request.params) {
-                Ok(lookup) => match get_business_application_cached(state.core.as_ref(), &lookup)
-                    .await
-                {
-                    Ok(Some(record)) => match transport.business_application(&record) {
-                        Ok(business_application) => {
-                            let record_dto = business_application.record.clone();
-                            JsonRpcResponse::ok(
+                Ok(lookup) => {
+                    let rule = state
+                        .cache_policy
+                        .active()
+                        .rule_for("business_application_get", "business_application");
+                    let cached = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                        Ok(None)
+                    } else {
+                        get_business_application_cached(state.core.as_ref(), &lookup)
+                            .await
+                            .map(|record| {
+                                record.filter(|record| {
+                                    rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                                        || rule.ttl.is_some_and(|ttl| {
+                                            record.synced_at + ttl > chrono::Utc::now()
+                                        })
+                                })
+                            })
+                    };
+                    match cached {
+                        Ok(Some(record)) => match business_application_get_result(
+                            transport,
+                            &record,
+                            snow_core::Source::Cache {
+                                last_refreshed_at: record.synced_at,
+                            },
+                            snow_core::Completeness::Partial {
+                                reason: snow_core::PartialReason::NarrowedProjection,
+                            },
+                            false,
+                        ) {
+                            Ok(result) => JsonRpcResponse::ok(id, result),
+                            Err(err) => internal_error(id, err),
+                        },
+                        Ok(None) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                            JsonRpcResponse::error(
                                 id,
-                                json!({
-                                    "business_application": business_application,
-                                    "record": record_dto,
-                                    "markdown": render_snow_record(&record),
-                                }),
+                                -32072,
+                                "cache miss",
+                                Some(json!({
+                                    "code": "CACHE_MISS",
+                                    "operation": "business_application_get",
+                                    "object": "business_application"
+                                })),
                             )
                         }
+                        Ok(None) => match core_business_application_lookup(lookup) {
+                            Ok(core_lookup) => {
+                                let live_without_local_io =
+                                    rule.mode == snow_core::cache::policy::CacheMode::Live;
+                                match state
+                                    .core
+                                    .get_business_application_policy_live(
+                                        core_lookup,
+                                        !live_without_local_io,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(application)) => match business_application_get_result(
+                                        transport,
+                                        &application.record,
+                                        snow_core::Source::Live,
+                                        snow_core::Completeness::Complete,
+                                        live_without_local_io,
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    },
+                                    Ok(None) => JsonRpcResponse::error(
+                                        id,
+                                        -32004,
+                                        "business application not found",
+                                        None,
+                                    ),
+                                    Err(err) => internal_error(id, err),
+                                }
+                            }
+                            Err(err) => invalid_params(id, err),
+                        },
                         Err(err) => internal_error(id, err),
-                    },
-                    Ok(None) => {
-                        JsonRpcResponse::error(id, -32004, "business application not found", None)
                     }
-                    Err(err) => internal_error(id, err),
-                },
+                }
                 Err(err) => invalid_params(id, err),
             }
         }
@@ -769,36 +981,122 @@ pub(in crate::rpc) async fn dispatch_business_applications(
         }
         RpcMethod::BusinessApplicationSearch => {
             match extract_business_application_search_params(&request.params) {
-                Ok((params, options)) => {
-                    match state
-                        .core
-                        .search_business_applications_live(params, options.clone().into())
-                        .await
-                    {
-                        Ok(business_applications) => {
-                            let mut applications = Vec::with_capacity(business_applications.len());
-                            let mut record_dtos = Vec::new();
-                            for application in business_applications {
-                                match transport.business_application(&application.record) {
-                                    Ok(mut application_dto) => {
-                                        application_dto.unresolved_references =
-                                            business_application_diagnostics(
-                                                &application.unresolved_references,
-                                            );
-                                        record_dtos.push(application_dto.record.clone());
-                                        applications.push(application_dto);
+                Ok((params, mut options)) => {
+                    let rule = state
+                        .cache_policy
+                        .active()
+                        .rule_for("business_application_search", "business_application");
+                    let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                        Ok(None)
+                    } else {
+                        business_application_cache_snapshot(state.core.as_ref()).await
+                    };
+                    match snapshot {
+                        Ok(Some((_, last_refreshed_at)))
+                            if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                                || rule.ttl.is_some_and(|ttl| {
+                                    last_refreshed_at + ttl > chrono::Utc::now()
+                                }) =>
+                        {
+                            match state
+                                .core
+                                .query_business_applications(
+                                    cached_business_application_search_query(&params),
+                                )
+                                .await
+                            {
+                                Ok(records) => {
+                                    let mut applications = Vec::with_capacity(records.len());
+                                    let mut record_dtos = Vec::with_capacity(records.len());
+                                    for record in records {
+                                        match transport.business_application(&record) {
+                                            Ok(application) => {
+                                                record_dtos.push(application.record.clone());
+                                                applications.push(application);
+                                            }
+                                            Err(err) => return internal_error(id, err),
+                                        }
                                     }
-                                    Err(err) => return internal_error(id, err),
+                                    options.persist = false;
+                                    match operation_envelope_result(
+                                        "business_application_search",
+                                        snow_core::Source::Cache { last_refreshed_at },
+                                        snow_core::Completeness::Partial {
+                                            reason: snow_core::PartialReason::NarrowedProjection,
+                                        },
+                                        json!({
+                                            "business_applications": applications,
+                                            "records": record_dtos,
+                                            "hydration": options,
+                                        }),
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
                                 }
+                                Err(err) => internal_error(id, err),
                             }
-                            JsonRpcResponse::ok(
-                                id,
-                                json!({
-                                    "business_applications": applications,
-                                    "records": record_dtos,
-                                    "hydration": options,
-                                }),
-                            )
+                        }
+                        Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                            business_application_cache_miss(id, "business_application_search")
+                        }
+                        Ok(_) => {
+                            let live_without_local_io =
+                                rule.mode == snow_core::cache::policy::CacheMode::Live;
+                            options.persist = !live_without_local_io;
+                            let limit = params.limit.unwrap_or(20);
+                            match state
+                                .core
+                                .search_business_applications_policy_live(params, options.persist)
+                                .await
+                            {
+                                Ok(business_applications) => {
+                                    let reached_limit = business_applications.len() == limit;
+                                    let mut applications =
+                                        Vec::with_capacity(business_applications.len());
+                                    let mut record_dtos =
+                                        Vec::with_capacity(business_applications.len());
+                                    for application in business_applications {
+                                        let dto = if live_without_local_io {
+                                            transport.live_business_application(&application.record)
+                                        } else {
+                                            transport.business_application(&application.record)
+                                        };
+                                        match dto {
+                                            Ok(mut application_dto) => {
+                                                application_dto.unresolved_references =
+                                                    business_application_diagnostics(
+                                                        &application.unresolved_references,
+                                                    );
+                                                record_dtos.push(application_dto.record.clone());
+                                                applications.push(application_dto);
+                                            }
+                                            Err(err) => return internal_error(id, err),
+                                        }
+                                    }
+                                    let completeness = if reached_limit {
+                                        snow_core::Completeness::Partial {
+                                            reason: snow_core::PartialReason::PageLimitReached,
+                                        }
+                                    } else {
+                                        snow_core::Completeness::Complete
+                                    };
+                                    match operation_envelope_result(
+                                        "business_application_search",
+                                        snow_core::Source::Live,
+                                        completeness,
+                                        json!({
+                                            "business_applications": applications,
+                                            "records": record_dtos,
+                                            "hydration": options,
+                                        }),
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
+                                }
+                                Err(err) => internal_error(id, err),
+                            }
                         }
                         Err(err) => internal_error(id, err),
                     }
@@ -808,21 +1106,106 @@ pub(in crate::rpc) async fn dispatch_business_applications(
         }
         RpcMethod::BusinessApplicationQuery => {
             match extract_business_application_query_params(&request.params) {
-                Ok(params) => match query_business_applications_local(state.core.as_ref(), &params)
-                    .await
-                {
-                    Ok(records) => {
-                        let mut applications = Vec::with_capacity(records.len());
-                        for record in records {
-                            match transport.business_application(&record) {
-                                Ok(application) => applications.push(application),
-                                Err(err) => return internal_error(id, err),
+                Ok(params) => {
+                    let rule = state
+                        .cache_policy
+                        .active()
+                        .rule_for("business_application_query", "business_application");
+                    let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                        Ok(None)
+                    } else {
+                        business_application_cache_snapshot(state.core.as_ref()).await
+                    };
+                    match snapshot {
+                        Ok(Some((_, last_refreshed_at)))
+                            if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                                || rule.ttl.is_some_and(|ttl| {
+                                    last_refreshed_at + ttl > chrono::Utc::now()
+                                }) =>
+                        {
+                            match query_business_applications_local(state.core.as_ref(), &params)
+                                .await
+                            {
+                                Ok(records) => {
+                                    let mut applications = Vec::with_capacity(records.len());
+                                    for record in records {
+                                        match transport.business_application(&record) {
+                                            Ok(application) => applications.push(application),
+                                            Err(err) => return internal_error(id, err),
+                                        }
+                                    }
+                                    match operation_envelope_result(
+                                        "business_application_query",
+                                        snow_core::Source::Cache { last_refreshed_at },
+                                        snow_core::Completeness::Partial {
+                                            reason: snow_core::PartialReason::NarrowedProjection,
+                                        },
+                                        json!({ "business_applications": applications }),
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
+                                }
+                                Err(err) => internal_error(id, err),
                             }
                         }
-                        JsonRpcResponse::ok(id, json!({ "business_applications": applications }))
+                        Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                            business_application_cache_miss(id, "business_application_query")
+                        }
+                        Ok(_) => {
+                            let live_without_local_io =
+                                rule.mode == snow_core::cache::policy::CacheMode::Live;
+                            let query = match core_business_application_query(&params) {
+                                Ok(query) => query,
+                                Err(err) => return invalid_params(id, err),
+                            };
+                            let limit = query.limit.unwrap_or(20);
+                            match state
+                                .core
+                                .query_business_applications_policy_live(
+                                    query,
+                                    !live_without_local_io,
+                                )
+                                .await
+                            {
+                                Ok(business_applications) => {
+                                    let reached_limit = business_applications.len() == limit;
+                                    let mut applications =
+                                        Vec::with_capacity(business_applications.len());
+                                    for application in business_applications {
+                                        let dto = if live_without_local_io {
+                                            transport.live_business_application(&application.record)
+                                        } else {
+                                            transport.business_application(&application.record)
+                                        };
+                                        match dto {
+                                            Ok(application) => applications.push(application),
+                                            Err(err) => return internal_error(id, err),
+                                        }
+                                    }
+                                    let completeness = if reached_limit {
+                                        snow_core::Completeness::Partial {
+                                            reason: snow_core::PartialReason::PageLimitReached,
+                                        }
+                                    } else {
+                                        snow_core::Completeness::Complete
+                                    };
+                                    match operation_envelope_result(
+                                        "business_application_query",
+                                        snow_core::Source::Live,
+                                        completeness,
+                                        json!({ "business_applications": applications }),
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
+                                }
+                                Err(err) => internal_error(id, err),
+                            }
+                        }
+                        Err(err) => internal_error(id, err),
                     }
-                    Err(err) => internal_error(id, err),
-                },
+                }
                 Err(err) => invalid_params(id, err),
             }
         }

@@ -175,6 +175,14 @@ pub struct ServiceNowCacheRebuildReport {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheRebuildKnowledgeScope {
+    /// Optional one-run override for the Knowledge base selected by cache policy.
+    pub knowledge_base_sys_id: Option<String>,
+    /// Optional category restriction within the selected Knowledge base.
+    pub knowledge_category_sys_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheRebuildProgressEvent {
     Preparing,
@@ -252,6 +260,8 @@ pub struct VaultVerificationReport {
     pub degraded_reads: Vec<DegradedReadDiagnostic>,
     pub missing_markdown_rows: Vec<OrphanRecordRow>,
     pub orphan_record_rows: Vec<OrphanRecordRow>,
+    pub cache_only_record_rows: usize,
+    pub legacy_unknown_record_rows: usize,
     pub unprojectable_documents: Vec<VaultScanFailure>,
     pub unindexed_documents: Vec<UnindexedVaultDocument>,
 }

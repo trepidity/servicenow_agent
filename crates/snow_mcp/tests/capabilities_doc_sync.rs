@@ -14,7 +14,6 @@ use snow_mcp::tools::ToolRegistry;
 /// the test below proves every entry is still classified as a write.
 const EXPLICIT_WRITE_TOOLS: &[&str] = &[
     "catalog_submit_request",
-    "catalog_cancel_request",
     "work_note_apply_add",
     "approval_approve",
     "approval_reject",
@@ -93,6 +92,25 @@ fn explicit_write_tools_are_classified_as_writes() {
     }
 }
 
+/// Deferred cancellation is not a capability: it must be absent from the
+/// registry, policy defaults, and the public capability catalog.
+#[test]
+fn deferred_catalog_cancellation_is_not_advertised() {
+    let registry = ToolRegistry::new();
+    assert!(
+        !registry
+            .metadata()
+            .iter()
+            .any(|tool| tool.name == "catalog_cancel_request")
+    );
+    assert!(
+        !PolicyConfig::default()
+            .tools
+            .contains_key("catalog_cancel_request")
+    );
+    assert!(!read_capabilities_doc().contains("catalog_cancel_request"));
+}
+
 /// The shipped example policy must remain parseable by the real loader so the
 /// deployer template never goes stale relative to the schema.
 #[test]
@@ -119,6 +137,12 @@ fn example_policy_parses() {
             "example policy {tool} allowlist missing requested_by_date"
         );
     }
+    assert!(
+        cfg.tools["change_request_apply_create"]
+            .field_allowlist
+            .contains("contact_type"),
+        "example policy change_request_apply_create allowlist missing contact_type"
+    );
 
     let read_only_agent = cfg
         .roles

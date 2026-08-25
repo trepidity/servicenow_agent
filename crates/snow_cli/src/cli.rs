@@ -3,6 +3,13 @@ use std::path::PathBuf;
 
 use snow_core::KnowledgeSearchMode;
 
+pub const DEFAULT_CACHE_REBUILD_PAGE_LIMIT: u32 = 500;
+pub const DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS: u64 = 30;
+
+fn parse_sys_id(value: &str) -> Result<String, String> {
+    snow_core::cache::policy::normalize_sys_id("sys_id", value).map_err(|error| error.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "snow", about = "ServiceNow CLI for change management")]
 pub struct Cli {
@@ -16,6 +23,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Validate or atomically reload the daemon-owned cache policy
+    CachePolicy {
+        #[command(subcommand)]
+        action: CachePolicyCommand,
+    },
     /// Launch the interactive terminal UI
     Tui {
         /// Enable auto-refresh. If no value is provided, defaults to 60 seconds.
@@ -98,8 +110,35 @@ pub enum Command {
     },
     /// Repair missing vault files from cached runtime data
     RepairVault,
+    /// Mark existing no-vault cache rows as an intentional cache-only projection
+    AdoptCacheOnlyProjection {
+        /// Confirm the non-destructive provenance update
+        #[arg(long)]
+        yes: bool,
+    },
     /// Rebuild the SQLite cache from terminal live ServiceNow reads
-    RebuildCache,
+    RebuildCache {
+        /// Maximum ServiceNow records requested per rebuild page
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CACHE_REBUILD_PAGE_LIMIT,
+            value_parser = clap::value_parser!(u32).range(1..=1_000)
+        )]
+        page_limit: u32,
+        /// Per-request ServiceNow timeout in seconds
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        timeout_seconds: u64,
+        /// Knowledge base sys_id to rebuild instead of the cache-policy base
+        #[arg(long, value_parser = parse_sys_id)]
+        knowledge_base: Option<String>,
+        /// Knowledge category sys_id to narrow the selected knowledge base
+        #[arg(long, requires = "knowledge_base", value_parser = parse_sys_id)]
+        knowledge_category: Option<String>,
+    },
     /// Import the SQLite cache projection from markdown vault documents
     ImportCacheFromVault,
     /// Replace the SQLite cache with an empty current-format database
@@ -137,6 +176,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ServerCommand,
     },
+    /// Incident typed-resource commands
+    Incident {
+        /// Incident subcommand.
+        #[command(subcommand)]
+        action: IncidentCommand,
+    },
     /// Show an approval through the typed runtime path
     Approval {
         /// Approval number
@@ -149,6 +194,22 @@ pub enum Command {
     },
     /// Launch the operator admin TUI
     Admin,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CachePolicyCommand {
+    /// Validate the fixed cache-policy.toml without changing daemon state
+    Validate {
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and atomically replace the active cache-policy snapshot
+    Reload {
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,6 +226,8 @@ pub enum DaemonCommand {
     Restart,
     /// Show daemon status
     Status,
+    /// Print the bounded daemon JSON-RPC contract report
+    ContractInfo,
     /// Tail the daemon log
     Logs {
         /// Follow the log (default true)
@@ -691,6 +754,95 @@ fn parse_business_app_number(value: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap owns this short-lived parsed command value.
+pub enum IncidentCommand {
+    /// Plan or apply one governed Incident update
+    Update {
+        /// Strict update request JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "plan")]
+        request: Option<PathBuf>,
+        /// Saved plan bundle JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "request")]
+        plan: Option<PathBuf>,
+        /// Apply the saved plan bundle after confirmation
+        #[arg(long, requires = "plan")]
+        apply: bool,
+        /// Bypass only the interactive confirmation prompt
+        #[arg(long, requires = "apply")]
+        yes: bool,
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan or apply a separately governed 3..=25 target Incident bulk update
+    BulkUpdate {
+        /// Strict bulk-plan request JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "plan")]
+        request: Option<PathBuf>,
+        /// Saved plan bundle JSON path, or - for stdin
+        #[arg(long, value_name = "PATH", conflicts_with = "request")]
+        plan: Option<PathBuf>,
+        /// Apply the saved plan bundle after confirmation
+        #[arg(long, requires = "plan")]
+        apply: bool,
+        /// Bypass only the interactive confirmation prompt
+        #[arg(long, requires = "apply")]
+        yes: bool,
+        /// Emit the exact JSON-RPC result object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get one Incident live by exact number or sys_id
+    Get {
+        #[arg(long)]
+        number: Option<String>,
+        #[arg(long = "sys-id")]
+        sys_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query one bounded live page of ACL-visible Incidents
+    Query {
+        #[arg(long = "number")]
+        numbers: Vec<String>,
+        #[arg(long = "assignment-group")]
+        assignment_group: Option<String>,
+        #[arg(long = "assigned-to")]
+        assigned_to: Option<String>,
+        #[arg(long = "caller-id")]
+        caller_id: Option<String>,
+        #[arg(long = "cmdb-ci")]
+        cmdb_ci: Option<String>,
+        #[arg(long = "state")]
+        states: Vec<String>,
+        #[arg(long = "priority")]
+        priorities: Vec<u8>,
+        #[arg(long)]
+        active: Option<bool>,
+        #[arg(long = "opened-after")]
+        opened_after: Option<String>,
+        #[arg(long = "opened-before")]
+        opened_before: Option<String>,
+        #[arg(long = "updated-after")]
+        updated_after: Option<String>,
+        #[arg(long = "updated-before")]
+        updated_before: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover readable and writable Incident fields from ServiceNow
+    Fields {
+        /// Emit the raw daemon JSON payload
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ServerCommand {
     /// Get one cached Server by sys_id, exact name, or IP address
     Get {
@@ -778,12 +930,55 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn parses_incident_fields_command() {
+        let cli = Cli::parse_from(["snow", "incident", "fields"]);
+        assert!(matches!(
+            cli.command,
+            Command::Incident {
+                action: IncidentCommand::Fields { json: false }
+            }
+        ));
+
+        let cli = Cli::parse_from(["snow", "incident", "fields", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Incident {
+                action: IncidentCommand::Fields { json: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn incident_fields_rejects_a_caller_supplied_table() {
+        // Metadata discovery is bound to the `incident` table by the operation.
+        // Accepting a table argument would turn it into the generic table
+        // browser the capability contract forbids.
+        assert!(
+            Cli::try_parse_from(["snow", "incident", "fields", "--table", "sys_user"]).is_err()
+        );
+    }
+
+    #[test]
     fn parses_runtime_maintenance_commands() {
         let cli = Cli::parse_from(["snow", "repair-vault"]);
         assert!(matches!(cli.command, Command::RepairVault));
 
+        let cli = Cli::parse_from(["snow", "adopt-cache-only-projection", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Command::AdoptCacheOnlyProjection { yes: true }
+        ));
+
         let cli = Cli::parse_from(["snow", "rebuild-cache"]);
-        assert!(matches!(cli.command, Command::RebuildCache));
+        assert!(matches!(
+            cli.command,
+            Command::RebuildCache {
+                page_limit: DEFAULT_CACHE_REBUILD_PAGE_LIMIT,
+                timeout_seconds: DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS,
+                knowledge_base: None,
+                knowledge_category: None,
+            }
+        ));
 
         let cli = Cli::parse_from(["snow", "verify-vault"]);
         assert!(matches!(cli.command, Command::VerifyVault));

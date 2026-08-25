@@ -226,12 +226,16 @@ impl ConfirmationStore for SqliteConfirmationStore {
             }
         }
 
-        self.conn
+        let changed = self
+            .conn
             .execute(
-                "UPDATE mcp_confirmations SET consumed = 1 WHERE token_id = ?1",
+                "UPDATE mcp_confirmations SET consumed = 1 WHERE token_id = ?1 AND consumed = 0 AND revoked = 0",
                 [token_id],
             )
             .map_err(|_| ConfirmationConsumeError::NotFound)?;
+        if changed != 1 {
+            return Err(ConfirmationConsumeError::AlreadyConsumed);
+        }
         record.consumed = true;
         Ok(record)
     }

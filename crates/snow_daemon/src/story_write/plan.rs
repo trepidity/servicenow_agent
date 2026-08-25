@@ -475,7 +475,11 @@ pub(super) async fn handle_story_plan_impl(
             );
         }
     };
-    if !state.mcp_config.policy.is_tool_enabled(tool) {
+    if !state
+        .mcp_config
+        .policy
+        .tool_enabled_in_environment(tool, &state.mcp_config.environment.label)
+    {
         return story_error(
             id,
             -32051,

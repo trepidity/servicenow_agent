@@ -12,7 +12,7 @@ interprocess.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.0"
+sha2.workspace = true
 tokio.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
@@ -23,3 +23,4 @@ servicenow_rs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

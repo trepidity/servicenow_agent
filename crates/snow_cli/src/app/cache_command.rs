@@ -1,6 +1,9 @@
 use super::*;
 use crate::daemon_cmd::{client::endpoint_alive, paths::DaemonPaths};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub(super) fn cmd_cache_info() -> Result<(), SnowError> {
@@ -37,8 +40,34 @@ pub(super) fn ensure_cache_replacement_is_offline(action: &str) -> Result<(), Sn
     Ok(())
 }
 
+pub(super) fn acquire_cache_maintenance_lock() -> Result<File, SnowError> {
+    let paths = runtime_paths();
+    let parent = paths.database.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(SnowError::from)?;
+    let lock_path = parent.join("cache.maintenance.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(SnowError::from)?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(SnowError::Api(
+            "another cache maintenance command is active; wait for it to finish before replacing the cache"
+                .to_string(),
+        )),
+        Err(error) => Err(SnowError::Api(format!(
+            "locking cache maintenance file {}: {error}",
+            lock_path.display()
+        ))),
+    }
+}
+
 pub(super) fn cmd_import_cache_from_vault_offline() -> Result<(), SnowError> {
     ensure_cache_replacement_is_offline("importing")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
     let paths = runtime_paths();
     let report = snow_core::rebuild_cache_from_vault(&paths.vault, &paths.database)
         .map_err(|error| SnowError::Api(error.to_string()))?;
@@ -48,11 +77,30 @@ pub(super) fn cmd_import_cache_from_vault_offline() -> Result<(), SnowError> {
 
 pub(super) fn cmd_reset_cache_offline() -> Result<(), SnowError> {
     ensure_cache_replacement_is_offline("resetting")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
     let paths = runtime_paths();
     snow_core::reset_cache(&paths.database).map_err(|error| SnowError::Api(error.to_string()))?;
     println!("reset-cache");
     println!("cache format: {}", snow_core::cache::store::CACHE_FORMAT_ID);
     println!("records: 0");
+    Ok(())
+}
+
+pub(super) fn cmd_adopt_cache_only_projection(yes: bool) -> Result<(), SnowError> {
+    if !yes {
+        return Err(SnowError::Api(
+            "refusing to change cache provenance without --yes".to_string(),
+        ));
+    }
+    ensure_cache_replacement_is_offline("adopting")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
+    let paths = runtime_paths();
+    let store = Store::open(&paths.database).map_err(|error| SnowError::Api(error.to_string()))?;
+    let adopted = store
+        .adopt_legacy_cache_only_records()
+        .map_err(|error| SnowError::Api(error.to_string()))?;
+    println!("adopt-cache-only-projection");
+    println!("adopted cache-only records: {adopted}");
     Ok(())
 }
 
@@ -62,6 +110,8 @@ pub(super) async fn cmd_rebuild_cache_from_servicenow(
     credential: auth::CredentialProvider,
     metadata_password: snow_core::credential::SecretString,
     client: ServiceNowClient,
+    page_limit: u32,
+    knowledge_scope: snow_core::CacheRebuildKnowledgeScope,
 ) -> Result<(), SnowError> {
     let paths = runtime_paths();
     let file_name = paths
@@ -96,7 +146,9 @@ pub(super) async fn cmd_rebuild_cache_from_servicenow(
             return Err(error);
         }
     };
-    let report = core.rebuild_cache_from_servicenow(&progress_sink).await;
+    let report = core
+        .rebuild_cache_from_servicenow(&progress_sink, page_limit, knowledge_scope)
+        .await;
     drop(core);
     let report = match report {
         Ok(report) => report,

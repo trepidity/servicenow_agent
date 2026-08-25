@@ -51,7 +51,7 @@ pub(super) fn command_uses_daemon_auto_spawn(command: &Command) -> bool {
         } if *daemon || socket_path.is_some()
     ) || matches!(
         command,
-        Command::BusinessApp { .. } | Command::Server { .. }
+        Command::BusinessApp { .. } | Command::Server { .. } | Command::Incident { .. }
     )
 }
 
@@ -62,8 +62,10 @@ pub(super) fn command_uses_local_credentials(command: &Command) -> bool {
         Command::Daemon { .. }
         | Command::Admin
         | Command::CacheInfo
+        | Command::AdoptCacheOnlyProjection { .. }
         | Command::BusinessApp { .. }
-        | Command::Server { .. } => false,
+        | Command::Server { .. }
+        | Command::Incident { .. } => false,
         Command::Tui {
             daemon,
             socket_path,

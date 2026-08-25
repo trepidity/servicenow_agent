@@ -283,6 +283,15 @@ fn rpc_method_parsing_covers_known_methods() {
 
 #[test]
 fn contract_info_method_lists_cover_canonical_and_deprecated_rpc_methods() {
+    assert!(
+        !SUPPORTED_RPC_METHODS.contains(&"catalog_cancel_request"),
+        "deferred catalog cancellation must not be advertised by the daemon"
+    );
+    assert_eq!(
+        RpcMethod::from_method("catalog_cancel_request"),
+        RpcMethod::Unknown
+    );
+
     for method in SUPPORTED_RPC_METHODS {
         assert_ne!(
             RpcMethod::from_method(method),
@@ -302,6 +311,36 @@ fn contract_info_method_lists_cover_canonical_and_deprecated_rpc_methods() {
             "{method} should point to canonical method {replacement}"
         );
     }
+}
+
+#[test]
+fn contract_info_advertises_the_named_live_change_task_child_read() {
+    assert!(
+        SUPPORTED_RPC_METHODS.contains(&"change_request_list_tasks"),
+        "the Mullet Change workflow must not fall back to cached get_children"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_rejects_deferred_catalog_cancellation_as_unknown() {
+    let fixture = build_fixture_state().await.expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "catalog_cancel_request".to_string(),
+            params: json!({}),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let error = response
+        .error
+        .expect("deferred cancellation must not have a callable route");
+    assert_eq!(error.code, -32601);
+    assert_eq!(error.message, "method not found");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -701,6 +740,45 @@ async fn change_task_completed_remains_terminal() {
     assert_eq!(
         error.data.expect("guard error data")["reason"],
         json!("terminal_record_skipped")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn change_task_update_plan_admits_the_parent_restore_field_through_rpc() {
+    let (instance_url, _request_rx) = spawn_json_http_sequence_server(vec![
+        change_update_response("CTASK001", "1", "Open"),
+        json!({ "result": [] }),
+    ])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+    let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+        Arc::clone(&fixture.state.core),
+        fixture.tempdir.path().join("change-task-parent-restore"),
+        enabled_change_update_mcp_config(),
+    ));
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "change_task_plan_update".to_string(),
+            params: json!({
+                "number": "CTASK001",
+                "change_request": "0123456789abcdef0123456789abcdef"
+            }),
+            id: Some(json!(1)),
+        },
+        &state,
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("update plan");
+    assert_eq!(
+        result["preview"]["change_request"],
+        json!("0123456789abcdef0123456789abcdef")
     );
 }
 
@@ -1729,6 +1807,15 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
     let (instance_url, _approval_requests) = spawn_json_http_sequence_server(vec![
         json!({
             "result": [{
+                "sys_id": "chg-sys",
+                "number": "CHG001",
+                "short_description": "Example change",
+                "state": "assess"
+            }]
+        }),
+        json!({ "result": [] }),
+        json!({
+            "result": [{
                 "sys_id": "user-1",
                 "user_name": "tester",
                 "email": "tester@example.com",
@@ -1780,11 +1867,8 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
         record.get("resource_type").and_then(Value::as_str),
         Some("change")
     );
-    assert_eq!(record.get("source").and_then(Value::as_str), Some("disk"));
-    assert_eq!(
-        record.get("vault_relative_path").and_then(Value::as_str),
-        Some("changes/CHG001.md")
-    );
+    assert_eq!(record.get("source").and_then(Value::as_str), Some("api"));
+    assert!(record.get("vault_relative_path").is_none());
     assert!(
         record
             .get("browser_url")
@@ -1895,7 +1979,8 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
     .await;
     let knowledge_result = knowledge_list.result.expect("knowledge list result");
     let knowledge_articles = knowledge_result
-        .get("articles")
+        .get("data")
+        .and_then(|data| data.get("articles"))
         .and_then(Value::as_array)
         .expect("knowledge articles");
     assert_eq!(knowledge_articles.len(), 1);
@@ -1975,7 +2060,7 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
     let cache_info = cache_info.result.expect("cache info");
     assert_eq!(
         cache_info.get("total_rows").and_then(Value::as_u64),
-        Some(4)
+        Some(5)
     );
     assert!(
         cache_info
@@ -2123,7 +2208,7 @@ async fn direct_rpc_contract_exposes_wrapped_aliases_metadata_and_filters() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_rpc_omits_browser_url_when_instance_config_is_absent() {
+async fn direct_rpc_work_record_omission_does_not_fall_back_to_cached_projection() {
     let fixture = build_fixture_state_without_instance_config()
         .await
         .expect("fixture");
@@ -2139,17 +2224,19 @@ async fn direct_rpc_omits_browser_url_when_instance_config_is_absent() {
     )
     .await;
 
-    let record = response
-        .result
-        .expect("record result")
-        .get("record")
-        .cloned()
-        .expect("wrapped record");
-    assert!(record.get("browser_url").is_none());
-    assert_eq!(
-        record.get("vault_relative_path").and_then(Value::as_str),
-        Some("changes/CHG001.md")
+    assert!(response.result.is_none());
+    assert!(
+        response.error.is_some(),
+        "live upstream failure must surface"
     );
+    let cached = fixture
+        .state
+        .core
+        .get_record("CHG001")
+        .await
+        .expect("inspect seeded cache")
+        .expect("seeded cached projection remains present");
+    assert_eq!(cached.source, snow_core::CacheSource::Disk);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2433,10 +2520,8 @@ async fn direct_rpc_get_record_refreshes_uncached_demand() {
         record.get("number").and_then(Value::as_str),
         Some("DMND0320098")
     );
-    assert_eq!(
-        record.get("vault_relative_path").and_then(Value::as_str),
-        Some("demands/DMND0320098/DMND0320098.md")
-    );
+    assert_eq!(record.get("source").and_then(Value::as_str), Some("api"));
+    assert!(record.get("vault_relative_path").is_none());
     assert!(
         record
             .get("browser_url")
@@ -2448,10 +2533,71 @@ async fn direct_rpc_get_record_refreshes_uncached_demand() {
     let request_line = request_rx.await.expect("request line");
     assert!(request_line.contains("/api/now/table/dmn_demand"));
     assert!(request_line.contains("DMND0320098"));
+    assert!(
+        fixture
+            .state
+            .core
+            .get_record("DMND0320098")
+            .await
+            .expect("inspect derived cache")
+            .is_none(),
+        "a live-only compatibility read must not persist"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_rpc_private_task_record_includes_best_effort_vtb_context() {
+async fn direct_rpc_get_record_ignores_cached_change_and_returns_live_record() {
+    let response = json!({
+        "result": [
+            {
+                "sys_id": "chg-sys",
+                "number": "CHG001",
+                "short_description": "Live emergency patch",
+                "description": "The live record is newer than the cached fixture",
+                "state": "Assess"
+            }
+        ]
+    });
+    let (instance_url, request_rx) =
+        spawn_json_http_sequence_server(vec![response, json!({ "result": [] })])
+            .await
+            .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "get_record".to_string(),
+            params: json!({ "number": "CHG001" }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let record = response
+        .result
+        .expect("record result")
+        .get("record")
+        .cloned()
+        .expect("wrapped record");
+    assert_eq!(
+        record.get("short_description").and_then(Value::as_str),
+        Some("Live emergency patch"),
+        "get_record must not return the cached 'Database patch' fixture"
+    );
+    assert_eq!(record.get("source").and_then(Value::as_str), Some("api"));
+
+    let requests = request_rx.await.expect("request lines");
+    let request_line = requests.first().expect("record request");
+    assert!(request_line.contains("/api/now/table/change_request"));
+    assert!(request_line.contains("CHG001"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_rpc_private_task_live_read_skips_local_vtb_projection() {
     let task_sys_id = "11111111111111111111111111111111";
     let (instance_url, request_rx) = spawn_json_http_sequence_server(vec![
         json!({
@@ -2463,8 +2609,6 @@ async fn direct_rpc_private_task_record_includes_best_effort_vtb_context() {
                 "state": "open"
             }]
         }),
-        json!({ "result": [] }),
-        json!({ "result": [] }),
         json!({ "result": [] }),
     ])
     .await
@@ -2494,19 +2638,15 @@ async fn direct_rpc_private_task_record_includes_best_effort_vtb_context() {
         record.get("resource_type").and_then(Value::as_str),
         Some("private_task")
     );
-    let vtb_context = record
-        .get("vtb_context")
-        .expect("VTB context on private task");
-    assert!(vtb_context.is_object());
-    assert_eq!(vtb_context["checklist_items"], json!([]));
+    assert!(record.get("vtb_context").is_none());
+    assert!(record.get("vault_relative_path").is_none());
 
-    let requests = request_rx.await.expect("record and enrichment requests");
+    let requests = request_rx.await.expect("record requests");
     assert!(requests.iter().any(|request| request.contains("/vtb_task")));
-    assert!(requests.iter().any(|request| request.contains("/vtb_card")));
     assert!(
-        requests
+        !requests
             .iter()
-            .any(|request| request.contains("/checklist"))
+            .any(|request| request.contains("/vtb_card") || request.contains("/checklist"))
     );
 }
 
@@ -3272,16 +3412,19 @@ async fn json_rpc_get_article_repairs_missing_body_with_live_client() {
 
     let result = response.result.expect("article result");
     assert_eq!(
-        result["article"]["record"]["number"].as_str(),
+        result["data"]["article"]["record"]["number"].as_str(),
         Some("KB0105015")
     );
     assert_eq!(
-        result["article"]["content"].as_str(),
+        result["data"]["article"]["content"].as_str(),
         Some("Recovered KB body")
     );
-    assert_eq!(result["article"]["body_cached"].as_bool(), Some(true));
+    assert_eq!(
+        result["data"]["article"]["body_cached"].as_bool(),
+        Some(true)
+    );
     assert!(
-        result["markdown"]
+        result["data"]["markdown"]
             .as_str()
             .expect("markdown")
             .contains("Recovered KB body")
@@ -3456,6 +3599,48 @@ async fn search_records_falls_back_to_live_fetch_for_exact_number() {
             .and_then(|r| r.get("number"))
             .and_then(Value::as_str),
         Some("INC4992697")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_records_exact_work_number_ignores_seeded_local_projection() {
+    let (instance_url, request_rx) = spawn_json_http_sequence_server(vec![
+        json!({
+            "result": [{
+                "sys_id": "chg-sys",
+                "number": "CHG001",
+                "short_description": "Live change title",
+                "description": "Live projection",
+                "state": "assess"
+            }]
+        }),
+        json!({ "result": [] }),
+    ])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture with seeded CHG001 cache");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "search_records".to_string(),
+            params: json!({ "query": "CHG001" }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    let record = &response.result.expect("search result")["results"][0]["record"];
+    assert_eq!(record["short_description"], json!("Live change title"));
+    assert!(record.get("vault_relative_path").is_none());
+    let requests = request_rx.await.expect("live record requests");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/change_request"))
     );
 }
 
@@ -3756,7 +3941,7 @@ fn task_sla_row(sys_id: &str, task_sys_id: &str, task_display: &str, sla_name: &
 // ----- server_get read-through (live fallback) RPC tests -----
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
+async fn direct_rpc_server_get_default_live_mode_does_not_persist() {
     let sys_id = "abababababababababababababababab";
     let response = json!({
         "result": [{
@@ -3786,7 +3971,8 @@ async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
     let server = response
         .result
         .expect("server result")
-        .get("server")
+        .get("data")
+        .and_then(|data| data.get("server"))
         .cloned()
         .expect("wrapped server");
     assert_eq!(
@@ -3809,12 +3995,14 @@ async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
         })
         .await
         .expect("cached server query");
-    assert_eq!(cached.len(), 1, "default server_get must cache live hit");
-    assert_eq!(cached[0].sys_id, sys_id);
+    assert!(
+        cached.is_empty(),
+        "default server_get must not persist the live response"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_rpc_server_get_persist_false_does_not_write_cache() {
+async fn direct_rpc_server_get_policy_owns_persistence_over_legacy_caller_hint() {
     let sys_id = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
     let response = json!({
         "result": [{
@@ -3829,6 +4017,27 @@ async fn direct_rpc_server_get_persist_false_does_not_write_cache() {
     let fixture = build_fixture_state_at_instance(&instance_url)
         .await
         .expect("fixture");
+    std::fs::write(
+        fixture.tempdir.path().join("cache-policy.toml"),
+        concat!(
+            "version = 1\n",
+            "[objects.server]\n",
+            "mode = \"read_through\"\n",
+            "ttl = \"7d\"\n",
+        ),
+    )
+    .expect("server read-through policy");
+    let reloaded = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "cache_policy_reload".to_string(),
+            params: json!({}),
+            id: Some(json!(0)),
+        },
+        &fixture.state,
+    )
+    .await;
+    assert!(reloaded.error.is_none(), "reload failed: {reloaded:?}");
 
     let response = dispatch(
         JsonRpcRequest {
@@ -3847,7 +4056,8 @@ async fn direct_rpc_server_get_persist_false_does_not_write_cache() {
     let server = response
         .result
         .expect("server result")
-        .get("server")
+        .get("data")
+        .and_then(|data| data.get("server"))
         .cloned()
         .expect("wrapped server");
     assert_eq!(
@@ -3867,10 +4077,12 @@ async fn direct_rpc_server_get_persist_false_does_not_write_cache() {
         })
         .await
         .expect("cached server query");
-    assert!(
-        cached.is_empty(),
-        "persist=false must not cache server_get hit"
+    assert_eq!(
+        cached.len(),
+        1,
+        "read-through policy must cache the live hit"
     );
+    assert_eq!(cached[0].sys_id, sys_id);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4217,4 +4429,55 @@ async fn record_query_is_routable_and_advertised() {
             .iter()
             .any(|method| method == "record_query")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn change_request_list_tasks_is_live_paged_and_never_uses_cached_children() {
+    let (instance_url, request_rx) = spawn_json_http_sequence_server(vec![json!({
+        "result": [{
+            "sys_id": "22222222222222222222222222222222",
+            "number": "CTASK0000001",
+            "short_description": "Plan the approved change",
+            "change_request": { "value": "change-sys", "display_value": "CHG0000001" },
+            "change_task_type": { "value": "planning", "display_value": "Planning" },
+            "state": { "value": "1", "display_value": "Open" }
+        }]
+    })])
+    .await
+    .expect("http server");
+    let fixture = build_fixture_state_at_instance(&instance_url)
+        .await
+        .expect("fixture");
+
+    let response = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "change_request_list_tasks".to_string(),
+            params: json!({ "change_request_number": "CHG0000001", "limit": 1 }),
+            id: Some(json!(1)),
+        },
+        &fixture.state,
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    let result = response.result.expect("live task page");
+    assert_eq!(result["operation"], json!("change_request_list_tasks"));
+    assert_eq!(result["source"]["kind"], json!("live"));
+    assert_eq!(result["completeness"]["kind"], json!("partial"));
+    assert_eq!(result["data"]["complete"], json!(false));
+    assert_eq!(
+        result["data"]["next_cursor"],
+        json!("22222222222222222222222222222222")
+    );
+    assert_eq!(
+        result["data"]["records"][0]["number"],
+        json!("CTASK0000001")
+    );
+
+    let requests = request_rx.await.expect("one live ServiceNow request");
+    let request = requests.first().expect("first request");
+    assert!(request.contains("/api/now/table/change_task"));
+    assert!(request.contains("change_request.number%3DCHG0000001"));
+    assert!(request.contains("sysparm_limit=1"));
 }

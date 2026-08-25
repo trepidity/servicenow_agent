@@ -937,6 +937,83 @@ pub fn format_business_application_fields(fields: &serde_json::Value) -> String 
 }
 
 /// Generically render the Server dictionary/observed fields array.
+/// Render a typed-resource descriptor envelope for a terminal.
+///
+/// Renders the envelope's source and completeness alongside the fields, because
+/// "where did this come from" is part of the contract, not decoration. An
+/// unavailable category is rendered with its reason rather than as an empty
+/// list, so a permissions problem never looks like a table with no fields.
+pub fn format_resource_descriptor(envelope: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let data = envelope.get("data").unwrap_or(envelope);
+    let table = data.get("table").and_then(|v| v.as_str()).unwrap_or("?");
+    let source = envelope
+        .get("source")
+        .and_then(|s| s.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let completeness = envelope
+        .get("completeness")
+        .and_then(|c| c.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    out.push_str(&format!(
+        "table: {table}  source: {source}  completeness: {completeness}\n"
+    ));
+    if let Some(paging) = data.get("paging") {
+        let mode = paging.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+        match (paging.get("default_limit"), paging.get("max_limit")) {
+            (Some(default_limit), Some(max_limit)) => {
+                out.push_str(&format!(
+                    "paging: {mode} (default {default_limit}, max {max_limit})\n"
+                ));
+            }
+            _ => out.push_str(&format!("paging: {mode}\n")),
+        }
+    }
+    for (label, key) in [
+        ("readable", "readable_fields"),
+        ("writable", "writable_fields"),
+    ] {
+        out.push('\n');
+        let Some(category) = data.get(key) else {
+            continue;
+        };
+        match category.get("status").and_then(|v| v.as_str()) {
+            Some("available") => {
+                let fields = category.get("value").and_then(|v| v.as_array());
+                let count = fields.map_or(0, Vec::len);
+                out.push_str(&format!("{label} fields ({count}):\n"));
+                for field in fields.into_iter().flatten() {
+                    let name = field.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let kind = field.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                    out.push_str(&format!("  {name}  [{kind}]"));
+                    if let Some(reference) = field.get("reference_table").and_then(|v| v.as_str()) {
+                        out.push_str(&format!(" -> {reference}"));
+                    }
+                    if let Some(choices) = field
+                        .get("choices")
+                        .filter(|c| c.get("status").and_then(|v| v.as_str()) == Some("available"))
+                        .and_then(|c| c.get("value"))
+                        .and_then(|v| v.as_array())
+                    {
+                        out.push_str(&format!(" ({} choices)", choices.len()));
+                    }
+                    out.push('\n');
+                }
+            }
+            _ => {
+                let reason = category
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                out.push_str(&format!("{label} fields: unavailable ({reason})\n"));
+            }
+        }
+    }
+    out
+}
+
 pub fn format_server_fields(fields: &serde_json::Value) -> String {
     format_observed_fields(fields, "No Server fields found.\n")
 }

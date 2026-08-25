@@ -145,6 +145,22 @@ impl SqliteIdempotencyStore {
         Ok(())
     }
 
+    pub fn try_mark_apply_started(&self, key: &IdempotencyKey, tool: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE mcp_idempotency SET apply_started_at = ?1 WHERE key = ?2 AND tool = ?3 AND apply_started_at IS NULL AND receipt_json IS NULL",
+            params![Utc::now().to_rfc3339(), key.value, tool],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn clear_apply_started(&self, key: &IdempotencyKey, tool: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mcp_idempotency SET apply_started_at = NULL WHERE key = ?1 AND tool = ?2 AND receipt_json IS NULL",
+            params![key.value, tool],
+        )?;
+        Ok(())
+    }
+
     fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
         if self.table_has_column(table, column)? {
             return Ok(());

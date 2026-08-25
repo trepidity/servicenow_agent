@@ -2,7 +2,7 @@ mod support;
 
 use serde_json::json;
 use snow_mcp::{
-    JsonRpcRequest, McpServer,
+    JsonRpcRequest, McpConfig, McpServer, McpTransport,
     domain::policy::is_write_tool,
     planner::is_governed_write_tool,
     tools::records::{RESOURCE_PLAN_LOOKUP_TABLES, RecordLookup, parse_record_lookup},
@@ -42,6 +42,13 @@ async fn representative_read_tool_calls_round_trip() {
         let name = tool["name"].as_str().expect("tool name");
         assert_eq!(tool["read_only"], json!(!is_write_tool(name)));
     }
+    for name in ["catalog_submit_request", "work_note_apply_add"] {
+        let capability = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing capability {name}"));
+        assert_eq!(capability["enabled"], json!(false), "{name}");
+    }
     let ba_servers = tools
         .iter()
         .find(|tool| tool["name"] == "business_application_servers")
@@ -49,6 +56,30 @@ async fn representative_read_tool_calls_round_trip() {
     assert_eq!(ba_servers["mode"], json!("read"));
     assert_eq!(ba_servers["read_only"], json!(true));
     assert_eq!(ba_servers["requires_confirmation"], json!(false));
+}
+
+#[tokio::test]
+async fn direct_mcp_rejects_deferred_catalog_cancellation_as_unknown() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+
+    let response = server
+        .dispatch(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "catalog_cancel_request",
+                "arguments": {"number": "RITM0010001"}
+            }),
+            id: Some(json!(99)),
+        })
+        .await;
+
+    let error = response
+        .error
+        .expect("deferred cancellation must not have a callable route");
+    assert_eq!(error.code, -32601);
+    assert_eq!(error.message, "tool not found");
 }
 
 #[tokio::test]
@@ -103,6 +134,43 @@ async fn foreground_refuses_governed_write_tools_with_daemon_required() {
         assert_eq!(error.message, "DAEMON_REQUIRED_FOR_WRITE", "{name}");
         assert_eq!(error.data.unwrap()["reason"], "daemon_not_attached");
     }
+}
+
+#[tokio::test]
+async fn foreground_denies_disabled_incident_bulk_apply_before_daemon_proxy() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let mut config = McpConfig::default();
+    config.environment.label = "prod".to_string();
+    let policy = config
+        .policy
+        .tools
+        .get_mut("incident_bulk_apply_update")
+        .expect("bulk Incident apply policy");
+    policy.enabled = true;
+    policy.environments = vec!["test".to_string()];
+    let server = McpServer::with_config(fixture.core, config, McpTransport::Stdio);
+
+    let response = server
+        .dispatch(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "incident_bulk_apply_update",
+                "arguments": {}
+            }),
+            id: Some(json!(91)),
+        })
+        .await;
+
+    let error = response
+        .error
+        .expect("disabled bulk Incident apply must be rejected locally");
+    assert_eq!(error.code, -32040);
+    assert_eq!(error.message, "policy denied");
+    assert_eq!(
+        error.data.expect("policy data")["tool"],
+        "incident_bulk_apply_update"
+    );
 }
 
 #[test]

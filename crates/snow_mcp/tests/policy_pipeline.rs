@@ -26,7 +26,7 @@ fn policy_describe_exposes_read_only_defaults() {
 
     let tools = resolve_role_allowlist(&cfg, ["governance_reviewer"]);
     assert!(tools.contains("audit_chain_verify"));
-    assert!(cfg.tool_enabled_in_environment("work_note_apply_add", "test"));
+    assert!(!cfg.tool_enabled_in_environment("work_note_apply_add", "test"));
     assert!(!cfg.tool_enabled_in_environment("work_note_apply_add", "prod"));
 }
 
@@ -80,7 +80,12 @@ environment = "test"
     )
     .expect("policy TOML should parse");
 
-    assert!(cfg.tool_enabled_in_environment("catalog_submit_request", "test"));
+    for tool in ["catalog_submit_request", "work_note_apply_add"] {
+        assert!(
+            !cfg.tool_enabled_in_environment(tool, "test"),
+            "{tool} must be disabled until explicitly enabled"
+        );
+    }
     assert!(
         cfg.tools
             .get("catalog_submit_request")
@@ -100,6 +105,26 @@ enabled = false
     .expect("policy TOML should parse");
 
     assert!(!cfg.tool_enabled_in_environment("catalog_submit_request", "test"));
+}
+
+#[test]
+fn explicitly_enabled_mutation_without_named_environment_remains_disabled() {
+    let cfg = PolicyConfig::from_toml_str(
+        r#"
+[mcp.tools.attachment_upload]
+enabled = true
+"#,
+    )
+    .expect("policy TOML should parse");
+
+    assert!(
+        !cfg.tool_enabled_in_environment("attachment_upload", "test"),
+        "mutation enablement without a named environment must fail closed"
+    );
+    assert!(
+        !cfg.tool_enabled_in_environment("attachment_upload", "production"),
+        "mutation enablement without a named environment must not widen to production"
+    );
 }
 
 #[test]

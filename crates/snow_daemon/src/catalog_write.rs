@@ -34,9 +34,12 @@ pub async fn handle_catalog_item_get(
             vec![json!({"field": "sys_id", "reason": "type_mismatch"})],
         );
     };
-    match state.core.get_catalog_item(&item_sys_id).await {
-        Ok(item) => JsonRpcResponse::ok(id, json!({ "item": item })),
-        Err(err) => internal_error(id, err),
+    match state.core.catalog_item_get_envelope(&item_sys_id).await {
+        Ok(envelope) => match serde_json::to_value(envelope) {
+            Ok(value) => JsonRpcResponse::ok(id, value),
+            Err(err) => internal_error(id, err),
+        },
+        Err(err) => catalog_read_error(id, err),
     }
 }
 
@@ -56,9 +59,16 @@ pub async fn handle_catalog_items_search(
         .and_then(Value::as_u64)
         .unwrap_or(10)
         .min(50) as u32;
-    match state.core.search_catalog_items(&query, limit).await {
-        Ok(items) => JsonRpcResponse::ok(id, json!({ "items": items })),
-        Err(err) => internal_error(id, err),
+    match state
+        .core
+        .catalog_items_search_envelope(&query, limit)
+        .await
+    {
+        Ok(envelope) => match serde_json::to_value(envelope) {
+            Ok(value) => JsonRpcResponse::ok(id, value),
+            Err(err) => internal_error(id, err),
+        },
+        Err(err) => catalog_read_error(id, err),
     }
 }
 
@@ -648,6 +658,22 @@ fn confirmation_invalid(id: Option<Value>, err: ConfirmationConsumeError) -> Jso
 
 fn catalog_error(id: Option<Value>, code: i64, message: &str, data: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, code, message, Some(data))
+}
+
+fn catalog_read_error(id: Option<Value>, err: anyhow::Error) -> JsonRpcResponse {
+    if let Some(miss) = err.downcast_ref::<snow_core::cache::policy::CacheMiss>() {
+        return catalog_error(
+            id,
+            -32072,
+            "cache miss",
+            json!({
+                "code": "CACHE_MISS",
+                "operation": miss.operation,
+                "object": miss.object,
+            }),
+        );
+    }
+    internal_error(id, err)
 }
 
 fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {

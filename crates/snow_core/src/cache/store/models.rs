@@ -1,4 +1,4 @@
-use crate::{KnowledgeEmbeddingCoverage, ResourceType};
+use crate::{CatalogItem, KnowledgeEmbeddingCoverage, ResourceType};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,11 +8,43 @@ pub enum CacheFormat {
     Incompatible { found: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogProductProjectionRow {
+    pub item: CatalogItem,
+    pub last_refreshed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordLifecycle {
     Active,
     Tombstoned,
     Pruned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultProjectionProvenance {
+    VaultBacked,
+    CacheOnly,
+    LegacyUnknown,
+}
+
+impl VaultProjectionProvenance {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::VaultBacked => "vault_backed",
+            Self::CacheOnly => "cache_only",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "vault_backed" => Some(Self::VaultBacked),
+            "cache_only" => Some(Self::CacheOnly),
+            "legacy_unknown" => Some(Self::LegacyUnknown),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

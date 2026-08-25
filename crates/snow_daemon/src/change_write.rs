@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
+use servicenow_rs::prelude::Error as SnowApiError;
 use sha2::{Digest, Sha256};
 use snow_core::SnowRecord;
 use snow_mcp::audit::{AuditSink, SqliteAuditSink};
@@ -189,7 +190,7 @@ pub async fn handle_change_plan(
         None,
         tool,
         ResultStatus::Plan,
-        Some(plan.planned_changes.clone()),
+        Some(redacted_plan_audit_summary(tool, &plan.planned_changes)),
         None,
         None,
         Some((&actor, &requester)),
@@ -437,7 +438,14 @@ pub async fn handle_change_apply(
 
     let before_record = if is_update_tool(tool) {
         match plan.target.as_ref() {
-            Some(target) => match state.core.get_record_fresh(&target.number).await {
+            Some(target) => match if tool == "incident_apply_update" {
+                state
+                    .core
+                    .get_record_live_without_persistence(&target.number)
+                    .await
+            } else {
+                state.core.get_record_fresh(&target.number).await
+            } {
                 Ok(record) => record,
                 Err(err) => return internal_error(id, err),
             },
@@ -501,6 +509,20 @@ pub async fn handle_change_apply(
     match stores.confirmation_store.lookup(&confirmation_token) {
         Ok(Some(record)) => {
             if let Err(err) = validate_confirmation(&record, &binding) {
+                if tool == "incident_apply_update"
+                    && err == ConfirmationConsumeError::AlreadyConsumed
+                    && let Ok(Some(idempotency)) =
+                        stores.idempotency_store.lookup_record(&key, tool)
+                {
+                    if let Some(mut receipt) = idempotency.receipt {
+                        receipt.idempotency_replay = true;
+                        return JsonRpcResponse::ok(id, json!(receipt));
+                    }
+                    if idempotency.apply_started_at.is_some() {
+                        return pending_resolution_required(state, id, tool, &plan, &idempotency)
+                            .await;
+                    }
+                }
                 return confirmation_invalid(state, id, tool, err).await;
             }
         }
@@ -511,7 +533,21 @@ pub async fn handle_change_apply(
     }
 
     let apply_started_at = Utc::now();
-    if let Err(err) = stores
+    if tool == "incident_apply_update" {
+        match stores.idempotency_store.try_mark_apply_started(&key, tool) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match stores.idempotency_store.lookup_record(&key, tool) {
+                    Ok(Some(record)) => {
+                        pending_resolution_required(state, id, tool, &plan, &record).await
+                    }
+                    Ok(None) => internal_error(id, "idempotency reservation disappeared"),
+                    Err(error) => internal_error(id, error),
+                };
+            }
+            Err(error) => return internal_error(id, error),
+        }
+    } else if let Err(err) = stores
         .idempotency_store
         .mark_apply_started(&key, tool)
         .await
@@ -521,15 +557,43 @@ pub async fn handle_change_apply(
 
     let write_result = match apply_plan(tool, &plan, state).await {
         Ok(result) => result,
-        Err(err) => {
+        Err(ApplyWriteError::Upstream(err)) => {
+            if tool == "incident_apply_update"
+                && let Err(clear_error) = stores.idempotency_store.clear_apply_started(&key, tool)
+            {
+                return internal_error(id, clear_error);
+            }
             return audited_change_error(
                 state,
                 id,
                 tool,
                 -32059,
                 "UPSTREAM_ERROR",
-                upstream_error_data(tool, &plan, err.to_string()),
+                upstream_error_data(
+                    tool,
+                    &plan,
+                    safe_upstream_diagnostic(&err, &sensitive_strings(&plan.planned_changes)),
+                ),
                 ResultStatus::Error,
+            )
+            .await;
+        }
+        Err(ApplyWriteError::LocalCoherence) => {
+            return audited_change_error(
+                state,
+                id,
+                tool,
+                -32046,
+                "LOCAL_COHERENCE_FAILED",
+                json!({
+                    "code": "LOCAL_COHERENCE_FAILED",
+                    "upstream_applied": true,
+                    "plan_id": plan.plan_id,
+                    "op_hash": plan.op_hash,
+                    "idempotency_key": idempotency_key,
+                    "reason": "ServiceNow accepted the PATCH but exact local invalidation could not be certified"
+                }),
+                ResultStatus::AppliedPartial,
             )
             .await;
         }
@@ -592,11 +656,20 @@ struct DaemonStores {
 fn stores(state: &DaemonState) -> Result<DaemonStores> {
     std::fs::create_dir_all(&state.data_dir)?;
     let path = state.data_dir.join("mcp_story_write.sqlite3");
+    let audit_path = state
+        .mcp_config
+        .audit
+        .path
+        .as_deref()
+        .unwrap_or(path.as_path());
+    if let Some(parent) = audit_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     Ok(DaemonStores {
         plan_store: SqlitePlanStore::open(&path)?,
         confirmation_store: SqliteConfirmationStore::open(&path)?,
         idempotency_store: SqliteIdempotencyStore::open(&path)?,
-        audit_sink: SqliteAuditSink::open(&path)?,
+        audit_sink: SqliteAuditSink::open(audit_path)?,
     })
 }
 
@@ -675,12 +748,16 @@ async fn build_plan_input(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let record = state
-                .core
-                .get_record_fresh(&number)
-                .await
-                .map_err(PlanBuildError::Upstream)?
-                .ok_or_else(|| PlanBuildError::NotFound(format!("record {number} not found")))?;
+            let record = if tool == "incident_plan_update" {
+                state
+                    .core
+                    .get_record_live_without_persistence(&number)
+                    .await
+            } else {
+                state.core.get_record_fresh(&number).await
+            }
+            .map_err(PlanBuildError::Upstream)?
+            .ok_or_else(|| PlanBuildError::NotFound(format!("record {number} not found")))?;
             let expected_table = match tool {
                 "change_request_plan_update" => "change_request",
                 "change_task_plan_update" => "change_task",
@@ -754,7 +831,13 @@ async fn normalize_incident_update_payload(
     let object = payload
         .as_object_mut()
         .ok_or_else(|| PlanBuildError::Invalid("payload".to_string()))?;
-    let allowed = ["assigned_to", "assignment_group", "state", "work_notes"];
+    let allowed = [
+        "assigned_to",
+        "assignment_group",
+        "state",
+        "work_notes",
+        "comments",
+    ];
     if !object.keys().any(|field| allowed.contains(&field.as_str())) {
         return Err(PlanBuildError::FieldRejected(vec![json!({
             "field": "changes",
@@ -851,10 +934,14 @@ async fn normalize_incident_update_payload(
         object.insert("state".to_string(), Value::String(state_choice.value));
     }
 
-    if let Some(value) = object.get("work_notes")
-        && value.as_str().is_none_or(|note| note.trim().is_empty())
-    {
-        return Err(PlanBuildError::Invalid("work_notes".to_string()));
+    for field in ["work_notes", "comments"] {
+        if let Some(value) = object.get(field)
+            && value
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty() || text.chars().count() > 16_000)
+        {
+            return Err(PlanBuildError::Invalid(field.to_string()));
+        }
     }
     Ok(())
 }
@@ -1071,52 +1158,66 @@ async fn apply_plan(
     tool: &str,
     plan: &OperationPlan,
     state: &DaemonState,
-) -> Result<snow_core::ChangeWriteResult> {
+) -> std::result::Result<snow_core::ChangeWriteResult, ApplyWriteError> {
     match tool {
-        "change_request_apply_create" => {
-            state
-                .core
-                .create_change_request(plan.planned_changes.clone())
-                .await
-        }
-        "change_task_apply_create" => {
-            state
-                .core
-                .create_change_task(plan.planned_changes.clone())
-                .await
-        }
+        "change_request_apply_create" => state
+            .core
+            .create_change_request(plan.planned_changes.clone())
+            .await
+            .map_err(ApplyWriteError::Upstream),
+        "change_task_apply_create" => state
+            .core
+            .create_change_task(plan.planned_changes.clone())
+            .await
+            .map_err(ApplyWriteError::Upstream),
         "change_request_apply_update" => {
-            let target = plan
-                .target
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("change update plan missing target"))?;
+            let target = plan.target.as_ref().ok_or_else(|| {
+                ApplyWriteError::Upstream(anyhow::anyhow!("change update plan missing target"))
+            })?;
             state
                 .core
                 .update_change_request(&target.sys_id, plan.planned_changes.clone())
                 .await
+                .map_err(ApplyWriteError::Upstream)
         }
         "change_task_apply_update" => {
-            let target = plan
-                .target
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("change task update plan missing target"))?;
+            let target = plan.target.as_ref().ok_or_else(|| {
+                ApplyWriteError::Upstream(anyhow::anyhow!("change task update plan missing target"))
+            })?;
             state
                 .core
                 .update_change_task(&target.sys_id, plan.planned_changes.clone())
                 .await
+                .map_err(ApplyWriteError::Upstream)
         }
         "incident_apply_update" => {
-            let target = plan
-                .target
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("incident update plan missing target"))?;
-            state
+            let target = plan.target.as_ref().ok_or_else(|| {
+                ApplyWriteError::Upstream(anyhow::anyhow!("incident update plan missing target"))
+            })?;
+            match state
                 .core
                 .update_incident(&target.sys_id, plan.planned_changes.clone())
                 .await
+            {
+                Ok(result) => Ok(result),
+                Err(snow_core::IncidentWriteError::Upstream(error)) => {
+                    Err(ApplyWriteError::Upstream(error))
+                }
+                Err(snow_core::IncidentWriteError::LocalCoherence(error)) => {
+                    let _ = error;
+                    Err(ApplyWriteError::LocalCoherence)
+                }
+            }
         }
-        _ => Err(anyhow::anyhow!("unsupported Change apply tool {tool}")),
+        _ => Err(ApplyWriteError::Upstream(anyhow::anyhow!(
+            "unsupported Change apply tool {tool}"
+        ))),
     }
+}
+
+enum ApplyWriteError {
+    Upstream(anyhow::Error),
+    LocalCoherence,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1130,12 +1231,15 @@ fn receipt_for_write(
     before_record: Option<&SnowRecord>,
     state: &DaemonState,
 ) -> OperationReceipt {
-    let record_url = format!(
-        "{}/nav_to.do?uri={}.do?sys_id={}",
-        state.core.config().instance.url.trim_end_matches('/'),
-        record.table,
-        record.sys_id
-    );
+    let incident = tool == "incident_apply_update";
+    let record_url = (!incident).then(|| {
+        format!(
+            "{}/nav_to.do?uri={}.do?sys_id={}",
+            state.core.config().instance.url.trim_end_matches('/'),
+            record.table,
+            record.sys_id
+        )
+    });
     let changed_fields = plan
         .planned_changes
         .as_object()
@@ -1144,8 +1248,20 @@ fn receipt_for_write(
                 .iter()
                 .map(|(field, after)| FieldChange {
                     field: field.clone(),
-                    before: before_record.and_then(|record| record_field_value(record, field)),
-                    after: Some(after.clone()),
+                    before: before_record
+                        .and_then(|record| record_field_value(record, field))
+                        .map(|value| {
+                            if incident {
+                                Value::String(hash_audit_value(Some(&value)))
+                            } else {
+                                value
+                            }
+                        }),
+                    after: Some(if incident {
+                        Value::String(hash_audit_value(Some(after)))
+                    } else {
+                        after.clone()
+                    }),
                 })
                 .collect()
         })
@@ -1157,7 +1273,15 @@ fn receipt_for_write(
         parent_audit_id: plan.plan_id.clone(),
         tool: tool.to_string(),
         status: ReceiptStatus::Success,
-        applied_changes_summary: Some(plan.planned_changes.clone()),
+        applied_changes_summary: Some(if incident {
+            json!({
+                "fields": plan.planned_changes.as_object().map(|object| {
+                    object.keys().cloned().collect::<Vec<_>>()
+                }).unwrap_or_default()
+            })
+        } else {
+            plan.planned_changes.clone()
+        }),
         service_now_metadata: Some(ServiceNowMetadata {
             sys_id: Some(record.sys_id.clone()),
             number: Some(record.number.clone()),
@@ -1166,13 +1290,27 @@ fn receipt_for_write(
         idempotency_replay: false,
         completed_at: Utc::now(),
         op_hash: plan.op_hash.clone(),
-        record_url: Some(record_url),
-        record_snapshot: serde_json::to_value(&record).ok(),
+        record_url,
+        record_snapshot: (!incident)
+            .then(|| serde_json::to_value(&record).ok())
+            .flatten(),
         changed_fields,
         concurrency_token_observed: Some(concurrency_token),
         apply_started_at: Some(apply_started_at),
         error_code: None,
         warnings: Vec::new(),
+    }
+}
+
+fn redacted_plan_audit_summary(tool: &str, planned_changes: &Value) -> Value {
+    if tool == "incident_plan_update" {
+        json!({
+            "fields": planned_changes.as_object().map(|object| {
+                object.keys().cloned().collect::<Vec<_>>()
+            }).unwrap_or_default()
+        })
+    } else {
+        planned_changes.clone()
     }
 }
 
@@ -1457,6 +1595,59 @@ fn upstream_error_data(tool: &str, plan: &OperationPlan, reason: String) -> Valu
     data
 }
 
+pub(crate) fn safe_upstream_diagnostic(error: &anyhow::Error, sensitive: &[String]) -> String {
+    let candidate = match error.downcast_ref::<SnowApiError>() {
+        Some(SnowApiError::Api {
+            status, message, ..
+        }) => format!("ServiceNow API {status}: {message}"),
+        Some(SnowApiError::Auth { status, .. }) => {
+            format!("ServiceNow authentication rejected with status {status:?}")
+        }
+        Some(SnowApiError::RateLimited { .. }) => "ServiceNow rate limited the request".to_string(),
+        Some(SnowApiError::Http(http)) => http
+            .status()
+            .map(|status| format!("ServiceNow HTTP status {}", status.as_u16()))
+            .unwrap_or_else(|| "ServiceNow transport failure".to_string()),
+        _ => "ServiceNow request failed".to_string(),
+    };
+    let lowered = candidate.to_ascii_lowercase();
+    if [
+        "http://",
+        "https://",
+        "authorization",
+        "bearer ",
+        "basic ",
+        "password",
+        "work_notes",
+        "comments",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+        || sensitive
+            .iter()
+            .filter(|value| !value.is_empty())
+            .any(|value| candidate.contains(value))
+    {
+        return "ServiceNow request failed with a redacted diagnostic".to_string();
+    }
+    candidate.chars().take(240).collect()
+}
+
+fn sensitive_strings(value: &Value) -> Vec<String> {
+    fn collect(value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::String(value) => output.push(value.clone()),
+            Value::Array(values) => values.iter().for_each(|value| collect(value, output)),
+            Value::Object(values) => values.values().for_each(|value| collect(value, output)),
+            _ => {}
+        }
+    }
+
+    let mut output = Vec::new();
+    collect(value, &mut output);
+    output
+}
+
 fn pending_resolution_data(plan: &OperationPlan, idempotency: &IdempotencyRecord) -> Value {
     json!({
         "code": "PENDING_RESOLUTION_REQUIRED",
@@ -1596,6 +1787,7 @@ fn is_free_text_field(field: &str) -> bool {
             | "test_plan"
             | "justification"
             | "work_notes"
+            | "comments"
     )
 }
 
@@ -1640,7 +1832,7 @@ fn policy_decisions_for(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn append_audit_event(
+pub(crate) async fn append_audit_event(
     state: &DaemonState,
     audit_id: &str,
     parent_audit_id: Option<&str>,
@@ -1653,6 +1845,9 @@ async fn append_audit_event(
     applied_changes: Option<Vec<AppliedChange>>,
 ) -> snow_mcp::Result<AuditEvent> {
     let stores = stores(state).map_err(snow_mcp::Error::Anyhow)?;
+    stores
+        .audit_sink
+        .enforce_retention(state.mcp_config.audit.retention_days)?;
     let (actor, requester) = identities.unwrap_or_else(|| {
         let configured = state.core.config().instance.user.as_str();
         (configured, configured)

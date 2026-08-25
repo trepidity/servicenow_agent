@@ -2555,7 +2555,7 @@ dependencies = [
 [[package]]
 name = "servicenow_rs"
 version = "0.7.0"
-source = "git+https://github.com/trepidity/servicenow_rs.git?rev=4d67e2bec0c5be21686a74ce51985f899d766321#4d67e2bec0c5be21686a74ce51985f899d766321"
+source = "git+https://github.com/trepidity/servicenow_rs.git?rev=ad9a52acebcc5d68270e4d9124fb5ccf103bb838#ad9a52acebcc5d68270e4d9124fb5ccf103bb838"
 dependencies = [
  "async-trait",
  "base64",
@@ -2706,6 +2706,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "servicenow_rs",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2736,6 +2737,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

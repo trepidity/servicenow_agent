@@ -1038,6 +1038,64 @@ async fn bridge_preserves_structured_daemon_story_errors() {
 }
 
 #[tokio::test]
+async fn bridge_advertises_incident_fields_only_when_the_daemon_declares_it() {
+    // The bridge is the fourth declared transport for the T-OPS-01 foundation
+    // resource. Advertising it while the daemon cannot route it is exactly the
+    // ghost-surface failure T-OPS-05 removed, so presence must track the
+    // daemon contract rather than the static registry.
+    let without = MockDaemon::new(contract(&["contract_info"]));
+    let response = bridge(without)
+        .dispatch(request("tools/list", json!({})))
+        .await;
+    let result = response.result.expect("tools/list");
+    let names = result["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        !names.iter().any(|name| name == "incident_fields"),
+        "an undeclared daemon method must not be advertised"
+    );
+
+    let with = MockDaemon::new(contract(&["contract_info", "incident_fields"]));
+    let response = bridge(with)
+        .dispatch(request("tools/list", json!({})))
+        .await;
+    let result = response.result.expect("tools/list");
+    let names = result["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| name == "incident_fields"),
+        "a declared daemon method must reach the bridge transport: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn bridge_rejects_incident_fields_arguments_outside_the_closed_schema() {
+    let daemon = MockDaemon::new(contract(&["contract_info", "incident_fields"]));
+    let response = bridge(daemon.clone())
+        .dispatch(request(
+            "tools/call",
+            json!({
+                "name": "incident_fields",
+                "arguments": { "table": "sys_user" }
+            }),
+        ))
+        .await;
+
+    assert_eq!(response.error.expect("invalid params").code, -32602);
+    assert_eq!(daemon.method_names().await, vec!["contract_info"]);
+}
+
+#[tokio::test]
 async fn bridge_filters_tools_against_daemon_contract() {
     let daemon = MockDaemon::new(contract(&["contract_info", "get_record"]));
     let server = bridge(daemon);
@@ -1061,6 +1119,10 @@ async fn bridge_filters_tools_against_daemon_contract() {
     assert!(names.contains(&"resource_plan_get"));
     assert!(names.contains(&"story_get"));
     assert!(names.contains(&"tool_capabilities"));
+    // Daemon-mapped and undeclared by this contract, so the bridge must not
+    // advertise it. The paired test below proves it appears once declared.
+    assert!(!names.contains(&"incident_fields"));
+    assert!(!names.contains(&"catalog_cancel_request"));
     assert!(!names.contains(&"knowledge_fetch"));
 
     let get_record = tools

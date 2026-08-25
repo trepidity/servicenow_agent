@@ -87,7 +87,7 @@ reported as completed.
 
 ```text
 rebuild-cache: preparing ServiceNow staging cache
-rebuild-cache: tables=12 page_size=100
+rebuild-cache: tables=12 page_size=1000
 rebuild-cache: resolving configured user scope
 rebuild-cache: configured user scope resolved
 [1/12] incident (incident): start

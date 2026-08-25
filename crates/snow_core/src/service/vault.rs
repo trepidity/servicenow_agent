@@ -11,6 +11,7 @@ use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::cache::store::VaultProjectionProvenance;
 use crate::cache::store::{AliasRow, KeywordRow, Store, TagRow};
 use crate::context::CoreContext;
 use crate::convert::enrichment_origin_label;
@@ -34,7 +35,7 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error when the replacement cache cannot be created, validated,
-/// cleaned of prior SQLite sidecars, or moved into place.
+/// moved into place, or cleaned of prior Snow-owned SQLite artifacts.
 pub fn reset_cache(database_path: &Path) -> Result<()> {
     let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -50,9 +51,12 @@ pub fn reset_cache(database_path: &Path) -> Result<()> {
         if Store::inspect_format(&temporary)? != crate::cache::store::CacheFormat::Current {
             anyhow::bail!("reset cache did not validate as the current format");
         }
+        checkpoint_sqlite(&temporary)?;
+        remove_sqlite_sidecars(&temporary)?;
         remove_sqlite_sidecars(database_path)?;
         std::fs::rename(&temporary, database_path)
             .with_context(|| format!("replacing cache {}", database_path.display()))?;
+        remove_stale_cache_artifacts(database_path)?;
         Ok(())
     })();
 
@@ -71,13 +75,18 @@ pub fn promote_rebuilt_cache(staging_path: &Path, database_path: &Path) -> Resul
     if Store::inspect_format(staging_path)? != crate::cache::store::CacheFormat::Current {
         anyhow::bail!("ServiceNow rebuild cache did not validate as the current format");
     }
-    let connection = rusqlite::Connection::open(staging_path)?;
-    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-    drop(connection);
+    checkpoint_sqlite(staging_path)?;
     remove_sqlite_sidecars(staging_path)?;
     remove_sqlite_sidecars(database_path)?;
     std::fs::rename(staging_path, database_path)
         .with_context(|| format!("promoting rebuilt cache to {}", database_path.display()))?;
+    Ok(())
+}
+
+fn checkpoint_sqlite(database_path: &Path) -> Result<()> {
+    let connection = rusqlite::Connection::open(database_path)?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(connection);
     Ok(())
 }
 
@@ -96,6 +105,53 @@ fn remove_sqlite_sidecars(database_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_stale_cache_artifacts(database_path: &Path) -> Result<()> {
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = database_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snow.db");
+
+    for entry in std::fs::read_dir(parent)
+        .with_context(|| format!("scanning cache directory {}", parent.display()))?
+    {
+        let entry = entry?;
+        if !is_snow_owned_cache_artifact(&entry.file_name(), file_name) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())
+            .with_context(|| format!("removing stale cache artifact {}", entry.path().display()))?;
+    }
+    Ok(())
+}
+
+fn is_snow_owned_cache_artifact(name: &std::ffi::OsStr, database_file_name: &str) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+
+    ["reset", "rebuild", "servicenow-rebuild"]
+        .into_iter()
+        .any(|operation| {
+            let prefix = format!(".{database_file_name}.{operation}-");
+            let Some(remainder) = name.strip_prefix(&prefix) else {
+                return false;
+            };
+            let without_sidecar = ["-wal", "-shm", "-journal"]
+                .into_iter()
+                .find_map(|suffix| remainder.strip_suffix(suffix))
+                .unwrap_or(remainder);
+            let Some(candidate_uuid) = without_sidecar.strip_suffix(".tmp") else {
+                return false;
+            };
+            uuid::Uuid::parse_str(candidate_uuid).is_ok()
+        })
 }
 
 /// Builds a fresh current-format projection beside `database_path` and replaces
@@ -225,11 +281,16 @@ impl VaultService {
 
     pub async fn repair_vault(&self) -> Result<RepairReport> {
         let rows = self.ctx.query.store().list_active_records(None)?;
+        let provenance = self.ctx.query.store().active_record_vault_provenance()?;
         let mut repaired = 0usize;
         let mut skipped = 0usize;
         let scanned = rows.len();
 
         for row in rows.into_iter().filter(|row| row.file_path.is_none()) {
+            if provenance.get(&row.sys_id) == Some(&VaultProjectionProvenance::CacheOnly) {
+                skipped += 1;
+                continue;
+            }
             let Some(document) = self
                 .ctx
                 .load_runtime_document(&row.number, &row.resource_type)
@@ -306,10 +367,13 @@ impl VaultService {
         let scan_report = scan_documents_detailed(&self.ctx.vault_path)?;
         let entries = scan_report.entries;
         let rows = self.ctx.query.store().list_active_records(None)?;
+        let provenance = self.ctx.query.store().active_record_vault_provenance()?;
 
         let mut indexed_sys_ids = BTreeMap::new();
         let mut missing_markdown_rows = Vec::new();
         let mut orphan_record_rows = Vec::new();
+        let mut cache_only_record_rows = 0usize;
+        let mut legacy_unknown_record_rows = 0usize;
         for row in &rows {
             indexed_sys_ids.insert(row.sys_id.clone(), row.clone());
             match row.file_path.as_deref() {
@@ -325,11 +389,21 @@ impl VaultService {
                         orphan_record_rows.push(orphan);
                     }
                 }
-                None => orphan_record_rows.push(OrphanRecordRow {
-                    sys_id: row.sys_id.clone(),
-                    number: row.number.clone(),
-                    file_path: None,
-                }),
+                None => match provenance
+                    .get(&row.sys_id)
+                    .copied()
+                    .unwrap_or(VaultProjectionProvenance::LegacyUnknown)
+                {
+                    VaultProjectionProvenance::CacheOnly => cache_only_record_rows += 1,
+                    VaultProjectionProvenance::LegacyUnknown => legacy_unknown_record_rows += 1,
+                    VaultProjectionProvenance::VaultBacked => {
+                        orphan_record_rows.push(OrphanRecordRow {
+                            sys_id: row.sys_id.clone(),
+                            number: row.number.clone(),
+                            file_path: None,
+                        })
+                    }
+                },
             }
         }
 
@@ -362,6 +436,8 @@ impl VaultService {
             degraded_reads: self.ctx.query.degraded_reads(),
             missing_markdown_rows,
             orphan_record_rows,
+            cache_only_record_rows,
+            legacy_unknown_record_rows,
             unprojectable_documents: scan_report.failures,
             unindexed_documents,
         })
@@ -574,11 +650,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_only_projection_is_not_repaired_or_pruned_as_an_orphan() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = build_test_core(tempdir.path().join("vault")).await;
+        let record = sample_change_task_record();
+        core.ctx
+            .project_live_records_without_vault(std::slice::from_ref(&record))
+            .expect("project cache-only record");
+
+        let verification = core.verify_vault().expect("verify cache-only projection");
+        assert_eq!(verification.active_records, 1);
+        assert_eq!(verification.cache_only_record_rows, 1);
+        assert_eq!(verification.legacy_unknown_record_rows, 0);
+        assert!(verification.orphan_record_rows.is_empty());
+
+        let repair = core
+            .repair_vault()
+            .await
+            .expect("repair cache-only projection");
+        assert_eq!(repair.repaired_records, 0);
+        assert_eq!(repair.skipped_records, 1);
+
+        let prune = core
+            .prune_orphans(false)
+            .await
+            .expect("prune cache-only projection");
+        assert_eq!(prune.orphan_rows_pruned, 0);
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_number("CTASK001")
+                .expect("lookup cache-only row")
+                .is_some(),
+            "cache-only projection must remain after prune"
+        );
+    }
+
+    #[tokio::test]
     async fn prune_orphans_dry_run_and_execution_report_rows() {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
         let record = sample_change_task_record();
-        let legacy_row = record_row_from_servicenow(&record).expect("legacy row");
+        let mut legacy_row = record_row_from_servicenow(&record).expect("legacy row");
+        legacy_row.file_path = Some("changes/CHG001/CTASK001.md".to_string());
         core.ctx
             .query
             .store()

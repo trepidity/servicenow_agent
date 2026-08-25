@@ -4,6 +4,8 @@ pub(in crate::rpc) const CONTRACT_VERSION: &str = "daemon-json-rpc-v1";
 
 pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "contract_info",
+    "cache_policy_validate",
+    "cache_policy_reload",
     "ping",
     "get_record",
     "get_record_fresh",
@@ -25,7 +27,10 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "business_application_fields",
     "resource_plan_list",
     "incident_list_by_assignment_group",
+    "incident_get",
+    "incident_query",
     "incident_assignment_groups",
+    "incident_fields",
     "incident_assignment_group_queue",
     "server_get",
     "server_get_fresh",
@@ -43,6 +48,7 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "catalog_plan_request",
     "catalog_submit_request",
     "get_children",
+    "change_request_list_tasks",
     "get_work_notes",
     "list_records",
     "record_query",
@@ -89,6 +95,8 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "change_task_apply_update",
     "incident_plan_update",
     "incident_apply_update",
+    "incident_bulk_plan_update",
+    "incident_bulk_apply_update",
     "resource_plan_plan_create",
     "resource_plan_apply_create",
     "resource_plan_plan_update",
@@ -259,6 +267,64 @@ pub(in crate::rpc) async fn dispatch_system(
 ) -> JsonRpcResponse {
     match method {
         RpcMethod::ContractInfo => JsonRpcResponse::ok(id, contract_info(state.as_ref())),
+        RpcMethod::CachePolicyValidate | RpcMethod::CachePolicyReload => {
+            if request
+                .params
+                .as_object()
+                .is_none_or(|params| !params.is_empty())
+            {
+                return invalid_params(id, "cache-policy lifecycle accepts exactly {}");
+            }
+            let result = if method == RpcMethod::CachePolicyValidate {
+                state.cache_policy.validate().and_then(|value| {
+                    serde_json::to_value(value).map_err(|err| {
+                        snow_core::cache::policy::CachePolicyError::Invalid {
+                            field: None,
+                            rule: None,
+                            reason: err.to_string(),
+                        }
+                    })
+                })
+            } else {
+                state.cache_policy.reload().and_then(|value| {
+                    serde_json::to_value(value).map_err(|err| {
+                        snow_core::cache::policy::CachePolicyError::Invalid {
+                            field: None,
+                            rule: None,
+                            reason: err.to_string(),
+                        }
+                    })
+                })
+            };
+            match result {
+                Ok(value) => JsonRpcResponse::ok(id, value),
+                Err(snow_core::cache::policy::CachePolicyError::Invalid {
+                    field,
+                    rule,
+                    reason,
+                }) => {
+                    let mut data = json!({ "code": "CACHE_POLICY_INVALID", "reason": reason });
+                    let map = data.as_object_mut().expect("JSON object literal");
+                    if let Some(field) = field {
+                        map.insert("field".to_string(), json!(field));
+                    }
+                    if let Some(rule) = rule {
+                        map.insert("rule".to_string(), json!(rule));
+                    }
+                    JsonRpcResponse::error(id, -32070, "cache policy invalid", Some(data))
+                }
+                Err(snow_core::cache::policy::CachePolicyError::Io { kind, source }) => {
+                    JsonRpcResponse::error(
+                        id,
+                        -32071,
+                        "cache policy I/O failed",
+                        Some(
+                            json!({ "code": "CACHE_POLICY_IO", "kind": kind, "reason": source.to_string() }),
+                        ),
+                    )
+                }
+            }
+        }
         RpcMethod::Ping => JsonRpcResponse::ok(id, json!({ "ok": true })),
         RpcMethod::Shutdown => JsonRpcResponse::ok(id, json!({ "status": "shutting_down" })),
         RpcMethod::CatalogItemsSearch => {
@@ -291,6 +357,9 @@ pub(in crate::rpc) async fn dispatch_system(
             crate::change_write::handle_change_plan(id, &request.method, &request.params, state)
                 .await
         }
+        RpcMethod::IncidentBulkPlanUpdate => {
+            crate::incident_bulk_write::handle_plan(id, &request.params, state).await
+        }
         RpcMethod::ChangeRequestApplyCreate
         | RpcMethod::ChangeRequestApplyUpdate
         | RpcMethod::ChangeTaskApplyCreate
@@ -298,6 +367,9 @@ pub(in crate::rpc) async fn dispatch_system(
         | RpcMethod::IncidentApplyUpdate => {
             crate::change_write::handle_change_apply(id, &request.method, &request.params, state)
                 .await
+        }
+        RpcMethod::IncidentBulkApplyUpdate => {
+            crate::incident_bulk_write::handle_apply(id, &request.params, state).await
         }
         RpcMethod::ResourcePlanPlanCreate | RpcMethod::ResourcePlanPlanUpdate => {
             crate::resource_plan_write::handle_resource_plan_plan(

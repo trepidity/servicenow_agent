@@ -127,6 +127,80 @@ pub(in crate::rpc) fn default_min_count() -> usize {
     1
 }
 
+pub(in crate::rpc) async fn knowledge_cache_snapshot(
+    core: &SnowCore,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let records = core
+        .list_records_query(
+            ListQuery::new()
+                .resource_type(ResourceType::Knowledge)
+                .include_tombstoned(false),
+        )
+        .await?;
+    Ok(records.iter().map(|record| record.synced_at).min())
+}
+
+pub(in crate::rpc) fn knowledge_cache_miss(
+    id: Option<Value>,
+    operation: &'static str,
+) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32072,
+        "cache miss",
+        Some(json!({
+            "code": "CACHE_MISS", "operation": operation, "object": "knowledge"
+        })),
+    )
+}
+
+pub(in crate::rpc) fn knowledge_article_result(
+    transport: &DaemonTransport<'_>,
+    article: &snow_core::KnowledgeArticle,
+    source: snow_core::Source,
+    live_without_local_io: bool,
+) -> Result<Value> {
+    let article_dto = if live_without_local_io {
+        transport.live_knowledge_article(article)?
+    } else {
+        transport.knowledge_article(article)?
+    };
+    operation_envelope_result(
+        "get_article",
+        source,
+        snow_core::Completeness::Complete,
+        json!({
+            "article": article_dto,
+            "markdown": render_knowledge_article(article),
+        }),
+    )
+}
+
+pub(in crate::rpc) fn knowledge_list_result(
+    operation: &'static str,
+    transport: &DaemonTransport<'_>,
+    articles: Vec<snow_core::KnowledgeArticle>,
+    source: snow_core::Source,
+    completeness: snow_core::Completeness,
+    live_without_local_io: bool,
+) -> Result<Value> {
+    let mut article_dtos = Vec::with_capacity(articles.len());
+    for article in articles {
+        let article = if live_without_local_io {
+            transport.live_knowledge_article(&article)?
+        } else {
+            transport.knowledge_article(&article)?
+        };
+        article_dtos.push(article);
+    }
+    operation_envelope_result(
+        operation,
+        source,
+        completeness,
+        json!({"articles": article_dtos}),
+    )
+}
+
 pub(in crate::rpc) fn validate_kb_tag_filter(layer: &str) -> Result<()> {
     match layer.trim().to_ascii_lowercase().as_str() {
         "all" | "sn" | "auto" | "user" => Ok(()),
@@ -153,26 +227,87 @@ pub(in crate::rpc) async fn dispatch_knowledge(
     match method {
         RpcMethod::GetKnowledgeArticle | RpcMethod::GetArticle => {
             match extract_number(&request.params) {
-                Ok(number) => match state
-                    .core
-                    .get_knowledge_article_cached_or_fresh(&number)
-                    .await
-                {
-                    Ok(Some(article)) => match transport.knowledge_article(&article) {
-                        Ok(article_dto) => JsonRpcResponse::ok(
-                            id,
-                            json!({
-                                "article": article_dto,
-                                "markdown": render_knowledge_article(&article),
-                            }),
-                        ),
+                Ok(number) => {
+                    let rule = state
+                        .cache_policy
+                        .active()
+                        .rule_for("get_article", "knowledge");
+                    let cached = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                        Ok(None)
+                    } else {
+                        state
+                            .core
+                            .get_knowledge_article(&number)
+                            .await
+                            .map(|article| {
+                                article.filter(|article| {
+                                    article.body_cached
+                                        && (rule.mode
+                                            == snow_core::cache::policy::CacheMode::CacheOnly
+                                            || rule.ttl.is_some_and(|ttl| {
+                                                article.record.synced_at + ttl > chrono::Utc::now()
+                                            }))
+                                })
+                            })
+                    };
+                    match cached {
+                        Ok(Some(article)) => match knowledge_article_result(
+                            transport,
+                            &article,
+                            snow_core::Source::Cache {
+                                last_refreshed_at: article.record.synced_at,
+                            },
+                            false,
+                        ) {
+                            Ok(result) => JsonRpcResponse::ok(id, result),
+                            Err(err) => internal_error(id, err),
+                        },
+                        Ok(None) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                            knowledge_cache_miss(id, "get_article")
+                        }
+                        Ok(None) => {
+                            let live_without_local_io =
+                                rule.mode == snow_core::cache::policy::CacheMode::Live;
+                            match state
+                                .core
+                                .get_knowledge_article_cached_or_fresh(&number)
+                                .await
+                            {
+                                Ok(Some(article)) => match knowledge_article_result(
+                                    transport,
+                                    &article,
+                                    snow_core::Source::Live,
+                                    live_without_local_io,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                },
+                                Ok(None) => JsonRpcResponse::error(
+                                    id,
+                                    -32004,
+                                    "knowledge article not found",
+                                    None,
+                                ),
+                                Err(err)
+                                    if err
+                                        .downcast_ref::<snow_core::cache::policy::CacheMiss>()
+                                        .is_some() =>
+                                {
+                                    JsonRpcResponse::error(
+                                        id,
+                                        -32072,
+                                        "cache miss",
+                                        Some(json!({
+                                            "code": "CACHE_MISS", "operation": "get_article", "object": "knowledge"
+                                        })),
+                                    )
+                                }
+                                Err(err) => internal_error(id, err),
+                            }
+                        }
                         Err(err) => internal_error(id, err),
-                    },
-                    Ok(None) => {
-                        JsonRpcResponse::error(id, -32004, "knowledge article not found", None)
                     }
-                    Err(err) => internal_error(id, err),
-                },
+                }
                 Err(err) => invalid_params(id, err),
             }
         }
@@ -198,19 +333,78 @@ pub(in crate::rpc) async fn dispatch_knowledge(
             }
         }
         RpcMethod::SearchKnowledge => match extract_knowledge_search_filters(&request.params) {
-            Ok((query, filters)) => match state.core.search_knowledge(&query, filters).await {
-                Ok(articles) => {
-                    let mut article_dtos = Vec::with_capacity(articles.len());
-                    for article in articles {
-                        match transport.knowledge_article(&article) {
-                            Ok(article) => article_dtos.push(article),
-                            Err(err) => return internal_error(id, err),
+            Ok((query, filters)) => {
+                let rule = state
+                    .cache_policy
+                    .active()
+                    .rule_for("search_knowledge", "knowledge");
+                let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                    Ok(None)
+                } else {
+                    knowledge_cache_snapshot(state.core.as_ref()).await
+                };
+                match snapshot {
+                    Ok(Some(last_refreshed_at))
+                        if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                            || rule.ttl.is_some_and(|ttl| {
+                                last_refreshed_at + ttl > chrono::Utc::now()
+                            }) =>
+                    {
+                        match state.core.search_knowledge(&query, filters).await {
+                            Ok(articles) => match knowledge_list_result(
+                                "search_knowledge",
+                                transport,
+                                articles,
+                                snow_core::Source::Cache { last_refreshed_at },
+                                snow_core::Completeness::Partial {
+                                    reason: snow_core::PartialReason::NarrowedProjection,
+                                },
+                                false,
+                            ) {
+                                Ok(result) => JsonRpcResponse::ok(id, result),
+                                Err(err) => internal_error(id, err),
+                            },
+                            Err(err) => internal_error(id, err),
                         }
                     }
-                    JsonRpcResponse::ok(id, json!({ "articles": article_dtos }))
+                    Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                        knowledge_cache_miss(id, "search_knowledge")
+                    }
+                    Ok(_) => {
+                        let limit = filters.limit.unwrap_or(20).max(1);
+                        let live_without_local_io =
+                            rule.mode == snow_core::cache::policy::CacheMode::Live;
+                        match state
+                            .core
+                            .search_knowledge_policy_live(&query, filters, !live_without_local_io)
+                            .await
+                        {
+                            Ok(articles) => {
+                                let completeness = if articles.len() == limit {
+                                    snow_core::Completeness::Partial {
+                                        reason: snow_core::PartialReason::PageLimitReached,
+                                    }
+                                } else {
+                                    snow_core::Completeness::Complete
+                                };
+                                match knowledge_list_result(
+                                    "search_knowledge",
+                                    transport,
+                                    articles,
+                                    snow_core::Source::Live,
+                                    completeness,
+                                    live_without_local_io,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                }
+                            }
+                            Err(err) => internal_error(id, err),
+                        }
+                    }
+                    Err(err) => internal_error(id, err),
                 }
-                Err(err) => internal_error(id, err),
-            },
+            }
             Err(err) => invalid_params(id, err),
         },
         RpcMethod::KbSemanticSearch => match extract_kb_semantic_search_filters(&request.params) {
@@ -261,27 +455,96 @@ pub(in crate::rpc) async fn dispatch_knowledge(
         },
         RpcMethod::ListKnowledgeArticles => {
             match extract_list_knowledge_articles_params(&request.params) {
-                Ok(params) => match state
-                    .core
-                    .list_knowledge_articles(
-                        params.knowledge_base_sys_id.as_deref(),
-                        params.category_sys_id.as_deref(),
-                        params.limit,
-                    )
-                    .await
-                {
-                    Ok(articles) => {
-                        let mut article_dtos = Vec::with_capacity(articles.len());
-                        for article in articles {
-                            match transport.knowledge_article(&article) {
-                                Ok(article) => article_dtos.push(article),
-                                Err(err) => return internal_error(id, err),
+                Ok(params) => {
+                    let rule = state
+                        .cache_policy
+                        .active()
+                        .rule_for("list_knowledge_articles", "knowledge");
+                    let snapshot = if rule.mode == snow_core::cache::policy::CacheMode::Live {
+                        Ok(None)
+                    } else {
+                        knowledge_cache_snapshot(state.core.as_ref()).await
+                    };
+                    match snapshot {
+                        Ok(Some(last_refreshed_at))
+                            if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly
+                                || rule.ttl.is_some_and(|ttl| {
+                                    last_refreshed_at + ttl > chrono::Utc::now()
+                                }) =>
+                        {
+                            match state
+                                .core
+                                .list_knowledge_articles(
+                                    params.knowledge_base_sys_id.as_deref(),
+                                    params.category_sys_id.as_deref(),
+                                    params.limit,
+                                )
+                                .await
+                            {
+                                Ok(articles) => match knowledge_list_result(
+                                    "list_knowledge_articles",
+                                    transport,
+                                    articles,
+                                    snow_core::Source::Cache { last_refreshed_at },
+                                    snow_core::Completeness::Partial {
+                                        reason: snow_core::PartialReason::NarrowedProjection,
+                                    },
+                                    false,
+                                ) {
+                                    Ok(result) => JsonRpcResponse::ok(id, result),
+                                    Err(err) => internal_error(id, err),
+                                },
+                                Err(err) => internal_error(id, err),
                             }
                         }
-                        JsonRpcResponse::ok(id, json!({ "articles": article_dtos }))
+                        Ok(_) if rule.mode == snow_core::cache::policy::CacheMode::CacheOnly => {
+                            knowledge_cache_miss(id, "list_knowledge_articles")
+                        }
+                        Ok(_) => {
+                            let live_without_local_io =
+                                rule.mode == snow_core::cache::policy::CacheMode::Live;
+                            match state
+                                .core
+                                .list_knowledge_articles_policy_live(
+                                    params.knowledge_base_sys_id.as_deref(),
+                                    params.category_sys_id.as_deref(),
+                                    params.limit,
+                                    !live_without_local_io,
+                                )
+                                .await
+                            {
+                                Ok(articles) => {
+                                    let completeness = match params.limit {
+                                        Some(limit) if articles.len() == limit.max(1) => {
+                                            snow_core::Completeness::Partial {
+                                                reason: snow_core::PartialReason::PageLimitReached,
+                                            }
+                                        }
+                                        None if articles.len() == 10_000 => {
+                                            snow_core::Completeness::Partial {
+                                                reason: snow_core::PartialReason::UpstreamTruncated,
+                                            }
+                                        }
+                                        _ => snow_core::Completeness::Complete,
+                                    };
+                                    match knowledge_list_result(
+                                        "list_knowledge_articles",
+                                        transport,
+                                        articles,
+                                        snow_core::Source::Live,
+                                        completeness,
+                                        live_without_local_io,
+                                    ) {
+                                        Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
+                                }
+                                Err(err) => internal_error(id, err),
+                            }
+                        }
+                        Err(err) => internal_error(id, err),
                     }
-                    Err(err) => internal_error(id, err),
-                },
+                }
                 Err(err) => invalid_params(id, err),
             }
         }

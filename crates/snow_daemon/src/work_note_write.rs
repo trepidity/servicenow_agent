@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use snow_core::SnowRecord;
+use snow_core::{FieldSupport, SnowRecord};
 use snow_mcp::audit::{AuditSink, SqliteAuditSink};
 use snow_mcp::domain::audit::{
     ActorIdentity, AppliedChange, AuditEvent, ClientIdentity, ErrorRow, PolicyDecisionRow,
@@ -26,6 +26,18 @@ use crate::rpc::JsonRpcResponse;
 const PLAN_TTL_SECONDS: i64 = 600;
 const WORK_NOTE_PLAN_TOOL: &str = "work_note_plan_add";
 const WORK_NOTE_APPLY_TOOL: &str = "work_note_apply_add";
+const WORK_NOTES_FIELD: &str = "work_notes";
+
+/// Result of daemon-internal, live field support discovery.
+///
+/// This deliberately is not an RPC shape. The table comes only from the
+/// record resolved by number, and the result is used only to decide whether a
+/// governed work-note operation may proceed.
+enum WorkNoteFieldSupport {
+    Supported,
+    Unsupported,
+    Unavailable,
+}
 
 pub async fn handle_work_note_plan_add(
     id: Option<Value>,
@@ -77,6 +89,9 @@ pub async fn handle_work_note_plan_add(
         Ok(None) => return JsonRpcResponse::error(id, -32004, "record not found", None),
         Err(err) => return internal_error(id, err),
     };
+    if let Some(response) = reject_unsupported_work_notes(id.clone(), state, &record).await {
+        return response;
+    }
 
     let plan = OperationPlanBuilder::new(WORK_NOTE_PLAN_TOOL)
         .target(record_ref_from_snow(&record))
@@ -440,6 +455,27 @@ pub async fn handle_work_note_apply_add(
         return internal_error(id, "work-note plan missing work_notes");
     };
 
+    let resolved_record = match get_record_cached_or_fresh(state, &target.number).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return audited_work_note_error(
+                state,
+                id,
+                -32004,
+                "record not found",
+                json!({ "details": format!("record {} not found", target.number) }),
+                ResultStatus::Error,
+            )
+            .await;
+        }
+        Err(err) => return internal_error(id, err),
+    };
+    if let Some(response) =
+        audited_reject_unsupported_work_notes(id.clone(), state, &resolved_record).await
+    {
+        return response;
+    }
+
     let apply_started_at = Utc::now();
     if let Err(err) = stores
         .idempotency_store
@@ -554,6 +590,87 @@ async fn get_record_cached_or_fresh(
     match state.core.get_record(number).await? {
         Some(record) => Ok(Some(record)),
         None => state.core.get_record_fresh(number).await,
+    }
+}
+
+/// Check live descriptor metadata for the record-derived table. An unavailable
+/// descriptor is not evidence that `work_notes` is absent, so it remains
+/// distinct from verified lack of support and fails closed.
+async fn work_note_field_support(state: &DaemonState, table: &str) -> WorkNoteFieldSupport {
+    match state.core.supports_field(table, WORK_NOTES_FIELD).await {
+        Ok(FieldSupport::Available { value: true }) => WorkNoteFieldSupport::Supported,
+        Ok(FieldSupport::Available { value: false }) => WorkNoteFieldSupport::Unsupported,
+        Ok(FieldSupport::Unavailable { .. }) | Err(_) => WorkNoteFieldSupport::Unavailable,
+    }
+}
+
+async fn reject_unsupported_work_notes(
+    id: Option<Value>,
+    state: &DaemonState,
+    record: &SnowRecord,
+) -> Option<JsonRpcResponse> {
+    match work_note_field_support(state, &record.table).await {
+        WorkNoteFieldSupport::Supported => None,
+        WorkNoteFieldSupport::Unsupported => Some(work_note_error(
+            id,
+            -32053,
+            "WORK_NOTES_UNSUPPORTED",
+            json!({
+                "code": "WORK_NOTES_UNSUPPORTED",
+                "field": WORK_NOTES_FIELD,
+                "table": record.table,
+            }),
+        )),
+        WorkNoteFieldSupport::Unavailable => Some(work_note_error(
+            id,
+            -32054,
+            "WORK_NOTES_DISCOVERY_UNAVAILABLE",
+            json!({
+                "code": "WORK_NOTES_DISCOVERY_UNAVAILABLE",
+                "field": WORK_NOTES_FIELD,
+                "table": record.table,
+            }),
+        )),
+    }
+}
+
+async fn audited_reject_unsupported_work_notes(
+    id: Option<Value>,
+    state: &DaemonState,
+    record: &SnowRecord,
+) -> Option<JsonRpcResponse> {
+    match work_note_field_support(state, &record.table).await {
+        WorkNoteFieldSupport::Supported => None,
+        WorkNoteFieldSupport::Unsupported => Some(
+            audited_work_note_error(
+                state,
+                id,
+                -32053,
+                "WORK_NOTES_UNSUPPORTED",
+                json!({
+                    "code": "WORK_NOTES_UNSUPPORTED",
+                    "field": WORK_NOTES_FIELD,
+                    "table": record.table,
+                }),
+                ResultStatus::Denied,
+            )
+            .await,
+        ),
+        WorkNoteFieldSupport::Unavailable => Some(
+            audited_work_note_error(
+                state,
+                id,
+                -32054,
+                "WORK_NOTES_DISCOVERY_UNAVAILABLE",
+                json!({
+                    "code": "WORK_NOTES_DISCOVERY_UNAVAILABLE",
+                    "field": WORK_NOTES_FIELD,
+                    "table": record.table,
+                }),
+                ResultStatus::Denied,
+            )
+            .await,
+        ),
     }
 }
 
@@ -986,8 +1103,40 @@ fn internal_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    /// Build an MCP config that explicitly enables the work-note apply tool for
+    /// the `test` environment.
+    ///
+    /// Governed mutation tools are disabled by default in every environment, so
+    /// a plan that must reach field validation has to name the tool and the
+    /// environment first. Without this the policy gate short-circuits ahead of
+    /// the behavior each test is written to prove.
+    fn enabled_work_note_mcp_config() -> snow_mcp::McpConfig {
+        let mut policy = snow_mcp::domain::policy::PolicyConfig::default();
+        policy
+            .tools
+            .get_mut(WORK_NOTE_APPLY_TOOL)
+            .expect("work-note apply policy")
+            .enabled = true;
+        snow_mcp::McpConfig {
+            environment: snow_mcp::McpEnvironment::explicit_config("test", "America/Chicago"),
+            policy,
+            ..Default::default()
+        }
+    }
+
+    /// Rebuild the fixture daemon state with the work-note apply tool enabled.
+    fn enabled_work_note_state(fixture: &crate::test_support::FixtureState) -> Arc<DaemonState> {
+        Arc::new(DaemonState::with_data_dir_and_mcp_config(
+            Arc::clone(&fixture.state.core),
+            fixture.tempdir.path().join("work-note-plan-add"),
+            enabled_work_note_mcp_config(),
+        ))
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn work_note_plan_add_accepts_explicit_work_notes_field() {
+    async fn work_note_plan_add_is_denied_when_policy_does_not_enable_the_apply_tool() {
         let fixture = crate::test_support::build_fixture_state()
             .await
             .expect("fixture");
@@ -1002,15 +1151,15 @@ mod tests {
         )
         .await;
 
-        assert!(response.error.is_none(), "{response:?}");
-        let result = response.result.expect("result");
-        assert_eq!(result["target"]["number"], json!("CHG001"));
+        let error = response
+            .error
+            .expect("default policy must deny the work-note plan");
+        assert_eq!(error.code, -32040);
+        assert_eq!(error.message, "policy denied");
         assert_eq!(
-            result["preview"]["work_notes"],
-            json!("Implementation is queued for validation.")
+            error.data.expect("data")["tool"],
+            json!(WORK_NOTE_APPLY_TOOL)
         );
-        assert!(result["confirmation_token"].as_str().is_some());
-        assert!(result["idempotency_key"].as_str().is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1018,6 +1167,7 @@ mod tests {
         let fixture = crate::test_support::build_fixture_state()
             .await
             .expect("fixture");
+        let state = enabled_work_note_state(&fixture);
 
         let response = handle_work_note_plan_add(
             Some(json!(1)),
@@ -1025,7 +1175,7 @@ mod tests {
                 "number": "CHG001",
                 "description": "This must not be treated as a journal note."
             }),
-            &fixture.state,
+            &state,
         )
         .await;
 

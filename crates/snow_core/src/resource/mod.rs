@@ -2,6 +2,7 @@ pub mod approval;
 pub mod business_application;
 pub mod catalog;
 pub mod change;
+pub mod descriptor;
 pub mod incident;
 pub mod knowledge;
 pub mod record_query;

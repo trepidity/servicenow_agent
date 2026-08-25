@@ -76,6 +76,12 @@ async fn tools_list_contains_daemon_read_parity_tools_with_schema_shape() {
     let result = response.result.expect("result");
     let tools = result["tools"].as_array().expect("tools array");
     assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"] != "catalog_cancel_request"),
+        "deferred catalog cancellation must not be advertised"
+    );
+    assert!(
         tools.iter().all(|tool| tool["name"] != "rebuild_cache"),
         "cache replacement must remain offline-only"
     );
@@ -218,6 +224,48 @@ fn incident_list_by_assignment_group_is_a_bounded_read_tool() {
     );
 }
 
+/// L1 MCP registration seam for the approved B-OPS-07 request boundary.
+#[test]
+fn incident_get_and_query_advertise_only_the_typed_live_contract() {
+    let registry = ToolRegistry::new();
+    let get = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "incident_get")
+        .expect("incident_get registered");
+    let query = registry
+        .metadata()
+        .iter()
+        .find(|tool| tool.name == "incident_query")
+        .expect("incident_query registered");
+
+    for tool in [get, query] {
+        assert!(tool.default_enabled);
+        assert!(!tool.requires_confirmation);
+        assert_eq!(tool.input_schema["type"], "object");
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_no_top_level_schema_composition(&tool.input_schema);
+    }
+    assert_eq!(
+        get.input_schema["properties"]
+            .as_object()
+            .map(|properties| {
+                let mut keys = properties.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            }),
+        Some(vec!["number".to_string(), "sys_id".to_string()])
+    );
+    assert_eq!(query.input_schema["properties"]["limit"]["maximum"], 200);
+    assert_eq!(
+        query.input_schema["properties"]["filters"]["additionalProperties"],
+        false
+    );
+    assert!(query.input_schema["properties"].get("table").is_none());
+    assert!(query.input_schema["properties"].get("sort").is_none());
+    assert!(query.input_schema["properties"].get("source").is_none());
+}
+
 #[test]
 fn record_query_schema_is_strict_bounded_and_composition_free() {
     let registry = ToolRegistry::new();
@@ -299,7 +347,8 @@ fn incident_assignment_group_operations_have_operational_and_governed_contracts(
             "assignment_group",
             "number",
             "state",
-            "work_notes"
+            "work_notes",
+            "comments"
         ]
         .into_iter()
         .map(str::to_string)
@@ -316,9 +365,47 @@ fn incident_assignment_group_operations_have_operational_and_governed_contracts(
         snow_mcp::domain::policy::PolicyConfig::read_only_default().tools["incident_apply_update"]
             .field_allowlist
             .iter()
-            .eq(["assigned_to", "assignment_group", "state", "work_notes"]
-                .iter()
-                .copied())
+            .eq([
+                "assigned_to",
+                "assignment_group",
+                "comments",
+                "state",
+                "work_notes"
+            ]
+            .iter()
+            .copied())
+    );
+
+    let bulk_plan = tools
+        .iter()
+        .find(|tool| tool.name == "incident_bulk_plan_update")
+        .expect("Incident bulk plan registered");
+    assert!(!bulk_plan.default_enabled);
+    assert_eq!(bulk_plan.input_schema["additionalProperties"], json!(false));
+    assert_eq!(
+        bulk_plan.input_schema["properties"]["targets"]["minItems"],
+        3
+    );
+    assert_eq!(
+        bulk_plan.input_schema["properties"]["targets"]["maxItems"],
+        25
+    );
+    assert_no_top_level_schema_composition(&bulk_plan.input_schema);
+
+    let bulk_apply = tools
+        .iter()
+        .find(|tool| tool.name == "incident_bulk_apply_update")
+        .expect("Incident bulk apply registered");
+    assert!(!bulk_apply.default_enabled);
+    assert!(bulk_apply.requires_confirmation);
+    assert_eq!(
+        bulk_apply.input_schema["required"],
+        json!([
+            "plan_id",
+            "confirmation_token",
+            "idempotency_key",
+            "concurrency_tokens"
+        ])
     );
 }
 
@@ -1096,6 +1183,10 @@ fn schemas_include_required_fields_for_create_update_apply() {
         change_task_update["properties"]["number"]["pattern"],
         "^CTASK\\d+$"
     );
+    assert_eq!(
+        change_task_update["properties"]["change_request"]["type"],
+        "string"
+    );
 
     let work_note_plan = &tool("work_note_plan_add").input_schema;
     assert_eq!(work_note_plan["type"], "object");
@@ -1320,4 +1411,55 @@ fn policy_defaults_allow_full_change_request_form_fields() {
         );
     }
     assert!(update.contains("state"));
+    assert!(create.contains("contact_type"));
+    assert!(!update.contains("contact_type"));
+}
+
+#[test]
+fn policy_defaults_allow_the_change_task_restore_and_tester_fields() {
+    let cfg = PolicyConfig::default();
+    let create = &cfg
+        .tools
+        .get("change_task_apply_create")
+        .expect("change task create policy")
+        .field_allowlist;
+    let update = &cfg
+        .tools
+        .get("change_task_apply_update")
+        .expect("change task update policy")
+        .field_allowlist;
+
+    for field in [
+        "change_request",
+        "short_description",
+        "description",
+        "assignment_group",
+        "start_date",
+        "end_date",
+        "cmdb_ci",
+        "change_task_type",
+        "planned_start_date",
+        "planned_end_date",
+        "due_date",
+        "u_primary_tester",
+    ] {
+        assert!(
+            create.contains(field),
+            "change_task_apply_create missing {field}"
+        );
+    }
+    for field in [
+        "change_request",
+        "cmdb_ci",
+        "change_task_type",
+        "planned_start_date",
+        "planned_end_date",
+        "due_date",
+        "u_primary_tester",
+    ] {
+        assert!(
+            update.contains(field),
+            "change_task_apply_update missing {field}"
+        );
+    }
 }

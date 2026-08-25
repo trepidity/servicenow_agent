@@ -16,6 +16,7 @@ use anyhow::Result;
 use servicenow_rs::prelude::{BasicAuth, ServiceNowClient};
 use snow_core::{
     SnowCore,
+    cache::policy::CachePolicyManager,
     config::{self as core_config, SnowConfig},
     credential::CredentialProvider,
     ipc::IpcEndpoint,
@@ -23,6 +24,7 @@ use snow_core::{
 
 pub mod catalog_write;
 pub mod change_write;
+pub mod incident_bulk_write;
 pub mod jobs;
 pub mod resource_plan_write;
 pub mod rpc;
@@ -65,6 +67,9 @@ pub struct DaemonState {
     pub data_dir: PathBuf,
     /// MCP governance configuration used by daemon-owned plan/apply handlers.
     pub mcp_config: snow_mcp::McpConfig,
+    /// Atomically replaceable cache-policy snapshot captured from the fixed
+    /// daemon configuration directory.
+    pub cache_policy: Arc<CachePolicyManager>,
 }
 
 impl DaemonState {
@@ -80,21 +85,34 @@ impl DaemonState {
         data_dir: PathBuf,
         mcp_config: snow_mcp::McpConfig,
     ) -> Self {
+        let cache_policy = core.cache_policy_manager();
+        Self::new_with_data_dir_and_policy(core, data_dir.clone(), mcp_config, cache_policy)
+    }
+
+    fn new_with_data_dir_and_policy(
+        core: Arc<SnowCore>,
+        data_dir: PathBuf,
+        mcp_config: snow_mcp::McpConfig,
+        cache_policy: Arc<CachePolicyManager>,
+    ) -> Self {
         Self {
             core,
             jobs: Arc::new(JobRegistry::new()),
             data_dir,
             mcp_config,
+            cache_policy,
         }
     }
 
     #[cfg(test)]
     pub fn with_data_dir(core: Arc<SnowCore>, data_dir: PathBuf) -> Self {
+        let cache_policy = core.cache_policy_manager();
         Self {
             core,
             jobs: Arc::new(JobRegistry::new()),
             data_dir,
             mcp_config: snow_mcp::McpConfig::default(),
+            cache_policy,
         }
     }
 
@@ -104,11 +122,13 @@ impl DaemonState {
         data_dir: PathBuf,
         mcp_config: snow_mcp::McpConfig,
     ) -> Self {
+        let cache_policy = core.cache_policy_manager();
         Self {
             core,
             jobs: Arc::new(JobRegistry::new()),
             data_dir,
             mcp_config,
+            cache_policy,
         }
     }
 }
@@ -240,10 +260,12 @@ fn run_blocking_with_config(config: DaemonConfig) -> Result<()> {
     runtime.block_on(async move {
         load_daemon_env();
         let core = Arc::new(build_core(&config).await?);
-        let state = Arc::new(DaemonState::new_with_data_dir(
+        let cache_policy = core.cache_policy_manager();
+        let state = Arc::new(DaemonState::new_with_data_dir_and_policy(
             core,
             config.data_dir.clone(),
             mcp_config_from_env(),
+            cache_policy,
         ));
         let runtime = DaemonRuntime::new(config, state);
         tokio::task::LocalSet::new().run_until(runtime.run()).await
@@ -334,12 +356,19 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let credential = CredentialProvider::from_runtime_env();
     let password = credential.resolve()?;
     let auth = BasicAuth::new(&username, password.as_str()).without_session();
+    let write_auth = BasicAuth::new(&username, password.as_str()).without_session();
     let metadata_password = password.clone();
     drop(password);
 
     let client = ServiceNowClient::builder()
         .instance(&instance)
         .auth(auth)
+        .build()
+        .await?;
+    let write_client = ServiceNowClient::builder()
+        .instance(&instance)
+        .auth(write_auth)
+        .max_retries(0)
         .build()
         .await?;
 
@@ -372,6 +401,7 @@ async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     SnowCore::builder()
         .config(config.clone())
         .client(client)
+        .write_client(write_client)
         .ui_metadata_basic_auth(username, metadata_password)
         .vault_path(config.vault.path)
         .build()

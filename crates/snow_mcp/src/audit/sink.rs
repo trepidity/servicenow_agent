@@ -65,6 +65,50 @@ impl SqliteAuditSink {
             Err(err) => Err(err.into()),
         }
     }
+
+    /// Remove events outside the configured retention window and rebuild the
+    /// retained hash chain from a new GENESIS boundary atomically.
+    pub fn enforce_retention(&self, retention_days: u32) -> Result<usize> {
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let transaction = self.conn.unchecked_transaction()?;
+        let deleted = transaction.execute(
+            "DELETE FROM mcp_audit_events WHERE timestamp < ?1",
+            [cutoff.to_rfc3339()],
+        )?;
+        if deleted == 0 {
+            transaction.commit()?;
+            return Ok(0);
+        }
+        let mut events = {
+            let mut statement = transaction.prepare(
+                "SELECT event_json FROM mcp_audit_events ORDER BY timestamp ASC, audit_id ASC",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(serde_json::from_str::<AuditEvent>(&row?)?);
+            }
+            events
+        };
+        let mut previous = "GENESIS".to_string();
+        for event in &mut events {
+            event.prev_hash = previous.clone();
+            let value = serde_json::to_value(&*event)?;
+            event.row_hash = compute_row_hash(&previous, &value);
+            transaction.execute(
+                "UPDATE mcp_audit_events SET prev_hash = ?1, row_hash = ?2, event_json = ?3 WHERE audit_id = ?4",
+                params![
+                    event.prev_hash,
+                    event.row_hash,
+                    serde_json::to_string(&event)?,
+                    event.audit_id,
+                ],
+            )?;
+            previous = event.row_hash.clone();
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
 }
 
 impl SqliteAuditSink {

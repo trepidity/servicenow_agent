@@ -15,6 +15,8 @@ impl Store {
                 assigned_to TEXT,
                 parent_id TEXT,
                 file_path TEXT,
+                vault_provenance TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (vault_provenance IN ('vault_backed', 'cache_only', 'legacy_unknown')),
                 synced_at INTEGER NOT NULL,
                 sys_updated_on INTEGER NOT NULL,
                 etag TEXT,
@@ -320,6 +322,20 @@ impl Store {
                 expires_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS catalog_products_complete (
+                sys_id TEXT PRIMARY KEY,
+                item_json TEXT NOT NULL,
+                last_refreshed_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS catalog_products_narrowed (
+                sys_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                short_description TEXT NOT NULL,
+                item_json TEXT NOT NULL,
+                last_refreshed_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_records_number ON records(number);
             CREATE INDEX IF NOT EXISTS idx_records_table_scope ON records(table_name, in_scope, number);
             CREATE INDEX IF NOT EXISTS idx_records_parent ON records(parent_id);
@@ -398,6 +414,8 @@ impl Store {
                 ON cached_users(first_name, last_name);
             CREATE INDEX IF NOT EXISTS idx_cached_user_queries_expires
                 ON cached_user_queries(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_catalog_products_narrowed_name
+                ON catalog_products_narrowed(name, sys_id);
             "#,
         )?;
         self.conn
