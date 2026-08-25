@@ -1005,7 +1005,11 @@ pub(in crate::rpc) async fn dispatch_business_applications(
                                 )
                                 .await
                             {
-                                Ok(records) => {
+                                Ok(records)
+                                    if !records.is_empty()
+                                        || rule.mode
+                                            == snow_core::cache::policy::CacheMode::CacheOnly =>
+                                {
                                     let mut applications = Vec::with_capacity(records.len());
                                     let mut record_dtos = Vec::with_capacity(records.len());
                                     for record in records {
@@ -1031,6 +1035,75 @@ pub(in crate::rpc) async fn dispatch_business_applications(
                                         }),
                                     ) {
                                         Ok(result) => JsonRpcResponse::ok(id, result),
+                                        Err(err) => internal_error(id, err),
+                                    }
+                                }
+                                // Cache hit but zero results and mode allows live: fall through to
+                                // live so a record that was never synced isn't silently missing.
+                                Ok(_) => {
+                                    let live_without_local_io =
+                                        rule.mode == snow_core::cache::policy::CacheMode::Live;
+                                    options.persist = !live_without_local_io;
+                                    let limit = params.limit.unwrap_or(20);
+                                    match state
+                                        .core
+                                        .search_business_applications_policy_live(
+                                            params,
+                                            options.persist,
+                                        )
+                                        .await
+                                    {
+                                        Ok(business_applications) => {
+                                            let reached_limit =
+                                                business_applications.len() == limit;
+                                            let mut applications =
+                                                Vec::with_capacity(business_applications.len());
+                                            let mut record_dtos =
+                                                Vec::with_capacity(business_applications.len());
+                                            for application in business_applications {
+                                                let dto = if live_without_local_io {
+                                                    transport.live_business_application(
+                                                        &application.record,
+                                                    )
+                                                } else {
+                                                    transport
+                                                        .business_application(&application.record)
+                                                };
+                                                match dto {
+                                                    Ok(mut application_dto) => {
+                                                        application_dto.unresolved_references =
+                                                            business_application_diagnostics(
+                                                                &application.unresolved_references,
+                                                            );
+                                                        record_dtos
+                                                            .push(application_dto.record.clone());
+                                                        applications.push(application_dto);
+                                                    }
+                                                    Err(err) => return internal_error(id, err),
+                                                }
+                                            }
+                                            let completeness = if reached_limit {
+                                                snow_core::Completeness::Partial {
+                                                    reason:
+                                                        snow_core::PartialReason::PageLimitReached,
+                                                }
+                                            } else {
+                                                snow_core::Completeness::Complete
+                                            };
+                                            match operation_envelope_result(
+                                                "business_application_search",
+                                                snow_core::Source::Live,
+                                                completeness,
+                                                json!({
+                                                    "business_applications": applications,
+                                                    "records": record_dtos,
+                                                    "hydration": options,
+                                                }),
+                                            ) {
+                                                Ok(result) => JsonRpcResponse::ok(id, result),
+                                                Err(err) => internal_error(id, err),
+                                            }
+                                        }
                                         Err(err) => internal_error(id, err),
                                     }
                                 }

@@ -3,14 +3,23 @@
 use serde_json::{Value, json};
 
 use super::{JsonRpcRequest, dispatch};
-use crate::test_support::{build_fixture_state_at_instance, spawn_json_http_server};
+use crate::test_support::{
+    build_fixture_state_at_instance, spawn_json_http_sequence_server, spawn_json_http_server,
+};
 
 fn live_business_application_list() -> Value {
+    business_application_list(
+        "54a4b61b6fe845000ed852a03f3ee4d0",
+        "Example Business Application",
+    )
+}
+
+fn business_application_list(sys_id: &str, name: &str) -> Value {
     json!({
         "result": [{
-            "sys_id": "54a4b61b6fe845000ed852a03f3ee4d0",
-            "name": "Example Business Application",
-            "short_description": "Example Business Application",
+            "sys_id": sys_id,
+            "name": name,
+            "short_description": name,
             "sys_class_name": "cmdb_ci_business_app",
             "operational_status": { "value": "1", "display_value": "Operational" },
             "sys_updated_on": "2026-08-20 12:00:00"
@@ -336,6 +345,97 @@ async fn read_through_search_refreshes_then_query_uses_fresh_cache() {
         cached["completeness"],
         json!({"kind":"partial","reason":"narrowed_projection"})
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_through_search_with_fresh_nonmatching_cache_falls_back_to_live() {
+    let live_name = "Uncached Business Application";
+    let (instance, requests) = spawn_json_http_sequence_server(vec![
+        live_business_application_list(),
+        business_application_list("54a4b61b6fe845000ed852a03f3ee4d1", live_name),
+    ])
+    .await
+    .expect("local ServiceNow fake");
+    let fixture = build_fixture_state_at_instance(&instance)
+        .await
+        .expect("fixture");
+
+    let warmed = call(
+        &fixture.state,
+        "business_application_search",
+        json!({"limit":10}),
+    )
+    .await
+    .result
+    .expect("initial live cache warm");
+    assert_eq!(warmed["source"], json!({"kind":"live"}));
+
+    let fallback = call(
+        &fixture.state,
+        "business_application_search",
+        json!({"name":live_name, "limit":10}),
+    )
+    .await
+    .result
+    .expect("live fallback for nonmatching fresh cache");
+    assert_eq!(fallback["source"], json!({"kind":"live"}));
+    assert_eq!(
+        fallback["data"]["business_applications"][0]["name"],
+        live_name
+    );
+    assert_eq!(requests.await.expect("two ServiceNow reads").len(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cache_only_search_with_fresh_nonmatching_cache_returns_empty_without_live_fallback() {
+    let (instance, request) = spawn_json_http_server(live_business_application_list())
+        .await
+        .expect("local ServiceNow fake");
+    let fixture = build_fixture_state_at_instance(&instance)
+        .await
+        .expect("fixture");
+
+    call(
+        &fixture.state,
+        "business_application_search",
+        json!({"limit":10}),
+    )
+    .await
+    .result
+    .expect("initial live cache warm");
+    request.await.expect("initial ServiceNow read");
+
+    std::fs::write(
+        fixture.tempdir.path().join("cache-policy.toml"),
+        concat!(
+            "version = 1\n",
+            "[operations.business_application_search]\n",
+            "object = \"business_application\"\n",
+            "mode = \"cache_only\"\n",
+            "ttl = \"30d\"\n",
+        ),
+    )
+    .expect("cache-only policy");
+    assert!(
+        call(&fixture.state, "cache_policy_reload", json!({}))
+            .await
+            .error
+            .is_none()
+    );
+
+    let cached = call(
+        &fixture.state,
+        "business_application_search",
+        json!({"name":"Uncached Business Application", "limit":10}),
+    )
+    .await;
+    assert!(
+        cached.error.is_none(),
+        "cache-only search failed: {cached:?}"
+    );
+    let cached = cached.result.expect("cache-only result");
+    assert_eq!(cached["source"]["kind"], "cache");
+    assert_eq!(cached["data"]["business_applications"], json!([]));
 }
 
 #[tokio::test(flavor = "current_thread")]
