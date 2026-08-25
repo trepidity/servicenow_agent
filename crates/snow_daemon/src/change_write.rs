@@ -547,16 +547,6 @@ pub async fn handle_change_apply(
             }
             Err(error) => return internal_error(id, error),
         }
-        if let Err(error) = stores
-            .confirmation_store
-            .consume(&confirmation_token, &binding)
-            .await
-        {
-            if let Err(clear_error) = stores.idempotency_store.clear_apply_started(&key, tool) {
-                return internal_error(id, clear_error);
-            }
-            return confirmation_invalid(state, id, tool, error).await;
-        }
     } else if let Err(err) = stores
         .idempotency_store
         .mark_apply_started(&key, tool)
@@ -568,6 +558,11 @@ pub async fn handle_change_apply(
     let write_result = match apply_plan(tool, &plan, state).await {
         Ok(result) => result,
         Err(ApplyWriteError::Upstream(err)) => {
+            if tool == "incident_apply_update"
+                && let Err(clear_error) = stores.idempotency_store.clear_apply_started(&key, tool)
+            {
+                return internal_error(id, clear_error);
+            }
             return audited_change_error(
                 state,
                 id,
@@ -604,11 +599,10 @@ pub async fn handle_change_apply(
         }
     };
 
-    if tool != "incident_apply_update"
-        && let Err(err) = stores
-            .confirmation_store
-            .consume(&confirmation_token, &binding)
-            .await
+    if let Err(err) = stores
+        .confirmation_store
+        .consume(&confirmation_token, &binding)
+        .await
     {
         return confirmation_invalid(state, id, tool, err).await;
     }

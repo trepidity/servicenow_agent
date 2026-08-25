@@ -190,6 +190,11 @@ impl CoreContext {
             })
             .collect::<Vec<_>>();
         self.query.store().upsert_records(&batch)?;
+        let sys_ids = entries
+            .iter()
+            .map(|(row, _, _, _)| row.sys_id.clone())
+            .collect::<Vec<_>>();
+        self.query.store().mark_records_cache_only(&sys_ids)?;
         for document in &documents {
             self.project_runtime_document(document)?;
             self.persist_enrichment(document.record())?;

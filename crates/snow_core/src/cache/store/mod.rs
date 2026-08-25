@@ -78,6 +78,7 @@ impl Store {
         };
         if existed {
             store.configure_connection()?;
+            store.migrate_schema()?;
         } else {
             store.bootstrap_new()?;
         }
@@ -141,6 +142,19 @@ impl Store {
     fn configure_connection(&self) -> Result<()> {
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
         self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
+    fn migrate_schema(&self) -> Result<()> {
+        let mut statement = self.conn.prepare("PRAGMA table_info(records)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        if !columns.contains("vault_provenance") {
+            self.conn.execute_batch(
+                "ALTER TABLE records ADD COLUMN vault_provenance TEXT NOT NULL DEFAULT 'legacy_unknown' CHECK (vault_provenance IN ('vault_backed', 'cache_only', 'legacy_unknown'));",
+            )?;
+        }
         Ok(())
     }
 

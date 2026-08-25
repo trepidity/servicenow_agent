@@ -85,6 +85,11 @@ pub(super) fn print_verification_report(report: &VaultVerificationReport) {
         report.missing_markdown_rows.len()
     );
     println!("orphan record rows: {}", report.orphan_record_rows.len());
+    println!("cache-only record rows: {}", report.cache_only_record_rows);
+    println!(
+        "legacy-unknown record rows: {}",
+        report.legacy_unknown_record_rows
+    );
     println!(
         "unprojectable documents: {}",
         report.unprojectable_documents.len()

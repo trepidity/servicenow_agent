@@ -3941,7 +3941,7 @@ fn task_sla_row(sys_id: &str, task_sys_id: &str, task_display: &str, sla_name: &
 // ----- server_get read-through (live fallback) RPC tests -----
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
+async fn direct_rpc_server_get_default_live_mode_does_not_persist() {
     let sys_id = "abababababababababababababababab";
     let response = json!({
         "result": [{
@@ -3995,8 +3995,10 @@ async fn direct_rpc_server_get_cache_miss_falls_through_to_live() {
         })
         .await
         .expect("cached server query");
-    assert_eq!(cached.len(), 1, "default server_get must cache live hit");
-    assert_eq!(cached[0].sys_id, sys_id);
+    assert!(
+        cached.is_empty(),
+        "default server_get must not persist the live response"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4015,6 +4017,27 @@ async fn direct_rpc_server_get_policy_owns_persistence_over_legacy_caller_hint()
     let fixture = build_fixture_state_at_instance(&instance_url)
         .await
         .expect("fixture");
+    std::fs::write(
+        fixture.tempdir.path().join("cache-policy.toml"),
+        concat!(
+            "version = 1\n",
+            "[objects.server]\n",
+            "mode = \"read_through\"\n",
+            "ttl = \"7d\"\n",
+        ),
+    )
+    .expect("server read-through policy");
+    let reloaded = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "cache_policy_reload".to_string(),
+            params: json!({}),
+            id: Some(json!(0)),
+        },
+        &fixture.state,
+    )
+    .await;
+    assert!(reloaded.error.is_none(), "reload failed: {reloaded:?}");
 
     let response = dispatch(
         JsonRpcRequest {

@@ -59,6 +59,23 @@ async fn reload_policy(state: &std::sync::Arc<crate::DaemonState>) {
     );
 }
 
+async fn enable_server_read_through(
+    state: &std::sync::Arc<crate::DaemonState>,
+    root: &std::path::Path,
+) {
+    std::fs::write(
+        root.join("cache-policy.toml"),
+        concat!(
+            "version = 1\n",
+            "[objects.server]\n",
+            "mode = \"read_through\"\n",
+            "ttl = \"7d\"\n",
+        ),
+    )
+    .expect("server read-through policy");
+    reload_policy(state).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cache_only_server_search_and_query_miss_without_servicenow() {
     let fixture = build_fixture_state_at_instance("http://127.0.0.1:9")
@@ -286,6 +303,7 @@ async fn read_through_server_search_refreshes_then_server_query_uses_fresh_cache
     let fixture = build_fixture_state_at_instance(&instance)
         .await
         .expect("fixture");
+    enable_server_read_through(&fixture.state, fixture.tempdir.path()).await;
 
     let refreshed = call(
         &fixture.state,
@@ -322,6 +340,7 @@ async fn stale_read_through_server_query_refresh_failure_never_falls_back() {
     let fixture = build_fixture_state_at_instance(&instance)
         .await
         .expect("fixture");
+    enable_server_read_through(&fixture.state, fixture.tempdir.path()).await;
     let params = json!({"name":"example-server","limit":10});
     let first = call(&fixture.state, "server_query", params.clone()).await;
     assert!(

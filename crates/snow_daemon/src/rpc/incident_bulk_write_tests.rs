@@ -319,11 +319,15 @@ async fn daemon_bulk_apply_stops_on_first_failure_and_durably_replays_exact_part
                 }),
                 id: Some(json!(77)),
             };
-            let direct = McpServer::new(Arc::clone(&state.core))
-                .dispatch(call.clone())
-                .await
-                .result
-                .expect("direct replay result");
+            let direct = McpServer::with_config(
+                Arc::clone(&state.core),
+                enabled_bulk_config(25),
+                snow_mcp::McpTransport::Stdio,
+            )
+            .dispatch(call.clone())
+            .await
+            .result
+            .expect("direct replay result");
             let bridge = DaemonBackedMcpBridge::from_socket(socket.clone())
                 .dispatch(call)
                 .await
@@ -1123,6 +1127,103 @@ async fn ordinary_incident_apply_reports_post_patch_coherence_failure_and_never_
     )
     .await;
     assert_eq!(replay.error.expect("pending replay").code, -32060);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_incident_apply_retries_same_confirmation_after_upstream_failure() {
+    let instance = MockServer::start().await;
+    let sys_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(query_param_contains("sysparm_query", "number=INC0019999"))
+        .respond_with(incident_list("INC0019999", sys_id, "2026-08-20 14:00:00"))
+        .mount(&instance)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .respond_with(incident_get("INC0019999", sys_id, "2026-08-20 14:00:00"))
+        .mount(&instance)
+        .await;
+    let patch_attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .respond_with({
+            let patch_attempts = Arc::clone(&patch_attempts);
+            move |_request: &wiremock::Request| {
+                if patch_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500).set_body_json(json!({
+                        "error": {"message": "transient upstream failure"}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "result": {"sys_id": sys_id, "number": "INC0019999"}
+                    }))
+                }
+            }
+        })
+        .expect(2)
+        .mount(&instance)
+        .await;
+    let fixture = crate::test_support::build_fixture_state_at_instance(&instance.uri())
+        .await
+        .expect("fixture");
+    let state = Arc::new(DaemonState::with_data_dir_and_mcp_config(
+        Arc::clone(&fixture.state.core),
+        fixture
+            .tempdir
+            .path()
+            .join("incident-single-upstream-retry"),
+        enabled_single_config(),
+    ));
+    let plan = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "incident_plan_update".to_string(),
+            params: json!({
+                "number": "INC0019999",
+                "comments": "Public-safe retry body"
+            }),
+            id: Some(json!(1)),
+        },
+        &state,
+    )
+    .await
+    .result
+    .expect("plan");
+    let apply = json!({
+        "plan_id": plan["plan_id"],
+        "confirmation_token": plan["confirmation_token"],
+        "idempotency_key": plan["idempotency_key"],
+        "concurrency_token": plan["concurrency_token"],
+    });
+
+    let first = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "incident_apply_update".to_string(),
+            params: apply.clone(),
+            id: Some(json!(2)),
+        },
+        &state,
+    )
+    .await;
+    assert_eq!(first.error.expect("upstream failure").code, -32059);
+
+    let retry = dispatch(
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "incident_apply_update".to_string(),
+            params: apply,
+            id: Some(json!(3)),
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        retry.error.is_none(),
+        "retry should reuse confirmation: {retry:?}"
+    );
+    assert_eq!(patch_attempts.load(Ordering::SeqCst), 2);
 }
 
 fn tool_list_has(result: &Value, name: &str) -> bool {

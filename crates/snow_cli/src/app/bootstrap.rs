@@ -62,6 +62,7 @@ pub(super) fn command_uses_local_credentials(command: &Command) -> bool {
         Command::Daemon { .. }
         | Command::Admin
         | Command::CacheInfo
+        | Command::AdoptCacheOnlyProjection { .. }
         | Command::BusinessApp { .. }
         | Command::Server { .. }
         | Command::Incident { .. } => false,

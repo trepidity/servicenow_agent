@@ -285,8 +285,9 @@ not live/read-through lookup authorization or ServiceNow ACL behavior.
   invalid file fails daemon startup; a running daemon retains its prior active
   snapshot when validation or reload fails.
 - Built-in object defaults are `knowledge = 7d`,
-  `business_application = 30d`, `service_catalog_product = 30d`, and
-  `server = 24h`, all in `read_through` mode.
+  `business_application = 30d`, and `service_catalog_product = 30d`, all in
+  `read_through` mode. Server reads are live-only unless an explicit policy
+  entry enables caching.
 - File entries override the exact built-in object or operation entry. A
   `live` override explicitly disables caching. After composing defaults and
   overrides, an operation/object pair with no rule is live-only.

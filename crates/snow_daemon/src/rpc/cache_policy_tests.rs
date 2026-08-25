@@ -32,8 +32,8 @@ async fn daemon_rpc_validates_independently_authored_builtin_policy() {
         Some(json!({
             "version": 1,
             "source": "built_in_defaults",
-            "rule_count": 4,
-            "fingerprint": "aa83e29dc9c4f2b46fc0f9912dda4614f7ffb0301c05470bb16774d40ebcb145"
+            "rule_count": 3,
+            "fingerprint": "16701a2ecc0bc31d0a7c95d56107ab23ee5328e2606bafcc8ef86a0e06d29b28"
         }))
     );
 }
@@ -85,8 +85,54 @@ async fn daemon_rpc_rejects_unknown_params_and_invalid_policy_without_replacing_
     assert_eq!(restored["previous_fingerprint"], accepted);
     assert_eq!(
         restored["fingerprint"],
-        "aa83e29dc9c4f2b46fc0f9912dda4614f7ffb0301c05470bb16774d40ebcb145"
+        "16701a2ecc0bc31d0a7c95d56107ab23ee5328e2606bafcc8ef86a0e06d29b28"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_rpc_ttl_parsing_is_unicode_safe_and_legacy_compatible() {
+    let fixture = build_fixture_state().await.expect("fixture");
+    let path = fixture.tempdir.path().join("cache-policy.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n[objects.server]\nmode = \"cache_only\"\nttl = \"24h\"\n",
+    )
+    .expect("initial policy");
+    let first = call(&fixture.state, "cache_policy_reload", json!({}))
+        .await
+        .result
+        .expect("initial reload");
+    let accepted = first["fingerprint"]
+        .as_str()
+        .expect("accepted fingerprint")
+        .to_string();
+
+    std::fs::write(
+        &path,
+        "version = 1\n[objects.server]\nmode = \"cache_only\"\nttl = \"60日\"\n",
+    )
+    .expect("non-ascii policy");
+    let validation_error = call(&fixture.state, "cache_policy_validate", json!({}))
+        .await
+        .error
+        .expect("non-ascii validation rejection");
+    assert_eq!(validation_error.code, -32070);
+    let reload_error = call(&fixture.state, "cache_policy_reload", json!({}))
+        .await
+        .error
+        .expect("non-ascii reload rejection");
+    assert_eq!(reload_error.code, -32070);
+
+    std::fs::write(
+        &path,
+        "version = 1\n[objects.server]\nmode = \"cache_only\"\nttl = \" 2 days \"\n",
+    )
+    .expect("second legacy-spelling policy");
+    let second = call(&fixture.state, "cache_policy_reload", json!({}))
+        .await
+        .result
+        .expect("second legacy-spelling reload");
+    assert_eq!(second["previous_fingerprint"], accepted);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -98,7 +144,6 @@ async fn daemon_rpc_rejects_strict_schema_mode_ttl_and_operation_object_violatio
         "version = 1\nunknown = true\n",
         "version = 1\n[objects.server]\nmode = \"live\"\nttl = \"24h\"\n",
         "version = 1\n[objects.server]\nmode = \"cache_only\"\nttl = \"59s\"\n",
-        "version = 1\n[objects.server]\nmode = \"read_through\"\nttl = \"1 day\"\n",
         "version = 1\n[operations.server_get]\nobject = \"knowledge\"\nmode = \"live\"\n",
         "version = 1\n[rebuild.knowledge]\nknowledge_base_sys_id = \"IT Knowledge\"\n",
         "version = 1\n[rebuild.knowledge]\nknowledge_base_sys_id = \"11111111111111111111111111111111\"\nunknown = true\n",
@@ -130,7 +175,7 @@ async fn daemon_rpc_fingerprints_knowledge_rebuild_scope_without_disclosing_it()
         .await
         .result
         .expect("first validation");
-    assert_eq!(first["rule_count"], 5);
+    assert_eq!(first["rule_count"], 4);
     assert_eq!(first["source"], "built_in_plus_file");
     assert!(first["fingerprint"].as_str().is_some());
     assert!(!first.to_string().contains(FIRST_BASE));

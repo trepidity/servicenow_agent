@@ -444,6 +444,15 @@ work_record_ttl = "90m"
     }
 
     #[test]
+    fn cache_policy_legacy_duration_spellings_remain_supported() {
+        let policy = CacheTtlPolicy::from_ttl_strings(" 7 days ", "30 sec")
+            .expect("legacy cache duration spellings");
+
+        assert_eq!(policy.stable_reference_ttl(), Duration::days(7));
+        assert_eq!(policy.work_record_ttl(), Duration::seconds(30));
+    }
+
+    #[test]
     fn cache_policy_rejects_stable_reference_ttl_below_minimum() {
         let err = CacheTtlPolicy::from_ttl_strings("6d", "60m").expect_err("minimum enforced");
 

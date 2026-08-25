@@ -342,6 +342,12 @@ fn materialize_rule(name: &str, raw: RawRule) -> Result<CacheRule, CachePolicyEr
                     "ttl must be an integer s/m/h/d duration from 1m through 365d",
                 )
             })?;
+            if !(MIN_TTL_SECONDS..=MAX_TTL_SECONDS).contains(&duration.num_seconds()) {
+                return Err(invalid_rule(
+                    name,
+                    "ttl must be an integer s/m/h/d duration from 1m through 365d",
+                ));
+            }
             Ok(CacheRule {
                 mode: raw.mode,
                 ttl: Some(duration),
@@ -351,31 +357,37 @@ fn materialize_rule(name: &str, raw: RawRule) -> Result<CacheRule, CachePolicyEr
 }
 
 pub fn parse_cache_ttl(input: &str) -> Option<Duration> {
-    if input.len() < 2 {
+    let input = input.trim();
+    if input.is_empty() {
         return None;
     }
-    let (amount, unit) = input.split_at(input.len() - 1);
-    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+    let digit_count = input
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit())
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?;
+    let amount = input[..digit_count].parse::<i64>().ok()?;
+    if amount <= 0 {
         return None;
     }
-    let amount = amount.parse::<i64>().ok()?;
-    let seconds = match unit {
-        "s" => amount,
-        "m" => amount.checked_mul(60)?,
-        "h" => amount.checked_mul(3600)?,
-        "d" => amount.checked_mul(86400)?,
-        _ => return None,
-    };
-    (MIN_TTL_SECONDS..=MAX_TTL_SECONDS)
-        .contains(&seconds)
-        .then(|| Duration::seconds(seconds))
+    let unit = input[digit_count..]
+        .trim()
+        .to_ascii_lowercase()
+        .replace(' ', "");
+
+    match unit.as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(Duration::seconds(amount)),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::minutes(amount)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::hours(amount)),
+        "d" | "day" | "days" => Some(Duration::days(amount)),
+        _ => None,
+    }
 }
 
 fn builtin_objects() -> BTreeMap<String, CacheRule> {
     [
         ("business_application", "30d"),
         ("knowledge", "7d"),
-        ("server", "24h"),
         ("service_catalog_product", "30d"),
     ]
     .into_iter()
@@ -454,7 +466,7 @@ fn canonical_rules(
     output
 }
 
-fn normalize_sys_id(field: &str, value: &str) -> Result<String, CachePolicyError> {
+pub fn normalize_sys_id(field: &str, value: &str) -> Result<String, CachePolicyError> {
     if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid_field(
             field,
@@ -542,20 +554,6 @@ fn parse_legacy_ttl(input: &str, default: &str) -> anyhow::Result<Duration> {
     } else {
         input.trim()
     };
-    let normalized = value.to_ascii_lowercase();
-    let (digits, suffix) = normalized.split_at(normalized.len().saturating_sub(1));
-    let amount = digits
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("cache ttl must be a positive s/m/h/d duration"))?;
-    let duration = match suffix {
-        "s" => Duration::seconds(amount),
-        "m" => Duration::minutes(amount),
-        "h" => Duration::hours(amount),
-        "d" => Duration::days(amount),
-        _ => anyhow::bail!("cache ttl must be a positive s/m/h/d duration"),
-    };
-    if amount <= 0 {
-        anyhow::bail!("cache ttl must be a positive s/m/h/d duration");
-    }
-    Ok(duration)
+    parse_cache_ttl(value)
+        .ok_or_else(|| anyhow::anyhow!("cache ttl must be a positive s/m/h/d duration"))
 }

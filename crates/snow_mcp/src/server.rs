@@ -134,6 +134,14 @@ impl McpServer {
             name,
             "incident_bulk_plan_update" | "incident_bulk_apply_update"
         ) {
+            if is_write_tool(name)
+                && !self
+                    .config
+                    .policy
+                    .tool_enabled_in_environment(name, &self.config.environment.label)
+            {
+                return policy_denied_for_write(id, name);
+            }
             let arguments = params
                 .get("arguments")
                 .cloned()
@@ -163,14 +171,7 @@ impl McpServer {
                 .policy
                 .tool_enabled_in_environment(name, &self.config.environment.label)
         {
-            return JsonRpcResponse::error(
-                id,
-                -32040,
-                "policy denied",
-                Some(
-                    json!({ "details": "write tool is disabled by current MCP policy", "tool": name }),
-                ),
-            );
+            return policy_denied_for_write(id, name);
         }
 
         match name {
@@ -2473,6 +2474,18 @@ fn daemon_required_for_write(id: Option<Value>, tool: &str, details: &str) -> Js
             "tool_name": tool,
             "reason": "daemon_not_attached",
             "details": details,
+        })),
+    )
+}
+
+fn policy_denied_for_write(id: Option<Value>, tool: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32040,
+        "policy denied",
+        Some(json!({
+            "details": "write tool is disabled by current MCP policy",
+            "tool": tool,
         })),
     )
 }

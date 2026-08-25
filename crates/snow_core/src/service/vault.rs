@@ -11,6 +11,7 @@ use chrono::Utc;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::cache::store::VaultProjectionProvenance;
 use crate::cache::store::{AliasRow, KeywordRow, Store, TagRow};
 use crate::context::CoreContext;
 use crate::convert::enrichment_origin_label;
@@ -280,11 +281,16 @@ impl VaultService {
 
     pub async fn repair_vault(&self) -> Result<RepairReport> {
         let rows = self.ctx.query.store().list_active_records(None)?;
+        let provenance = self.ctx.query.store().active_record_vault_provenance()?;
         let mut repaired = 0usize;
         let mut skipped = 0usize;
         let scanned = rows.len();
 
         for row in rows.into_iter().filter(|row| row.file_path.is_none()) {
+            if provenance.get(&row.sys_id) == Some(&VaultProjectionProvenance::CacheOnly) {
+                skipped += 1;
+                continue;
+            }
             let Some(document) = self
                 .ctx
                 .load_runtime_document(&row.number, &row.resource_type)
@@ -361,10 +367,13 @@ impl VaultService {
         let scan_report = scan_documents_detailed(&self.ctx.vault_path)?;
         let entries = scan_report.entries;
         let rows = self.ctx.query.store().list_active_records(None)?;
+        let provenance = self.ctx.query.store().active_record_vault_provenance()?;
 
         let mut indexed_sys_ids = BTreeMap::new();
         let mut missing_markdown_rows = Vec::new();
         let mut orphan_record_rows = Vec::new();
+        let mut cache_only_record_rows = 0usize;
+        let mut legacy_unknown_record_rows = 0usize;
         for row in &rows {
             indexed_sys_ids.insert(row.sys_id.clone(), row.clone());
             match row.file_path.as_deref() {
@@ -380,11 +389,21 @@ impl VaultService {
                         orphan_record_rows.push(orphan);
                     }
                 }
-                None => orphan_record_rows.push(OrphanRecordRow {
-                    sys_id: row.sys_id.clone(),
-                    number: row.number.clone(),
-                    file_path: None,
-                }),
+                None => match provenance
+                    .get(&row.sys_id)
+                    .copied()
+                    .unwrap_or(VaultProjectionProvenance::LegacyUnknown)
+                {
+                    VaultProjectionProvenance::CacheOnly => cache_only_record_rows += 1,
+                    VaultProjectionProvenance::LegacyUnknown => legacy_unknown_record_rows += 1,
+                    VaultProjectionProvenance::VaultBacked => {
+                        orphan_record_rows.push(OrphanRecordRow {
+                            sys_id: row.sys_id.clone(),
+                            number: row.number.clone(),
+                            file_path: None,
+                        })
+                    }
+                },
             }
         }
 
@@ -417,6 +436,8 @@ impl VaultService {
             degraded_reads: self.ctx.query.degraded_reads(),
             missing_markdown_rows,
             orphan_record_rows,
+            cache_only_record_rows,
+            legacy_unknown_record_rows,
             unprojectable_documents: scan_report.failures,
             unindexed_documents,
         })
@@ -629,11 +650,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_only_projection_is_not_repaired_or_pruned_as_an_orphan() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let core = build_test_core(tempdir.path().join("vault")).await;
+        let record = sample_change_task_record();
+        core.ctx
+            .project_live_records_without_vault(std::slice::from_ref(&record))
+            .expect("project cache-only record");
+
+        let verification = core.verify_vault().expect("verify cache-only projection");
+        assert_eq!(verification.active_records, 1);
+        assert_eq!(verification.cache_only_record_rows, 1);
+        assert_eq!(verification.legacy_unknown_record_rows, 0);
+        assert!(verification.orphan_record_rows.is_empty());
+
+        let repair = core
+            .repair_vault()
+            .await
+            .expect("repair cache-only projection");
+        assert_eq!(repair.repaired_records, 0);
+        assert_eq!(repair.skipped_records, 1);
+
+        let prune = core
+            .prune_orphans(false)
+            .await
+            .expect("prune cache-only projection");
+        assert_eq!(prune.orphan_rows_pruned, 0);
+        assert!(
+            core.ctx
+                .query
+                .store()
+                .get_record_by_number("CTASK001")
+                .expect("lookup cache-only row")
+                .is_some(),
+            "cache-only projection must remain after prune"
+        );
+    }
+
+    #[tokio::test]
     async fn prune_orphans_dry_run_and_execution_report_rows() {
         let tempdir = TempDir::new().expect("tempdir");
         let core = build_test_core(tempdir.path().join("vault")).await;
         let record = sample_change_task_record();
-        let legacy_row = record_row_from_servicenow(&record).expect("legacy row");
+        let mut legacy_row = record_row_from_servicenow(&record).expect("legacy row");
+        legacy_row.file_path = Some("changes/CHG001/CTASK001.md".to_string());
         core.ctx
             .query
             .store()

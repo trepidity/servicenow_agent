@@ -21,6 +21,32 @@ pub enum RecordLifecycle {
     Pruned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultProjectionProvenance {
+    VaultBacked,
+    CacheOnly,
+    LegacyUnknown,
+}
+
+impl VaultProjectionProvenance {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::VaultBacked => "vault_backed",
+            Self::CacheOnly => "cache_only",
+            Self::LegacyUnknown => "legacy_unknown",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "vault_backed" => Some(Self::VaultBacked),
+            "cache_only" => Some(Self::CacheOnly),
+            "legacy_unknown" => Some(Self::LegacyUnknown),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordRow {
     pub sys_id: String,

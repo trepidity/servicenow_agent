@@ -86,12 +86,32 @@ pub(super) fn cmd_reset_cache_offline() -> Result<(), SnowError> {
     Ok(())
 }
 
+pub(super) fn cmd_adopt_cache_only_projection(yes: bool) -> Result<(), SnowError> {
+    if !yes {
+        return Err(SnowError::Api(
+            "refusing to change cache provenance without --yes".to_string(),
+        ));
+    }
+    ensure_cache_replacement_is_offline("adopting")?;
+    let _maintenance_lock = acquire_cache_maintenance_lock()?;
+    let paths = runtime_paths();
+    let store = Store::open(&paths.database).map_err(|error| SnowError::Api(error.to_string()))?;
+    let adopted = store
+        .adopt_legacy_cache_only_records()
+        .map_err(|error| SnowError::Api(error.to_string()))?;
+    println!("adopt-cache-only-projection");
+    println!("adopted cache-only records: {adopted}");
+    Ok(())
+}
+
 pub(super) async fn cmd_rebuild_cache_from_servicenow(
     instance: &str,
     username: &str,
     credential: auth::CredentialProvider,
     metadata_password: snow_core::credential::SecretString,
     client: ServiceNowClient,
+    page_limit: u32,
+    knowledge_scope: snow_core::CacheRebuildKnowledgeScope,
 ) -> Result<(), SnowError> {
     let paths = runtime_paths();
     let file_name = paths
@@ -126,7 +146,9 @@ pub(super) async fn cmd_rebuild_cache_from_servicenow(
             return Err(error);
         }
     };
-    let report = core.rebuild_cache_from_servicenow(&progress_sink).await;
+    let report = core
+        .rebuild_cache_from_servicenow(&progress_sink, page_limit, knowledge_scope)
+        .await;
     drop(core);
     let report = match report {
         Ok(report) => report,

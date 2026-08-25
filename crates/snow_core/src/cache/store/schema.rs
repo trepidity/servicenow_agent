@@ -15,6 +15,8 @@ impl Store {
                 assigned_to TEXT,
                 parent_id TEXT,
                 file_path TEXT,
+                vault_provenance TEXT NOT NULL DEFAULT 'legacy_unknown'
+                    CHECK (vault_provenance IN ('vault_backed', 'cache_only', 'legacy_unknown')),
                 synced_at INTEGER NOT NULL,
                 sys_updated_on INTEGER NOT NULL,
                 etag TEXT,

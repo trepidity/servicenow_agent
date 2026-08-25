@@ -27,6 +27,52 @@ fn initializes_schema_and_persists_records() {
     assert_eq!(store.count_active_records().unwrap(), 1);
 }
 
+// L1 on-disk contract: a record first persisted with a vault path must remain
+// recoverable if a later cache projection no longer has that path.
+#[test]
+fn vault_backed_provenance_survives_path_loss_and_cache_only_adoption() {
+    let store = Store::open_in_memory().expect("store");
+    let mut vault_backed = RecordRow::active(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "INC0019999",
+        "incident",
+        ResourceType::Incident,
+        Utc.timestamp_opt(1_712_649_600, 0).unwrap(),
+    );
+    vault_backed.file_path = Some("incidents/INC0019999.md".to_string());
+    store
+        .upsert_record(&vault_backed, "", "")
+        .expect("insert vault-backed row");
+
+    let mut path_lost = vault_backed.clone();
+    path_lost.file_path = None;
+    store
+        .upsert_record(&path_lost, "", "")
+        .expect("update after markdown path loss");
+
+    assert_eq!(
+        store
+            .active_record_vault_provenance()
+            .expect("provenance before adoption")
+            .get(&vault_backed.sys_id),
+        Some(&VaultProjectionProvenance::VaultBacked)
+    );
+    assert_eq!(
+        store
+            .adopt_legacy_cache_only_records()
+            .expect("adopt cache-only projection"),
+        0,
+        "a formerly vault-backed record must not be adopted as cache-only"
+    );
+    assert_eq!(
+        store
+            .active_record_vault_provenance()
+            .expect("provenance after adoption")
+            .get(&vault_backed.sys_id),
+        Some(&VaultProjectionProvenance::VaultBacked)
+    );
+}
+
 #[test]
 fn persists_base_task_resource_type() {
     let store = Store::open_in_memory().expect("store");

@@ -3,6 +3,13 @@ use std::path::PathBuf;
 
 use snow_core::KnowledgeSearchMode;
 
+pub const DEFAULT_CACHE_REBUILD_PAGE_LIMIT: u32 = 500;
+pub const DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS: u64 = 30;
+
+fn parse_sys_id(value: &str) -> Result<String, String> {
+    snow_core::cache::policy::normalize_sys_id("sys_id", value).map_err(|error| error.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "snow", about = "ServiceNow CLI for change management")]
 pub struct Cli {
@@ -103,8 +110,35 @@ pub enum Command {
     },
     /// Repair missing vault files from cached runtime data
     RepairVault,
+    /// Mark existing no-vault cache rows as an intentional cache-only projection
+    AdoptCacheOnlyProjection {
+        /// Confirm the non-destructive provenance update
+        #[arg(long)]
+        yes: bool,
+    },
     /// Rebuild the SQLite cache from terminal live ServiceNow reads
-    RebuildCache,
+    RebuildCache {
+        /// Maximum ServiceNow records requested per rebuild page
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CACHE_REBUILD_PAGE_LIMIT,
+            value_parser = clap::value_parser!(u32).range(1..=1_000)
+        )]
+        page_limit: u32,
+        /// Per-request ServiceNow timeout in seconds
+        #[arg(
+            long,
+            default_value_t = DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        timeout_seconds: u64,
+        /// Knowledge base sys_id to rebuild instead of the cache-policy base
+        #[arg(long, value_parser = parse_sys_id)]
+        knowledge_base: Option<String>,
+        /// Knowledge category sys_id to narrow the selected knowledge base
+        #[arg(long, requires = "knowledge_base", value_parser = parse_sys_id)]
+        knowledge_category: Option<String>,
+    },
     /// Import the SQLite cache projection from markdown vault documents
     ImportCacheFromVault,
     /// Replace the SQLite cache with an empty current-format database
@@ -929,8 +963,22 @@ mod tests {
         let cli = Cli::parse_from(["snow", "repair-vault"]);
         assert!(matches!(cli.command, Command::RepairVault));
 
+        let cli = Cli::parse_from(["snow", "adopt-cache-only-projection", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Command::AdoptCacheOnlyProjection { yes: true }
+        ));
+
         let cli = Cli::parse_from(["snow", "rebuild-cache"]);
-        assert!(matches!(cli.command, Command::RebuildCache));
+        assert!(matches!(
+            cli.command,
+            Command::RebuildCache {
+                page_limit: DEFAULT_CACHE_REBUILD_PAGE_LIMIT,
+                timeout_seconds: DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS,
+                knowledge_base: None,
+                knowledge_category: None,
+            }
+        ));
 
         let cli = Cli::parse_from(["snow", "verify-vault"]);
         assert!(matches!(cli.command, Command::VerifyVault));

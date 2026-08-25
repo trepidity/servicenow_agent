@@ -457,8 +457,12 @@ impl SnowCore {
     pub async fn rebuild_cache_from_servicenow(
         &self,
         progress: &CacheRebuildProgressSink,
+        page_limit: u32,
+        knowledge_scope: CacheRebuildKnowledgeScope,
     ) -> Result<ServiceNowCacheRebuildReport> {
-        self.cache_rebuild.rebuild_from_servicenow(progress).await
+        self.cache_rebuild
+            .rebuild_from_servicenow(progress, page_limit, &knowledge_scope)
+            .await
     }
 
     pub fn verify_vault(&self) -> Result<VaultVerificationReport> {
