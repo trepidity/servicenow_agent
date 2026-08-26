@@ -232,6 +232,33 @@ The pidfile lives at `~/.config/snow/daemon.pid` and the log at `~/.config/snow/
 
 Use `snow tui --daemon` to launch the record browser against the daemon endpoint; if it needs to auto-start the daemon, it uses the same production default. Pass `--env test` when you want daemon-mode TUI startup against test. The older `scripts/start_daemon.sh` and `scripts/start_tui.sh` wrappers have been removed because these flows are now handled by the CLI.
 
+### Supervised daemon (macOS launchd)
+
+`scripts/build_release.sh` installs the daemon as a user LaunchAgent
+(`com.servicenow-agent.snow-daemon`) via `scripts/manage_daemon_launchagent.sh install`,
+rather than starting it with `snow daemon start`. launchd runs
+`snow daemon __serve --no-idle-timeout` in the foreground and becomes the **sole**
+owner of the daemon process: it restarts the daemon on non-zero exit and keeps it
+alive across idle periods, and logs land in `~/Library/Logs/snow/`.
+
+Because launchd owns the process, do not use `snow daemon start` or
+`snow daemon restart` against a supervised daemon — both detach a child that
+outlives launchd's lifecycle bookkeeping, leaving two competing owners on one
+socket. Use launchd instead, and reserve the `snow daemon` lifecycle commands for
+unsupervised local runs:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.servicenow-agent.snow-daemon   # restart
+launchctl bootout gui/$(id -u)/com.servicenow-agent.snow-daemon        # stop
+snow daemon status                                                     # still the health check
+```
+
+The installer drains any pre-existing `snow daemon __serve` owner before
+bootstrapping, and fails if the service never reaches a running state or its
+endpoint never becomes reachable. For the same reason, `snow_mcp_bridge` accepts
+`--no-auto-spawn`, which suppresses its `snow daemon start` fallback so an MCP
+client cannot spawn a competing daemon behind launchd's back.
+
 ### Admin TUI
 
 ```bash

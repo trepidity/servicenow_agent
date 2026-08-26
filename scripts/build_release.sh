@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 install_dir="${SNOW_RELEASE_INSTALL_DIR:-$HOME/.cargo/bin}"
 snow_bin="$install_dir/snow"
 bridge_bin="$install_dir/snow_mcp_bridge"
+daemon_service_manager="${SNOW_DAEMON_SERVICE_MANAGER:-$repo_root/scripts/manage_daemon_launchagent.sh}"
 
 run() {
   printf '+'
@@ -22,6 +23,6 @@ run install -m 755 target/release/snow "$snow_bin"
 run install -m 755 target/release/snow_daemon "$install_dir/snow_daemon"
 run install -m 755 target/release/snow_mcp_bridge "$bridge_bin"
 
-run "$snow_bin" daemon restart
+run "$daemon_service_manager" install
 run "$snow_bin" daemon status
-run python3 scripts/mcp_schema_smoke.py -- "$bridge_bin" --snow-bin "$snow_bin" --require-contract daemon-json-rpc-v1
+run python3 scripts/mcp_schema_smoke.py -- "$bridge_bin" --snow-bin "$snow_bin" --no-auto-spawn --require-contract daemon-json-rpc-v1

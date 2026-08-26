@@ -20,15 +20,19 @@ async fn main() -> Result<()> {
     }
 
     let config = bridge_config(&args.daemon_endpoint);
-    let daemon = match resolve_snow_binary(args.snow_bin) {
-        Some(snow_bin) => LocalSocketDaemonJsonRpcClient::with_auto_spawn(
-            args.daemon_endpoint,
-            ProcessDaemonAutoSpawn::new(snow_bin),
-        ),
-        None => LocalSocketDaemonJsonRpcClient::with_unavailable_auto_spawn(
-            args.daemon_endpoint,
-            "searched --snow-bin, SNOW_BIN, same-directory sibling, and PATH",
-        ),
+    let daemon = if args.auto_spawn {
+        match resolve_snow_binary(args.snow_bin) {
+            Some(snow_bin) => LocalSocketDaemonJsonRpcClient::with_auto_spawn(
+                args.daemon_endpoint,
+                ProcessDaemonAutoSpawn::new(snow_bin),
+            ),
+            None => LocalSocketDaemonJsonRpcClient::with_unavailable_auto_spawn(
+                args.daemon_endpoint,
+                "searched --snow-bin, SNOW_BIN, same-directory sibling, and PATH",
+            ),
+        }
+    } else {
+        LocalSocketDaemonJsonRpcClient::new(args.daemon_endpoint)
     };
 
     let bridge =
@@ -42,6 +46,7 @@ struct Args {
     daemon_endpoint: DaemonEndpoint,
     required_contract: String,
     snow_bin: Option<PathBuf>,
+    auto_spawn: bool,
     help: bool,
 }
 
@@ -53,6 +58,7 @@ impl Args {
         let mut daemon_endpoint = None;
         let mut required_contract = DEFAULT_CONTRACT_VERSION.to_string();
         let mut snow_bin = None;
+        let mut auto_spawn = true;
         let mut help = false;
         let mut iter = args.into_iter();
 
@@ -82,6 +88,7 @@ impl Args {
                     };
                     snow_bin = Some(expand_home(&value));
                 }
+                "--no-auto-spawn" => auto_spawn = false,
                 "-h" | "--help" => help = true,
                 other => bail!("unknown argument: {other}"),
             }
@@ -91,6 +98,7 @@ impl Args {
             daemon_endpoint: daemon_endpoint.unwrap_or_else(default_daemon_endpoint),
             required_contract,
             snow_bin,
+            auto_spawn,
             help,
         })
     }
@@ -276,9 +284,9 @@ fn unquote_env_value(value: &str) -> String {
 
 fn print_help() {
     println!(
-        "snow_mcp_bridge [--daemon-endpoint <NAME>] [--daemon-socket <PATH>] [--snow-bin <PATH>] [--require-contract daemon-json-rpc-v1]\n\
+        "snow_mcp_bridge [--daemon-endpoint <NAME>] [--daemon-socket <PATH>] [--snow-bin <PATH>] [--no-auto-spawn] [--require-contract daemon-json-rpc-v1]\n\
          \n\
-         Serves ServiceNow MCP over stdio by forwarding calls to snow_daemon JSON-RPC over a local socket. If the daemon is unavailable, the bridge tries to auto-spawn it via `snow daemon start`."
+         Serves ServiceNow MCP over stdio by forwarding calls to snow_daemon JSON-RPC over a local socket. If the daemon is unavailable, the bridge tries to auto-spawn it via `snow daemon start` unless --no-auto-spawn is selected for an externally supervised daemon."
     );
 }
 
@@ -307,6 +315,12 @@ mod tests {
             args.daemon_endpoint,
             DaemonEndpoint::namespaced("snow-daemon-test")
         );
+    }
+
+    #[test]
+    fn parses_no_auto_spawn_for_externally_supervised_daemon() {
+        let args = Args::parse(["--no-auto-spawn".to_string()]).expect("args parse");
+        assert!(!args.auto_spawn);
     }
 
     #[test]
