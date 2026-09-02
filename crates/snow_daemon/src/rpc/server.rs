@@ -1,4 +1,8 @@
 use super::*;
+use snow_mcp::protocol::frame::{
+    FrameRead, MAX_JSON_RPC_RESPONSE_BYTES, RESULT_TOO_LARGE_CODE, read_frame,
+    request_too_large_data, result_too_large_data,
+};
 
 #[derive(Clone)]
 pub struct JsonRpcServer {
@@ -185,34 +189,44 @@ where
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut frame = Vec::new();
 
     loop {
-        line.clear();
-        let read = match reader.read_line(&mut line).await {
-            Ok(read) => read,
+        let frame_status = match read_frame(&mut reader, &mut frame).await {
+            Ok(status) => status,
             Err(err) if is_peer_disconnect(&err) => break,
             Err(err) => return Err(err.into()),
         };
-        if read == 0 {
+        if frame_status == FrameRead::Eof {
             break;
         }
+        let close_after_response = frame_status == FrameRead::TooLarge;
 
         let mut should_shutdown = false;
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => {
-                should_shutdown = RpcMethod::from_method(&request.method) == RpcMethod::Shutdown;
-                dispatch(request, &state).await
-            }
-            Err(err) => JsonRpcResponse::error(
+        let response = match frame_status {
+            FrameRead::TooLarge => JsonRpcResponse::error(
                 None,
-                -32700,
-                "parse error",
-                Some(json!({ "details": err.to_string() })),
+                RESULT_TOO_LARGE_CODE,
+                "request frame exceeds maximum size",
+                Some(request_too_large_data()),
             ),
+            FrameRead::Frame => match serde_json::from_slice::<JsonRpcRequest>(&frame) {
+                Ok(request) => {
+                    should_shutdown =
+                        RpcMethod::from_method(&request.method) == RpcMethod::Shutdown;
+                    dispatch(request, &state).await
+                }
+                Err(err) => JsonRpcResponse::error(
+                    None,
+                    -32700,
+                    "parse error",
+                    Some(json!({ "details": err.to_string() })),
+                ),
+            },
+            FrameRead::Eof => unreachable!("EOF was handled before response construction"),
         };
 
-        let payload = serde_json::to_vec(&response)?;
+        let payload = bounded_payload(response)?;
         if let Err(err) = writer.write_all(&payload).await {
             if is_peer_disconnect(&err) {
                 break;
@@ -227,6 +241,10 @@ where
         }
         writer.flush().await?;
 
+        if close_after_response {
+            break;
+        }
+
         if should_shutdown {
             shutdown.notify_one();
             break;
@@ -234,6 +252,31 @@ where
     }
 
     Ok(())
+}
+
+pub(crate) fn bounded_payload(response: JsonRpcResponse) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(&response)?;
+    if payload.len() <= MAX_JSON_RPC_RESPONSE_BYTES {
+        return Ok(payload);
+    }
+
+    let fallback = JsonRpcResponse::error(
+        response.id,
+        RESULT_TOO_LARGE_CODE,
+        "result exceeds maximum size",
+        Some(result_too_large_data(payload.len())),
+    );
+    let fallback_payload = serde_json::to_vec(&fallback)?;
+    if fallback_payload.len() <= MAX_JSON_RPC_RESPONSE_BYTES {
+        return Ok(fallback_payload);
+    }
+
+    Ok(serde_json::to_vec(&JsonRpcResponse::error(
+        None,
+        RESULT_TOO_LARGE_CODE,
+        "result exceeds maximum size",
+        Some(result_too_large_data(payload.len())),
+    ))?)
 }
 
 fn is_peer_disconnect(err: &std::io::Error) -> bool {

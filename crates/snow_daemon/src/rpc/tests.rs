@@ -3726,6 +3726,65 @@ async fn handle_connection_ignores_broken_pipe_when_client_disconnects() {
         .expect("broken pipe should be treated as disconnect");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_json_rpc_rejects_an_oversized_request_frame() {
+    let fixture = build_fixture_state().await.expect("fixture");
+    let (server, client) = duplex(512 * 1024);
+    let (client_reader, mut client_writer) = split(client);
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","method":"ping","params":{{"padding":"{}"}},"id":1}}\n"#,
+        "x".repeat(300 * 1024),
+    );
+
+    let client = async move {
+        client_writer
+            .write_all(request.as_bytes())
+            .await
+            .expect("write oversized request");
+        client_writer
+            .shutdown()
+            .await
+            .expect("close request stream");
+        let mut reader = BufReader::new(client_reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read rejection");
+        serde_json::from_str::<JsonRpcResponse>(&line).expect("structured rejection")
+    };
+
+    let (server_result, response) = tokio::join!(
+        handle_connection(server, Arc::clone(&fixture.state), Arc::new(Notify::new())),
+        client,
+    );
+    server_result.expect("oversized frame should be handled without a transport failure");
+    assert_eq!(
+        response.error.as_ref().map(|error| error.code),
+        Some(-32070)
+    );
+    assert_eq!(
+        response
+            .error
+            .as_ref()
+            .and_then(|error| error.data.as_ref())
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some("RESULT_TOO_LARGE")
+    );
+}
+
+#[test]
+fn daemon_json_rpc_response_budget_returns_a_small_structured_error() {
+    let payload = super::server::bounded_payload(JsonRpcResponse::ok(
+        Some(json!(1)),
+        json!({ "payload": "x".repeat(snow_mcp::protocol::frame::MAX_JSON_RPC_RESPONSE_BYTES) }),
+    ))
+    .expect("response encoding");
+
+    assert!(payload.len() <= snow_mcp::protocol::frame::MAX_JSON_RPC_RESPONSE_BYTES);
+    let response: Value = serde_json::from_slice(&payload).expect("JSON-RPC");
+    assert_eq!(response["error"]["code"], -32070);
+    assert_eq!(response["error"]["data"]["code"], "RESULT_TOO_LARGE");
+}
+
 /// Round-trip the `start_job` and `get_job` RPC methods through `dispatch`,
 /// ensuring the start handler returns a UUID and the get handler can look
 /// up the resulting registry entry. Runs inside a `LocalSet` because

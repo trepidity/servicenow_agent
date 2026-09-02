@@ -19,6 +19,7 @@ pub use daemon_bridge::{
     ProcessDaemonAutoSpawn, UnixDaemonJsonRpcClient, default_daemon_endpoint,
 };
 pub use error::{Error, Result};
+pub use protocol::frame::RESULT_TOO_LARGE_CODE;
 pub use protocol::schema::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpResourceDescriptor, McpToolDescriptor,
     PolicyDescribeReport, ToolCapabilitiesReport,

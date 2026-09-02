@@ -1,7 +1,7 @@
 mod support;
 
 use anyhow::Result;
-use snow_mcp::McpServer;
+use snow_mcp::{McpServer, RESULT_TOO_LARGE_CODE};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
 
 #[tokio::test(flavor = "current_thread")]
@@ -60,4 +60,28 @@ async fn stdio_initialize_tools_call_and_resource_round_trip() {
             assert!(line.ends_with('\n'));
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stdio_rejects_an_oversized_request_frame() {
+    let fixture = support::build_fixture_state().await.expect("fixture");
+    let server = McpServer::new(fixture.core);
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","method":"initialize","params":{{"padding":"{}"}},"id":1}}\n"#,
+        "x".repeat(300 * 1024),
+    );
+    let mut output = Vec::new();
+
+    server
+        .serve_streams(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            std::future::pending::<Result<(), std::io::Error>>(),
+        )
+        .await
+        .expect("oversized input should receive a structured rejection");
+
+    let response: serde_json::Value = serde_json::from_slice(&output).expect("JSON-RPC error");
+    assert_eq!(response["error"]["code"], RESULT_TOO_LARGE_CODE);
+    assert_eq!(response["error"]["data"]["code"], "RESULT_TOO_LARGE");
 }

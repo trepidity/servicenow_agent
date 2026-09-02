@@ -19,6 +19,9 @@ use tokio::time::{Instant, sleep, timeout};
 use crate::config::McpConfig;
 use crate::domain::policy::is_write_tool;
 use crate::planner::is_governed_write_tool;
+use crate::protocol::frame::{
+    FrameRead, RESULT_TOO_LARGE_CODE, read_frame, request_too_large_data,
+};
 use crate::protocol::schema::{
     JsonRpcRequest, JsonRpcResponse, PolicyDescribeReport, ToolCapabilitiesReport, ToolCapability,
 };
@@ -479,17 +482,23 @@ impl DaemonBackedMcpBridge {
         F: Future<Output = std::result::Result<(), std::io::Error>>,
     {
         tokio::pin!(shutdown);
-        let mut line = String::new();
+        let mut frame = Vec::new();
 
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
-                read = reader.read_line(&mut line) => {
-                    let read = read?;
-                    if read == 0 {
-                        break;
-                    }
-                    let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+                read = read_frame(&mut reader, &mut frame) => {
+                    let frame_status = read?;
+                    let close_after_response = frame_status == FrameRead::TooLarge;
+                    let response = match frame_status {
+                        FrameRead::Eof => break,
+                        FrameRead::TooLarge => JsonRpcResponse::error(
+                            None,
+                            RESULT_TOO_LARGE_CODE,
+                            "request frame exceeds maximum size",
+                            Some(request_too_large_data()),
+                        ),
+                        FrameRead::Frame => match serde_json::from_slice::<JsonRpcRequest>(&frame) {
                         Ok(request) => self.dispatch(request).await,
                         Err(err) => JsonRpcResponse::error(
                             None,
@@ -497,13 +506,16 @@ impl DaemonBackedMcpBridge {
                             "parse error",
                             Some(json!({ "details": err.to_string() })),
                         ),
+                        },
                     };
-                    if response.id.is_some() {
-                        writer.write_all(serde_json::to_vec(&response)?.as_slice()).await?;
+                    if response.id.is_some() || close_after_response {
+                        writer.write_all(crate::transport::stdio::bounded_payload(response)?.as_slice()).await?;
                         writer.write_all(b"\n").await?;
                         writer.flush().await?;
                     }
-                    line.clear();
+                    if close_after_response {
+                        break;
+                    }
                 }
             }
         }
