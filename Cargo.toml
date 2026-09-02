@@ -24,6 +24,7 @@ interprocess = { version = "2.4.2", features = ["tokio"] }
 open = "5"
 ratatui = "0.30"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+rust_xlsxwriter = "0.92"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 servicenow_rs = { git = "https://github.com/trepidity/servicenow_rs.git", rev = "ad9a52acebcc5d68270e4d9124fb5ccf103bb838" }
@@ -32,6 +33,7 @@ tokio = { version = "1", features = ["full"] }
 toml = "1.1.2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 zeroize = "1"
 
 # Keep useful line tables and backtraces without emitting full debug symbols for

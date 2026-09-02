@@ -45,8 +45,9 @@ use snow_core::{
 use crate::error::SnowError;
 use cli::{
     AttachmentCommand, BusinessAppCommand, BusinessAppFilter, Cli, Command,
-    DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS, KnowledgeCommand, KnowledgeSearchModeArg,
-    KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand, TimecardCommand,
+    DEFAULT_CACHE_REBUILD_TIMEOUT_SECONDS, ExportFormat, ExportTable, KnowledgeCommand,
+    KnowledgeSearchModeArg, KnowledgeSemanticCommand, KnowledgeTagLayer, ServerCommand,
+    TimecardCommand,
 };
 use tui_client::{
     BusinessApplicationQueryArgs, BusinessApplicationQueryFilter, BusinessApplicationQueryPageArgs,
@@ -250,6 +251,24 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
     }
     let client = client_builder.build().await?;
     let core_client = core_client_builder.build().await?;
+    if let Command::Export {
+        table,
+        number,
+        sys_id,
+        format,
+        output,
+    } = &cli.command
+    {
+        return cmd_export(
+            &client,
+            *table,
+            number.as_deref(),
+            sys_id.as_deref(),
+            *format,
+            output,
+        )
+        .await;
+    }
     if let Command::RebuildCache {
         page_limit,
         knowledge_base,
@@ -320,6 +339,7 @@ async fn run(cli: Cli, auth_context: Option<AuthContext>) -> Result<(), SnowErro
             )
             .await
         }
+        Command::Export { .. } => unreachable!("export is dispatched before core construction"),
         Command::Tasks { number } => cmd_tasks_core(core.as_ref(), &number).await,
         Command::Sla { number } => cmd_sla(core.as_ref(), &number).await,
         Command::Approve { number, yes } => cmd_approve_core(core.as_ref(), &number, yes).await,

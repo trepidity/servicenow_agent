@@ -59,6 +59,29 @@ pub enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Export one ACL-readable record from an allowlisted ServiceNow table
+    Export {
+        /// Record table type
+        #[arg(long, value_enum)]
+        table: ExportTable,
+        /// Record number within the selected table
+        #[arg(long, required_unless_present = "sys_id", conflicts_with = "sys_id")]
+        number: Option<String>,
+        /// Record sys_id within the selected table
+        #[arg(
+            long,
+            value_parser = parse_sys_id,
+            required_unless_present = "number",
+            conflicts_with = "number"
+        )]
+        sys_id: Option<String>,
+        /// Artifact format
+        #[arg(long, value_enum)]
+        format: ExportFormat,
+        /// Destination file path
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
     /// Show Task SLA status for a record
     Sla {
         /// Record number
@@ -194,6 +217,72 @@ pub enum Command {
     },
     /// Launch the operator admin TUI
     Admin,
+}
+
+/// ServiceNow record tables approved for exact-record export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportTable {
+    Change,
+    ChangeTask,
+    Demand,
+    DemandTask,
+    Incident,
+    Project,
+    Request,
+    RequestItem,
+    RequestTask,
+    ResourcePlan,
+    Story,
+    ScrumTask,
+    Task,
+}
+
+impl ExportTable {
+    pub const fn table_name(self) -> &'static str {
+        match self {
+            Self::Change => "change_request",
+            Self::ChangeTask => "change_task",
+            Self::Demand => "dmn_demand",
+            Self::DemandTask => "dmn_demand_task",
+            Self::Incident => "incident",
+            Self::Project => "pm_project",
+            Self::Request => "sc_request",
+            Self::RequestItem => "sc_req_item",
+            Self::RequestTask => "sc_task",
+            Self::ResourcePlan => "resource_plan",
+            Self::Story => "rm_story",
+            Self::ScrumTask => "rm_scrum_task",
+            Self::Task => "task",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Change => "Change",
+            Self::ChangeTask => "Change Task",
+            Self::Demand => "Demand",
+            Self::DemandTask => "Demand Task",
+            Self::Incident => "Incident",
+            Self::Project => "Project",
+            Self::Request => "Request",
+            Self::RequestItem => "Request Item",
+            Self::RequestTask => "Request Task",
+            Self::ResourcePlan => "Resource Plan",
+            Self::Story => "Story",
+            Self::ScrumTask => "Scrum Task",
+            Self::Task => "Task",
+        }
+    }
+}
+
+/// Durable export formats supported by the exact-record export command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Json,
+    Jsonl,
+    Csv,
+    Markdown,
+    Xlsx,
 }
 
 #[derive(Debug, Subcommand)]

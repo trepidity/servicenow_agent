@@ -77,6 +77,25 @@ snow show INC0000001 sla          # Task SLA status alias
 
 Summary includes: state, category, dates, assigned to, description, change plan, implementation steps, and backout plan.
 
+### Exact-record export
+
+`snow export` reads one record from an explicitly allowlisted ServiceNow table
+and writes a durable artifact. It never accepts an arbitrary table name or a
+free-form query. Select exactly one record by number or sys_id.
+
+```bash
+snow export --table demand --number DMND0001234 --format markdown --output demand.md
+snow export --table project --sys-id <PROJECT_SYS_ID> --format xlsx --output project.xlsx
+snow export --table incident --number INC0012345 --format csv --output incident.csv
+```
+
+Supported tables are `change`, `change-task`, `demand`, `demand-task`,
+`incident`, `project`, `request`, `request-item`, `request-task`,
+`resource-plan`, `story`, `scrum-task`, and `task`. Formats are `json`,
+`jsonl`, `csv`, `markdown`, and `xlsx`. The command reads only fields allowed
+by the caller's ServiceNow ACLs; the destination artifact is local and may
+contain sensitive record data, so store it accordingly.
+
 ### Task SLA status
 
 ```bash
