@@ -26,6 +26,7 @@ pub mod catalog_write;
 pub mod change_write;
 pub mod incident_bulk_write;
 pub mod jobs;
+pub mod knowledge_write;
 pub mod resource_plan_write;
 pub mod rpc;
 pub mod story_write;

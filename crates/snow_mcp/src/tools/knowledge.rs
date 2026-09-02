@@ -155,6 +155,45 @@ pub fn register(registry: &mut ToolRegistry) {
             requires_confirmation: false,
         },
     ];
+    for tool in [
+        ToolMetadata {
+            name: "knowledge_plan_create_draft".to_string(),
+            description: "Plan a draft-only ServiceNow Knowledge article creation; publishing is not supported".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "short_description": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 120000},
+                    "knowledge_base_sys_id": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
+                    "category_sys_id": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"}
+                },
+                "required": ["short_description", "text", "knowledge_base_sys_id"]
+            }),
+            output_schema: object_schema(),
+            default_enabled: true,
+            requires_confirmation: false,
+        },
+        ToolMetadata {
+            name: "knowledge_apply_create_draft".to_string(),
+            description: "Create a confirmed ServiceNow Knowledge article draft; publishing is not supported".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "plan_id": {"type": "string"},
+                    "confirmation_token": {"type": "string"},
+                    "idempotency_key": {"type": "string"}
+                },
+                "required": ["plan_id", "confirmation_token", "idempotency_key"]
+            }),
+            output_schema: object_schema(),
+            default_enabled: false,
+            requires_confirmation: true,
+        },
+    ] {
+        registry.add(tool);
+    }
     for tool in tools {
         registry.add(tool);
     }

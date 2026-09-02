@@ -35,8 +35,12 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         | RpcMethod::IncidentBulkApplyUpdate
         | RpcMethod::ResourcePlanPlanCreate
         | RpcMethod::ResourcePlanPlanUpdate
+        | RpcMethod::ResourcePlanPlanDecision
         | RpcMethod::ResourcePlanApplyCreate
         | RpcMethod::ResourcePlanApplyUpdate
+        | RpcMethod::ResourcePlanApplyDecision
+        | RpcMethod::KnowledgePlanCreateDraft
+        | RpcMethod::KnowledgeApplyCreateDraft
         | RpcMethod::StoryPlanCreate
         | RpcMethod::StoryPlanUpdate
         | RpcMethod::StoryTaskPlanCreate

@@ -88,6 +88,68 @@ async fn daemon_rpc_work_note_plan_add_succeeds_when_resolved_table_supports_wor
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn daemon_rpc_work_note_plan_add_does_not_require_ancestry_when_target_defines_work_notes() {
+    let instance = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_dictionary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": [{
+                "name": "change_request",
+                "element": "work_notes",
+                "internal_type": "journal_input",
+                "active": "true"
+            }]
+        })))
+        .expect(1)
+        .mount(&instance)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_db_object"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": { "message": "Access denied" }
+        })))
+        .expect(0)
+        .mount(&instance)
+        .await;
+    let fixture = build_fixture_state_at_instance(&instance.uri())
+        .await
+        .expect("fixture");
+    let state = work_note_enabled_state(&fixture);
+
+    let response = plan_work_note(&state, "CHG001").await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.expect("plan")["confirmation_token"].is_string());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_rpc_work_note_plan_add_accepts_visible_work_notes_when_descriptor_type_is_hidden() {
+    let instance = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_dictionary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": [{
+                "name": "change_request",
+                "element": "work_notes",
+                "active": "true"
+            }]
+        })))
+        .expect(1)
+        .mount(&instance)
+        .await;
+    mount_no_ancestors(&instance, "change_request").await;
+    let fixture = build_fixture_state_at_instance(&instance.uri())
+        .await
+        .expect("fixture");
+    let state = work_note_enabled_state(&fixture);
+
+    let response = plan_work_note(&state, "CHG001").await;
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(response.result.expect("plan")["confirmation_token"].is_string());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_rpc_work_note_plan_add_refuses_when_resolved_table_lacks_work_notes() {
     let instance = MockServer::start().await;
     Mock::given(method("GET"))
@@ -161,6 +223,7 @@ async fn daemon_rpc_work_note_plan_add_refuses_when_field_discovery_is_unavailab
         json!({
             "code": "WORK_NOTES_DISCOVERY_UNAVAILABLE",
             "field": "work_notes",
+            "reason": "acl_denied",
             "table": "change_request"
         })
     );

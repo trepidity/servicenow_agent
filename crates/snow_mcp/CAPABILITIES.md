@@ -29,6 +29,7 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Approval (`sysapproval_approver`) | `approval_approve` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals`; target record number still accepted; daemon required |
 | Approval (`sysapproval_approver`) | `approval_reject` | **Update** | ❌ | yes | prefer `approval_sys_id` from `list_my_approvals` plus reason; target record number still accepted; daemon required |
 | Work note / journal | `work_note_apply_add` | **Create** | ❌ | yes | `work_notes` only; explicit environment policy required |
+| Knowledge article (`kb_knowledge`) | `knowledge_apply_create_draft` | **Create draft** | ❌ | yes | governed; daemon required; accepts title, HTML body, required knowledge-base sys_id, optional category sys_id; fresh refetch must prove `workflow_state=draft`; no publish tool exists |
 | Story (`rm_story`) | `story_apply_create` | **Create** | ❌ | yes | governed; daemon required |
 | Story (`rm_story`) | `story_apply_update` | **Update** | ❌ | yes | governed; daemon required; includes `state`,`percent_complete` |
 | Story task (`rm_scrum_task`) | `story_task_apply_create` | **Create** | ❌ | yes | governed; daemon required |
@@ -42,15 +43,17 @@ explicitly listed in `is_write_tool()`. Everything else is read-only.
 | Incident (`incident`) | `incident_apply_update` | **Update** | ❌ | yes | compatible single-target operation; daemon required; `assigned_to`,`assignment_group`,`state`,`work_notes`,`comments`; concurrency checked |
 | Incident (`incident`) | `incident_bulk_apply_update` | **Update 3..=25** | ❌ | yes | separately governed daemon operation; explicit `max_targets`; ordered, stop-first, no rollback/retry |
 | Resource plan (`resource_plan`) | `resource_plan_apply_create` | **Create** | ❌ | yes | governed; daemon required; writes `task`,`group_resource` or `user_resource`,`resource_type`,`state`,`planned_hours`,`notes`,`start_date`,`end_date` |
-| Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `state`,`planned_hours`,`notes`,`start_date`,`end_date` only |
+| Resource plan (`resource_plan`) | `resource_plan_apply_update` | **Update** | ❌ | yes | governed; daemon required; concurrency checked; updates `planned_hours`,`notes`,`start_date`,`end_date` only |
+| Resource plan (`resource_plan`) | `resource_plan_apply_decision` | **Confirm / Confirm and Allocate** | ❌ | yes | governed; daemon required; Requested precondition; verifies resulting state and allocation booking type |
 | MCP operation plan | `plan_cancel` | **Delete** (cancel) | ❌ | yes | cancels a pending plan, not a SN record |
 
 `*_plan_*` tools (`story_plan_create`, `story_plan_update`, `story_task_plan_create`,
 `story_task_plan_update`, `change_request_plan_create`, `change_request_plan_update`,
 `change_task_plan_create`, `change_task_plan_update`,
 `incident_plan_update`, `incident_bulk_plan_update`,
-`resource_plan_plan_create`, `resource_plan_plan_update`,
-`timecard_plan_set_hours`, `work_note_plan_add`, `catalog_plan_request`) are **not** transactions — they
+`resource_plan_plan_create`, `resource_plan_plan_update`, `resource_plan_plan_decision`,
+`timecard_plan_set_hours`, `work_note_plan_add`, `knowledge_plan_create_draft`,
+`catalog_plan_request`) are **not** transactions — they
 build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 `*_submit_*` tool executes the plan.
 
@@ -60,10 +63,26 @@ build/preview a plan and never mutate ServiceNow. The matching `*_apply_*` /
 - Governed Story, Change, Resource Plan, and time-card writes need an attached daemon, else `-32044 DAEMON_REQUIRED_FOR_WRITE` (`server.rs`).
 - A disabled tool returns `-32040 policy denied`.
 
+### Knowledge draft creation
+
+`knowledge_plan_create_draft` and `knowledge_apply_create_draft` are the
+draft-only Knowledge write surface. The planner accepts exactly
+`short_description`, `text`, `knowledge_base_sys_id`, and an optional
+`category_sys_id`; it rejects `workflow_state`, publication fields, and every
+other field. The apply tool requires the plan-issued confirmation token and
+idempotency key, writes `workflow_state=draft`, then performs a fresh
+`kb_knowledge` read. If ServiceNow reports any workflow state other than
+`draft`, the operation fails rather than claiming a draft was created.
+
+The preview, audit summary, and receipt expose a SHA-256 of the article body,
+not the body itself. This capability deliberately does **not** provide edit,
+publish, retire, delete, or generic Knowledge-record mutation.
+
 ### Resource Plan Writes
 
 `resource_plan_plan_create`, `resource_plan_apply_create`,
-`resource_plan_plan_update`, and `resource_plan_apply_update` are governed
+`resource_plan_plan_update`, `resource_plan_apply_update`,
+`resource_plan_plan_decision`, and `resource_plan_apply_decision` are governed
 daemon-backed writes for the `resource_plan` table.
 
 - **Parent model:** create sets the single polymorphic `task` field from
@@ -74,15 +93,17 @@ daemon-backed writes for the `resource_plan` table.
   `resource_sys_id`, then writes `group_resource` or `user_resource` plus
   `resource_type`. Update does not allow changing `task`, resource assignment,
   or `resource_type`.
-- **State model:** `state` accepts a raw integer string or the known labels
-  `Planning` and `Allocated`. Unknown raw integers pass through; unknown labels
-  are rejected at plan time.
+- **State model:** generic update no longer accepts `state`; lifecycle decisions
+  use `resource_plan_plan_decision` with `decision = confirm|confirm_and_allocate`.
+  The daemon requires Requested (`2`), maps Confirm to Confirmed (`11`) with
+  Soft allocations and Confirm and Allocate to Allocated (`3`) with Hard
+  allocations, then verifies both the refreshed record and allocation rows.
 - **Notes:** caller `notes` maps to the ServiceNow `notes` column. `work_notes`
   is intentionally absent from schemas and allowlists because Resource Plan
   journal writes no-op in ServiceNow.
-- **Period and hours:** `start_date` and `end_date` are date strings. v1 writes
-  `planned_hours` as a direct scalar and does not manage allocation child rows
-  or rollups.
+- **Period and hours:** `start_date` and `end_date` are date strings. Generic
+  writes treat `planned_hours` as a direct scalar; the named decision operation
+  verifies allocation child rows created by ServiceNow's lifecycle processing.
 - **Concurrency:** update apply requires the plan-issued concurrency token
   (`sys_updated_on` plus optional `sys_mod_count`). A missing/mismatched caller
   token returns `CONCURRENCY_TOKEN_INVALID` (`-32061`); a changed record returns

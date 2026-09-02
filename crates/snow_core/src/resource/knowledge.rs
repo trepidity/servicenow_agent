@@ -10,6 +10,19 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct KnowledgeResource;
 
+/// Verified result of creating a Knowledge article that remains a draft.
+///
+/// This is intentionally narrower than a general Knowledge lifecycle model:
+/// callers can create a draft, but cannot publish or retire an article through
+/// this write result.
+#[derive(Debug, Clone)]
+pub struct KnowledgeDraftWriteResult {
+    pub record: SnowRecord,
+    pub workflow_state: String,
+    pub knowledge_base_sys_id: String,
+    pub category_sys_id: Option<String>,
+}
+
 impl KnowledgeResource {
     pub fn from_servicenow(
         record: &Record,

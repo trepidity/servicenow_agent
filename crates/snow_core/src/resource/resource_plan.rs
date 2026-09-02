@@ -7,18 +7,32 @@ use crate::{SnowRecord, parse_i64};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePlanState {
     Planning,
+    Requested,
     Allocated,
+    Completed,
+    Canceled,
+    Confirmed,
     Other(u16),
 }
 
 impl ResourcePlanState {
-    pub const KNOWN: [ResourcePlanState; 2] =
-        [ResourcePlanState::Planning, ResourcePlanState::Allocated];
+    pub const KNOWN: [ResourcePlanState; 6] = [
+        ResourcePlanState::Planning,
+        ResourcePlanState::Requested,
+        ResourcePlanState::Allocated,
+        ResourcePlanState::Completed,
+        ResourcePlanState::Canceled,
+        ResourcePlanState::Confirmed,
+    ];
 
     pub const fn raw(self) -> u16 {
         match self {
             ResourcePlanState::Planning => 1,
+            ResourcePlanState::Requested => 2,
             ResourcePlanState::Allocated => 3,
+            ResourcePlanState::Completed => 7,
+            ResourcePlanState::Canceled => 8,
+            ResourcePlanState::Confirmed => 11,
             ResourcePlanState::Other(value) => value,
         }
     }
@@ -26,7 +40,11 @@ impl ResourcePlanState {
     pub const fn label(self) -> Option<&'static str> {
         match self {
             ResourcePlanState::Planning => Some("Planning"),
+            ResourcePlanState::Requested => Some("Requested"),
             ResourcePlanState::Allocated => Some("Allocated"),
+            ResourcePlanState::Completed => Some("Completed"),
+            ResourcePlanState::Canceled => Some("Canceled"),
+            ResourcePlanState::Confirmed => Some("Confirmed"),
             ResourcePlanState::Other(_) => None,
         }
     }
@@ -39,16 +57,61 @@ impl ResourcePlanState {
         if input.eq_ignore_ascii_case("planning") {
             return Some(Self::Planning);
         }
+        if input.eq_ignore_ascii_case("requested") {
+            return Some(Self::Requested);
+        }
         if input.eq_ignore_ascii_case("allocated") {
             return Some(Self::Allocated);
+        }
+        if input.eq_ignore_ascii_case("completed") {
+            return Some(Self::Completed);
+        }
+        if input.eq_ignore_ascii_case("canceled") || input.eq_ignore_ascii_case("cancelled") {
+            return Some(Self::Canceled);
+        }
+        if input.eq_ignore_ascii_case("confirmed") {
+            return Some(Self::Confirmed);
         }
         let raw = input.parse::<u16>().ok()?;
         Some(match raw {
             1 => Self::Planning,
+            2 => Self::Requested,
             3 => Self::Allocated,
+            7 => Self::Completed,
+            8 => Self::Canceled,
+            11 => Self::Confirmed,
             other => Self::Other(other),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePlanDecision {
+    Confirm,
+    ConfirmAndAllocate,
+}
+
+impl ResourcePlanDecision {
+    pub const fn target_state(self) -> ResourcePlanState {
+        match self {
+            Self::Confirm => ResourcePlanState::Confirmed,
+            Self::ConfirmAndAllocate => ResourcePlanState::Allocated,
+        }
+    }
+
+    pub const fn expected_booking_type(self) -> &'static str {
+        match self {
+            Self::Confirm => "Soft",
+            Self::ConfirmAndAllocate => "Hard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourcePlanAllocationEvidence {
+    pub allocation_count: usize,
+    pub booking_types: Vec<String>,
 }
 
 impl Serialize for ResourcePlanState {
@@ -561,6 +624,22 @@ mod tests {
             Some(ResourcePlanState::Allocated)
         );
         assert_eq!(
+            ResourcePlanState::parse("2"),
+            Some(ResourcePlanState::Requested)
+        );
+        assert_eq!(
+            ResourcePlanState::parse("7"),
+            Some(ResourcePlanState::Completed)
+        );
+        assert_eq!(
+            ResourcePlanState::parse("8"),
+            Some(ResourcePlanState::Canceled)
+        );
+        assert_eq!(
+            ResourcePlanState::parse("11"),
+            Some(ResourcePlanState::Confirmed)
+        );
+        assert_eq!(
             ResourcePlanState::parse("planning"),
             Some(ResourcePlanState::Planning)
         );
@@ -573,6 +652,14 @@ mod tests {
             Some(ResourcePlanState::Allocated)
         );
         assert_eq!(
+            ResourcePlanState::parse("requested"),
+            Some(ResourcePlanState::Requested)
+        );
+        assert_eq!(
+            ResourcePlanState::parse("confirmed"),
+            Some(ResourcePlanState::Confirmed)
+        );
+        assert_eq!(
             ResourcePlanState::parse("99"),
             Some(ResourcePlanState::Other(99))
         );
@@ -583,6 +670,8 @@ mod tests {
     fn state_label_none_for_other() {
         assert_eq!(ResourcePlanState::Other(99).label(), None);
         assert_eq!(ResourcePlanState::Planning.label(), Some("Planning"));
+        assert_eq!(ResourcePlanState::Requested.label(), Some("Requested"));
+        assert_eq!(ResourcePlanState::Confirmed.label(), Some("Confirmed"));
     }
 
     #[test]

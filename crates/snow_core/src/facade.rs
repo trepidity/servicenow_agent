@@ -712,6 +712,32 @@ impl SnowCore {
         self.writes.update_resource_plan(sys_id, payload).await
     }
 
+    pub async fn resource_plan_allocation_evidence(
+        &self,
+        resource_plan_sys_id: &str,
+    ) -> Result<ResourcePlanAllocationEvidence> {
+        self.writes
+            .resource_plan_allocation_evidence(resource_plan_sys_id)
+            .await
+    }
+
+    pub async fn create_knowledge_draft(
+        &self,
+        short_description: &str,
+        text: &str,
+        knowledge_base_sys_id: &str,
+        category_sys_id: Option<&str>,
+    ) -> Result<KnowledgeDraftWriteResult> {
+        self.writes
+            .create_knowledge_draft(
+                short_description,
+                text,
+                knowledge_base_sys_id,
+                category_sys_id,
+            )
+            .await
+    }
+
     pub async fn add_work_note(&self, number: &str, text: &str) -> Result<Option<SnowRecord>> {
         self.records.add_work_note(number, text).await
     }

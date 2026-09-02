@@ -230,6 +230,14 @@ fn rpc_method_parsing_covers_known_methods() {
         RpcMethod::ResourcePlanApplyUpdate
     );
     assert_eq!(
+        RpcMethod::from_method("resource_plan_plan_decision"),
+        RpcMethod::ResourcePlanPlanDecision
+    );
+    assert_eq!(
+        RpcMethod::from_method("resource_plan_apply_decision"),
+        RpcMethod::ResourcePlanApplyDecision
+    );
+    assert_eq!(
         RpcMethod::from_method("story_plan_create"),
         RpcMethod::StoryPlanCreate
     );

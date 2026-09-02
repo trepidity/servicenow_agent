@@ -90,7 +90,7 @@ const RESOURCE_PLAN_APPLY_CREATE_FIELDS: &[&str] = &[
 ];
 
 const RESOURCE_PLAN_APPLY_UPDATE_FIELDS: &[&str] =
-    &["state", "planned_hours", "notes", "start_date", "end_date"];
+    &["planned_hours", "notes", "start_date", "end_date"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyConfig {
@@ -611,6 +611,7 @@ pub fn is_write_tool(tool: &str) -> bool {
             tool,
             "catalog_submit_request"
                 | "work_note_apply_add"
+                | "knowledge_apply_create_draft"
                 | "attachment_upload"
                 | "approval_approve"
                 | "approval_reject"
@@ -747,6 +748,21 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
             ),
         ),
         (
+            "knowledge_writer".to_string(),
+            role(
+                &[
+                    "knowledge_search",
+                    "knowledge_fetch",
+                    "list_knowledge_bases",
+                    "list_categories",
+                    "knowledge_plan_create_draft",
+                    "policy_describe",
+                    "tool_capabilities",
+                ],
+                &["knowledge_apply_create_draft"],
+            ),
+        ),
+        (
             "story_writer".to_string(),
             role(
                 &[
@@ -818,11 +834,16 @@ fn default_roles() -> BTreeMap<String, RoleAllowList> {
                     "user_search",
                     "resource_plan_plan_create",
                     "resource_plan_plan_update",
+                    "resource_plan_plan_decision",
                     "plan_get",
                     "policy_describe",
                     "tool_capabilities",
                 ],
-                &["resource_plan_apply_create", "resource_plan_apply_update"],
+                &[
+                    "resource_plan_apply_create",
+                    "resource_plan_apply_update",
+                    "resource_plan_apply_decision",
+                ],
             ),
         ),
         (
@@ -1066,12 +1087,55 @@ fn default_tools() -> BTreeMap<String, ToolPolicy> {
             resource_plan_plan_policy(),
         ),
         (
+            "resource_plan_plan_decision".to_string(),
+            resource_plan_plan_policy(),
+        ),
+        (
             "resource_plan_apply_create".to_string(),
             resource_plan_apply_policy(RESOURCE_PLAN_APPLY_CREATE_FIELDS, false),
         ),
         (
             "resource_plan_apply_update".to_string(),
             resource_plan_apply_policy(RESOURCE_PLAN_APPLY_UPDATE_FIELDS, true),
+        ),
+        (
+            "resource_plan_apply_decision".to_string(),
+            resource_plan_apply_policy(&["state"], true),
+        ),
+        (
+            "knowledge_plan_create_draft".to_string(),
+            ToolPolicy {
+                enabled: true,
+                requires_confirmation: false,
+                requires_kb_evidence: false,
+                field_allowlist: BTreeSet::from([
+                    "short_description".to_string(),
+                    "text".to_string(),
+                    "kb_knowledge_base".to_string(),
+                    "kb_category".to_string(),
+                    "workflow_state".to_string(),
+                ]),
+                environments: vec!["test".to_string(), "training".to_string()],
+                ..ToolPolicy::default()
+            },
+        ),
+        (
+            "knowledge_apply_create_draft".to_string(),
+            ToolPolicy {
+                enabled: false,
+                requires_confirmation: true,
+                requires_kb_evidence: false,
+                field_allowlist: BTreeSet::from([
+                    "short_description".to_string(),
+                    "text".to_string(),
+                    "kb_knowledge_base".to_string(),
+                    "kb_category".to_string(),
+                    "workflow_state".to_string(),
+                ]),
+                environments: vec!["test".to_string(), "training".to_string()],
+                confirmation_ttl_seconds: Some(300),
+                ..ToolPolicy::default()
+            },
         ),
         (
             "work_note_apply_add".to_string(),
@@ -1248,8 +1312,10 @@ mod tests {
     fn is_write_tool_classifies_resource_plan_apply() {
         assert!(is_write_tool("resource_plan_apply_create"));
         assert!(is_write_tool("resource_plan_apply_update"));
+        assert!(is_write_tool("resource_plan_apply_decision"));
         assert!(!is_write_tool("resource_plan_plan_create"));
         assert!(!is_write_tool("resource_plan_plan_update"));
+        assert!(!is_write_tool("resource_plan_plan_decision"));
     }
 
     #[test]
@@ -1257,12 +1323,16 @@ mod tests {
         let tools = default_tools();
         assert!(tools["resource_plan_plan_create"].enabled);
         assert!(tools["resource_plan_plan_update"].enabled);
+        assert!(tools["resource_plan_plan_decision"].enabled);
         assert!(!tools["resource_plan_apply_create"].enabled);
         assert!(!tools["resource_plan_apply_update"].enabled);
+        assert!(!tools["resource_plan_apply_decision"].enabled);
         assert!(tools["resource_plan_apply_create"].requires_confirmation);
         assert!(tools["resource_plan_apply_update"].requires_confirmation);
+        assert!(tools["resource_plan_apply_decision"].requires_confirmation);
         assert!(!tools["resource_plan_apply_create"].skip_terminal_records);
         assert!(tools["resource_plan_apply_update"].skip_terminal_records);
+        assert!(tools["resource_plan_apply_decision"].skip_terminal_records);
     }
 
     #[test]
@@ -1285,12 +1355,15 @@ mod tests {
         assert_eq!(
             tools["resource_plan_apply_update"].field_allowlist,
             BTreeSet::from([
-                "state".to_string(),
                 "planned_hours".to_string(),
                 "notes".to_string(),
                 "start_date".to_string(),
                 "end_date".to_string(),
             ])
+        );
+        assert_eq!(
+            tools["resource_plan_apply_decision"].field_allowlist,
+            BTreeSet::from(["state".to_string()])
         );
     }
 
@@ -1304,7 +1377,9 @@ mod tests {
         assert!(role.read_tools.contains("resource_plan_list"));
         assert!(role.read_tools.contains("resource_plan_plan_create"));
         assert!(role.read_tools.contains("resource_plan_plan_update"));
+        assert!(role.read_tools.contains("resource_plan_plan_decision"));
         assert!(role.write_tools.contains("resource_plan_apply_create"));
         assert!(role.write_tools.contains("resource_plan_apply_update"));
+        assert!(role.write_tools.contains("resource_plan_apply_decision"));
     }
 }

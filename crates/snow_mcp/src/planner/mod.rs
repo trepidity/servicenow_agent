@@ -25,6 +25,11 @@ pub const GOVERNED_TIMECARD_TOOL_NAMES: &[&str] =
 
 pub const GOVERNED_WORK_NOTE_TOOL_NAMES: &[&str] = &["work_note_plan_add", "work_note_apply_add"];
 
+pub const GOVERNED_KNOWLEDGE_TOOL_NAMES: &[&str] = &[
+    "knowledge_plan_create_draft",
+    "knowledge_apply_create_draft",
+];
+
 pub const GOVERNED_ATTACHMENT_TOOL_NAMES: &[&str] = &["attachment_upload"];
 
 pub const GOVERNED_CATALOG_TOOL_NAMES: &[&str] =
@@ -52,6 +57,8 @@ pub const GOVERNED_RESOURCE_PLAN_TOOL_NAMES: &[&str] = &[
     "resource_plan_apply_create",
     "resource_plan_plan_update",
     "resource_plan_apply_update",
+    "resource_plan_plan_decision",
+    "resource_plan_apply_decision",
 ];
 
 pub fn is_governed_story_tool(tool: &str) -> bool {
@@ -64,6 +71,10 @@ pub fn is_governed_timecard_tool(tool: &str) -> bool {
 
 pub fn is_governed_work_note_tool(tool: &str) -> bool {
     GOVERNED_WORK_NOTE_TOOL_NAMES.contains(&tool)
+}
+
+pub fn is_governed_knowledge_tool(tool: &str) -> bool {
+    GOVERNED_KNOWLEDGE_TOOL_NAMES.contains(&tool)
 }
 
 pub fn is_governed_attachment_tool(tool: &str) -> bool {
@@ -90,6 +101,7 @@ pub fn is_governed_write_tool(tool: &str) -> bool {
     is_governed_story_tool(tool)
         || is_governed_timecard_tool(tool)
         || is_governed_work_note_tool(tool)
+        || is_governed_knowledge_tool(tool)
         || is_governed_attachment_tool(tool)
         || is_governed_catalog_tool(tool)
         || is_governed_approval_tool(tool)
@@ -102,7 +114,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_governed_resource_plan_tool_recognizes_four_names() {
+    fn is_governed_resource_plan_tool_recognizes_all_names() {
         for tool in GOVERNED_RESOURCE_PLAN_TOOL_NAMES {
             assert!(is_governed_resource_plan_tool(tool), "{tool}");
         }

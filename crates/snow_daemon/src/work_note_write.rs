@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use snow_core::{FieldSupport, SnowRecord};
+use snow_core::{FieldSupport, SnowRecord, UnavailableReason};
 use snow_mcp::audit::{AuditSink, SqliteAuditSink};
 use snow_mcp::domain::audit::{
     ActorIdentity, AppliedChange, AuditEvent, ClientIdentity, ErrorRow, PolicyDecisionRow,
@@ -36,7 +36,12 @@ const WORK_NOTES_FIELD: &str = "work_notes";
 enum WorkNoteFieldSupport {
     Supported,
     Unsupported,
-    Unavailable,
+    /// Discovery did not establish field support. The reason is safe to
+    /// return to the caller, but deliberately never includes upstream error
+    /// text that could contain instance-specific details.
+    Unavailable {
+        reason: &'static str,
+    },
 }
 
 pub async fn handle_work_note_plan_add(
@@ -600,7 +605,16 @@ async fn work_note_field_support(state: &DaemonState, table: &str) -> WorkNoteFi
     match state.core.supports_field(table, WORK_NOTES_FIELD).await {
         Ok(FieldSupport::Available { value: true }) => WorkNoteFieldSupport::Supported,
         Ok(FieldSupport::Available { value: false }) => WorkNoteFieldSupport::Unsupported,
-        Ok(FieldSupport::Unavailable { .. }) | Err(_) => WorkNoteFieldSupport::Unavailable,
+        Ok(FieldSupport::Unavailable { reason }) => WorkNoteFieldSupport::Unavailable {
+            reason: match reason {
+                UnavailableReason::NotReturnedByInstance => "not_returned_by_instance",
+                UnavailableReason::AclDenied => "acl_denied",
+                UnavailableReason::NotSupportedByOperation => "not_supported_by_operation",
+            },
+        },
+        Err(_) => WorkNoteFieldSupport::Unavailable {
+            reason: "upstream_error",
+        },
     }
 }
 
@@ -621,13 +635,14 @@ async fn reject_unsupported_work_notes(
                 "table": record.table,
             }),
         )),
-        WorkNoteFieldSupport::Unavailable => Some(work_note_error(
+        WorkNoteFieldSupport::Unavailable { reason } => Some(work_note_error(
             id,
             -32054,
             "WORK_NOTES_DISCOVERY_UNAVAILABLE",
             json!({
                 "code": "WORK_NOTES_DISCOVERY_UNAVAILABLE",
                 "field": WORK_NOTES_FIELD,
+                "reason": reason,
                 "table": record.table,
             }),
         )),
@@ -656,7 +671,7 @@ async fn audited_reject_unsupported_work_notes(
             )
             .await,
         ),
-        WorkNoteFieldSupport::Unavailable => Some(
+        WorkNoteFieldSupport::Unavailable { reason } => Some(
             audited_work_note_error(
                 state,
                 id,
@@ -665,6 +680,7 @@ async fn audited_reject_unsupported_work_notes(
                 json!({
                     "code": "WORK_NOTES_DISCOVERY_UNAVAILABLE",
                     "field": WORK_NOTES_FIELD,
+                    "reason": reason,
                     "table": record.table,
                 }),
                 ResultStatus::Denied,

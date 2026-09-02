@@ -4,8 +4,8 @@ use serde_json::{Map, Value, json};
 use servicenow_rs::prelude::Error as SnowApiError;
 use sha2::{Digest, Sha256};
 use snow_core::{
-    ResourcePlanParentType, ResourcePlanResource, ResourcePlanResourceType, ResourcePlanState,
-    ResourcePlanWriteResult, SnowRecord,
+    ResourcePlanDecision, ResourcePlanParentType, ResourcePlanResource, ResourcePlanResourceType,
+    ResourcePlanState, ResourcePlanWriteResult, SnowRecord,
 };
 use snow_mcp::audit::{AuditSink, SqliteAuditSink};
 use snow_mcp::domain::audit::{
@@ -17,8 +17,8 @@ use snow_mcp::planner::{
     ConcurrencyToken, ConfirmationBinding, ConfirmationConsumeError, ConfirmationRecord,
     ConfirmationStore, FieldChange, IdempotencyOutcome, IdempotencyRecord, IdempotencyStore,
     OperationPlan, OperationPlanBuilder, OperationReceipt, PlanLifecycleState, PlanStore,
-    PlanStoreRecord, ReceiptStatus, SqliteConfirmationStore, SqliteIdempotencyStore,
-    SqlitePlanStore,
+    PlanStoreRecord, ReceiptStatus, ReceiptWarning, SqliteConfirmationStore,
+    SqliteIdempotencyStore, SqlitePlanStore,
 };
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -108,6 +108,23 @@ pub async fn handle_resource_plan_plan(
                     "code": "GUARD_FAILED",
                     "reason": "terminal_record_skipped",
                     "number": number,
+                }),
+            );
+        }
+        Err(PlanBuildError::GuardFailed {
+            number,
+            reason,
+            current_state,
+        }) => {
+            return rpc_error(
+                id,
+                -32050,
+                "GUARD_FAILED",
+                json!({
+                    "code": "GUARD_FAILED",
+                    "reason": reason,
+                    "number": number,
+                    "current_state": current_state,
                 }),
             );
         }
@@ -556,14 +573,20 @@ pub async fn handle_resource_plan_apply(
         write_result,
         before_record.as_ref(),
         state,
-    );
+    )
+    .await;
     let (audit_summary, applied_changes) = audit_summary_for_receipt(&receipt);
+    let audit_status = if receipt.status == ReceiptStatus::Success {
+        ResultStatus::AppliedSuccess
+    } else {
+        ResultStatus::AppliedPartial
+    };
     if let Err(err) = append_audit_event(
         state,
         &audit_id,
         Some(plan.plan_id.as_str()),
         tool,
-        ResultStatus::AppliedSuccess,
+        audit_status,
         Some(audit_summary),
         receipt.service_now_metadata.clone(),
         None,
@@ -611,8 +634,16 @@ enum PlanBuildError {
     Invalid(String),
     FieldRejected(Vec<Value>),
     NotFound(String),
-    WrongType { selector: String, table: String },
+    WrongType {
+        selector: String,
+        table: String,
+    },
     TerminalRecord(String),
+    GuardFailed {
+        number: String,
+        reason: &'static str,
+        current_state: Option<String>,
+    },
     Upstream(anyhow::Error),
 }
 
@@ -624,6 +655,7 @@ async fn build_plan_input(
     match tool {
         "resource_plan_plan_create" => build_create_plan_input(tool, args, state).await,
         "resource_plan_plan_update" => build_update_plan_input(tool, args, state).await,
+        "resource_plan_plan_decision" => build_decision_plan_input(tool, args, state).await,
         _ => Err(PlanBuildError::Invalid(format!(
             "unsupported Resource Plan tool {tool}"
         ))),
@@ -785,6 +817,77 @@ async fn build_update_plan_input(
         concurrency_token: concurrency_from_record(&record),
         preview,
     })
+}
+
+async fn build_decision_plan_input(
+    tool: &str,
+    args: &Map<String, Value>,
+    state: &DaemonState,
+) -> std::result::Result<PlanInput, PlanBuildError> {
+    let number = require_string(args, "number")?;
+    let decision = match require_string(args, "decision")?.as_str() {
+        "confirm" => ResourcePlanDecision::Confirm,
+        "confirm_and_allocate" => ResourcePlanDecision::ConfirmAndAllocate,
+        _ => return Err(field_rejection("decision", "value_not_in_enum")),
+    };
+    let record = state
+        .core
+        .get_record_fresh(&number)
+        .await
+        .map_err(PlanBuildError::Upstream)?
+        .ok_or_else(|| PlanBuildError::NotFound(format!("record {number} not found")))?;
+    require_table(&record, ResourcePlanResource::TABLE, "number")?;
+
+    let current_state = resource_plan_state_from_record(&record);
+    if current_state != Some(ResourcePlanState::Requested) {
+        return Err(PlanBuildError::GuardFailed {
+            number: record.number,
+            reason: "decision_requires_requested",
+            current_state: current_state
+                .and_then(ResourcePlanState::label)
+                .map(ToOwned::to_owned),
+        });
+    }
+
+    let target_state = decision.target_state();
+    let payload = json!({"state": target_state.raw().to_string()});
+    let preview = json!({
+        "target": {"sys_id": record.sys_id, "number": record.number},
+        "decision": decision,
+        "current_state": {
+            "value": ResourcePlanState::Requested.raw().to_string(),
+            "label": ResourcePlanState::Requested.label(),
+        },
+        "expected_state": {
+            "value": target_state.raw().to_string(),
+            "label": target_state.label(),
+        },
+        "expected_allocation": {
+            "booking_type": decision.expected_booking_type(),
+            "effect": match decision {
+                ResourcePlanDecision::Confirm => "soft_allocations_created",
+                ResourcePlanDecision::ConfirmAndAllocate => "hard_allocations_created",
+            },
+        },
+    });
+
+    Ok(PlanInput {
+        builder: OperationPlanBuilder::new(tool)
+            .target(record_ref_from_snow(&record))
+            .planned_changes(payload),
+        concurrency_token: concurrency_from_record(&record),
+        preview,
+    })
+}
+
+fn resource_plan_state_from_record(record: &SnowRecord) -> Option<ResourcePlanState> {
+    record
+        .fields
+        .get("state")
+        .map(|field| field.value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!record.state.trim().is_empty()).then_some(record.state.as_str()))
+        .and_then(ResourcePlanState::parse)
 }
 
 fn non_empty_arg(args: &Map<String, Value>, field: &str) -> bool {
@@ -1086,12 +1189,26 @@ fn blocked_fields_for_tool(tool: &str) -> BTreeSet<&'static str> {
     }
     if tool == "resource_plan_plan_update" {
         blocked.extend([
+            "state",
             "task",
             "resource",
             "resource_type",
             "parent_sys_id",
             "parent_type",
             "resource_sys_id",
+        ]);
+    }
+    if tool == "resource_plan_plan_decision" {
+        blocked.extend([
+            "sys_id",
+            "state",
+            "task",
+            "resource",
+            "resource_type",
+            "planned_hours",
+            "notes",
+            "start_date",
+            "end_date",
         ]);
     }
     blocked
@@ -1110,6 +1227,7 @@ fn plan_selector_fields(tool: &str) -> &'static [&'static str] {
             "resource_type",
         ],
         "resource_plan_plan_update" => &["sys_id", "number"],
+        "resource_plan_plan_decision" => &["number", "decision"],
         _ => &[],
     }
 }
@@ -1148,13 +1266,23 @@ async fn apply_plan(
                 .update_resource_plan(&target.sys_id, plan.planned_changes.clone())
                 .await
         }
+        "resource_plan_apply_decision" => {
+            let target = plan
+                .target
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("resource_plan decision plan missing target"))?;
+            state
+                .core
+                .update_resource_plan(&target.sys_id, plan.planned_changes.clone())
+                .await
+        }
         _ => Err(anyhow::anyhow!(
             "unsupported Resource Plan apply tool {tool}"
         )),
     }
 }
 
-fn receipt_for_write(
+async fn receipt_for_write(
     plan: &OperationPlan,
     tool: &str,
     audit_id: &str,
@@ -1193,7 +1321,7 @@ fn receipt_for_write(
                 .collect()
         })
         .unwrap_or_default();
-    OperationReceipt {
+    let mut receipt = OperationReceipt {
         plan_id: plan.plan_id.clone(),
         audit_id: audit_id.to_string(),
         parent_audit_id: plan.plan_id.clone(),
@@ -1218,6 +1346,87 @@ fn receipt_for_write(
         apply_started_at: Some(apply_started_at),
         error_code: None,
         warnings: Vec::new(),
+    };
+
+    if tool == "resource_plan_apply_decision" {
+        apply_decision_evidence(&mut receipt, plan, &record, state).await;
+    }
+    receipt
+}
+
+async fn apply_decision_evidence(
+    receipt: &mut OperationReceipt,
+    plan: &OperationPlan,
+    record: &SnowRecord,
+    state: &DaemonState,
+) {
+    let decision = plan
+        .planned_changes
+        .get("state")
+        .and_then(Value::as_str)
+        .and_then(ResourcePlanState::parse)
+        .and_then(|target| match target {
+            ResourcePlanState::Confirmed => Some(ResourcePlanDecision::Confirm),
+            ResourcePlanState::Allocated => Some(ResourcePlanDecision::ConfirmAndAllocate),
+            _ => None,
+        });
+    let observed_state = resource_plan_state_from_record(record);
+    let evidence_result = state
+        .core
+        .resource_plan_allocation_evidence(&record.sys_id)
+        .await;
+
+    let expected_state = decision.map(ResourcePlanDecision::target_state);
+    let expected_booking_type = decision.map(ResourcePlanDecision::expected_booking_type);
+    let (allocation_count, booking_types) = match evidence_result {
+        Ok(evidence) => (evidence.allocation_count, evidence.booking_types),
+        Err(_) => (0, Vec::new()),
+    };
+    let matching_allocation_count = expected_booking_type
+        .filter(|expected| {
+            !booking_types.is_empty()
+                && booking_types
+                    .iter()
+                    .all(|value| value.eq_ignore_ascii_case(expected))
+        })
+        .map_or(0, |_| allocation_count);
+    let verified = expected_state.is_some()
+        && observed_state == expected_state
+        && matching_allocation_count > 0;
+
+    let evidence = json!({
+        "decision": decision,
+        "verified": verified,
+        "expected_state": expected_state.map(|value| json!({
+            "value": value.raw().to_string(),
+            "label": value.label(),
+        })),
+        "observed_state": observed_state.map(|value| json!({
+            "value": value.raw().to_string(),
+            "label": value.label(),
+        })),
+        "expected_booking_type": expected_booking_type,
+        "allocation_count": allocation_count,
+        "matching_allocation_count": matching_allocation_count,
+        "booking_types": booking_types,
+    });
+    let mut snapshot = receipt.record_snapshot.take().unwrap_or_else(|| json!({}));
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("decision_evidence".to_string(), evidence);
+    } else {
+        snapshot = json!({"record": snapshot, "decision_evidence": evidence});
+    }
+    receipt.record_snapshot = Some(snapshot);
+
+    if !verified {
+        receipt.status = ReceiptStatus::Partial;
+        receipt.error_code = Some("DECISION_POSTCONDITION_INCOMPLETE".to_string());
+        receipt.warnings.push(ReceiptWarning {
+            code: "DECISION_POSTCONDITION_INCOMPLETE".to_string(),
+            field: Some("state".to_string()),
+            message: "ServiceNow accepted the Resource Plan transition, but the expected state and allocation evidence were not both observed".to_string(),
+            data: None,
+        });
     }
 }
 
@@ -1283,12 +1492,16 @@ fn apply_tool_for_plan_tool(tool: &str) -> &str {
     match tool {
         "resource_plan_plan_create" => "resource_plan_apply_create",
         "resource_plan_plan_update" => "resource_plan_apply_update",
+        "resource_plan_plan_decision" => "resource_plan_apply_decision",
         other => other,
     }
 }
 
 fn is_update_tool(tool: &str) -> bool {
-    tool == "resource_plan_apply_update"
+    matches!(
+        tool,
+        "resource_plan_apply_update" | "resource_plan_apply_decision"
+    )
 }
 
 fn parent_type_value(parent_type: ResourcePlanParentType) -> &'static str {
@@ -1805,12 +2018,13 @@ mod tests {
         assert!(fields.iter().any(|field| field["field"] == "resource"));
         assert!(fields.iter().any(|field| field["field"] == "resource_type"));
         assert!(fields.iter().any(|field| field["field"] == "task"));
+        assert!(fields.iter().any(|field| field["field"] == "state"));
     }
 
     #[test]
     fn state_unknown_int_passes_through() {
-        let state = parse_state(Some(&json!("7")), "state").expect("state");
-        assert_eq!(state, ResourcePlanState::Other(7));
+        let state = parse_state(Some(&json!("99")), "state").expect("state");
+        assert_eq!(state, ResourcePlanState::Other(99));
         assert_eq!(state.label(), None);
     }
 

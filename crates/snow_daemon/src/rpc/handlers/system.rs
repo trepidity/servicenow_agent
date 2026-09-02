@@ -85,6 +85,8 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "plan_get",
     "work_note_plan_add",
     "work_note_apply_add",
+    "knowledge_plan_create_draft",
+    "knowledge_apply_create_draft",
     "change_request_plan_create",
     "change_request_apply_create",
     "change_request_plan_update",
@@ -101,6 +103,8 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "resource_plan_apply_create",
     "resource_plan_plan_update",
     "resource_plan_apply_update",
+    "resource_plan_plan_decision",
+    "resource_plan_apply_decision",
     "story_plan_create",
     "story_apply_create",
     "story_plan_update",
@@ -349,6 +353,14 @@ pub(in crate::rpc) async fn dispatch_system(
         RpcMethod::WorkNoteApplyAdd => {
             crate::work_note_write::handle_work_note_apply_add(id, &request.params, state).await
         }
+        RpcMethod::KnowledgePlanCreateDraft => {
+            crate::knowledge_write::handle_knowledge_plan_create_draft(id, &request.params, state)
+                .await
+        }
+        RpcMethod::KnowledgeApplyCreateDraft => {
+            crate::knowledge_write::handle_knowledge_apply_create_draft(id, &request.params, state)
+                .await
+        }
         RpcMethod::ChangeRequestPlanCreate
         | RpcMethod::ChangeRequestPlanUpdate
         | RpcMethod::ChangeTaskPlanCreate
@@ -371,7 +383,9 @@ pub(in crate::rpc) async fn dispatch_system(
         RpcMethod::IncidentBulkApplyUpdate => {
             crate::incident_bulk_write::handle_apply(id, &request.params, state).await
         }
-        RpcMethod::ResourcePlanPlanCreate | RpcMethod::ResourcePlanPlanUpdate => {
+        RpcMethod::ResourcePlanPlanCreate
+        | RpcMethod::ResourcePlanPlanUpdate
+        | RpcMethod::ResourcePlanPlanDecision => {
             crate::resource_plan_write::handle_resource_plan_plan(
                 id,
                 &request.method,
@@ -380,7 +394,9 @@ pub(in crate::rpc) async fn dispatch_system(
             )
             .await
         }
-        RpcMethod::ResourcePlanApplyCreate | RpcMethod::ResourcePlanApplyUpdate => {
+        RpcMethod::ResourcePlanApplyCreate
+        | RpcMethod::ResourcePlanApplyUpdate
+        | RpcMethod::ResourcePlanApplyDecision => {
             crate::resource_plan_write::handle_resource_plan_apply(
                 id,
                 &request.method,

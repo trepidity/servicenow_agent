@@ -60,6 +60,15 @@ field_allowlist = ["work_notes"]
 environments = ["test", "training"]
 confirmation_ttl_seconds = 300
 
+# Draft-only Knowledge article creation. This operation never publishes an
+# article: the daemon freshly verifies workflow_state=draft after creation.
+[mcp.tools.knowledge_apply_create_draft]
+enabled = false
+requires_confirmation = true
+field_allowlist = ["short_description", "text", "kb_knowledge_base", "kb_category", "workflow_state"]
+environments = ["test", "training"]
+confirmation_ttl_seconds = 300
+
 # Enable governed MCP time-card hour updates. This is disabled by default and
 # also requires SNOW_ENV or explicit config; an implicit default "test" label is
 # intentionally not enough for writes.
@@ -77,7 +86,7 @@ enabled = false
 
 # --- Remaining write tools (all ship DISABLED by default) ---
 # The complete set of write tools you may toggle (is_write_tool):
-#   catalog_submit_request, work_note_apply_add,
+#   catalog_submit_request, work_note_apply_add, knowledge_apply_create_draft,
 #   approval_approve, approval_reject,
 #   story_apply_create, story_apply_update,
 #   story_task_apply_create, story_task_apply_update,
@@ -85,7 +94,8 @@ enabled = false
 #   timecard_apply_set_hours,
 #   change_request_apply_create, change_request_apply_update,
 #   change_task_apply_create, change_task_apply_update,
-#   resource_plan_apply_create, resource_plan_apply_update, plan_cancel
+#   resource_plan_apply_create, resource_plan_apply_update,
+#   resource_plan_apply_decision, plan_cancel
 # Read tools are enabled by default and never need an entry here. For approval
 # discovery, list_my_approvals also requires read access to sys_user_grmember so
 # it can resolve the daemon-authenticated user's direct group memberships.
@@ -213,7 +223,19 @@ enabled = false
 requires_confirmation = true
 environments = ["test", "training"]
 skip_terminal_records = true
-field_allowlist = ["state", "planned_hours", "notes", "start_date", "end_date"]
+field_allowlist = ["planned_hours", "notes", "start_date", "end_date"]
+
+[mcp.tools.resource_plan_plan_decision]
+enabled = true
+requires_confirmation = false
+environments = ["test", "training"]
+
+[mcp.tools.resource_plan_apply_decision]
+enabled = false
+requires_confirmation = true
+environments = ["test", "training"]
+skip_terminal_records = true
+field_allowlist = ["state"]
 
 # Cancel a pending MCP operation plan (not a ServiceNow record). No board needed.
 [mcp.tools.plan_cancel]
@@ -254,9 +276,13 @@ write_tools = [
 read_tools = [
     "resource_plan_get", "resource_plan_list", "get_record", "user_lookup", "user_search",
     "resource_plan_plan_create", "resource_plan_plan_update",
+    "resource_plan_plan_decision",
     "plan_get", "policy_describe", "tool_capabilities",
 ]
-write_tools = ["resource_plan_apply_create", "resource_plan_apply_update"]
+write_tools = [
+    "resource_plan_apply_create", "resource_plan_apply_update",
+    "resource_plan_apply_decision",
+]
 
 # ---------------------------------------------------------------------------
 # Optional: story-board bindings, required for governed story_* write tools.

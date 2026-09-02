@@ -96,7 +96,7 @@ does not choose capability, policy, authorization, or installed readiness.
 | Approve/reject | Selected | Governed write with explicit environment enablement. |
 | Create common work records | Selected | Typed per-resource create; no generic create. |
 | Service Catalog request planning/submission | Selected | `catalog_plan_request` / `catalog_submit_request`; distinct from generic work-record creation. |
-| Knowledge article lifecycle | Selected | Typed create, edit, publish, and retire. |
+| Knowledge article lifecycle | In progress | Governed typed draft creation is shipped (`knowledge_plan_create_draft` / `knowledge_apply_create_draft`); edit, publish, and retire remain deferred. |
 | Resource Plans and Time Cards | Selected | Typed create/update operations. |
 | Attachment upload | Retained legacy | Existing CLI/daemon/daemon-backed MCP behavior only; disabled by default; no expansion. |
 | Catalog cancellation | Remove advertisement | Remove `catalog_cancel_request` registration/policy/docs; do not implement. |

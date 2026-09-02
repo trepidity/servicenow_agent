@@ -593,43 +593,7 @@ impl CoreContext {
         let mut current = table.to_string();
 
         for _ in 0..8 {
-            let record = self
-                .client
-                .table("sys_db_object")
-                .equals("name", &current)
-                .fields(&["name", "super_class"])
-                .display_value(DisplayValue::Both)
-                .limit(1)
-                .first()
-                .await?;
-
-            let Some(record) = record else {
-                break;
-            };
-
-            let Some(parent_sys_id) = record
-                .get_raw("super_class")
-                .or(record.get_str("super_class"))
-            else {
-                break;
-            };
-            if parent_sys_id.is_empty() {
-                break;
-            }
-
-            let parent = self
-                .client
-                .table("sys_db_object")
-                .equals("sys_id", parent_sys_id)
-                .fields(&["name"])
-                .display_value(DisplayValue::Both)
-                .limit(1)
-                .first()
-                .await?;
-
-            let Some(parent) =
-                parent.and_then(|record| record.get_str("name").map(ToString::to_string))
-            else {
+            let Some(parent) = self.table_parent(&current).await? else {
                 break;
             };
 
@@ -642,6 +606,44 @@ impl CoreContext {
         }
 
         Ok(ancestors)
+    }
+
+    pub(crate) async fn table_parent(&self, table: &str) -> Result<Option<String>> {
+        let record = self
+            .client
+            .table("sys_db_object")
+            .equals("name", table)
+            .fields(&["name", "super_class"])
+            .display_value(DisplayValue::Both)
+            .limit(1)
+            .first()
+            .await?;
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+
+        let Some(parent_sys_id) = record
+            .get_raw("super_class")
+            .or(record.get_str("super_class"))
+        else {
+            return Ok(None);
+        };
+        if parent_sys_id.is_empty() {
+            return Ok(None);
+        }
+
+        let parent = self
+            .client
+            .table("sys_db_object")
+            .equals("sys_id", parent_sys_id)
+            .fields(&["name"])
+            .display_value(DisplayValue::Both)
+            .limit(1)
+            .first()
+            .await?;
+
+        Ok(parent.and_then(|record| record.get_str("name").map(ToString::to_string)))
     }
 
     pub(crate) async fn resolve_user_sys_id(&self, user: &str) -> Result<String> {

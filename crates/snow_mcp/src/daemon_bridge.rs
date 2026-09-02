@@ -94,6 +94,11 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("resource_plan_apply_create", "resource_plan_apply_create"),
     ("resource_plan_plan_update", "resource_plan_plan_update"),
     ("resource_plan_apply_update", "resource_plan_apply_update"),
+    ("resource_plan_plan_decision", "resource_plan_plan_decision"),
+    (
+        "resource_plan_apply_decision",
+        "resource_plan_apply_decision",
+    ),
     ("story_get", "get_record"),
     ("story_tasks_list", "get_children"),
     ("change_request_plan_create", "change_request_plan_create"),
@@ -117,6 +122,11 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("timecard_apply_set_hours", "timecard_apply_set_hours"),
     ("work_note_plan_add", "work_note_plan_add"),
     ("work_note_apply_add", "work_note_apply_add"),
+    ("knowledge_plan_create_draft", "knowledge_plan_create_draft"),
+    (
+        "knowledge_apply_create_draft",
+        "knowledge_apply_create_draft",
+    ),
     ("plan_get", "plan_get"),
     ("search_knowledge", "search_knowledge"),
     ("knowledge_search", "search_knowledge"),
@@ -1478,6 +1488,8 @@ mod tests {
             "resource_plan_apply_create",
             "resource_plan_plan_update",
             "resource_plan_apply_update",
+            "resource_plan_plan_decision",
+            "resource_plan_apply_decision",
         ] {
             assert_eq!(canonical_daemon_method(tool), Some(tool));
         }

@@ -10,9 +10,9 @@
 //! [`CoreContext`] (Task 6).
 
 use anyhow::Result;
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use servicenow_rs::prelude::{
@@ -26,9 +26,9 @@ use crate::resource::catalog::{
 };
 use crate::{
     CatalogChoice, CatalogItem, CatalogSubmitResult, CatalogVariable, ChangeWriteConcurrency,
-    ChangeWriteResult, Completeness, OperationEnvelope, PartialReason, ResourcePlanWriteResult,
-    SetMode, SimpleRef, SnowRecord, StoryWriteResult, TimeCard, TimeValue, TimecardSheet, UserRef,
-    WeekSelector, Weekday,
+    ChangeWriteResult, Completeness, KnowledgeDraftWriteResult, OperationEnvelope, PartialReason,
+    ResourcePlanAllocationEvidence, ResourcePlanWriteResult, SetMode, SimpleRef, SnowRecord,
+    StoryWriteResult, TimeCard, TimeValue, TimecardSheet, UserRef, WeekSelector, Weekday,
     cache::policy::{CacheMiss, CacheMode},
     canonical_record_table, normalize_record_lookup_sys_id, parse_servicenow_date, record_bool,
     record_field_display_or_raw, record_field_raw_or_display,
@@ -216,6 +216,11 @@ pub(crate) struct WriteService {
     ctx: CoreContext,
 }
 
+enum TimecardSheetResolution {
+    Found(Record),
+    Absent { week_starts_on: NaiveDate },
+}
+
 impl WriteService {
     pub(crate) fn new(ctx: CoreContext) -> Self {
         Self { ctx }
@@ -226,7 +231,17 @@ impl WriteService {
             .ctx
             .resolve_user_ref(&self.ctx.config.instance.user)
             .await?;
-        let sheet_row = self.resolve_my_timecard_sheet(week, &actor).await?;
+        let sheet_row = match self.resolve_my_timecard_sheet(week, &actor).await? {
+            TimecardSheetResolution::Found(row) => row,
+            TimecardSheetResolution::Absent { week_starts_on } => {
+                return Ok(TimecardSheet {
+                    sheet: None,
+                    week_starts_on: week_starts_on.to_string(),
+                    state: "Absent".to_string(),
+                    cards: Vec::new(),
+                });
+            }
+        };
         let sheet_ref = SimpleRef {
             sys_id: sheet_row.sys_id.clone(),
             table: resource::timecard::TimecardResource::SHEET_TABLE.to_string(),
@@ -562,6 +577,135 @@ impl WriteService {
         payload: serde_json::Value,
     ) -> Result<ResourcePlanWriteResult> {
         self.update_resource_plan_record(sys_id, payload).await
+    }
+
+    pub async fn resource_plan_allocation_evidence(
+        &self,
+        resource_plan_sys_id: &str,
+    ) -> Result<ResourcePlanAllocationEvidence> {
+        let resource_plan_sys_id = normalize_record_lookup_sys_id(resource_plan_sys_id)?;
+        let response = self
+            .ctx
+            .client
+            .table("resource_allocation")
+            .equals("resource_plan", &resource_plan_sys_id)
+            .fields(&["sys_id", "resource_plan", "booking_type"])
+            .display_value(DisplayValue::Both)
+            .limit(1000)
+            .execute()
+            .await?;
+        let allocation_count = response.records.len();
+        let booking_types = response
+            .records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .get_display("booking_type")
+                    .or_else(|| record.get_raw("booking_type"))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        Ok(ResourcePlanAllocationEvidence {
+            allocation_count,
+            booking_types,
+        })
+    }
+
+    /// Create a Knowledge article in the `draft` workflow state and freshly
+    /// refetch it to prove ServiceNow did not publish it as a side effect.
+    pub async fn create_knowledge_draft(
+        &self,
+        short_description: &str,
+        text: &str,
+        knowledge_base_sys_id: &str,
+        category_sys_id: Option<&str>,
+    ) -> Result<KnowledgeDraftWriteResult> {
+        let short_description = short_description.trim();
+        let text = text.trim();
+        let knowledge_base_sys_id = normalize_record_lookup_sys_id(knowledge_base_sys_id)?;
+        if short_description.is_empty() || text.is_empty() {
+            return Err(anyhow::anyhow!(
+                "knowledge draft requires a non-empty short_description and text"
+            ));
+        }
+
+        let mut payload = serde_json::json!({
+            "short_description": short_description,
+            "text": text,
+            "kb_knowledge_base": knowledge_base_sys_id,
+            "workflow_state": "draft",
+        });
+        if let Some(category_sys_id) = category_sys_id {
+            payload["kb_category"] =
+                serde_json::Value::String(normalize_record_lookup_sys_id(category_sys_id)?);
+        }
+
+        let table = "kb_knowledge";
+        let written = self.ctx.client.table(table).create(payload).await?;
+        let expected_sys_id = written.sys_id.trim();
+        if expected_sys_id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{table} create response did not include a sys_id to refetch"
+            ));
+        }
+        let Some((fresh_row, record)) = self
+            .ctx
+            .get_record_by_table_sys_id_fresh_with_source(table, expected_sys_id)
+            .await?
+        else {
+            return Err(anyhow::anyhow!(
+                "{table} create response returned {expected_sys_id}, but fresh refetch found no row"
+            ));
+        };
+
+        let workflow_state = fresh_row
+            .get_raw("workflow_state")
+            .or_else(|| fresh_row.get_str("workflow_state"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("fresh {table} draft has no workflow_state"))?
+            .to_string();
+        if !workflow_state.eq_ignore_ascii_case("draft") {
+            return Err(anyhow::anyhow!(
+                "fresh {table} record {expected_sys_id} has workflow_state {workflow_state:?}, expected draft"
+            ));
+        }
+
+        let fresh_knowledge_base_sys_id = fresh_row
+            .get_raw("kb_knowledge_base")
+            .or_else(|| fresh_row.get_raw("knowledge_base"))
+            .or_else(|| fresh_row.get_str("kb_knowledge_base"))
+            .or_else(|| fresh_row.get_str("knowledge_base"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("fresh {table} draft has no knowledge base"))?
+            .to_string();
+        if fresh_knowledge_base_sys_id != knowledge_base_sys_id {
+            return Err(anyhow::anyhow!(
+                "fresh {table} record {expected_sys_id} has knowledge base {fresh_knowledge_base_sys_id:?}, expected {knowledge_base_sys_id:?}"
+            ));
+        }
+
+        let category_sys_id = fresh_row
+            .get_raw("kb_category")
+            .or_else(|| fresh_row.get_raw("category"))
+            .or_else(|| fresh_row.get_str("kb_category"))
+            .or_else(|| fresh_row.get_str("category"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        Ok(KnowledgeDraftWriteResult {
+            record,
+            workflow_state,
+            knowledge_base_sys_id: fresh_knowledge_base_sys_id,
+            category_sys_id,
+        })
     }
 
     async fn create_change_write_record(
@@ -1186,7 +1330,7 @@ impl WriteService {
         &self,
         week: WeekSelector,
         actor: &UserRef,
-    ) -> Result<Record> {
+    ) -> Result<TimecardSheetResolution> {
         self.resolve_my_timecard_sheet_at(week, actor, chrono::Local::now().date_naive())
             .await
     }
@@ -1209,7 +1353,7 @@ impl WriteService {
         week: WeekSelector,
         actor: &UserRef,
         today: NaiveDate,
-    ) -> Result<Record> {
+    ) -> Result<TimecardSheetResolution> {
         let (date, label) = match week {
             WeekSelector::Current => (today, "current week".to_string()),
             WeekSelector::Date(date) => (date, date.to_string()),
@@ -1228,13 +1372,50 @@ impl WriteService {
             .await?
             .records;
 
-        rows.into_iter()
+        if let Some(row) = rows
+            .iter()
             .find(|row| time_sheet_row_contains_date(row, date))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No time sheet found for {label}. This command edits existing cards only; create them in the portal first."
+        {
+            return Ok(TimecardSheetResolution::Found(row.clone()));
+        }
+
+        let starts = rows
+            .iter()
+            .map(|row| {
+                parse_servicenow_date(
+                    row.get_raw("week_starts_on")
+                        .or_else(|| row.get_display("week_starts_on"))
+                        .or_else(|| row.get_str("week_starts_on")),
                 )
+                .ok_or_else(|| anyhow::anyhow!("time sheet lookup has no valid week start anchor"))
             })
+            .collect::<Result<Vec<_>>>()?;
+        let Some(anchor) = starts.first().map(|start| start.weekday()) else {
+            return Err(anyhow::anyhow!(
+                "time sheet lookup has no week start anchor for {label}"
+            ));
+        };
+        if starts.iter().any(|start| start.weekday() != anchor) {
+            return Err(anyhow::anyhow!(
+                "time sheet lookup has inconsistent week start anchors for {label}"
+            ));
+        }
+        let offset =
+            (date.weekday().num_days_from_sunday() + 7 - anchor.num_days_from_sunday()) % 7;
+        let target_start = date - chrono::Duration::days(i64::from(offset));
+        if rows.len() >= 80
+            && starts
+                .iter()
+                .min()
+                .is_some_and(|oldest| target_start < *oldest)
+        {
+            return Err(anyhow::anyhow!(
+                "time sheet lookup horizon is ambiguous for {label}"
+            ));
+        }
+        Ok(TimecardSheetResolution::Absent {
+            week_starts_on: target_start,
+        })
     }
 
     fn ensure_timecard_write_allowed(&self, card: &TimeCard, actor_sys_id: &str) -> Result<()> {
@@ -1620,6 +1801,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_knowledge_draft_refetches_and_rejects_an_implicit_publish() {
+        let server = MockServer::start().await;
+        let sys_id = "11111111111111111111111111111111";
+        let knowledge_base_sys_id = "22222222222222222222222222222222";
+
+        Mock::given(method("POST"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .and(body_partial_json(serde_json::json!({
+                "short_description": "Example environment naming policy",
+                "text": "<p>Draft article body</p>",
+                "kb_knowledge_base": knowledge_base_sys_id,
+                "workflow_state": "draft"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "result": {"sys_id": sys_id, "number": "KB0012345"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/now/table/kb_knowledge/{sys_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": sys_id,
+                    "number": "KB0012345",
+                    "short_description": "Example environment naming policy",
+                    "workflow_state": "draft",
+                    "kb_knowledge_base": {
+                        "value": knowledge_base_sys_id,
+                        "display_value": "Example Knowledge"
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .and(query_param("sysparm_display_value", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{"sys_id": sys_id, "work_notes": "", "comments": ""}]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server(&server).await;
+        let result = core
+            .create_knowledge_draft(
+                "Example environment naming policy",
+                "<p>Draft article body</p>",
+                knowledge_base_sys_id,
+                None,
+            )
+            .await
+            .expect("create draft knowledge article");
+
+        assert_eq!(result.record.sys_id, sys_id);
+        assert_eq!(result.record.number, "KB0012345");
+        assert_eq!(result.workflow_state, "draft");
+        assert_eq!(result.knowledge_base_sys_id, knowledge_base_sys_id);
+    }
+
+    #[tokio::test]
     async fn update_resource_plan_captures_concurrency() {
         let server = MockServer::start().await;
         let sys_id = "44444444444444444444444444444444";
@@ -1776,13 +2020,58 @@ mod tests {
         // Friday in the Monday-start week of 2026-05-18.
         let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
 
-        let row = core
+        let resolution = core
             .writes
             .resolve_my_timecard_sheet_at(WeekSelector::Current, &actor, today)
             .await
             .expect("current sheet should resolve to the week containing today");
 
+        let TimecardSheetResolution::Found(row) = resolution else {
+            panic!("expected a found time sheet");
+        };
+
         assert_eq!(row.get_str("week_starts_on"), Some("2026-05-18"));
+    }
+
+    #[tokio::test]
+    async fn list_timecards_returns_typed_absence_for_a_conclusive_missing_week() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "user-sys",
+                    "user_name": "test_user",
+                    "email": "test@example.com",
+                    "name": "Test User"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/time_sheet"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [
+                    time_sheet_row_json("2026-05-25"),
+                    time_sheet_row_json("2026-05-18"),
+                    time_sheet_row_json("2026-05-11"),
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let (core, _tempdir) = core_for_mock_server_with_user(&server, "test_user").await;
+        let sheet = core
+            .list_my_timecards(WeekSelector::Date(
+                chrono::NaiveDate::from_ymd_opt(2026, 4, 6).unwrap(),
+            ))
+            .await
+            .expect("a missing week within a non-saturated lookup horizon is conclusive");
+
+        assert_eq!(sheet.sheet, None);
+        assert_eq!(sheet.week_starts_on, "2026-04-06");
+        assert_eq!(sheet.state, "Absent");
+        assert!(sheet.cards.is_empty());
     }
 
     #[tokio::test]

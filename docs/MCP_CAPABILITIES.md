@@ -48,11 +48,14 @@ It documents every MCP tool, which ones perform write transactions
 
 - **Resource Plan writes** are governed daemon-backed plan/apply tools:
   `resource_plan_plan_create`, `resource_plan_apply_create`,
-  `resource_plan_plan_update`, and `resource_plan_apply_update`. Create writes
+  `resource_plan_plan_update`, `resource_plan_apply_update`,
+  `resource_plan_plan_decision`, and `resource_plan_apply_decision`. Create writes
   the polymorphic `task` parent field after validating `parent_type`
   (`demand`→`dmn_demand`, `project`→`pm_project`), writes caller `notes` to the
   `notes` column, omits `work_notes`, and uses `start_date`/`end_date` instead
-  of `year`/`quarter`. Apply tools ship disabled by default, require
+  of `year`/`quarter`. Generic update cannot change lifecycle state; the named
+  decision path maps Confirm to Confirmed plus Soft allocations and verifies
+  both postconditions. Apply tools ship disabled by default, require
   confirmation, enforce update concurrency, and obey
   `SNOW_RESOURCE_PLAN_WRITE_KILL_SWITCH`.
 

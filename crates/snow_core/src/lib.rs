@@ -86,6 +86,7 @@ pub use resource::incident::{
     IncidentRecord, ResolvedIncidentState, ValidatedIncidentAssignmentGroupQuery,
     resolve_incident_state, validate_incident_assignment_group_input,
 };
+pub use resource::knowledge::KnowledgeDraftWriteResult;
 pub use resource::record_query::{
     CHANGE_REQUEST_QUERY_FIELDS, CHANGE_REQUEST_TASK_QUERY_FIELDS, ChangeRequestQueryFilters,
     ChangeRequestTaskListInput, RECORD_QUERY_DEFAULT_LIMIT, RECORD_QUERY_MAX_LIMIT,
@@ -95,7 +96,8 @@ pub use resource::record_query::{
     validate_change_request_task_list, validate_record_query,
 };
 pub use resource::resource_plan::{
-    ResolvedResourceFilter, ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
+    ResolvedResourceFilter, ResourcePlanAllocationEvidence, ResourcePlanDecision,
+    ResourcePlanListError, ResourcePlanListInput, ResourcePlanListResponse,
     ResourcePlanListWarning, ResourcePlanParentRef, ResourcePlanParentType,
     ResourcePlanQuerySummary, ResourcePlanRecord, ResourcePlanResource, ResourcePlanResourceRef,
     ResourcePlanResourceType, ResourcePlanState, ResourcePlanStateFilter,

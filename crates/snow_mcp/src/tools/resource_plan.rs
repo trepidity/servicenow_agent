@@ -55,6 +55,24 @@ pub fn register(registry: &mut ToolRegistry) {
         false,
         true,
     );
+    add_tool(
+        registry,
+        "resource_plan_plan_decision",
+        "Plan a governed Resource Plan confirmation decision",
+        resource_plan_plan_decision_input_schema(),
+        plan_output_schema(true),
+        true,
+        false,
+    );
+    add_tool(
+        registry,
+        "resource_plan_apply_decision",
+        "Apply a confirmed governed Resource Plan decision",
+        apply_update_input_schema(),
+        receipt_output_schema(),
+        false,
+        true,
+    );
 }
 
 pub fn resource_plan_list_arg_schema() -> Value {
@@ -137,6 +155,24 @@ fn resource_plan_plan_update_input_schema() -> Value {
             "start_date": {"type": "string", "format": "date"},
             "end_date": {"type": "string", "format": "date"}
         }
+    })
+}
+
+fn resource_plan_plan_decision_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "number": {
+                "type": "string",
+                "pattern": "^RPLN\\d+$"
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["confirm", "confirm_and_allocate"]
+            }
+        },
+        "required": ["number", "decision"]
     })
 }
 
@@ -227,13 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn registers_four_resource_plan_write_tools() {
+    fn registers_resource_plan_write_tools() {
         let registry = ToolRegistry::default();
         for name in [
             "resource_plan_plan_create",
             "resource_plan_apply_create",
             "resource_plan_plan_update",
             "resource_plan_apply_update",
+            "resource_plan_plan_decision",
+            "resource_plan_apply_decision",
         ] {
             assert!(registry.metadata().iter().any(|tool| tool.name == name));
         }
@@ -277,6 +315,10 @@ mod tests {
         assert!(tool(&registry, "resource_plan_apply_create").requires_confirmation);
         assert!(!tool(&registry, "resource_plan_apply_update").default_enabled);
         assert!(tool(&registry, "resource_plan_apply_update").requires_confirmation);
+        assert!(tool(&registry, "resource_plan_plan_decision").default_enabled);
+        assert!(!tool(&registry, "resource_plan_plan_decision").requires_confirmation);
+        assert!(!tool(&registry, "resource_plan_apply_decision").default_enabled);
+        assert!(tool(&registry, "resource_plan_apply_decision").requires_confirmation);
     }
 
     #[test]
@@ -340,6 +382,8 @@ mod tests {
             "resource_plan_apply_create",
             "resource_plan_plan_update",
             "resource_plan_apply_update",
+            "resource_plan_plan_decision",
+            "resource_plan_apply_decision",
         ] {
             let schema = &tool(&registry, name).input_schema;
             for keyword in ["oneOf", "anyOf", "allOf"] {

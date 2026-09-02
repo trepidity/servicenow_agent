@@ -101,13 +101,59 @@ impl DescriptorService {
         table: &str,
         field: &str,
     ) -> Result<FieldSupport<bool>> {
-        match self.discover_fields(table).await? {
-            FieldSupport::Available { value } => Ok(FieldSupport::available_value(
-                value
-                    .iter()
-                    .any(|candidate| candidate.descriptor.name == field),
-            )),
-            FieldSupport::Unavailable { reason } => Ok(FieldSupport::Unavailable { reason }),
+        let mut discovered_any_field = false;
+        let mut current = table.to_string();
+        let mut seen = std::collections::HashSet::from([current.clone()]);
+
+        for _ in 0..8 {
+            let records = match self
+                .ctx
+                .client
+                .table("sys_dictionary")
+                .equals("name", &current)
+                .equals("active", "true")
+                .display_value(DisplayValue::Both)
+                .exclude_reference_link(true)
+                .limit(DICTIONARY_ROW_LIMIT)
+                .execute()
+                .await
+            {
+                Ok(response) => response.records,
+                Err(err) if is_acl_error(&err) => {
+                    return Ok(FieldSupport::Unavailable {
+                        reason: UnavailableReason::AclDenied,
+                    });
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            for record in records {
+                let Some(name) = non_empty_owned(record.get_raw("element"))
+                    .or_else(|| non_empty_owned(record.get_str("element")))
+                else {
+                    continue;
+                };
+                discovered_any_field = true;
+                if name == field {
+                    return Ok(FieldSupport::available_value(true));
+                }
+            }
+
+            let Some(parent) = self.ctx.table_parent(&current).await? else {
+                break;
+            };
+            if !seen.insert(parent.clone()) {
+                break;
+            }
+            current = parent;
+        }
+
+        if discovered_any_field {
+            Ok(FieldSupport::available_value(false))
+        } else {
+            Ok(FieldSupport::Unavailable {
+                reason: UnavailableReason::NotReturnedByInstance,
+            })
         }
     }
 
