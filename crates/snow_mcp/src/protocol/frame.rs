@@ -9,7 +9,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 /// Largest accepted newline-framed JSON-RPC request, including its delimiter.
 pub const MAX_JSON_RPC_REQUEST_BYTES: usize = 256 * 1024;
 /// Largest serialized JSON-RPC response, excluding its newline delimiter.
-pub const MAX_JSON_RPC_RESPONSE_BYTES: usize = 16 * 1024;
+///
+/// The complete MCP `tools/list` catalog is intentionally returned in one
+/// response and currently needs roughly 76 KiB. Keep a finite transport
+/// ceiling, but leave room for that required protocol response and modest
+/// catalog growth.
+pub const MAX_JSON_RPC_RESPONSE_BYTES: usize = 128 * 1024;
 /// JSON-RPC server error used when a transport frame or result exceeds its budget.
 pub const RESULT_TOO_LARGE_CODE: i64 = -32070;
 

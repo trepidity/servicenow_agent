@@ -1144,6 +1144,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_tools_list_fits_the_bounded_stdio_response() {
+        let supported_methods = ToolRegistry::new()
+            .metadata()
+            .iter()
+            .filter_map(|tool| canonical_daemon_method(&tool.name))
+            .collect();
+        let bridge = DaemonBackedMcpBridge::new(
+            Arc::new(MockDaemon::with_supported_methods(supported_methods)),
+            McpConfig::default(),
+            DEFAULT_CONTRACT_VERSION,
+        );
+
+        let response = bridge
+            .dispatch(JsonRpcRequest {
+                jsonrpc: JSON_RPC_VERSION.to_string(),
+                method: "tools/list".to_string(),
+                params: json!({}),
+                id: Some(json!(1)),
+            })
+            .await;
+        let payload = crate::transport::stdio::bounded_payload(response)
+            .expect("tools/list response encoding");
+        let payload: Value = serde_json::from_slice(&payload).expect("tools/list JSON");
+
+        assert!(
+            payload.get("error").is_none(),
+            "tools/list was truncated: {payload}"
+        );
+        assert!(
+            payload["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "tools/list must retain the registered catalog"
+        );
+    }
+
+    #[tokio::test]
     async fn policy_describe_reflects_daemon_governed_writes() {
         let mut config = McpConfig::default();
         config
