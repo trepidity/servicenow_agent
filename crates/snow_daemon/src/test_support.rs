@@ -326,49 +326,22 @@ async fn fixture_state_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+/// Record-response fixture. The receiver reports domain requests; number
+/// metadata has its own fixed 403 response and never consumes a record response.
+/// Metadata contracts are exercised separately by the wiremock resolver tests.
 pub async fn spawn_json_http_server(
     response_body: Value,
 ) -> Result<(String, oneshot::Receiver<String>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let (request_tx, request_rx) = oneshot::channel();
-
+    let (url, requests) = spawn_json_http_sequence_server(vec![response_body]).await?;
+    let (send, receive) = oneshot::channel();
     tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            loop {
-                let read = match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(read) => read,
-                    Err(_) => return,
-                };
-                request.extend_from_slice(&buf[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-
-            if let Some(first_line) = request
-                .split(|byte| *byte == b'\n')
-                .next()
-                .and_then(|line| std::str::from_utf8(line).ok())
-            {
-                let _ = request_tx.send(first_line.trim().to_string());
-            }
-
-            let body = response_body.to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
+        if let Ok(mut requests) = requests.await
+            && !requests.is_empty()
+        {
+            let _ = send.send(requests.remove(0));
         }
     });
-
-    Ok((format!("http://{}", addr), request_rx))
+    Ok((url, receive))
 }
 
 pub async fn spawn_json_http_sequence_server(
@@ -380,7 +353,8 @@ pub async fn spawn_json_http_sequence_server(
 
     tokio::spawn(async move {
         let mut request_lines = Vec::new();
-        for response_body in response_bodies {
+        let mut response_bodies = response_bodies.into_iter().peekable();
+        while response_bodies.peek().is_some() {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
@@ -398,6 +372,18 @@ pub async fn spawn_json_http_sequence_server(
                 }
             }
 
+            if request.starts_with(b"GET /api/now/table/sys_number?") {
+                let body = r#"{"error":{"message":"Metadata ACL denies numbering"}}"#;
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+                continue;
+            }
+            let response_body = response_bodies.next().expect("pending fixture response");
             if let Some(first_line) = request
                 .split(|byte| *byte == b'\n')
                 .next()

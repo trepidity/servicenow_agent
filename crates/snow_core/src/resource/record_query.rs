@@ -64,6 +64,21 @@ pub const STORY_QUERY_DESCRIPTION_FIELDS: &[&str] = &["description", "acceptance
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "resource_type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecordQueryInput {
+    ResourcePlan {
+        filters: ChildQueryFilters,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    },
+    ProjectTask {
+        filters: ChildQueryFilters,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    },
+    Task {
+        filters: ChildQueryFilters,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    },
     ChangeRequest {
         #[serde(default)]
         filters: ChangeRequestQueryFilters,
@@ -82,6 +97,13 @@ pub enum RecordQueryInput {
         #[serde(default)]
         cursor: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChildQueryFilters {
+    pub parent_number: Option<String>,
+    pub parent_sys_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,6 +224,12 @@ impl std::error::Error for RecordQueryError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedRecordQuery {
+    Children {
+        table: &'static str,
+        filters: ChildQueryFilters,
+        limit: usize,
+        cursor: Option<String>,
+    },
     ChangeRequest {
         filters: ChangeRequestQueryFilters,
         limit: usize,
@@ -219,6 +247,21 @@ pub fn validate_record_query(
     input: RecordQueryInput,
 ) -> Result<ValidatedRecordQuery, RecordQueryError> {
     match input {
+        RecordQueryInput::ResourcePlan {
+            filters,
+            limit,
+            cursor,
+        } => validate_children("resource_plan", filters, limit, cursor),
+        RecordQueryInput::ProjectTask {
+            filters,
+            limit,
+            cursor,
+        } => validate_children("pm_project_task", filters, limit, cursor),
+        RecordQueryInput::Task {
+            filters,
+            limit,
+            cursor,
+        } => validate_children("task", filters, limit, cursor),
         RecordQueryInput::ChangeRequest {
             mut filters,
             limit,
@@ -283,6 +326,43 @@ pub fn validate_record_query(
             })
         }
     }
+}
+
+fn validate_children(
+    table: &'static str,
+    mut filters: ChildQueryFilters,
+    limit: Option<usize>,
+    cursor: Option<String>,
+) -> Result<ValidatedRecordQuery, RecordQueryError> {
+    if filters.parent_number.is_some() == filters.parent_sys_id.is_some() {
+        return Err(RecordQueryError::InvalidParams(
+            "child queries require exactly one of filters.parent_number or filters.parent_sys_id"
+                .into(),
+        ));
+    }
+    if let Some(number) = filters.parent_number.as_mut() {
+        *number = number.trim().to_ascii_uppercase();
+        if number.len() > 80
+            || !number
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            || !number.as_bytes().last().is_some_and(u8::is_ascii_digit)
+            || !number.bytes().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(RecordQueryError::InvalidParams(
+                "filters.parent_number must be a task record number".into(),
+            ));
+        }
+    }
+    filters.parent_sys_id =
+        normalize_optional_sys_id("filters.parent_sys_id", filters.parent_sys_id)?;
+    Ok(ValidatedRecordQuery::Children {
+        table,
+        filters,
+        limit: validate_limit(limit)?,
+        cursor: normalize_cursor(cursor)?,
+    })
 }
 
 pub fn validate_change_request_task_list(

@@ -477,29 +477,17 @@ pub fn normalize_record_lookup_table(table: &str) -> Result<String> {
 
 pub fn is_record_lookup_table_allowed(table: &str) -> bool {
     let normalized = table.trim().to_ascii_lowercase();
-    RECORD_LOOKUP_ALLOWED_TABLES.contains(&normalized.as_str()) || normalized == "servers"
+    super::record_types::identifier(&normalized)
 }
 
-pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[
-    "dmn_demand",
-    "dmn_demand_task",
-    "resource_plan",
-    "pm_project",
-    "change_request",
-    "business_application",
-    "business_app",
-    "cmdb_ci_business_app",
-    "server",
-    "cmdb_ci_server",
-    "cmdb_ci_linux_server",
-    "cmdb_ci_win_server",
-    // Private task (vtb_task) — table/sys_id lookup for get_record / get_work_notes.
-    "vtb_task",
-];
+/// Empty means generic read selectors admit any syntactically valid table.
+/// Domain-specific tools pass their own restricted table sets.
+pub const RECORD_LOOKUP_ALLOWED_TABLES: &[&str] = &[];
 
 pub fn table_for_builtin_record_number(number: &str) -> Option<&'static str> {
     match record_number_prefix(number)?.as_str() {
         "DMNTSK" => Some("dmn_demand_task"),
+        "SPNT" => Some("rm_sprint"),
         _ => None,
     }
 }
@@ -970,7 +958,8 @@ impl RecordService {
             return Ok(cached);
         }
 
-        let Some(parent_record) = self.ctx.client.get_by_number(number).await? else {
+        let Some(parent_record) = super::record_types::lookup_number(&self.ctx, number).await?
+        else {
             return Ok(Vec::new());
         };
         self.ctx.persist_record(&parent_record)?;
@@ -1089,12 +1078,22 @@ impl RecordService {
         self.ctx.query.list_records(query).await
     }
 
-    /// Executes one bounded, deterministic, live page for the two explicitly
-    /// supported Mullet record kinds. The returned rows are ephemeral: this
+    /// Executes one bounded, deterministic, live page for typed record kinds.
+    /// The returned rows are ephemeral: this
     /// method never writes the cache, vault, or search index.
     pub async fn record_query(&self, input: RecordQueryInput) -> Result<RecordQueryPage> {
         let validated = validate_record_query(input)?;
+        if let ValidatedRecordQuery::Children {
+            table,
+            filters,
+            limit,
+            cursor,
+        } = validated
+        {
+            return self.query_children(table, filters, limit, cursor).await;
+        }
         let (table, limit, cursor, mut query) = match validated {
+            ValidatedRecordQuery::Children { .. } => unreachable!("children handled above"),
             ValidatedRecordQuery::ChangeRequest {
                 filters,
                 limit,
@@ -1255,6 +1254,112 @@ impl RecordService {
         Ok(RecordQueryPage {
             records,
             next_cursor,
+            complete,
+            source: RecordQuerySource::Live,
+            limit,
+            rows_inspected,
+        })
+    }
+
+    async fn query_children(
+        &self,
+        table: &str,
+        filters: resource::record_query::ChildQueryFilters,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<RecordQueryPage> {
+        let parent = if let Some(number) = filters.parent_number {
+            let page = self
+                .ctx
+                .client
+                .table("task")
+                .equals("number", &number)
+                .fields(&["sys_id", "number"])
+                .limit(2)
+                .no_count()
+                .execute()
+                .await?;
+            if !page.errors.is_empty()
+                || page.records.len() != 1
+                || page.records[0].get_raw("number") != Some(number.as_str())
+            {
+                anyhow::bail!(
+                    "parent number is missing, inaccessible, ambiguous, or did not match; child enumeration was not performed"
+                );
+            }
+            crate::normalize_record_lookup_sys_id(&page.records[0].sys_id)?
+        } else {
+            filters.parent_sys_id.expect("validated parent selector")
+        };
+        let fields = if table == "resource_plan" {
+            RESOURCE_PLAN_LIST_FIELDS
+        } else {
+            &[
+                "sys_id",
+                "number",
+                "short_description",
+                "sys_class_name",
+                "state",
+                "parent",
+                "top_task",
+                "assigned_to",
+                "assignment_group",
+                "start_date",
+                "end_date",
+                "due_date",
+                "sys_updated_on",
+            ]
+        };
+        let link = if table == "resource_plan" {
+            "task"
+        } else {
+            "parent"
+        };
+        let mut query = self
+            .ctx
+            .client
+            .table(table)
+            .fields(fields)
+            .display_value(DisplayValue::Both)
+            .exclude_reference_link(true)
+            .equals(link, &parent)
+            .limit(limit as u32)
+            .no_count();
+        if table == "pm_project_task" {
+            query = query.or_filter(
+                "top_task",
+                servicenow_rs::prelude::Operator::Equals,
+                &parent,
+            );
+        }
+        if let Some(after) = cursor.as_deref() {
+            query = query.greater_than("sys_id", after);
+        }
+        let page = query.order_by("sys_id", Order::Asc).execute().await?;
+        if !page.errors.is_empty() || page.records.len() > limit {
+            anyhow::bail!("child query returned an incomplete or oversized provider page");
+        }
+        let mut previous = cursor.unwrap_or_default();
+        for row in &page.records {
+            let id = crate::normalize_record_lookup_sys_id(&row.sys_id)?;
+            if id <= previous
+                || !(row.get_raw(link) == Some(parent.as_str())
+                    || (table == "pm_project_task"
+                        && row.get_raw("top_task") == Some(parent.as_str())))
+            {
+                anyhow::bail!("child query returned a non-progressing or unrelated record");
+            }
+            previous = id;
+        }
+        let rows_inspected = page.records.len();
+        let complete = rows_inspected < limit;
+        Ok(RecordQueryPage {
+            next_cursor: if complete { None } else { Some(previous) },
+            records: page
+                .records
+                .iter()
+                .map(SnowRecord::from_servicenow)
+                .collect(),
             complete,
             source: RecordQuerySource::Live,
             limit,
@@ -2440,16 +2545,6 @@ mod tests {
             table_for_builtin_record_number("dmntsk0001122"),
             Some("dmn_demand_task")
         );
-    }
-
-    #[test]
-    fn private_task_table_is_allowed_by_the_runtime_gate_and_public_schema() {
-        assert!(is_record_lookup_table_allowed("vtb_task"));
-        assert_eq!(
-            normalize_record_lookup_table("VTB_TASK").unwrap(),
-            "vtb_task"
-        );
-        assert!(RECORD_LOOKUP_ALLOWED_TABLES.contains(&"vtb_task"));
     }
 
     #[test]

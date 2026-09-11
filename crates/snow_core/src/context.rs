@@ -831,18 +831,7 @@ impl CoreContext {
         &self,
         number: &str,
     ) -> Result<Option<SnowRecord>> {
-        let table = self.table_for_number(number).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
-            )
-        })?;
-        let Some(mut record) = self
-            .client
-            .table(&table)
-            .equals("number", number)
-            .display_value(DisplayValue::Both)
-            .first()
-            .await?
+        let Some(mut record) = crate::service::record_types::lookup_number(self, number).await?
         else {
             return Ok(None);
         };
@@ -861,18 +850,7 @@ impl CoreContext {
         &self,
         number: &str,
     ) -> Result<Option<(Record, SnowRecord)>> {
-        let table = self.table_for_number(number).ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot resolve table for number '{number}' — unknown ServiceNow prefix"
-            )
-        })?;
-        let Some(mut record) = self
-            .client
-            .table(&table)
-            .equals("number", number)
-            .display_value(DisplayValue::Both)
-            .first()
-            .await?
+        let Some(mut record) = crate::service::record_types::lookup_number(self, number).await?
         else {
             return Ok(None);
         };

@@ -282,7 +282,13 @@ fn record_query_schema_is_strict_bounded_and_composition_free() {
     assert_eq!(tool.input_schema["required"], json!(["resource_type"]));
     assert_eq!(
         tool.input_schema["properties"]["resource_type"]["enum"],
-        json!(["change_request", "story"])
+        json!([
+            "change_request",
+            "story",
+            "resource_plan",
+            "project_task",
+            "task"
+        ])
     );
     assert_eq!(
         tool.input_schema["properties"]["filters"]["additionalProperties"],
@@ -426,23 +432,14 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
         tool.input_schema["properties"]["number"]["type"],
         json!("string")
     );
+    assert!(
+        tool.input_schema["properties"]["table"]
+            .get("enum")
+            .is_none()
+    );
     assert_eq!(
-        tool.input_schema["properties"]["table"]["enum"],
-        json!([
-            "dmn_demand",
-            "dmn_demand_task",
-            "resource_plan",
-            "pm_project",
-            "change_request",
-            "business_application",
-            "business_app",
-            "cmdb_ci_business_app",
-            "server",
-            "cmdb_ci_server",
-            "cmdb_ci_linux_server",
-            "cmdb_ci_win_server",
-            "vtb_task"
-        ])
+        tool.input_schema["properties"]["table"]["pattern"],
+        json!("^[a-zA-Z0-9_]+$")
     );
     assert_eq!(
         tool.input_schema["properties"]["sys_id"]["pattern"],
@@ -451,13 +448,8 @@ fn get_record_schema_advertises_number_or_allowed_table_sys_id_lookup() {
 }
 
 #[test]
-fn generic_record_tools_warn_away_from_apm_business_application_numbers() {
+fn search_tools_recommend_domain_search_for_application_numbers() {
     let registry = ToolRegistry::new();
-    let get_record = registry
-        .metadata()
-        .iter()
-        .find(|tool| tool.name == "get_record")
-        .expect("get_record registered");
     let search_records = registry
         .metadata()
         .iter()
@@ -465,13 +457,6 @@ fn generic_record_tools_warn_away_from_apm_business_application_numbers() {
         .expect("search_records registered");
 
     for text in [
-        get_record.description.as_str(),
-        get_record.input_schema["description"]
-            .as_str()
-            .expect("get_record schema description"),
-        get_record.input_schema["properties"]["number"]["description"]
-            .as_str()
-            .expect("get_record number description"),
         search_records.description.as_str(),
         search_records.input_schema["description"]
             .as_str()

@@ -2556,7 +2556,15 @@ fn catalog_read_error_response(id: Option<Value>, err: anyhow::Error) -> JsonRpc
 /// JSON-RPC code for an unresolvable record-number prefix (caller mistake).
 const UNKNOWN_PREFIX_CODE: i64 = -32006;
 
-fn map_record_lookup_error(id: Option<Value>, err: impl ToString) -> JsonRpcResponse {
+fn map_record_lookup_error(id: Option<Value>, err: anyhow::Error) -> JsonRpcResponse {
+    if let Some(error) = err.downcast_ref::<snow_core::RecordResolveError>() {
+        let code = match error {
+            snow_core::RecordResolveError::InvalidParams(_) => -32602,
+            snow_core::RecordResolveError::Unavailable(_) => -32060,
+            snow_core::RecordResolveError::Integrity(_) => -32061,
+        };
+        return JsonRpcResponse::error(id, code, error.to_string(), None);
+    }
     let details = err.to_string();
     if details.contains("unknown ServiceNow prefix") {
         return JsonRpcResponse::error(

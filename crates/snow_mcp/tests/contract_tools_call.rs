@@ -270,12 +270,12 @@ fn foreground_record_lookup_parser_accepts_generic_table_sys_id_and_rejects_mixe
 
     let err = parse_record_lookup(
         &json!({
-            "table": "incident",
+            "table": "incident^ORactive=true",
             "sys_id": "7f029b89c3e7565067bdfd73e40131a1"
         }),
         snow_core::RECORD_LOOKUP_ALLOWED_TABLES,
     )
-    .expect_err("unsupported table should be invalid");
+    .expect_err("injected table selector should be invalid");
     assert!(err.to_string().contains("not allowed"));
 }
 

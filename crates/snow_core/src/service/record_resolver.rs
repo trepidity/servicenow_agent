@@ -31,7 +31,11 @@ const MAX_SESSIONS: usize = 32;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordResolveInput {
-    pub sys_id: String,
+    pub sys_id: Option<String>,
+    pub number: Option<String>,
+    pub resource_type: Option<String>,
+    pub name: Option<String>,
+    pub table: Option<String>,
     pub cursor: Option<String>,
 }
 
@@ -54,11 +58,29 @@ pub struct ResolvedRecord {
     // coerce arbitrary tables into SnowRecord's string-only field projection.
     pub fields: Value,
     pub data_model: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<super::record_types::RecordType>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RecordResolution {
+    TypeMatches {
+        types: Vec<super::record_types::RecordType>,
+        complete: bool,
+    },
+    NumberNotFoundOrInaccessible {
+        number: String,
+    },
+    NameMatches {
+        name: String,
+        records: Vec<super::record_name_resolver::RecordNameMatch>,
+        complete: bool,
+        cursor: Option<String>,
+        match_count: usize,
+        scanned_tables: usize,
+        unreadable_tables: usize,
+    },
     Document {
         sys_id: String,
         table: String,
@@ -112,11 +134,13 @@ pub(crate) struct RecordResolver {
     ctx: CoreContext,
     sessions: Arc<Mutex<HashMap<String, SearchState>>>,
     documents: Arc<Mutex<HashMap<String, DocumentState>>>,
+    names: super::record_name_resolver::RecordNameResolver,
 }
 
 impl RecordResolver {
     pub(crate) fn new(ctx: CoreContext) -> Self {
         Self {
+            names: super::record_name_resolver::RecordNameResolver::new(ctx.clone()),
             ctx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             documents: Arc::new(Mutex::new(HashMap::new())),
@@ -127,7 +151,80 @@ impl RecordResolver {
         &self,
         input: RecordResolveInput,
     ) -> Result<RecordResolution, RecordResolveError> {
-        let sys_id = crate::normalize_record_lookup_sys_id(&input.sys_id)
+        let selectors = usize::from(input.sys_id.is_some())
+            + usize::from(input.name.is_some())
+            + usize::from(input.number.is_some());
+        if selectors > 1 {
+            return Err(RecordResolveError::InvalidParams(
+                "provide one of name, number, or sys_id".into(),
+            ));
+        }
+        if selectors == 0 {
+            if input.cursor.is_some() || (input.resource_type.is_some() && input.table.is_some()) {
+                return Err(RecordResolveError::InvalidParams(
+                    "type discovery requires only resource_type or table".into(),
+                ));
+            }
+            let selector = input
+                .resource_type
+                .as_deref()
+                .or(input.table.as_deref())
+                .ok_or_else(|| {
+                    RecordResolveError::InvalidParams(
+                        "name, number, sys_id, or resource_type is required".into(),
+                    )
+                })?;
+            return Ok(RecordResolution::TypeMatches {
+                types: super::record_types::resolve_type(&self.ctx, selector).await?,
+                complete: true,
+            });
+        }
+        let mut scope = input.table.clone();
+        if let Some(hint) = input
+            .resource_type
+            .as_deref()
+            .filter(|hint| *hint != "record")
+        {
+            let resolved = super::record_types::unique_type(&self.ctx, hint).await?;
+            if scope.as_ref().is_some_and(|table| table != &resolved.table) {
+                return Err(RecordResolveError::InvalidParams(
+                    "table does not match resolved resource_type".into(),
+                ));
+            }
+            scope = Some(resolved.table);
+        }
+        if let Some(name) = input.name {
+            if input.sys_id.is_some() {
+                return Err(RecordResolveError::InvalidParams(
+                    "provide name or sys_id, not both".into(),
+                ));
+            }
+            return self.names.resolve(name, scope, input.cursor).await;
+        }
+        if let Some(number) = input.number {
+            if input.cursor.is_some() {
+                return Err(RecordResolveError::InvalidParams(
+                    "continue a numbered record document with its returned sys_id and cursor"
+                        .into(),
+                ));
+            }
+            let Some(record) =
+                super::record_types::lookup_number_scoped(&self.ctx, &number, scope.as_deref())
+                    .await?
+            else {
+                return Ok(RecordResolution::NumberNotFoundOrInaccessible { number });
+            };
+            if scope.as_ref().is_some_and(|table| table != &record.table) {
+                return Err(RecordResolveError::InvalidParams(
+                    "number does not match the resolved type".into(),
+                ));
+            }
+            return self.finish_record(record, None).await;
+        }
+        let sys_id =
+            crate::normalize_record_lookup_sys_id(input.sys_id.as_deref().ok_or_else(|| {
+                RecordResolveError::InvalidParams("name or sys_id is required".into())
+            })?)
             .map_err(|error| RecordResolveError::InvalidParams(error.to_string()))?;
         {
             let mut documents = self.documents.lock().await;
@@ -145,6 +242,29 @@ impl RecordResolver {
                 let offset = state.page_offsets[cursor];
                 return Ok(document_chunk(state, offset));
             }
+        }
+        if let Some(table) = scope {
+            if !super::record_types::identifier(&table) {
+                return Err(RecordResolveError::InvalidParams(
+                    "invalid table identifier".into(),
+                ));
+            }
+            let record = self
+                .ctx
+                .client
+                .table(&table)
+                .get(&sys_id)
+                .await
+                .map_err(|_| {
+                    RecordResolveError::Unavailable(
+                        "record table is unreadable or record was not found".into(),
+                    )
+                })?;
+            validate_identity(&record, &sys_id)?;
+            if actual_table(&record)? != table {
+                return Err(RecordResolveError::InvalidParams("sys_id does not match the resolved type; omit the hint to discover its actual class".into()));
+            }
+            return self.finish_record(record, input.cursor.as_deref()).await;
         }
         let mut search = {
             let mut sessions = self.sessions.lock().await;
@@ -312,6 +432,12 @@ impl RecordResolver {
                             table,
                             fields,
                             data_model: model,
+                            data_type: super::record_types::describe_table(
+                                &self.ctx,
+                                &record.table,
+                            )
+                            .await
+                            .ok(),
                         },
                         input.cursor.as_deref(),
                     )
@@ -346,6 +472,45 @@ impl RecordResolver {
         }
         sessions.insert(cursor, search);
         Ok(outcome)
+    }
+
+    async fn finish_record(
+        &self,
+        record: Record,
+        cursor: Option<&str>,
+    ) -> Result<RecordResolution, RecordResolveError> {
+        validate_identity(&record, &record.sys_id)?;
+        let table = actual_table(&record)?;
+        let data_model = match &self.ctx.ui_metadata {
+            Some(client) => match client.record_model(&table).await {
+                Ok(columns) => {
+                    json!({"status":"available","table":table,"source":"live_ui_metadata","columns":columns})
+                }
+                Err(_) => {
+                    json!({"status":"unavailable","table":table,"reason":"live_metadata_unreadable"})
+                }
+            },
+            None => {
+                json!({"status":"unavailable","table":table,"reason":"metadata_client_not_configured"})
+            }
+        };
+        let data_type = super::record_types::describe_table(&self.ctx, &table)
+            .await
+            .ok();
+        self.bounded_record(
+            ResolvedRecord {
+                sys_id: record.sys_id.clone(),
+                resource_type: resource_type(&table).into(),
+                table,
+                fields: serde_json::to_value(record.fields()).map_err(|_| {
+                    RecordResolveError::Integrity("record fields could not be represented".into())
+                })?,
+                data_model,
+                data_type,
+            },
+            cursor,
+        )
+        .await
     }
 
     async fn bounded_record(
@@ -459,7 +624,7 @@ fn validate_identity(record: &Record, expected: &str) -> Result<(), RecordResolv
     }
 }
 
-fn actual_table(record: &Record) -> Result<String, RecordResolveError> {
+pub(super) fn actual_table(record: &Record) -> Result<String, RecordResolveError> {
     if matches!(record.table.as_str(), "task" | "cmdb_ci" | "sys_metadata")
         && record.get_raw("sys_class_name").is_none_or(str::is_empty)
     {
@@ -492,28 +657,6 @@ fn actual_table(record: &Record) -> Result<String, RecordResolveError> {
 
 // Classification is descriptive, never an admission list. Unrecognized tables
 // retain their exact provider table and live model under the dynamic category.
-fn resource_type(table: &str) -> &str {
-    match table {
-        "rm_story" => "story",
-        "rm_scrum_task" => "story_task",
-        "incident" => "incident",
-        "change_request" => "change_request",
-        "change_task" => "change_task",
-        "sc_request" => "request",
-        "sc_req_item" => "request_item",
-        "sc_task" => "request_task",
-        "pm_project" => "project",
-        "dmn_demand" => "demand",
-        "dmn_demand_task" => "demand_task",
-        "resource_plan" => "resource_plan",
-        "time_card" => "timecard",
-        "sys_user" => "user",
-        "sysapproval_approver" => "approval",
-        "kb_knowledge" => "knowledge_article",
-        "cmdb_ci_business_app" => "business_application",
-        "planned_task" => "planned_task",
-        "problem" => "problem",
-        "task" => "task",
-        _ => "dynamic",
-    }
+pub(super) fn resource_type(table: &str) -> &str {
+    super::record_types::resource_type(table)
 }

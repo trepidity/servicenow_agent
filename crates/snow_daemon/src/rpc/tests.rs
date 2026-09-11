@@ -1259,7 +1259,7 @@ fn extract_record_lookup_accepts_number() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn record_lookup_methods_map_unknown_prefix_to_the_distinct_contract_error() {
+async fn record_lookup_methods_preserve_unreadable_prefix_metadata_as_unavailable() {
     let fixture = build_fixture_state().await.expect("fixture");
     assert_ne!(UNKNOWN_PREFIX_CODE, -32005);
 
@@ -1276,8 +1276,7 @@ async fn record_lookup_methods_map_unknown_prefix_to_the_distinct_contract_error
         .await;
 
         let error = response.error.expect("unknown-prefix error");
-        assert_eq!(error.code, UNKNOWN_PREFIX_CODE, "method={method}");
-        assert_eq!(error.message, "unknown record prefix", "method={method}");
+        assert_eq!(error.code, -32060, "method={method}: {error:?}");
     }
 }
 
@@ -1352,7 +1351,7 @@ fn extract_record_lookup_rejects_invalid_shapes() {
         json!({ "table": "dmn_demand" }),
         json!({ "table": "dmn_demand", "sys_id": "7f029b89c3e7565067bdfd73e40131a" }),
         json!({ "table": "dmn_demand", "sys_id": "7f029b89c3e7565067bdfd73e40131ag" }),
-        json!({ "table": "sys_user", "sys_id": "7f029b89c3e7565067bdfd73e40131a1" }),
+        json!({ "table": "sys_user^ORactive=true", "sys_id": "7f029b89c3e7565067bdfd73e40131a1" }),
     ] {
         assert!(
             extract_record_lookup(&params).is_err(),

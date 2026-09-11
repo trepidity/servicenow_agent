@@ -1133,31 +1133,22 @@ async fn bridge_filters_tools_against_daemon_contract() {
         get_record["description"]
             .as_str()
             .expect("get_record description")
-            .contains("APM0002456")
+            .contains("custom tables")
     );
     assert!(
         get_record["inputSchema"]["properties"]["number"]["description"]
             .as_str()
             .expect("get_record number description")
-            .contains("business_application_query")
+            .contains("shared core")
+    );
+    assert!(
+        get_record["inputSchema"]["properties"]["table"]
+            .get("enum")
+            .is_none()
     );
     assert_eq!(
-        get_record["inputSchema"]["properties"]["table"]["enum"],
-        json!([
-            "dmn_demand",
-            "dmn_demand_task",
-            "resource_plan",
-            "pm_project",
-            "change_request",
-            "business_application",
-            "business_app",
-            "cmdb_ci_business_app",
-            "server",
-            "cmdb_ci_server",
-            "cmdb_ci_linux_server",
-            "cmdb_ci_win_server",
-            "vtb_task"
-        ])
+        get_record["inputSchema"]["properties"]["table"]["pattern"],
+        json!("^[a-zA-Z0-9_]+$")
     );
 }
 

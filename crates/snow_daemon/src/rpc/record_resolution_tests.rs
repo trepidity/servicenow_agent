@@ -122,7 +122,7 @@ async fn record_resolution_discovers_custom_catalog_table_without_a_builtin_type
     assert!(response.error.is_none(), "{response:?}");
     let record = &response.result.unwrap()["record"];
     assert_eq!(record["table"], "x_example_widget");
-    assert_eq!(record["resource_type"], "dynamic");
+    assert_eq!(record["resource_type"], "x_example_widget");
     assert_eq!(
         record["fields"]["u_payload"]["value"],
         json!({"enabled":true,"count":7})
@@ -138,7 +138,7 @@ async fn record_resolution_rejects_mixed_or_malformed_selectors_without_http() {
         .unwrap();
     for params in [
         json!({"sys_id":"invalid"}),
-        json!({"sys_id":ID,"table":"task"}),
+        json!({"sys_id":ID,"table":"task^ORactive=true"}),
         json!({"sys_id":ID,"number":"STRY0000001"}),
         json!({"sys_id":ID,"cursor":"unknown"}),
     ] {

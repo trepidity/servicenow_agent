@@ -159,7 +159,13 @@ the approval collection under `records`, and includes a top-level
 
 ### `record_resolve`
 
-Resolve any readable sys_id without a caller-selected table. Returns the actual
+Resolve readable sys_ids or numbers, discover types from prefixes/labels/tables,
+or find records by exact name with an optional table
+scope. Name lookup discovers standard name/title/number and custom display fields
+from live metadata and returns all candidate sys_ids, actual types, and explicit
+completeness. It supports arbitrary instance tables, including sprints, releases,
+groups, users, and custom records. Follow the cursor; disambiguate duplicates.
+Sys_id lookup returns the actual
 table/class, raw/display field values, and live model metadata, including custom
 tables. Follow the returned cursor for bounded table discovery or oversized JSON
 document pages. Catalog/record/model ACL limits remain explicit. See
@@ -167,8 +173,9 @@ document pages. Catalog/record/model ACL limits remain explicit. See
 
 ### `record_query`
 
-`record_query` is the strict live query primitive for Change Requests and
-Stories. It accepts only `resource_type: change_request|story`, typed
+`record_query` is the strict live query primitive for Change Requests, Stories,
+resource plans, project tasks, and immediate task children. It accepts
+`resource_type: change_request|story|resource_plan|project_task|task`, typed
 resource-specific filters, an optional 32-hex exclusive cursor, and a page
 limit from 1 through 200 (default 50). Unknown fields, raw encoded queries,
 cross-resource filters, malformed ranges, and unsupported Story description
@@ -179,6 +186,14 @@ searches fail with `-32602` before record I/O.
 - Story filters: assignment group, assignee, story owner, lead developer,
   exact live-resolved states, sprint, project, CI, blocked flag, strict due or
   update bounds, Story numbers, and `short_description` text only.
+- Child filters: exactly one of `parent_number` or `parent_sys_id`. Numbers are
+  resolved live against `task`; missing or inaccessible parents are errors.
+  `resource_plan` follows `task` and includes every visible group/user plan.
+  `project_task` follows `parent` or `top_task` on `pm_project_task`, including
+  nested project tasks. `task` follows `parent` for immediate children only.
+  These reads do not rely on cached or embedded `children` arrays.
+- Example: `{"resource_type":"resource_plan","filters":{"parent_number":"PRJ0000001"}}`.
+  Use `project_task` with the same parent for the project task hierarchy.
 - Pages are ordered by `sys_id` ascending and return
   `{ records, next_cursor, complete, source: "live", limit, rows_inspected }`.
   A full page is incomplete; an exact-multiple scan requires a final empty page.

@@ -16,12 +16,12 @@ pub fn register(registry: &mut ToolRegistry) {
     for (name, description, input_schema) in [
         (
             "record_resolve",
-            "Resolve any readable ServiceNow sys_id without knowing its table. Discovers the actual object class, full field values and live data model, including custom tables. Follow the opaque cursor while status is searching. Read-only; ACL-hidden and absent records are indistinguishable.",
-            json!({"type":"object","additionalProperties":false,"required":["sys_id"],"properties":{"sys_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"cursor":{"type":"string"}}}),
+            "Resolve a record by sys_id, number, or exact name. Optional resource_type accepts any table, display label, reference field, or number prefix (e.g. DMND); the shared core translates it using ServiceNow metadata. resource_type alone returns candidate table/type definitions. table is an optional canonical scope. No surface table allowlist. Prefix discovery reports a core fallback when numbering metadata is unreadable. Follow paging and disambiguate multiple matches. Read-only and ACL-bound.",
+            json!({"type":"object","additionalProperties":false,"properties":{"sys_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"number":{"type":"string"},"resource_type":{"type":"string","description":"Table, label, reference field, or prefix; may be used alone to discover its type."},"name":{"type":"string","minLength":1,"maxLength":200},"table":{"type":"string","pattern":"^[a-zA-Z0-9_]+$"},"cursor":{"type":"string"}}}),
         ),
         (
             "get_record",
-            "Retrieve a generic ServiceNow record by number or allowed table/sys_id. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.",
+            "Retrieve any readable ServiceNow record by number or table/sys_id. Number prefixes are translated in the shared core; custom tables require no surface registration. Use record_resolve for type-label/prefix discovery or full dynamic fields and model.",
             record_lookup_arg_schema(RECORD_LOOKUP_ALLOWED_TABLES),
         ),
         (
@@ -121,7 +121,7 @@ pub fn register(registry: &mut ToolRegistry) {
         ),
         (
             "record_query",
-            "Query one bounded live page of Change Requests or Stories with typed allowlisted filters and stable cursor paging.",
+            "Query one bounded live page of Change Requests, Stories, or child records with typed filters and sys_id cursor paging. For resource_plan, project_task, or task, provide filters.parent_number or filters.parent_sys_id. Resource plans include all groups; project_task includes descendants via top_task and direct children via parent; task returns immediate children. Follow next_cursor until complete; embedded children and cached list_records are not exhaustive.",
             record_query_arg_schema(),
         ),
         (
@@ -200,12 +200,14 @@ pub fn record_query_arg_schema() -> Value {
         "properties": {
             "resource_type": {
                 "type": "string",
-                "enum": ["change_request", "story"]
+                "enum": ["change_request", "story", "resource_plan", "project_task", "task"]
             },
             "filters": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                    "parent_number": { "type": "string", "description": "For child queries: parent task number, e.g. PRJ0000001. Mutually exclusive with parent_sys_id." },
+                    "parent_sys_id": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$", "description": "For child queries: parent task sys_id. Mutually exclusive with parent_number." },
                     "assignment_group": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
                     "assigned_to": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" },
                     "state": { "type": "string", "minLength": 1, "maxLength": 80 },
@@ -249,19 +251,20 @@ pub fn record_query_arg_schema() -> Value {
 }
 
 pub fn record_lookup_arg_schema(allowed_tables: &[&str]) -> Value {
+    let table_schema = if allowed_tables == RECORD_LOOKUP_ALLOWED_TABLES {
+        json!({"type":"string","pattern":"^[a-zA-Z0-9_]+$","description":"Canonical ServiceNow table, including custom tables. No generic read allowlist."})
+    } else {
+        json!({"type":"string","enum":allowed_tables})
+    };
     json!({
         "type": "object",
-        "description": "Provide either number, or table and sys_id together. Runtime validation rejects missing, mixed, or partial lookup modes. Do not use this generic lookup for APM Business Application numbers such as APM0002456; use business_application_query with field=number.",
+        "description": "Provide number, or canonical table and sys_id together. Runtime validation rejects missing, mixed, or partial selectors. The shared core resolves record numbers; custom tables require no surface registration.",
         "properties": {
             "number": {
                 "type": "string",
-                "description": "Generic ServiceNow work-record number, for example TASK3497879. Not for APM Business Application identifiers such as APM0002456; route those to business_application_query/search."
+                "description": "Exact record number. The shared core resolves its table from number metadata or its configured prefix registry."
             },
-            "table": {
-                "type": "string",
-                "enum": allowed_tables,
-                "description": "Allowed table name for sys_id lookup"
-            },
+            "table": table_schema,
             "sys_id": {
                 "type": "string",
                 "pattern": "^[0-9a-fA-F]{32}$",
@@ -970,7 +973,11 @@ pub fn parse_record_lookup(args: &Value, allowed_tables: &[&str]) -> Result<Reco
     }
 
     let table = table.unwrap().to_ascii_lowercase();
-    if !allowed_tables.iter().any(|allowed| *allowed == table) {
+    if (allowed_tables == RECORD_LOOKUP_ALLOWED_TABLES
+        && !snow_core::is_record_lookup_table_allowed(&table))
+        || (allowed_tables != RECORD_LOOKUP_ALLOWED_TABLES
+            && !allowed_tables.iter().any(|allowed| *allowed == table))
+    {
         return Err(Error::InvalidParams(format!(
             "table `{table}` is not allowed for this record lookup"
         )));

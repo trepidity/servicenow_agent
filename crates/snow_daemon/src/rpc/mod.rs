@@ -51,17 +51,25 @@ mod cache_policy_tests;
 #[cfg(test)]
 mod catalog_cache_policy_tests;
 #[cfg(test)]
+mod child_query_tests;
+#[cfg(test)]
 mod incident_bulk_write_tests;
 #[cfg(test)]
 mod incident_fields_parity_tests;
 #[cfg(test)]
 mod incident_read_parity_tests;
 #[cfg(test)]
+mod name_resolution_tests;
+#[cfg(test)]
 mod record_resolution_tests;
+#[cfg(test)]
+mod record_type_tests;
 #[cfg(test)]
 mod resource_cache_policy_tests;
 #[cfg(test)]
 mod resource_plan_decision_tests;
+#[cfg(test)]
+mod sprint_lookup_tests;
 #[cfg(test)]
 mod surface_e2e;
 #[cfg(test)]
