@@ -52,6 +52,7 @@ pub(in crate::rpc) const SUPPORTED_RPC_METHODS: &[&str] = &[
     "get_work_notes",
     "list_records",
     "record_query",
+    "record_resolve",
     "list_my_tasks",
     "list_my_approvals",
     "list_my_projects",

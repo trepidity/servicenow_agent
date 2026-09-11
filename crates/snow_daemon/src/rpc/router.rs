@@ -75,6 +75,7 @@ pub(crate) async fn dispatch(request: JsonRpcRequest, state: &Arc<DaemonState>) 
         | RpcMethod::GetWorkNotes
         | RpcMethod::ListRecords
         | RpcMethod::RecordQuery
+        | RpcMethod::RecordResolve
         | RpcMethod::MyTasks
         | RpcMethod::MyTasksFresh
         | RpcMethod::ListMyTasks

@@ -325,6 +325,31 @@ pub(in crate::rpc) async fn dispatch_records(
     transport: &DaemonTransport<'_>,
 ) -> JsonRpcResponse {
     match method {
+        RpcMethod::RecordResolve => {
+            let input = match serde_json::from_value::<snow_core::RecordResolveInput>(
+                request.params.clone(),
+            ) {
+                Ok(input) => input,
+                Err(error) => return invalid_params(id, error),
+            };
+            match state.core.record_resolve(input).await {
+                Ok(result) => JsonRpcResponse::ok(id, json!(result)),
+                Err(error) => {
+                    let (code, kind) = match &error {
+                        snow_core::RecordResolveError::InvalidParams(_) => {
+                            (-32602, "INVALID_PARAMS")
+                        }
+                        snow_core::RecordResolveError::Unavailable(_) => {
+                            (-32060, "RECORD_RESOLUTION_UNAVAILABLE")
+                        }
+                        snow_core::RecordResolveError::Integrity(_) => {
+                            (-32061, "RECORD_RESOLUTION_INTEGRITY")
+                        }
+                    };
+                    JsonRpcResponse::error(id, code, &error.to_string(), Some(json!({"code":kind})))
+                }
+            }
+        }
         RpcMethod::GetRecord => match extract_record_lookup(&request.params) {
             Ok(RecordLookup::Number(number)) => {
                 match state

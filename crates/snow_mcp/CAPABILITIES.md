@@ -157,6 +157,14 @@ those memberships, accepts no caller-supplied user or approver override, keeps
 the approval collection under `records`, and includes a top-level
 `query_summary` on successful responses.
 
+### `record_resolve`
+
+Resolve any readable sys_id without a caller-selected table. Returns the actual
+table/class, raw/display field values, and live model metadata, including custom
+tables. Follow the returned cursor for bounded table discovery or oversized JSON
+document pages. Catalog/record/model ACL limits remain explicit. See
+[`IDENTIFIER_RESOLUTION.md`](IDENTIFIER_RESOLUTION.md).
+
 ### `record_query`
 
 `record_query` is the strict live query primitive for Change Requests and

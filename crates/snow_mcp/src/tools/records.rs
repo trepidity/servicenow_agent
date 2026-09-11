@@ -15,6 +15,11 @@ pub const RESOURCE_PLAN_LOOKUP_TABLES: &[&str] = &["resource_plan"];
 pub fn register(registry: &mut ToolRegistry) {
     for (name, description, input_schema) in [
         (
+            "record_resolve",
+            "Resolve any readable ServiceNow sys_id without knowing its table. Discovers the actual object class, full field values and live data model, including custom tables. Follow the opaque cursor while status is searching. Read-only; ACL-hidden and absent records are indistinguishable.",
+            json!({"type":"object","additionalProperties":false,"required":["sys_id"],"properties":{"sys_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"cursor":{"type":"string"}}}),
+        ),
+        (
             "get_record",
             "Retrieve a generic ServiceNow record by number or allowed table/sys_id. Do not use for APM Business Application numbers such as APM0002456; use business_application_query for APM-number lookup, or business_application_get/search when you have sys_id, exact name, or BA filters.",
             record_lookup_arg_schema(RECORD_LOOKUP_ALLOWED_TABLES),

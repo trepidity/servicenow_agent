@@ -147,6 +147,9 @@ pub use service::record::{
     normalize_record_lookup_table, table_for_builtin_record_number,
 };
 pub(crate) use service::record::{canonical_record_table, canonical_record_table_for_number};
+pub use service::record_resolver::{
+    RecordResolution, RecordResolveError, RecordResolveInput, ResolvedRecord,
+};
 
 mod facade;
 pub use facade::SnowCoreBuilder;
@@ -161,6 +164,7 @@ pub struct SnowCore {
     descriptors: service::DescriptorService,
     servers: service::ServerService,
     records: service::RecordService,
+    resolver: service::record_resolver::RecordResolver,
     knowledge: service::KnowledgeService,
     vault_svc: service::VaultService,
     writes: service::WriteService,

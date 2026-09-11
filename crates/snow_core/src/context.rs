@@ -87,6 +87,28 @@ pub(crate) struct UiMetadataClient {
 }
 
 impl UiMetadataClient {
+    /// Only called with a validated, provider-resolved class name.
+    pub(crate) async fn record_model(&self, table: &str) -> Result<serde_json::Value> {
+        if !is_metadata_identifier(table) {
+            return Err(anyhow::anyhow!("invalid metadata table"));
+        }
+        let body: serde_json::Value = self
+            .client
+            .get(format!("{}/api/now/ui/meta/{table}", self.base_url))
+            .basic_auth(&self.username, Some(self.password.as_str()))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        body.get("result")
+            .and_then(|value| value.get("columns"))
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("metadata omitted columns"))
+    }
+
     pub(crate) fn new(
         base_url: impl Into<String>,
         username: impl Into<String>,

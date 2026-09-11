@@ -216,6 +216,39 @@ impl McpServer {
             "knowledge_grounded_plan" => self.call_knowledge_grounded_plan(id, params).await,
             "list_records" => self.call_list_records(id, params).await,
             "record_query" => self.call_record_query(id, params).await,
+            "record_resolve" => {
+                let input = match serde_json::from_value::<snow_core::RecordResolveInput>(
+                    params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                ) {
+                    Ok(input) => input,
+                    Err(error) => return invalid_params(id, error),
+                };
+                match self.core.record_resolve(input).await {
+                    Ok(result) => JsonRpcResponse::ok(id, json!(result)),
+                    Err(error) => {
+                        let (code, kind) = match &error {
+                            snow_core::RecordResolveError::InvalidParams(_) => {
+                                (-32602, "INVALID_PARAMS")
+                            }
+                            snow_core::RecordResolveError::Unavailable(_) => {
+                                (-32060, "RECORD_RESOLUTION_UNAVAILABLE")
+                            }
+                            snow_core::RecordResolveError::Integrity(_) => {
+                                (-32061, "RECORD_RESOLUTION_INTEGRITY")
+                            }
+                        };
+                        JsonRpcResponse::error(
+                            id,
+                            code,
+                            error.to_string(),
+                            Some(json!({"code":kind})),
+                        )
+                    }
+                }
+            }
             "list_knowledge_bases" => self.call_list_knowledge_bases(id),
             "list_categories" => self.call_list_categories(id, params),
             "list_knowledge_articles" => self.call_list_knowledge_articles(id, params).await,

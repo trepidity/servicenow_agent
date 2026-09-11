@@ -14,6 +14,14 @@ use crate::query::filter::{BusinessApplicationQuery, ListQuery};
 use crate::vault::manager::VaultManager;
 
 impl SnowCore {
+    /// Resolve a live identifier without caller-supplied table knowledge or persistence.
+    pub async fn record_resolve(
+        &self,
+        input: crate::RecordResolveInput,
+    ) -> std::result::Result<crate::RecordResolution, crate::RecordResolveError> {
+        self.resolver.resolve(input).await
+    }
+
     pub fn cache_policy_manager(&self) -> Arc<cache::policy::CachePolicyManager> {
         Arc::clone(&self.ctx.named_cache_policy)
     }
@@ -999,6 +1007,7 @@ impl SnowCoreBuilder {
         let descriptors = service::DescriptorService::new(ctx.clone());
         let servers = service::ServerService::new(ctx.clone());
         let records = service::RecordService::new(ctx.clone());
+        let resolver = service::record_resolver::RecordResolver::new(ctx.clone());
         let knowledge = service::KnowledgeService::new(ctx.clone());
         let vault_svc = service::VaultService::new(ctx.clone());
         let writes = service::WriteService::new(ctx.clone());
@@ -1011,6 +1020,7 @@ impl SnowCoreBuilder {
             descriptors,
             servers,
             records,
+            resolver,
             knowledge,
             vault_svc,
             writes,

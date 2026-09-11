@@ -71,6 +71,7 @@ const BRIDGE_TOOL_METHODS: &[(&str, &str)] = &[
     ("incident_query", "incident_query"),
     ("list_records", "list_records"),
     ("record_query", "record_query"),
+    ("record_resolve", "record_resolve"),
     ("list_my_tasks", "list_my_tasks"),
     ("list_my_approvals", "list_my_approvals"),
     ("list_my_projects", "list_my_projects"),

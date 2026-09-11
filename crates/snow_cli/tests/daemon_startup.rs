@@ -33,7 +33,10 @@ impl Fixture {
             .env("SERVICENOW_INSTANCE", "https://example.service-now.com")
             .env("OP_ITEM_ID", "example-item")
             .env("OP_VAULT", "example-vault")
-            .env("SNOW_DAEMON_CREDENTIAL_TIMEOUT_SECS", "1")
+            // Exercise the configured bound without requiring a newly spawned
+            // shell to be scheduled within one second during a full build/test
+            // run. The hung helper still sleeps 30s and must be killed/reaped.
+            .env("SNOW_DAEMON_CREDENTIAL_TIMEOUT_SECS", "5")
             .env("STARTUP_HELPER_PID", dir.path().join("helper.pid"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -44,7 +47,7 @@ impl Fixture {
     }
 
     fn wait_for_exit(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if self.child.try_wait().unwrap().is_some() {
                 return true;
@@ -109,7 +112,7 @@ esac
 "#,
     );
     let socket = fixture.dir.path().join("snow_config/daemon.sock");
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut stream = loop {
         if let Ok(stream) = UnixStream::connect(&socket) {
             break stream;

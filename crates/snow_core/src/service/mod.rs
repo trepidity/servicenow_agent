@@ -13,6 +13,7 @@ pub(crate) mod cache_rebuild;
 pub(crate) mod descriptor;
 pub(crate) mod knowledge;
 pub(crate) mod record;
+pub(crate) mod record_resolver;
 pub(crate) mod server;
 pub(crate) mod user;
 pub(crate) mod vault;

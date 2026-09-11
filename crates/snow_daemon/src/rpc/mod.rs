@@ -57,6 +57,8 @@ mod incident_fields_parity_tests;
 #[cfg(test)]
 mod incident_read_parity_tests;
 #[cfg(test)]
+mod record_resolution_tests;
+#[cfg(test)]
 mod resource_cache_policy_tests;
 #[cfg(test)]
 mod resource_plan_decision_tests;
