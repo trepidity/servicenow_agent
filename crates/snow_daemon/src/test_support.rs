@@ -30,16 +30,21 @@ pub async fn build_fixture_state() -> Result<FixtureState> {
 }
 
 pub async fn build_fixture_state_at_instance(instance_url: &str) -> Result<FixtureState> {
-    build_fixture_state_with_config_instance(instance_url, instance_url).await
+    build_fixture_state_with_config_instance(instance_url, instance_url, false).await
+}
+
+pub async fn build_fixture_state_with_ui_metadata(instance_url: &str) -> Result<FixtureState> {
+    build_fixture_state_with_config_instance(instance_url, instance_url, true).await
 }
 
 pub async fn build_fixture_state_without_instance_config() -> Result<FixtureState> {
-    build_fixture_state_with_config_instance("http://localhost", "").await
+    build_fixture_state_with_config_instance("http://localhost", "", false).await
 }
 
 async fn build_fixture_state_with_config_instance(
     client_instance_url: &str,
     config_instance_url: &str,
+    ui_metadata: bool,
 ) -> Result<FixtureState> {
     let guard = fixture_state_lock().await;
     let tempdir = tempfile::tempdir()?;
@@ -77,13 +82,20 @@ async fn build_fixture_state_with_config_instance(
     };
     config.apply_defaults();
 
-    let core = SnowCore::builder()
+    let builder = SnowCore::builder()
         .config(config.clone())
         .client(client)
         .write_client(write_client)
-        .vault_path(vault_path)
-        .build()
-        .await?;
+        .vault_path(vault_path);
+    let builder = if ui_metadata {
+        builder.ui_metadata_basic_auth(
+            "tester",
+            snow_core::credential::SecretString::new("secret".to_string()),
+        )
+    } else {
+        builder
+    };
+    let core = builder.build().await?;
 
     let db_path = tempdir.path().join("snow.db");
     let engine = QueryEngine::open(db_path)?;

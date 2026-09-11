@@ -39,9 +39,9 @@ pub async fn handle_knowledge_plan_create_draft(
     if let Some(response) = policy_gate(id.clone(), state) {
         return response;
     }
-    let input = match parse_plan_input(id.clone(), params) {
+    let input = match parse_plan_input(params) {
         Ok(input) => input,
-        Err(response) => return response,
+        Err(fields) => return field_rejected(id, fields),
     };
 
     let plan = OperationPlanBuilder::new(KNOWLEDGE_DRAFT_PLAN_TOOL)
@@ -119,8 +119,10 @@ pub async fn handle_knowledge_plan_create_draft(
         None,
         KNOWLEDGE_DRAFT_PLAN_TOOL,
         ResultStatus::Plan,
-        Some(redacted_plan_change(&plan)),
-        None,
+        AuditChanges {
+            changes: Some(redacted_plan_change(&plan)),
+            metadata: None,
+        },
         Some((&actor, &requester)),
     )
     .await
@@ -348,8 +350,10 @@ pub async fn handle_knowledge_apply_create_draft(
         Some(&plan.plan_id),
         KNOWLEDGE_DRAFT_APPLY_TOOL,
         ResultStatus::AppliedSuccess,
-        Some(redacted_plan_change(&plan)),
-        receipt.service_now_metadata.clone(),
+        AuditChanges {
+            changes: Some(redacted_plan_change(&plan)),
+            metadata: receipt.service_now_metadata.clone(),
+        },
         Some((&actor, &requester)),
     )
     .await
@@ -371,15 +375,9 @@ struct DraftInput {
     category_sys_id: Option<String>,
 }
 
-fn parse_plan_input(
-    id: Option<Value>,
-    params: &Value,
-) -> std::result::Result<DraftInput, JsonRpcResponse> {
+fn parse_plan_input(params: &Value) -> std::result::Result<DraftInput, Vec<Value>> {
     let Some(args) = params.as_object() else {
-        return Err(field_rejected(
-            id,
-            vec![json!({"field": "payload", "reason": "type_mismatch"})],
-        ));
+        return Err(vec![json!({"field": "payload", "reason": "type_mismatch"})]);
     };
     let allowed = BTreeSet::from([
         "short_description",
@@ -398,31 +396,19 @@ fn parse_plan_input(
         .map(|field| json!({"field": field, "reason": "not_in_allowlist"}))
         .collect::<Vec<_>>();
     if !rejected.is_empty() {
-        return Err(field_rejected(id, rejected));
+        return Err(rejected);
     }
-    let short_description =
-        bounded_string(args, "short_description", MAX_TITLE_LENGTH).map_err(|reason| {
-            field_rejected(
-                id.clone(),
-                vec![json!({"field": "short_description", "reason": reason})],
-            )
-        })?;
-    let text = bounded_string(args, "text", MAX_BODY_LENGTH).map_err(|reason| {
-        field_rejected(id.clone(), vec![json!({"field": "text", "reason": reason})])
-    })?;
-    let knowledge_base_sys_id = sys_id(args, "knowledge_base_sys_id").map_err(|reason| {
-        field_rejected(
-            id.clone(),
-            vec![json!({"field": "knowledge_base_sys_id", "reason": reason})],
-        )
-    })?;
+    let short_description = bounded_string(args, "short_description", MAX_TITLE_LENGTH)
+        .map_err(|reason| vec![json!({"field": "short_description", "reason": reason})])?;
+    let text = bounded_string(args, "text", MAX_BODY_LENGTH)
+        .map_err(|reason| vec![json!({"field": "text", "reason": reason})])?;
+    let knowledge_base_sys_id = sys_id(args, "knowledge_base_sys_id")
+        .map_err(|reason| vec![json!({"field": "knowledge_base_sys_id", "reason": reason})])?;
     let category_sys_id = match args.get("category_sys_id") {
-        Some(_) => Some(sys_id(args, "category_sys_id").map_err(|reason| {
-            field_rejected(
-                id.clone(),
-                vec![json!({"field": "category_sys_id", "reason": reason})],
-            )
-        })?),
+        Some(_) => Some(
+            sys_id(args, "category_sys_id")
+                .map_err(|reason| vec![json!({"field": "category_sys_id", "reason": reason})])?,
+        ),
         None => None,
     };
     Ok(DraftInput {
@@ -449,7 +435,7 @@ fn input_from_plan(plan: &OperationPlan) -> Result<DraftInput> {
         changes.insert("category_sys_id".to_string(), category_sys_id);
     }
     let params = Value::Object(changes);
-    parse_plan_input(None, &params)
+    parse_plan_input(&params)
         .map_err(|_| anyhow::anyhow!("knowledge draft plan has invalid fields"))
 }
 
@@ -709,14 +695,19 @@ fn receipt_for_draft(
     }
 }
 
+#[derive(Default)]
+struct AuditChanges {
+    changes: Option<Value>,
+    metadata: Option<ServiceNowMetadata>,
+}
+
 async fn append_audit(
     state: &DaemonState,
     audit_id: &str,
     parent_audit_id: Option<&str>,
     tool: &str,
     status: ResultStatus,
-    changes: Option<Value>,
-    metadata: Option<ServiceNowMetadata>,
+    outcome: AuditChanges,
     identities: Option<(&str, &str)>,
 ) -> Result<()> {
     let stores = stores(state)?;
@@ -739,9 +730,9 @@ async fn append_audit(
     event.parent_audit_id = parent_audit_id.map(ToOwned::to_owned);
     event.result_status = status;
     event.policy_decisions = policy_decisions(status);
-    event.normalized_arguments_redacted = changes.clone().unwrap_or(Value::Null);
-    event.planned_changes = changes;
-    event.service_now_metadata = metadata;
+    event.normalized_arguments_redacted = outcome.changes.clone().unwrap_or(Value::Null);
+    event.planned_changes = outcome.changes;
+    event.service_now_metadata = outcome.metadata;
     stores
         .audit_sink
         .append(event)
@@ -823,8 +814,7 @@ async fn audited_error(
         None,
         KNOWLEDGE_DRAFT_APPLY_TOOL,
         status,
-        None,
-        None,
+        AuditChanges::default(),
         None,
     )
     .await;
@@ -845,8 +835,7 @@ async fn audited_knowledge_error(
         None,
         KNOWLEDGE_DRAFT_APPLY_TOOL,
         status,
-        None,
-        None,
+        AuditChanges::default(),
         None,
     )
     .await;
@@ -901,6 +890,42 @@ mod tests {
                 ..Default::default()
             },
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_draft_ambiguous_create_never_duplicates_an_article() {
+        let instance = MockServer::start().await;
+        let articles = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let saved = Arc::clone(&articles);
+        Mock::given(method("POST"))
+            .and(path("/api/now/table/kb_knowledge"))
+            .respond_with(move |request: &wiremock::Request| {
+                saved.lock().unwrap().push(request.body_json().unwrap());
+                // ServiceNow committed a draft but its response was lost.
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"error":{"message":"response lost"}}))
+            })
+            .mount(&instance)
+            .await;
+        let fixture = build_fixture_state_at_instance(&instance.uri())
+            .await
+            .unwrap();
+        let state = enabled_state(&fixture);
+        let plan = dispatch(JsonRpcRequest { jsonrpc:"2.0".into(),method:KNOWLEDGE_DRAFT_PLAN_TOOL.into(),params:json!({"short_description":"Example draft","text":"<p>One article only.</p>","knowledge_base_sys_id":"22222222222222222222222222222222"}),id:Some(json!(1)) },&state).await.result.unwrap();
+        for _ in 0..2 {
+            let applied = dispatch(JsonRpcRequest { jsonrpc:"2.0".into(),method:KNOWLEDGE_DRAFT_APPLY_TOOL.into(),params:json!({"plan_id":plan["plan_id"],"confirmation_token":plan["confirmation_token"],"idempotency_key":plan["idempotency_key"]}),id:Some(json!(2)) },&state).await;
+            assert_eq!(
+                applied.error.unwrap().message,
+                "PENDING_RESOLUTION_REQUIRED"
+            );
+            assert_eq!(
+                *articles.lock().unwrap(),
+                vec![
+                    json!({"short_description":"Example draft","text":"<p>One article only.</p>","kb_knowledge_base":"22222222222222222222222222222222","workflow_state":"draft"})
+                ],
+                "ambiguous create and replay must not duplicate provider records"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -742,6 +742,15 @@ impl SnowCore {
         self.records.add_work_note(number, text).await
     }
 
+    /// Append through the dedicated no-retry transport used by governed writes.
+    pub async fn add_work_note_without_retry(
+        &self,
+        number: &str,
+        text: &str,
+    ) -> Result<Option<SnowRecord>> {
+        self.records.add_work_note_without_retry(number, text).await
+    }
+
     pub async fn search_catalog_items(&self, query: &str, limit: u32) -> Result<Vec<CatalogItem>> {
         self.writes.search_catalog_items(query, limit).await
     }

@@ -2773,6 +2773,7 @@ dependencies = [
  "tokio-util",
  "uuid",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

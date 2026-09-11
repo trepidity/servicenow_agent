@@ -99,7 +99,14 @@ fn installer_creates_a_foreground_non_idle_launchagent() {
     assert!(calls.contains("bootout gui/"));
     assert!(calls.contains("bootstrap gui/"));
     assert!(calls.contains("enable gui/"));
-    assert!(calls.contains("kickstart -k gui/"));
+    assert!(
+        calls.contains("kickstart gui/"),
+        "start the service only if RunAtLoad has not already started it"
+    );
+    assert!(
+        !calls.contains("kickstart -k"),
+        "do not kill the just-bootstrapped daemon during credential startup"
+    );
     assert!(calls.contains("print gui/"));
 }
 

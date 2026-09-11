@@ -29,6 +29,7 @@ pub mod jobs;
 pub mod knowledge_write;
 pub mod resource_plan_write;
 pub mod rpc;
+mod startup_credentials;
 pub mod story_write;
 pub mod timecard_write;
 pub mod transport;
@@ -353,9 +354,14 @@ fn daemon_env_paths(env_name: &str) -> Vec<PathBuf> {
 async fn build_core(daemon_config: &DaemonConfig) -> Result<SnowCore> {
     let instance =
         std::env::var("SERVICENOW_INSTANCE").or_else(|_| std::env::var("SNOW_INSTANCE"))?;
-    let username = snow_core::credential::resolve_username_from_runtime_env()?;
     let credential = CredentialProvider::from_runtime_env();
-    let password = credential.resolve()?;
+    let started = std::time::Instant::now();
+    eprintln!("snow_daemon startup: resolving credentials");
+    let (username, password) = startup_credentials::resolve(&credential).await?;
+    eprintln!(
+        "snow_daemon startup: credentials ready elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     let auth = BasicAuth::new(&username, password.as_str()).without_session();
     let write_auth = BasicAuth::new(&username, password.as_str()).without_session();
     let metadata_password = password.clone();

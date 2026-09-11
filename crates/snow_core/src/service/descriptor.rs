@@ -1,7 +1,7 @@
 //! `DescriptorService` — live typed-resource metadata discovery (FND-OPS-001).
 //!
 //! Discovery is **fail-closed**: every value returned here came from the
-//! configured instance's `sys_dictionary` or `sys_choice`. Nothing is inferred
+//! configured instance's dictionary, choice, or authenticated UI field metadata. Nothing is inferred
 //! from a bundled schema, a display name, or a hardcoded field list. When the
 //! instance returns nothing, or ACLs deny the read, the affected category is
 //! reported as [`FieldSupport::Unavailable`] with a typed reason rather than as
@@ -97,6 +97,28 @@ impl DescriptorService {
     /// callers receive only the requested support fact, and must never accept
     /// the table from an RPC or MCP request.
     pub(crate) async fn supports_field(
+        &self,
+        table: &str,
+        field: &str,
+    ) -> Result<FieldSupport<bool>> {
+        let dictionary = self.dictionary_supports_field(table, field).await;
+        if matches!(dictionary, Ok(FieldSupport::Available { value: true })) {
+            return dictionary;
+        }
+        // Least-privilege identities may read table UI definitions while the
+        // dictionary or ancestor rows are hidden. This is another live source,
+        // never a static allowlist or a caller-supplied table/write bypass.
+        if let Some(metadata) = self.ctx.ui_metadata.as_ref()
+            && matches!(metadata.defines_field(table, field).await, Ok(true))
+        {
+            return Ok(FieldSupport::available_value(true));
+        }
+        // Empty, denied, malformed, or timed-out UI metadata proves nothing.
+        // Preserve the dictionary's typed unsupported/unavailable distinction.
+        dictionary
+    }
+
+    async fn dictionary_supports_field(
         &self,
         table: &str,
         field: &str,

@@ -2186,6 +2186,24 @@ impl RecordService {
         self.get_record_fresh(number).await
     }
 
+    /// Journal append is not idempotent. The governed path must never use the
+    /// read transport's automatic retries, even when the response is lost.
+    pub(crate) async fn add_work_note_without_retry(
+        &self,
+        number: &str,
+        text: &str,
+    ) -> Result<Option<SnowRecord>> {
+        let client =
+            self.ctx.write_client.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("governed work-note write client is not configured")
+            })?;
+        let Some((table, sys_id)) = self.ctx.lookup_table_and_sys_id(number).await? else {
+            return Ok(None);
+        };
+        client.add_work_note(&table, &sys_id, text).await?;
+        self.get_record_fresh(number).await
+    }
+
     pub async fn set_state(&self, number: &str, state: &str) -> Result<Option<SnowRecord>> {
         let Some((table, sys_id)) = self.ctx.lookup_table_and_sys_id(number).await? else {
             return Ok(None);

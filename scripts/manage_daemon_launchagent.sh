@@ -143,7 +143,10 @@ until "$launchctl_bin" bootstrap "$launch_domain" "$plist"; do
   sleep 1
 done
 "$launchctl_bin" enable "$service_target"
-"$launchctl_bin" kickstart -k "$service_target"
+# RunAtLoad may already be resolving credentials. A forced kickstart here kills
+# that fresh owner (and can orphan its helper) before it ever binds the socket.
+# Without -k this only starts the service if bootstrap has not already done so.
+"$launchctl_bin" kickstart "$service_target"
 
 deadline=$((SECONDS + start_timeout_secs))
 while :; do

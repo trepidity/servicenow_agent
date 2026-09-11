@@ -490,7 +490,11 @@ pub async fn handle_work_note_apply_add(
         return internal_error(id, err);
     }
 
-    let record = match state.core.add_work_note(&target.number, &text).await {
+    let record = match state
+        .core
+        .add_work_note_without_retry(&target.number, &text)
+        .await
+    {
         Ok(Some(record)) => record,
         Ok(None) => {
             return audited_work_note_error(

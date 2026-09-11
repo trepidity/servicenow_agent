@@ -222,6 +222,13 @@ enum TimecardSheetResolution {
 }
 
 impl WriteService {
+    /// The daemon always supplies a dedicated no-retry mutation transport. Keep
+    /// the legacy direct-core fallback for callers that do not configure one;
+    /// never use the retrying read client when a write client was provided.
+    fn mutation_client(&self) -> &servicenow_rs::prelude::ServiceNowClient {
+        self.ctx.write_client.as_deref().unwrap_or(&self.ctx.client)
+    }
+
     pub(crate) fn new(ctx: CoreContext) -> Self {
         Self { ctx }
     }
@@ -356,8 +363,7 @@ impl WriteService {
             }
         };
 
-        self.ctx
-            .client
+        self.mutation_client()
             .table(resource::timecard::TimecardResource::TABLE)
             .display_value(DisplayValue::Both)
             .update(
@@ -420,7 +426,7 @@ impl WriteService {
         table: &str,
         payload: serde_json::Value,
     ) -> Result<StoryWriteResult> {
-        let written = self.ctx.client.table(table).create(payload).await?;
+        let written = self.mutation_client().table(table).create(payload).await?;
         self.refetch_story_write_result(table, &written.sys_id, &written)
             .await
     }
@@ -431,7 +437,11 @@ impl WriteService {
         sys_id: &str,
         payload: serde_json::Value,
     ) -> Result<StoryWriteResult> {
-        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
+        let written = self
+            .mutation_client()
+            .table(table)
+            .update(sys_id, payload)
+            .await?;
         self.refetch_story_write_result(table, sys_id, &written)
             .await
     }
@@ -646,7 +656,7 @@ impl WriteService {
         }
 
         let table = "kb_knowledge";
-        let written = self.ctx.client.table(table).create(payload).await?;
+        let written = self.mutation_client().table(table).create(payload).await?;
         let expected_sys_id = written.sys_id.trim();
         if expected_sys_id.is_empty() {
             return Err(anyhow::anyhow!(
@@ -713,7 +723,7 @@ impl WriteService {
         table: &str,
         payload: serde_json::Value,
     ) -> Result<ChangeWriteResult> {
-        let written = self.ctx.client.table(table).create(payload).await?;
+        let written = self.mutation_client().table(table).create(payload).await?;
         self.refetch_change_write_result(table, &written.sys_id, &written)
             .await
     }
@@ -724,7 +734,11 @@ impl WriteService {
         sys_id: &str,
         payload: serde_json::Value,
     ) -> Result<ChangeWriteResult> {
-        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
+        let written = self
+            .mutation_client()
+            .table(table)
+            .update(sys_id, payload)
+            .await?;
         self.refetch_change_write_result(table, sys_id, &written)
             .await
     }
@@ -782,7 +796,7 @@ impl WriteService {
         payload: serde_json::Value,
     ) -> Result<ResourcePlanWriteResult> {
         let table = resource::resource_plan::ResourcePlanResource::TABLE;
-        let written = self.ctx.client.table(table).create(payload).await?;
+        let written = self.mutation_client().table(table).create(payload).await?;
         self.refetch_resource_plan_result(&written.sys_id, &written)
             .await
     }
@@ -793,7 +807,11 @@ impl WriteService {
         payload: serde_json::Value,
     ) -> Result<ResourcePlanWriteResult> {
         let table = resource::resource_plan::ResourcePlanResource::TABLE;
-        let written = self.ctx.client.table(table).update(sys_id, payload).await?;
+        let written = self
+            .mutation_client()
+            .table(table)
+            .update(sys_id, payload)
+            .await?;
         self.refetch_resource_plan_result(sys_id, &written).await
     }
 
@@ -1214,7 +1232,7 @@ impl WriteService {
     ) -> Result<CatalogSubmitResult> {
         let item_sys_id = normalize_record_lookup_sys_id(item_sys_id)?;
         let path = format!("/api/sn_sc/v1/servicecatalog/items/{item_sys_id}/order_now");
-        let raw_result = self.ctx.client.post(&path, request_body).await?;
+        let raw_result = self.mutation_client().post(&path, request_body).await?;
         let mut result = catalog_submit_result_from_response(
             item_sys_id.clone(),
             raw_result,
@@ -1319,8 +1337,7 @@ impl WriteService {
             return Ok(None);
         };
         Ok(Some(
-            self.ctx
-                .client
+            self.mutation_client()
                 .upload_attachment_file(&table, &sys_id, path, file_name, content_type)
                 .await?,
         ))

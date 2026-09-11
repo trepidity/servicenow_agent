@@ -100,6 +100,37 @@ impl UiMetadataClient {
         }
     }
 
+    /// Positive live field-definition proof only. Missing or malformed columns
+    /// are not evidence that a field is unsupported. Record ACLs and governed
+    /// write policy remain authoritative at apply time.
+    pub(crate) async fn defines_field(&self, table: &str, field: &str) -> Result<bool> {
+        if !is_metadata_identifier(table) || !is_metadata_identifier(field) {
+            return Err(anyhow::anyhow!("invalid metadata identifier"));
+        }
+        let body: serde_json::Value = self
+            .client
+            .get(format!("{}/api/now/ui/meta/{table}", self.base_url))
+            .basic_auth(&self.username, Some(self.password.as_str()))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let column = body
+            .get("result")
+            .and_then(|result| result.get("columns"))
+            .and_then(|columns| columns.get(field))
+            .and_then(serde_json::Value::as_object);
+        Ok(column.is_some_and(|column| {
+            column.get("name").and_then(serde_json::Value::as_str) == Some(field)
+                && column
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| !kind.trim().is_empty())
+        }))
+    }
+
     pub(crate) async fn field_choices(&self, table: &str, field: &str) -> Result<Vec<FieldChoice>> {
         if !is_metadata_identifier(table) || !is_metadata_identifier(field) {
             return Err(anyhow::anyhow!(

@@ -72,9 +72,9 @@ fn serialize_export(
             output.push(b'\n');
             Ok(output)
         }
-        ExportFormat::Csv => Ok(serialize_csv(&fields).into_bytes()),
-        ExportFormat::Markdown => Ok(serialize_markdown(table, &fields).into_bytes()),
-        ExportFormat::Xlsx => serialize_xlsx(table, &fields),
+        ExportFormat::Csv => Ok(serialize_csv(fields).into_bytes()),
+        ExportFormat::Markdown => Ok(serialize_markdown(table, fields).into_bytes()),
+        ExportFormat::Xlsx => serialize_xlsx(table, fields),
     }
 }
 
